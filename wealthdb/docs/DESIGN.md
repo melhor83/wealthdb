@@ -1697,7 +1697,7 @@ CREATE TABLE silver_sources (
         'relevate', 'viac', 'cointracking', 'carta', 'angellist',
         'equityzen', 'manual', 'fred', 'chase', 'firstcitizens',
         'raiffeisen_at', 'amex', 'synthetic', 'plaid', 'refdata',
-        'curves'
+        'curves', 'erstebank_at'
     )),
     silver_path         TEXT    NOT NULL,            -- as observed at last load
     high_watermark      BIGINT  NOT NULL,            -- plugin's logical change number after the last load
@@ -3573,9 +3573,9 @@ wealthdb/
 │   ├── canonical/                  — change types + enums (asset_class, vehicle, …); zero deps
 │   ├── silver/                     — adapter interface + registry, one package per source:
 │   │   │                             amex angellist carta chase cointracking curves
-│   │   │                             equityzen fidelity firstcitizens fred manual plaid
-│   │   │                             raiffeisen_at refdata relevate schwab swissquote
-│   │   │                             synthetic ubs viac
+│   │   │                             equityzen erstebank_at fidelity firstcitizens fred
+│   │   │                             manual plaid raiffeisen_at refdata relevate schwab
+│   │   │                             swissquote synthetic ubs viac
 │   │   └── <source>/               — impl (snapshots/transactions/classmap) + co-located policy.go, and lotpolicy.go where the lot engine replays the source
 │   ├── gold/                       — DuckDB schema, writer, queries, report macros
 │   │   └── migrations/             — 0001…NNNN SQL, //go:embed-ed by schema.go

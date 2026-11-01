@@ -89,7 +89,7 @@ func appendBalances(ctx context.Context, db *sql.DB, label, q string, args []any
 // AppendReportedBalances appends one CURRENT cash balance per account and
 // run that listed it inside w: the account's roster balance as of that run,
 // from its latest `accounts` row at or before it, in its currency (ccy) and
-// as stored. runsTable holds one (snapshot_at, account_external_id) row per
+// in the canonical sign (sign, nil for the figure as stored). runsTable holds one (snapshot_at, account_external_id) row per
 // loaded run and account the run's roster listed; it is the adapter's own
 // constant. An account's own roster rows count as listings too. A roster
 // row with no balance emits none. kind names the collector in errors. A
@@ -101,7 +101,8 @@ func appendBalances(ctx context.Context, db *sql.DB, label, q string, args []any
 // latest runs leave out has no balance after the last run that listed it,
 // so gold can end it (wealthdb/docs/DESIGN.md §10.7).
 func AppendReportedBalances(ctx context.Context, db *sql.DB, kind, runsTable string,
-	w canonical.Window, ccy func(accountID string) string, batch *canonical.SnapshotBatch) error {
+	w canonical.Window, ccy func(accountID string) string,
+	sign func(accountID string, v float64) canonical.Decimal, batch *canonical.SnapshotBatch) error {
 	label := kind + " roster balances"
 	has, err := HasTables(ctx, db, runsTable)
 	if err != nil {
@@ -122,7 +123,7 @@ SELECT id, at, balance FROM (
  WHERE balance IS NOT NULL
  ORDER BY id, at`
 	return appendBalances(ctx, db, label, q, []any{w.Start, w.End},
-		canonical.BalanceKindCurrent, `{"basis":"roster"}`, ccy, nil, batch)
+		canonical.BalanceKindCurrent, `{"basis":"roster"}`, ccy, sign, batch)
 }
 
 // BankRosterRow is an account's latest row in a bank silver's `accounts`

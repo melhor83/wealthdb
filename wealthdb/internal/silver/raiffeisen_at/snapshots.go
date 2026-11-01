@@ -26,7 +26,7 @@ func (c *Connection) Snapshots(ctx context.Context, w canonical.Window) (silver.
 	if err := c.appendAccounts(ctx, ccy, &batch); err != nil {
 		return nil, err
 	}
-	if err := silver.AppendReportedBalances(ctx, c.db, kindName, "run_accounts", w, ccy.Of, &batch); err != nil {
+	if err := silver.AppendReportedBalances(ctx, c.db, kindName, "run_accounts", w, ccy.Of, nil, &batch); err != nil {
 		return nil, err
 	}
 	if err := c.appendDailyBalances(ctx, w, ccy, &batch); err != nil {
