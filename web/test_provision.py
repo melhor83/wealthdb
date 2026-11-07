@@ -2255,7 +2255,7 @@ check("...and lists its legend in the bands' own order",
       all(VIZ[n].get("legend.is_reversed") is False for n in _stacked_bands),
       [n for n in _stacked_bands if VIZ[n].get("legend.is_reversed") is not False])
 check("...ending in that order and nothing after it",
-      all(q.rstrip().endswith(("NULLS FIRST, month", "NULLS FIRST, as_of_day", "ORDER BY series_rank, i"))
+      all(re.search(r"NULLS FIRST, q\.\w+, (month|as_of_day)\s*$|ORDER BY series_rank, i\s*$", q)
           or "AS latest FROM e" in q for q in _stacked_bands.values()))
 
 section("line charts list their legend top line first")
@@ -2270,6 +2270,9 @@ check("the ranked line charts order their rows largest series first",
       [n for n in _LINE_RANKED if "series_rank DESC" not in (sql_of(CARDS[n][2]) or "")])
 check("...and keep the legend in that order",
       all(VIZ[n].get("legend.is_reversed") is False for n in _LINE_RANKED))
+check("Cumulative return (TWR) draws the benchmark's rows last",
+      f"ORDER BY q.source = '{p.BENCHMARK_SERIES}', series_rank DESC NULLS LAST, q.source, year"
+      in sql_of(CARDS["Cumulative return (TWR)"][2]))
 
 section("the Exposure dashboard")
 
@@ -3726,6 +3729,42 @@ try:
 except ImportError:
     duckdb = None
 check("the duckdb module is installed", duckdb is not None, "make test-web runs these tests with it")
+
+# _series_order's rows, as the driver's engine orders them.
+if duckdb is not None:
+    section("a series' rank breaks its ties by name")
+
+    def ordered_rows(*args, **kwargs):
+        """The (series, t) rows of a _series_order query."""
+        return duckdb.connect().execute(
+            f"SELECT s, t FROM (\n{p._series_order(*args, **kwargs)}\n)").fetchall()
+
+    def ordered_series(*args, **kwargs):
+        """The series in the order their rows first appear."""
+        return list(dict.fromkeys(s for s, _ in ordered_rows(*args, **kwargs)))
+
+    # Two series tie on a rank and two more on a NULL one: they have no
+    # value at the last t.
+    _rows = ("SELECT * FROM (VALUES (2, 'Benchmark', 9.0), (1, 'nil-b', 1.0), (1, 'nil-a', 1.0), (2, 'low', 1.0),"
+             " (2, 'tied-b', 5.0), (2, 'tied-a', 5.0), (1, 'Benchmark', 9.0)) AS v(t, s, v)")
+    _no_benchmark = _rows.replace("(2, 'Benchmark', 9.0), ", "").replace(", (1, 'Benchmark', 9.0)", "")
+    _latest = (_rows, "t", "s", "v", "latest")
+    check("a tie on rank orders by the series' name, largest first",
+          ordered_series(*_latest, largest_first=True) == ["Benchmark", "tied-a", "tied-b", "low", "nil-a", "nil-b"])
+    check("...and smallest first, NULL ranks first",
+          ordered_series(*_latest) == ["nil-a", "nil-b", "low", "tied-a", "tied-b", "Benchmark"])
+    check("...and by a total",
+          ordered_series(_rows, "t", "s", "v", "total") == ["low", "nil-a", "nil-b", "tied-a", "tied-b", "Benchmark"])
+    check("a series' rows stay together in t's order",
+          [t for s, t in ordered_rows(*_latest, largest_first=True) if s == "Benchmark"] == [1, 2])
+    check("rows_last puts a series after the rest, NULL ranks too",
+          ordered_series(*_latest, largest_first=True, rows_last="Benchmark")
+          == ["tied-a", "tied-b", "low", "nil-a", "nil-b", "Benchmark"])
+    check("...and the others keep the places they hold without it",
+          ordered_series(*_latest, largest_first=True, rows_last="Benchmark")[:-1]
+          == ordered_series(_no_benchmark, "t", "s", "v", "latest", largest_first=True))
+    check("legend_last still comes first in a stack, by its NULL rank",
+          ordered_series(*_latest, legend_last="low") == ["low", "nil-a", "nil-b", "tied-a", "tied-b", "Benchmark"])
 
 _FIELD = {v: k for k, v in p.FIELD_IDS.items()}
 

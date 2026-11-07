@@ -1299,7 +1299,7 @@ def benchmark_line_sql(value, *, index=False):
             " ORDER BY series, day")
 
 
-def _series_order(sql, t, series, metric, by, largest_first=False, legend_last=None):
+def _series_order(sql, t, series, metric, by, largest_first=False, legend_last=None, rows_last=None):
     """A chart's query with its rows ordered by series, since Metabase
     takes the series in the order their rows first appear. `by` ranks a
     series by its value at the last `t` ("latest", a level that carries
@@ -1309,10 +1309,17 @@ def _series_order(sql, t, series, metric, by, largest_first=False, legend_last=N
     legend's default reversal switched off (STACKED_VIZ), the legend
     lists the largest first. A line chart wants `largest_first`, the
     legend's own order, top line first. A series with no value at the
-    last `t` ranks last. `sql` ends without an ORDER BY, and `t`,
-    `series` and `metric` are its column names; the result keeps its
-    columns. `legend_last` names a series with no rank, whose rows come
-    first, which puts it at the end of a stacked chart's legend.
+    last `t` ranks last. The series' name breaks a tie on rank, a NULL
+    rank included, so every load gives the rows one order. `sql` ends
+    without an ORDER BY, and `t`, `series` and `metric` are its column
+    names; the result keeps its columns. `legend_last` names a series
+    with no rank, whose rows come first, which puts it at the end of a
+    stacked chart's legend. `rows_last` names a series whose rows come
+    after every other's, NULL ranks too. So a picked benchmark keeps the
+    other series' order, and its line lies over theirs. Their colours
+    hold between two picks. Going from eight series to nine, Metabase
+    changes its palette whatever the rows' order, so a benchmark added
+    to eight series recolours them.
 
     The rank is an aggregate per series joined back, not a window: the
     DuckDB the Metabase driver bundles fails on a window partitioned by
@@ -1325,11 +1332,13 @@ def _series_order(sql, t, series, metric, by, largest_first=False, legend_last=N
     if legend_last:
         rank = f"CASE WHEN {series} <> '{legend_last}' THEN {rank} END"
     order = "series_rank DESC NULLS LAST" if largest_first else "series_rank NULLS FIRST"
+    if rows_last:
+        order = f"q.{series} = '{rows_last}', {order}"
     return (f"WITH q AS (\n{sql}\n),\n"
             f"ranks AS (SELECT {series} AS series_key, {rank} AS series_rank FROM q GROUP BY 1)\n"
             f"SELECT q.*\n"
             f"  FROM q LEFT JOIN ranks ON ranks.series_key IS NOT DISTINCT FROM q.{series}\n"
-            f" ORDER BY {order}, {t}")
+            f" ORDER BY {order}, q.{series}, {t}")
 
 
 # A line chart with one line per series: the legend in the lines' order.
@@ -2075,7 +2084,7 @@ def question_defs(db_id, mid):
             "Time-weighted return compounded year by year from the start year, "
             "per source and for '(all sources)'.",
             _series_order(returns_growth_sql(), "year", "source", "cumulative_return", "latest",
-                          largest_first=True),
+                          largest_first=True, rows_last=BENCHMARK_SERIES),
             {**_series_viz("year", "source", "cumulative_return", percent=True), **LINES_VIZ, **BENCHMARK_LINE}),
         "Monthly returns (TWR)": returns_native("Monthly returns (TWR)",
             "Time-weighted return per month, one line per source plus an "
