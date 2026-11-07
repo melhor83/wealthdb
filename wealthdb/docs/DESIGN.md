@@ -215,11 +215,46 @@ else is left alone):
 
 | Class | Renders as | Carries |
 | --- | --- | --- |
-| account-id | `****1234` — length preserved, a short tail and an IBAN country code left legible so rows stay distinguishable | account / portfolio / relationship / transaction ids. Applied only to identifier-shaped values: alphanumeric with a digit. A purely-alphabetic label (a bank-assigned `Education` / `Authorized`) and any value with a space or a paren are taxonomy or display text and pass through. |
+| account-id | `****1234` — length preserved, a short tail and an IBAN country code left legible so rows stay distinguishable | account / portfolio / relationship / transaction / lot ids, and the labels built on them. Every id in the value redacts (below). Words and short numbers stay. |
 | free-text | `***` — the whole cell, in every format | values that can carry a person's name, never look like an identifier, and were not typed by the household: statement narratives and their folds (`counterparty`, `description`, `merchant_signature` and the `merchant` built from it in §4.12). Also the instrument id of a holding no public key names, unless a person typed it. Shape-blind by design — the narratives worth hiding are multi-word, so a shape test would pass exactly them. |
 | pseudonym | `manual-1` — the same value reads the same in every row and column of a run, in every format | the names a person typed (below). Shape-blind like free-text. |
 | quantity | `***` (table) / empty (csv) / key dropped (json) | share counts. |
 | money | `*****.**` (table) / empty (csv) / key dropped (json) | every monetary amount. |
+
+**How an id redacts.** An id shows only its tail, and a value keeps the
+same length:
+
+| Letters and digits in the id | Shows |
+| --- | --- |
+| 8 or more | the last 4 |
+| 6 or 7 | the last 3 |
+| 4 or 5 | the last 2 |
+| 3 or fewer | nothing |
+
+An id of 15 to 34 characters that starts with two letters also keeps
+those letters, an IBAN's country code. A value reads like this:
+
+- `:`, `@` and `#` split a composite value into parts. Each part reads
+  alone, so each id keeps its own tail.
+- A part of letters and digits only, with at least one digit, is one id.
+- Any other part reads as runs. A run is groups of letters and digits
+  joined by separators:
+  - Two groups join through a dash or a dot.
+  - Two groups with digits join through any other separator, unless it
+    holds a comma or a semicolon and a space. Those end a phrase, as
+    between a street number and a postal code.
+  - A word never joins through a space.
+- A run with more than four digits is one id. So is a run with a group
+  of 8 or more characters that mixes letters and digits. Its separators
+  stay, and its letters mask with its digits. So `ABC-123456` prints
+  `***-**3456` and `1234 5678 9012` prints `**** **** 9012`.
+- Everything else stays. A word stays, so `Mortgage 12345678` prints
+  `Mortgage ****5678` and `<id>:overlay` keeps `overlay`. Up to four
+  digits stay too, as in `Portfolio 2024` and `401(k)`. Four digits are
+  what `-p` shows of any id, so masking them hides nothing.
+
+A filter under `-p` reads the printed cell. It matches the masked text,
+never the id behind it.
 
 **Typed names.** Every name a person typed is hidden. It prints as a
 pseudonym, or as a redacted id where an account column shows the
@@ -275,7 +310,15 @@ share is not an amount. Independently of the per-column pass, every
 cell also runs through a content scrub that masks structured bank
 identifiers wherever they appear, including inside columns that are
 not redacted at all (a mortgage account number surfacing as an
-instrument key).
+instrument key, its tail included). It also masks a postal address
+that closes a value: a comma, a street and a house number, a comma, a
+postal code of four or five digits, a town, to the end of the value. A
+bank can name a mortgage by the property. The product name before the
+address stays, and the address masks to stars, its separators kept, in
+every column. The scrub runs before the column's own redaction.
+
+The scrub knows these shapes only. A digit pattern over every cell
+would also hit dates, security names and public keys.
 
 Formats:
 - `table` — Postgres-style aligned ASCII (one column header line,

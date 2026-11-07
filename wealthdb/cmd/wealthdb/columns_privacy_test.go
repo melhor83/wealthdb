@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/csv"
 	"maps"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -13,6 +15,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/gold"
@@ -89,11 +92,72 @@ func TestRedactAccountID(t *testing.T) {
 		{"000", "***"},
 		{"0012", "**12"},
 		{"00045", "***45"},
-		// Display strings / sentinels: any non-alphanumeric → pass
-		// through unchanged.
+		// Letters, a dash, digits: one id, letters and all.
+		{"ABC-123456", "***-**3456"},
+		// Spaced and dotted digits: one id, separators kept.
+		{"1234 5678 9012", "**** **** 9012"},
+		{"1.234.567.890.12", "*.***.***.*90.12"},
+		{"1234.567890.1", "****.***890.1"},
+		// A spaced IBAN keeps its country code like a plain one.
+		{"CH00 0000 0000 0000 0295 7", "CH** **** **** **** *295 7"},
+		// A long number takes its product code and its tail along.
+		{"1234 00000001.MMM 0000", "**** ********.*** 0000"},
+		// Other separators join digits too.
+		{"12345678/90", "******78/90"},
+		{"1234 - 5678", "**** - 5678"},
+		// A short run masks like a short plain id.
+		{"12-345", "**-*45"},
+		// Each id of a composite keeps its own tail.
+		{"1234567890:CH0000000000000002957:0987654321",
+			"******7890:CH***************2957:******4321"},
+		{"1234567890@CH0000000000000002957", "******7890@CH***************2957"},
+		{"1234567890@CH0000000000000002957:WIR", "******7890@CH***************2957:WIR"},
+		{"BUY:1234567890@0987654321", "BUY:******7890@******4321"},
+		// A lot id: digits, a hash sign, a long hash.
+		{"123456789012#0123456789abcdef0123456789abcdef",
+			"********9012#****************************cdef"},
+		// A short id in a composite masks as it does alone.
+		{"1234:5678", "**34:**78"},
+		// Non-ASCII letters count as letters, and length is in characters.
+		{"Küche-123456", "*****-**3456"},
+		// A word stays beside an id: a letter group never joins
+		// through a space.
+		{"Mortgage 12345678", "Mortgage ****5678"},
+		{"Savings-Plus 12345678", "Savings-Plus ****5678"},
+		{"12345678 Joint 123456", "****5678 Joint ***456"},
+		// A long token of letters and digits is an id, whatever its
+		// digits number and whatever pads it.
+		{"AbCdEfGhIjKl3MnOpQrS==:WIR", "Ab**************pQrS==:WIR"},
+		// A mixed group is an id from 8 characters, and shorter it
+		// stays beside a word.
+		{"Plan ABCD12E", "Plan ABCD12E"},
+		{"Plan ABCD12EF", "Plan ****12EF"},
+		// A later group's being mixed makes the whole run an id.
+		{"AB-CDEFG1HIJ", "**-*****1HIJ"},
+		// A code keeps its country only from 15 to 34 characters, and
+		// only when both of its first two are letters.
+		{"AB345678901234", "**********1234"},
+		{"AB345678901234567890123456789012345", "*******************************2345"},
+		{"A12345678901234", "***********1234"},
+		// A semicolon and a space end a phrase too.
+		{"Tier 12; 3456", "Tier 12; 3456"},
+		// A comma and a space end a phrase, so numbers listed that way
+		// are no run. An address is the scrub's to mask.
+		{"Example Plan, Tier 12, 3456", "Example Plan, Tier 12, 3456"},
+		// Up to four digits stay, alone or in a run: masking them
+		// would hide nothing -p shows of an id.
+		{"Portfolio 2024", "Portfolio 2024"},
+		{"401(k)", "401(k)"},
+		{"Savings 3", "Savings 3"},
+		{"Rewards card ****1234", "Rewards card ****1234"},
+		{"Pillar 3a", "Pillar 3a"},
+		{"Series A1", "Series A1"},
+		{"ABC-1234", "ABC-1234"},
+		// Display strings and sentinels with no id in them stay.
 		{"Portfolio overlay", "Portfolio overlay"},
 		{"(no portfolio)", "(no portfolio)"},
 		{"Brokerage (other)", "Brokerage (other)"},
+		{"Example-Name.Part", "Example-Name.Part"},
 		// Multi-word free text is NOT an account id and must keep
 		// passing through here — the account-id contract is what
 		// keeps display strings legible. Values shaped like this
@@ -111,6 +175,123 @@ func TestRedactAccountID(t *testing.T) {
 		got := redactAccountID(c.in)
 		if got != c.want {
 			t.Errorf("redactAccountID(%q) = %q, want %q", c.in, got, c.want)
+		}
+		if a, b := utf8.RuneCountInString(c.in), utf8.RuneCountInString(c.want); a != b {
+			t.Errorf("case %q: length %d becomes %d", c.in, a, b)
+		}
+	}
+}
+
+// TestRedactedIDShowsItsTailAtMost: whatever separates an id's digits,
+// the redacted value shows no more of them than the plain id shows.
+func TestRedactedIDShowsItsTailAtMost(t *testing.T) {
+	t.Parallel()
+	const id = "987654321098"
+	for _, sep := range []string{" ", "  ", "-", ".", "/", "_", "+", ",", "'", " - ", ") ("} {
+		for _, split := range [][]int{{4}, {4, 8}, {2, 6, 10}, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}} {
+			var b strings.Builder
+			from := 0
+			for _, at := range split {
+				b.WriteString(id[from:at] + sep)
+				from = at
+			}
+			b.WriteString(id[from:])
+			got := redactAccountID(b.String())
+			var digits strings.Builder
+			for _, r := range got {
+				if r >= '0' && r <= '9' {
+					digits.WriteRune(r)
+				}
+			}
+			if digits.String() != id[len(id)-4:] {
+				t.Errorf("redactAccountID(%q) = %q shows %q", b.String(), got, digits.String())
+			}
+		}
+	}
+}
+
+// TestIdentifierPrivacyEveryFormat: an account's spaced id and a label
+// around one redact alike in every output format, a filter under -p
+// reads the masked text, and the privacy endpoint serves the same.
+func TestIdentifierPrivacyEveryFormat(t *testing.T) {
+	t.Parallel()
+	cfg := setupExposureGold(t,
+		`INSERT INTO silver_sources (silver_source_id, silver_kind, silver_path, high_watermark, first_loaded_at, last_loaded_at)
+		 VALUES ('bank', 'schwab', '/tmp/bank.db', -1, 0, 0)`,
+		`INSERT INTO accounts (silver_source_id, account_external_id, account_kind, display_name, nickname, base_currency,
+		 first_seen_at, last_seen_at)
+		 VALUES ('bank', '1357 2468 9753', 'cash', 'Example 2468 9753', NULL, 'USD', 0, 0),
+		        ('bank', 'ABC-864297', 'cash', 'Premier Checking', NULL, 'USD', 0, 0)`,
+		`INSERT INTO cash_balances (silver_source_id, snapshot_at, account_external_id, currency, balance_kind, amount)
+		 VALUES ('bank', ?, '1357 2468 9753', 'USD', 'current', 100), ('bank', ?, 'ABC-864297', 'USD', 'current', 200)`)
+	const cols = "account,account_id"
+	accounts := func(flags ...string) string {
+		t.Helper()
+		args := append([]string{"-c", cfg, "holdings", "accounts", "-d", "2026-06-30", "-C", cols}, flags...)
+		so, se, code := run(t, args...)
+		if code != 0 {
+			t.Fatalf("holdings accounts %v: exit %d: %s", flags, code, se)
+		}
+		return so
+	}
+	for _, format := range []string{"table", "csv", "csv_plain", "json"} {
+		out := accounts("-p", "-f", format)
+		for _, want := range []string{"Example **** 9753", "**** **** 9753", "Premier Checking", "***-**4297"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("%s: -p output lacks %q:\n%s", format, want, out)
+			}
+		}
+		for _, leak := range []string{"1357", "2468", "8642", "ABC"} {
+			if strings.Contains(out, leak) {
+				t.Errorf("%s: -p output shows %q:\n%s", format, leak, out)
+			}
+		}
+	}
+	if off := accounts("-f", "csv"); !strings.Contains(off, "Example 2468 9753,1357 2468 9753") {
+		t.Errorf("output without -p lost an id:\n%s", off)
+	}
+
+	// A filter reads the printed cell: the masked text matches, the
+	// real id does not, so a filter cannot probe what -p hides.
+	for filter, want := range map[string]bool{
+		"account_id = **** **** 9753": true,
+		"account_id contains 9753":    true,
+		"account_id = 1357 2468 9753": false,
+		"account_id contains 2468":    false,
+	} {
+		if got := strings.Contains(accounts("-p", "-f", "csv", "-F", filter), "9753"); got != want {
+			t.Errorf("-p -F %q matched the row: %v, want %v", filter, got, want)
+		}
+	}
+
+	srv := httptest.NewServer(newHTTPFront(newTestMCP(cfg, false), newTestMCP(cfg, true), testToken, nil))
+	defer srv.Close()
+	code, body := post(t, srv, "/mcp/privacy", "Bearer "+testToken, nil,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"holdings",
+		"arguments":{"view":"accounts","as_of":"2026-06-30","columns":"all"}}}`)
+	if code != http.StatusOK {
+		t.Fatalf("/mcp/privacy: status %d: %s", code, body)
+	}
+	if !strings.Contains(body, "**** **** 9753") || !strings.Contains(body, "***-**4297") {
+		t.Errorf("/mcp/privacy lacks the masked ids:\n%s", body)
+	}
+	for _, leak := range []string{"1357", "2468", "8642", "ABC-"} {
+		if strings.Contains(body, leak) {
+			t.Errorf("/mcp/privacy shows %q:\n%s", leak, body)
+		}
+	}
+}
+
+// TestLikelyAccountIDStaysNarrow pins what lineClass reads: a value
+// redactAccountID masks by its runs is still no id of a typed source.
+func TestLikelyAccountIDStaysNarrow(t *testing.T) {
+	t.Parallel()
+	for in, want := range map[string]bool{
+		"123456789": true, "ABC123": true, "1234 5678 9012": false, "ABC-123456": false,
+		"user:wallet1": false, "Savings": false, "12": false,
+	} {
+		if got := isLikelyAccountID(in); got != want {
+			t.Errorf("isLikelyAccountID(%q) = %v, want %v", in, got, want)
 		}
 	}
 }
@@ -204,13 +385,26 @@ func TestScrubSensitiveIDs(t *testing.T) {
 		// masked, last 4 digits kept. Synthetic.
 		{"1234 00000001", "**** ****0001"},
 		// UBS mortgage account number embeds the relationship prefix;
-		// the ".MMM <n>" product suffix is not sensitive and stays.
-		{"1234 00000001.MMM 0000", "**** ****0001.MMM 0000"},
+		// the match takes it whole, the ".MMM <n>" tail included.
+		{"1234 00000001.MMM 0987", "**** ********.*** 0987"},
+		{"ubs:1234 00000001.MMM 0987:x", "ubs:**** ********.*** 0987:x"},
+		{"1234 00000001.M1M 0987", "**** ********.*** 0987"},
 		// Portfolio form "<rel> R001": the trailing portfolio marker
 		// is preserved, only the relationship core is masked.
 		{"1234 00000001 R001", "**** ****0001 R001"},
 		// Embedded inside a longer free-text cell.
 		{"Mortgage 1234 00000001 (fixed)", "Mortgage **** ****0001 (fixed)"},
+		// An address closing a label masks to the end of the value, its
+		// separators kept. The example is web/test_provision.py's too.
+		{"Sample Loan, Invented Way 7b, 12345 Nowhere", "Sample Loan, ******** *** **, ***** *******"},
+		{"Sample Loan, Invented Way 7, 1234 Nowhere XX", "Sample Loan, ******** *** *, **** ******* **"},
+		// A label with commas before the address keeps them.
+		{"Sample, Fixed Loan, Invented Way 7, 1234 Nowhere", "Sample, Fixed Loan, ******** *** *, **** *******"},
+		// No street, no address: a list, a date, a security's name.
+		{"Sample Fund, 1234 Nowhere", "Sample Fund, 1234 Nowhere"},
+		{"Sample Note 2.5%, 01/02/2030", "Sample Note 2.5%, 01/02/2030"},
+		{"Sample Loan, Invented Way 7, 123 Nowhere", "Sample Loan, Invented Way 7, 123 Nowhere"},
+		{"Sample Loan, Invented Way 7, 1234", "Sample Loan, Invented Way 7, 1234"},
 		// Non-matches pass through untouched:
 		//   ISIN-shaped (no internal space). Synthetic placeholder.
 		{"CH0000000009", "CH0000000009"},
@@ -250,8 +444,36 @@ func TestScrubReachesPrivacyNoneColumn(t *testing.T) {
 	}
 	// privacy on: scrubbed even though the column is PrivacyNone.
 	on := rowsToTable(rows, cols, true, output.FormatTable, nil)
-	if on.Rows[0][0] != "**** ****0001.MMM 0000" {
+	if on.Rows[0][0] != "**** ********.*** 0000" {
 		t.Errorf("privacy on = %q, want the account number masked", on.Rows[0][0])
+	}
+}
+
+// TestAddressMasksInEveryClass: the scrub runs before the per-column
+// pass, so an address masks whole in a redacted column too, where a
+// five-digit postal code would otherwise star first and hide the shape.
+func TestAddressMasksInEveryClass(t *testing.T) {
+	t.Parallel()
+	type row struct{ label string }
+	get := func(r row) string { return r.label }
+	cols := []columnSpec[row]{
+		{Name: "name", Extract: get},
+		{Name: "account", Extract: get, Privacy: PrivacyAccountID},
+		{Name: "description", Extract: get, Privacy: PrivacyFreeText},
+	}
+	for label, want := range map[string]string{
+		"Sample Loan, Invented Way 7b, 12345 Nowhere": "Sample Loan, ******** *** **, ***** *******",
+		"Sample Loan, Invented Way 7, 1234 Nowhere":   "Sample Loan, ******** *** *, **** *******",
+	} {
+		for _, format := range []output.Format{output.FormatTable, output.FormatCSV, output.FormatCSVPlain, output.FormatJSON} {
+			got := rowsToTable([]row{{label}}, cols, true, format, nil).Rows[0]
+			if got[0] != want || got[1] != want || got[2] != freeTextPlaceholder {
+				t.Errorf("%s: %q = %q, want %q in name and account, and %s", format, label, got, want, freeTextPlaceholder)
+			}
+		}
+		if got := rowsToTable([]row{{label}}, cols, false, output.FormatTable, nil).Rows[0][0]; got != label {
+			t.Errorf("privacy off = %q, want %q", got, label)
+		}
 	}
 }
 
