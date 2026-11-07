@@ -330,7 +330,7 @@ type ownedFlow struct {
 	// can count on the money being inside.
 	live bool
 	// funds says the leg falls before acct's debut, where onboarding books acct's
-	// own first value.
+	// first value, alone or in its per-entity-once group's step.
 	funds bool
 	// closes says the leg falls into acct's closure: the closure day is the first
 	// valuation to show it, so the synthetic closure would book it again.
@@ -344,11 +344,15 @@ type movedLegs struct {
 	funded  map[*accountData]float64        // onboarding: what the first value holds through moves, signed
 	closing map[*accountData]float64        // closure: what the last value holds that stays inside, signed
 	moves   map[*accountData][]returns.Flow // each account's flows and inside legs
+	// fundedFrom is the other side of funded: each partner's legs that funded a
+	// debut, signed, by the day the partner's value shows them. A sibling's drop
+	// on a per-entity-once debut day that they explain is funded already.
+	fundedFrom map[*accountData]map[int64]float64
 }
 
 func newMovedLegs() *movedLegs {
 	return &movedLegs{funded: map[*accountData]float64{}, closing: map[*accountData]float64{},
-		moves: map[*accountData][]returns.Flow{}}
+		moves: map[*accountData][]returns.Flow{}, fundedFrom: map[*accountData]map[int64]float64{}}
 }
 
 func (m *movedLegs) add(a *accountData, f returns.Flow) { m.moves[a] = append(m.moves[a], f) }
@@ -367,6 +371,10 @@ func (m *movedLegs) cancel(a, b ownedFlow) {
 		leg, partner := p[0], p[1]
 		if leg.funds && partner.live {
 			m.funded[leg.acct] += leg.Amount
+			if m.fundedFrom[partner.acct] == nil {
+				m.fundedFrom[partner.acct] = map[int64]float64{}
+			}
+			m.fundedFrom[partner.acct][partner.ValuedOn] += partner.Amount
 		}
 		if leg.closes && leg.live && (partner.live || partner.funds) {
 			m.closing[leg.acct] += leg.Amount
@@ -477,7 +485,7 @@ func entityFlows(assets []*accountData, p ReturnParams, winFrom, winTo int64, ag
 			onSpine := f.Day > a.firstDay()
 			cand = append(cand, ownedFlow{Flow: f, subsumed: flowSubsumed(a, f.Day, winFrom, winTo, true),
 				acct: a, onSpine: onSpine, live: onSpine && f.ValuedOn != 0 && f.ValuedOn <= winTo,
-				funds:  onboardsOwnValue(a) && subsumesAtDebut(a, f.Day, winFrom, winTo),
+				funds:  onboardsFirstValue(a) && subsumesAtDebut(a, f.Day, winFrom, winTo),
 				closes: cd > winFrom && cd <= winTo && f.ValuedOn == cd && a.rpolicy.ClosureScope != returns.ClosureLedgerExact})
 		}
 	}
@@ -513,9 +521,11 @@ func entityFlows(assets []*accountData, p ReturnParams, winFrom, winTo int64, ag
 	//   - OnboardPerConstituent (default): the debuting account's OWN value, less
 	//     the legs netting cancelled against a live partner (movedLegs).
 	//   - OnboardPerEntityOnce: the newly-debuting constituents' first value MINUS
-	//     same-day sibling FUNDING drops only (NOT the raw calendar aggregate delta —
-	//     see groupOnboardStep: same-day external deposits and market moves on
-	//     siblings are excluded so they aren't double-counted). An internal
+	//     the legs netting cancelled against a live partner, as above, and MINUS
+	//     same-day sibling FUNDING drops those legs do not explain (NOT the raw
+	//     calendar aggregate delta — see groupOnboardStep: same-day external
+	//     deposits and market moves on siblings are excluded so they aren't
+	//     double-counted). An internal
 	//     cash->securities move inside a UBS
 	//     relationship debuts a securities account while its funding cash account
 	//     drops by the same amount, so the step-up nets to ~0 and NOTHING is
@@ -564,7 +574,7 @@ func entityFlows(assets []*accountData, p ReturnParams, winFrom, winTo int64, ag
 	// internal churn is nothing — capital counted exactly once.
 	for _, grp := range perEntityGroups {
 		for _, day := range groupDebutDays(grp, winFrom, winTo) {
-			step := groupOnboardStep(grp, day)
+			step := groupOnboardStep(grp, day, moved)
 			if of, ok := returns.OnboardingFlow(day, step); ok {
 				flows = append(flows, of)
 			}
@@ -619,8 +629,14 @@ func groupDebutDays(grp []*accountData, winFrom, winTo int64) []int64 {
 
 // groupOnboardStep is the capital onboarded when one or more constituents of a
 // per-entity-once group debut on `day`. It is the newly-debuting constituents'
-// first value NET OF same-day sibling FUNDING drops only — NOT the raw aggregate
-// calendar delta (the group's total value on day minus its total on day-1).
+// first value NET OF two offsets — NOT the raw aggregate calendar delta (the
+// group's total value on day minus its total on day-1):
+//
+//   - the pre-debut legs netting cancelled against a live partner (moved.funded),
+//     as per-constituent onboarding offsets them: a sibling's funding days before
+//     the debut, or another source's at a grain that holds both;
+//   - same-day sibling FUNDING drops, less what such cancelled legs already
+//     explain (moved.fundedFrom), so one move never offsets twice.
 //
 // The raw delta would absorb EVERY value movement across ALL group accounts on
 // the debut day, and so double-count two things that are not new onboarding
@@ -638,7 +654,7 @@ func groupDebutDays(grp []*accountData, winFrom, winTo int64) []int64 {
 // new account (no sibling drop) onboards its full value; same-day deposits and
 // market moves on siblings do not touch the step-up. Floored at 0 so a debut day
 // dominated by sibling drops can never book negative onboarding.
-func groupOnboardStep(grp []*accountData, day int64) float64 {
+func groupOnboardStep(grp []*accountData, day int64, moved *movedLegs) float64 {
 	var debutValue, siblingFundingDrop float64
 	for _, a := range grp {
 		newlyDebuts := a.firstDay() == day
@@ -646,6 +662,7 @@ func groupOnboardStep(grp []*accountData, day int64) float64 {
 			if v, alive := a.valueAt(day); alive {
 				debutValue += returns.ZeroedValue(v, day, a.closureDay())
 			}
+			debutValue -= moved.funded[a]
 			continue
 		}
 		// Already-alive sibling: count only a value DECREASE across the debut day
@@ -658,7 +675,9 @@ func groupOnboardStep(grp []*accountData, day int64) float64 {
 		}
 		prev := returns.ZeroedValue(vPrev, day-1, a.closureDay())
 		cur := returns.ZeroedValue(vCur, day, a.closureDay())
-		if drop := prev - cur; drop > 0 {
+		// A cancelled leg that funded a debut and that this day's value shows
+		// is offset through funded already.
+		if drop := prev - cur + moved.fundedFrom[a][day]; drop > 0 {
 			siblingFundingDrop += drop
 		}
 	}
@@ -832,10 +851,17 @@ func netOwnedTransfers(cand []ownedFlow, moved *movedLegs) (kept []ownedFlow, un
 	return kept, unmatched
 }
 
-// onboardsOwnValue reports whether a debut of a books a's own first value, so
-// that value alone stands for everything a's pre-debut legs moved.
-func onboardsOwnValue(a *accountData) bool {
-	return a.rpolicy.OnboardScope == returns.OnboardPerConstituent && !a.isConduit()
+// onboardsFirstValue reports whether a debut of a books a's first value, alone
+// or in its per-entity-once group's step, so that value stands for everything
+// a's pre-debut legs moved.
+func onboardsFirstValue(a *accountData) bool {
+	switch a.rpolicy.OnboardScope {
+	case returns.OnboardPerEntityOnce:
+		return true
+	case returns.OnboardPerConstituent:
+		return !a.isConduit()
+	}
+	return false
 }
 
 // ---- liability + window + identity --------------------------------------

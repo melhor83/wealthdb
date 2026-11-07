@@ -242,9 +242,9 @@ Guards: `TestBridgeReadsTheCommonCases`,
 - **Onboarding books the debut value.** A staggered constituent's real
   debut-region flows are subsumed first (`flowSubsumed` in `entityFlows`),
   then synthetic onboarding books the first-snapshot value, less the
-  pre-debut legs netting cancelled — or, under per-entity-once, the
-  sibling-netted step (`groupOnboardStep`). A ~0 or
-  negative amount is suppressed, never injected.
+  pre-debut legs netting cancelled. Under per-entity-once it books the
+  group's step (`groupOnboardStep`), less the same legs. A ~0 or
+  negative step is suppressed, never injected.
 - **XIRR:** Newton-Raphson (analytic derivative) from a 10% guess, with a
   bisection fallback scanning `[−0.9999, 100]` at 0.01 resolution for the
   first sign-change bracket. The rate is floored at −0.9999 (never worse
@@ -386,9 +386,14 @@ chained TWR below −100%.
 - **The same holds at a closure.** A leg the closure day first shows,
   cancelled against money that stays inside, leaves the synthetic closure
   flow.
-- **Per-entity-once nets a sibling's same-day drop only**
-  (`groupOnboardStep`). Funding days before the debut still books as new
-  money there.
+- **Per-entity-once offsets the same legs** (`groupOnboardStep`). Its
+  step is the debuting accounts' first value, less their cancelled
+  pre-debut legs, less a sibling's drop on the debut day. Funding days
+  before the debut is an inside move there too, and so is funding from
+  another source at a grain that holds both. A cancelled leg that the
+  sibling's drop on the debut day shows is taken off once, not twice.
+  The step is floored at zero. Guard:
+  `TestPerEntityOnceOffsetsCancelledFunding`.
 
 Onboarding still legitimately recognizes **untracked pre-existing
 capital** — a late account whose backfill carries no funding transactions
@@ -449,9 +454,9 @@ source.
   account and funds securities in another account of the same
   relationship. Its policy sets four knobs:
   - `OnboardScope = OnboardPerEntityOnce`: the relationship's inception
-    step-up is booked once, net of same-day negative sibling funding
-    drops, floored at 0. An internal cash→securities move onboards
-    nothing.
+    step-up is booked once, net of the cancelled legs that funded it and
+    of same-day negative sibling funding drops, floored at 0. An internal
+    cash→securities move onboards nothing.
   - `ConduitKinds = [cash]`: cash feeds the value spine but gets no
     per-account onboarding.
   - `ExternalOnly = true`: the silver tags conduit churn

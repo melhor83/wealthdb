@@ -143,3 +143,91 @@ func TestUBSConduitGenuineExternalDebutOnboards(t *testing.T) {
 		t.Errorf("net_flow = %.2f, want 4000 (genuine external debut onboards its full value)", nf)
 	}
 }
+
+// TestPerEntityOnceOffsetsCancelledFunding: a per-entity-once debut offsets what
+// netting cancelled as an inside move into it, as a per-constituent debut does,
+// besides a sibling's drop on the debut day. One move offsets once, and money
+// from outside onboards in full. Every case states the flow and the return.
+func TestPerEntityOnceOffsetsCancelledFunding(t *testing.T) {
+	t.Parallel()
+	wStart := dy(2023, time.January, 2)
+	debut := dy(2023, time.September, 30)
+	before := debut - 3*86400
+	end := dy(2024, time.June, 30)
+	const (
+		in, out = canonical.TxKindTransferIn, canonical.TxKindTransferOut
+		dep     = canonical.TxKindDeposit
+		bro     = canonical.AccountKindBrokerage
+		cash    = canonical.AccountKindCash
+	)
+	type add func(src, acct string, kind canonical.AccountKind, s []snap, x []txn)
+	anchor := func(a add) { a("ubsx", "SEC0", bro, []snap{{wStart, 10000}, {end, 10000}}, nil) }
+	cases := []struct {
+		name, level, entity string
+		seed                func(a add)
+		flow, twr           float64
+	}{
+		{"a sibling funds the debut three days before it", "sources", "ubsx", func(a add) {
+			anchor(a)
+			a("ubsx", "CASH", cash, []snap{{wStart, 6000}, {before, 4000}, {end, 4000}}, []txn{{before, out, -2000}})
+			a("ubsx", "SEC1", bro, []snap{{debut, 2000}, {end, 2000}}, []txn{{before, in, 2000}})
+		}, 0, 0},
+		{"another source funds the debut, at the global grain", "global", "", func(a add) {
+			anchor(a)
+			a("fidx", "LIVE", bro, []snap{{wStart, 6000}, {before, 4000}, {end, 4000}}, []txn{{before, out, -2000}})
+			a("ubsx", "SEC1", bro, []snap{{debut, 2000}, {end, 2000}}, []txn{{before, in, 2000}})
+		}, 0, 0},
+		{"a same-day sibling drop with no leg", "sources", "ubsx", func(a add) {
+			anchor(a)
+			a("ubsx", "CASH", cash, []snap{{wStart, 6000}, {debut, 4000}, {end, 4000}}, nil)
+			a("ubsx", "SEC1", bro, []snap{{debut, 2000}, {end, 2000}}, nil)
+		}, 0, 0},
+		{"a funding leg that is also a same-day sibling drop counts once", "sources", "ubsx", func(a add) {
+			anchor(a)
+			a("ubsx", "CASH", cash, []snap{{wStart, 6000}, {debut, 4000}, {end, 4000}}, []txn{{before, out, -2000}})
+			a("ubsx", "SEC1", bro, []snap{{debut, 5000}, {end, 5000}}, []txn{{before, in, 2000}})
+		}, 3000, 0},
+		{"a funding leg on the debut day counts once", "sources", "ubsx", func(a add) {
+			anchor(a)
+			a("ubsx", "CASH", cash, []snap{{wStart, 6000}, {debut, 4000}, {end, 4000}}, []txn{{debut, out, -2000}})
+			a("ubsx", "SEC1", bro, []snap{{debut, 5000}, {end, 5000}}, []txn{{debut, in, 2000}})
+		}, 3000, 0},
+		// The debut holds less than it was sent, so the step would be negative. It
+		// books nothing, and the money that left by no recorded path reads as a loss.
+		{"a debut worth less than its funding books nothing", "sources", "ubsx", func(a add) {
+			anchor(a)
+			a("ubsx", "CASH", cash, []snap{{wStart, 6000}, {before, 4000}, {end, 4000}}, []txn{{before, out, -2000}})
+			a("ubsx", "SEC1", bro, []snap{{debut, 1000}, {end, 1000}}, []txn{{before, in, 2000}})
+		}, 0, 0.875*15000/14000 - 1},
+		{"a debut funded from outside onboards its value", "sources", "ubsx", func(a add) {
+			anchor(a)
+			a("ubsx", "CASH", cash, []snap{{wStart, 6000}, {end, 6000}}, nil)
+			a("ubsx", "SEC1", bro, []snap{{debut, 4000}, {end, 4000}}, []txn{{before, dep, 4000}})
+		}, 4000, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			db, ctx := openMigrated(t)
+			seedReturnsSource(t, db, ctx, "ubsx", "ubs")
+			seedReturnsSource(t, db, ctx, "fidx", "fidelity")
+			c.seed(func(src, acct string, kind canonical.AccountKind, s []snap, x []txn) {
+				seedAcct(t, db, ctx, src, acct, kind, nil, s, x)
+			})
+			rows, err := RunReturns(ctx, db, params(c.level, 0, eod(2024, time.June, 30)))
+			if err != nil {
+				t.Fatalf("RunReturns: %v", err)
+			}
+			if nf := netFlowOf(t, rows, c.entity); math.Abs(nf-c.flow) > 1e-6 {
+				t.Errorf("net_flow = %.2f, want %.2f", nf, c.flow)
+			}
+			s, ok := summaryFor(rows, c.entity)
+			if !ok || s.TWR == nil {
+				t.Fatalf("no TWR: %+v", s)
+			}
+			if math.Abs(*s.TWR-c.twr) > 1e-9 {
+				t.Errorf("TWR = %.6f, want %.6f", *s.TWR, c.twr)
+			}
+		})
+	}
+}
