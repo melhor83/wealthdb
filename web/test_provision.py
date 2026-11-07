@@ -4287,6 +4287,8 @@ if duckdb is not None:
                    " country TEXT, country_weight DOUBLE, market_cap DOUBLE, size TEXT, value DOUBLE,"
                    " direct_value DOUBLE, via_funds_value DOUBLE, funds TEXT[], silver_source_id TEXT,"
                    " tax_wrapper TEXT, benchmark_share DOUBLE)")
+        db.execute("INSERT INTO web_exposure_securities VALUES (DATE '2026-10-21', 'USD', 'holding:s:lot-1', 'Sample Lot',"
+                   " NULL, 'private_equity', 1, NULL, 1, NULL, 1, NULL, NULL, 50, 50, 0, [], 's', 'taxable_joint', NULL)")
         for key, name in (("a", ADDRESS_NAME), ("b", "Sample Fund")):
             db.execute("INSERT INTO web_positions_history VALUES (DATE '2026-10-21', NULL, ?, 'real_estate', 'loan', ?,"
                        " 's', 'taxable_joint', -100, -80, -90, -70)", [name, key])
@@ -4300,6 +4302,9 @@ if duckdb is not None:
     check("the table twins drop it too",
           "Invented" not in str(_tables) and "Nowhere" not in str(_tables)
           and all("Sample Loan" in str(r) and "Sample Fund" in str(r) for r in _tables.values()), _tables)
+    check("a holding's own key reads (unnamed) on the securities twin, and its name shows",
+          ("(unnamed)", "Sample Lot") in [tuple(r[:2]) for r in _tables["Top securities (privacy)"]]
+          and "holding:" not in str(_tables), _tables["Top securities (privacy)"])
     check("the engine's example drops to its product",
           _names.execute(f"SELECT {p.twin_name('?')}", [ADDRESS_NAME]).fetchone()[0] == "Sample Loan"
           and _names.execute(f"SELECT {p.twin_name('?')}", ["Sample Fund, 1234 Nowhere"]).fetchone()[0]
@@ -4681,9 +4686,9 @@ if duckdb is not None:
     check("...a window that ends before today, its last instant",
           [r[0] for r in _secs_sep] == ["symbol:QOLD"], _secs_sep)
     _twin_secs = _run(p.privacy_name(_sec))
-    check("...and its twin the same rows as shares, a holding's own key and name hidden",
+    check("...and its twin the same rows as shares, a holding's own key hidden and its name shown",
           [(r[0], r[1], round(r[8], 6), round(r[11], 6)) for r in _twin_secs]
-          == [("symbol:QSTK", "Example Stock", 20.0, 40.0), ("(unnamed)", None, round(100 * 500 / 1500, 6),
+          == [("symbol:QSTK", "Example Stock", 20.0, 40.0), ("(unnamed)", "Example Private", round(100 * 500 / 1500, 6),
                                                             round(100 * 500 / 1500, 6)),
               ("cash:USD", None, round(100 * 400 / 1500, 6), round(100 * 400 / 1500, 6))], _twin_secs)
 

@@ -3301,11 +3301,12 @@ def exposure_cards(db_id, privacy):
     # the greater label on a tie, the funds counted once, as `wealthdb
     # exposure securities` gives them with nothing picked. The share is
     # of the selection, all of its securities counted. The twin drops the
-    # values and hides a key and a name that are a holding's own.
+    # values and hides a key that is a holding's own, which can carry a
+    # contract's or an account's id. The name shows, less any address.
     stags = {**native_tags("web_exposure_securities", EXPOSURE_FILTERS), "benchmark": BENCHMARK_TAG}
     hidden = f"security LIKE '%{HOLDING_KEY_PREFIX}%'"
     shown = ((f"CASE WHEN {hidden} THEN '(unnamed)' ELSE security END AS security,\n"
-              f"       CASE WHEN {hidden} THEN NULL ELSE {twin_name('name')} END AS name")
+              f"       {twin_name('name')} AS name")
              if privacy else "security, name")
     values = ("100 * direct / t.total AS direct_pct,\n       100 * via / t.total AS via_funds_pct"
               if privacy else "amount AS value, direct AS direct_value, via AS via_funds_value")

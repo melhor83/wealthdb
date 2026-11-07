@@ -254,8 +254,14 @@ line first, and both legends read largest first.
 Each dashboard but Gains also gets a **privacy twin** (linked from the
 dashboard's top row): same layout and filters, but every card shows
 shares (%) instead of money. Gains has none. Its tiles are gains on
-named positions. A twin would redact the names and normalise the money,
-and what would remain is the percent columns the tables carry already.
+named positions. A twin would normalise the money, and what would
+remain is the percent columns the tables carry already.
+
+A twin hides money and identifiers, never what is held. A holding's name
+shows, a hand-entered one's too, and so do the shares, classes and
+labels. A key that is a holding's own can carry a contract's or an
+account's id, so it reads `(unnamed)`, and the name beside it still
+shows.
 
 A twin never shows an address. A bank can name a mortgage by the
 property, so every twin card that shows a position's or a security's
@@ -404,8 +410,8 @@ card adds up a security's slices in the selection:
 
 With nothing picked, its rows are those of `wealthdb exposure
 securities`. Its twin drops the three values for their shares. It shows
-`(unnamed)` and no name for a key that is, or holds, a holding's own
-(`holding:<source>:<id>`).
+`(unnamed)` for a key that is, or holds, a holding's own
+(`holding:<source>:<id>`), and the holding's name beside it.
 
 The **Yield** dashboard shows what the holdings earn and how their
 value moves with rates ([wealthdb/docs/YIELD.md](../wealthdb/docs/YIELD.md)).
