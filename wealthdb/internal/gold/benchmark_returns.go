@@ -447,10 +447,27 @@ func (c *benchmarkWindows) compare(ix *returns.Index, p ReturnParams) *benchmark
 		return w
 	}
 	w.av = entityValue(w.assets)
-	w.flows, _, _ = entityFlows(w.assets, p, w.from, w.to, true)
-	w.v0, _ = w.av(w.from)
+	var rolled []returns.Flow
+	w.flows, _, rolled = entityFlows(w.assets, p, w.from, w.to, true)
+	w.v0 = openingValue(w.av, w.from, rolled)
 	w.ok = true
 	return w
+}
+
+// openingValue is the household's value at from as the chain and MWR read it:
+// what its accounts moved before from and do not show yet is in it.
+func openingValue(av func(int64) (float64, bool), from int64, rolled []returns.Flow) float64 {
+	v, _ := av(from)
+	return v + unshownValue(unvaluedAt([]int64{from}, rolled)[0])
+}
+
+// unshownValue is an unvaluedAt figure as money: float dust from moves that
+// cancel reads as nothing, so a value with nothing unshown stays as carried.
+func unshownValue(v float64) float64 {
+	if math.Abs(v) <= valueTol {
+		return 0
+	}
+	return v
 }
 
 // flowQuality are the row's flags a benchmark's figures inherit: the
@@ -575,11 +592,14 @@ func mwrLine(w *benchmarkWindow, ends []int64, value func(i int) float64, blocke
 func portfolioLine(w *benchmarkWindow) []BenchmarkMWRRow {
 	whole := *w
 	whole.to = w.ownTo
-	whole.flows, _, _ = entityFlows(w.assets, w.params, w.from, w.ownTo, true)
+	var rolled []returns.Flow
+	whole.flows, _, rolled = entityFlows(w.assets, w.params, w.from, w.ownTo, true)
+	whole.v0 = openingValue(w.av, w.from, rolled)
 	ends := lineEnds(whole.from, whole.to)
+	unshown := unvaluedAt(ends, rolled)
 	mwr, flags := mwrLine(&whole, ends, func(i int) float64 {
 		v, _ := w.av(ends[i])
-		return v
+		return v + unshownValue(unshown[i])
 	}, func(int) []string { return nil })
 	out := []BenchmarkMWRRow{lineStart(seriesPortfolio, w)}
 	for i, end := range ends {

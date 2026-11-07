@@ -478,3 +478,37 @@ VALUES ('test-src', 'symbol:IDX', ?, '2024-03-31', ?)`, f.asOf, f.pct); err != n
 		t.Errorf("March = %v, want the later filing's", r)
 	}
 }
+
+// TestMaterializeBenchmarkLineReadsRolledValues: a deposit into a quarterly
+// account after its last valuation, before the window's end. The tile's MWR
+// reads that account with the deposit rolled in, and the household's line ends
+// on the tile.
+func TestMaterializeBenchmarkLineReadsRolledValues(t *testing.T) {
+	t.Parallel()
+	db, ctx := openMigrated(t)
+	end := seedBenchmarkHousehold(t, db, ctx)
+	seedAcct(t, db, ctx, "src-a", "A2", canonical.AccountKindBrokerage, nil,
+		[]snap{{dy(2023, time.December, 31), 500}, {dy(2024, time.March, 31), 500}, {dy(2024, time.September, 30), 800}},
+		[]txn{{dy(2024, time.June, 20), canonical.TxKindDeposit, 300}})
+	seedFundMonths(t, db, ctx, "symbol:IDX", time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC), 1, 1, 1, 1, 1, 1)
+	seedBenchmark(t, db, ctx, "Test", canonical.BenchmarkFund{FundRef: "symbol:IDX", WeightPct: 100})
+	if _, err := MaterializeReturns(ctx, db, MaterializeParams{ToEpoch: end, ComputedAt: 1}); err != nil {
+		t.Fatal(err)
+	}
+	var lineMWR, tile float64
+	var quality string
+	if err := db.QueryRowContext(ctx, `SELECT mwr FROM benchmark_mwr WHERE currency = 'USD' AND window_from_year = 0
+AND series = 'portfolio' AND end_day = ?`, day0(2024, time.June, 30)).Scan(&lineMWR); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT mwr, quality FROM report_returns WHERE grain = 'global' AND granularity = 'total'
+AND is_summary AND currency = 'USD' AND window_from_year = 0`).Scan(&tile, &quality); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(quality, "rolled_forward") {
+		t.Errorf("quality %q, want rolled_forward", quality)
+	}
+	if math.Abs(lineMWR-tile) > 1e-12 {
+		t.Errorf("the household's line ends at %v, the tile says %v", lineMWR, tile)
+	}
+}

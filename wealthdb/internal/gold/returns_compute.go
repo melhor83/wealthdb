@@ -252,9 +252,16 @@ func summaryRow(base ReturnRow, winFrom, winTo int64, av func(int64) (float64, b
 		}
 	}
 
-	// MWR over the window.
+	// MWR over the window, on the values the chain reads: the window's edges with
+	// what moved but its accounts do not show yet rolled in. start, end and
+	// net_flow stay the carried values, which holdings and the bridge read.
+	edges := unvaluedAt([]int64{winFrom, winTo}, rolled)
+	edges[0], edges[1] = unshownValue(edges[0]), unshownValue(edges[1])
+	if edges[0] != 0 || edges[1] != 0 {
+		q = append(q, "rolled_forward")
+	}
 	if p.Method == "mwr" || p.Method == "both" {
-		r.MWR, r.MWRAnnualized, q = computeMWR(v0, v1, winFrom, winTo, flows, assets, p, q)
+		r.MWR, r.MWRAnnualized, q = computeMWR(v0+edges[0], v1+edges[1], winFrom, winTo, flows, assets, p, q)
 	}
 
 	r.Quality = dedupeStrings(q)

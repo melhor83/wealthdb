@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"time"
 
@@ -367,7 +368,9 @@ func (in bridgeInput) windowTags(assets []*accountData, p ReturnParams, bucket [
 		}
 	}
 	if rows := computeEntityReturn(assets, w, end, in.ds.fx); len(rows) > 0 {
-		tags = append(tags, rows[len(rows)-1].Quality...)
+		// rolled_forward speaks of the rates' values; the bridge reads the
+		// carried values, as holdings does.
+		tags = append(tags, slices.DeleteFunc(rows[len(rows)-1].Quality, func(t string) bool { return t == "rolled_forward" })...)
 	}
 	return tags
 }

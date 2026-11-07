@@ -627,3 +627,32 @@ func TestBridgeEmptyGold(t *testing.T) {
 		t.Fatalf("rows = %+v", rows)
 	}
 }
+
+// TestBridgeLeavesOutRolledForward: a deposit into a month-end account that its
+// next valuation shows, so a month ends with it unshown. The bridge reads the
+// carried values, so the rates' rolled_forward tag is not one of its tags.
+func TestBridgeLeavesOutRolledForward(t *testing.T) {
+	t.Parallel()
+	db, ctx := openMigrated(t)
+	seedReturnsSource(t, db, ctx, "bankx", "fidelity")
+	var daily []snap
+	for d := dy(2024, time.January, 1); d <= dy(2024, time.June, 30); d += 86400 {
+		daily = append(daily, snap{d, 10000})
+	}
+	seedAcct(t, db, ctx, "bankx", "DAILY", canonical.AccountKindBrokerage, nil, daily, nil)
+	seedAcct(t, db, ctx, "bankx", "MONTHLY", canonical.AccountKindBrokerage, nil,
+		[]snap{{dy(2024, time.January, 1), 1000}, {dy(2024, time.February, 29), 2000}, {dy(2024, time.June, 30), 2000}},
+		[]txn{{dy(2024, time.January, 20), canonical.TxKindDeposit, 1000}})
+	rows := runBridge(t, db, ctx, bridgeParams("USD", "monthly"))
+	checkIdentity(t, "USD", rows)
+	for _, r := range rows {
+		for _, q := range r.Quality {
+			if q == "rolled_forward" {
+				t.Errorf("%s carries rolled_forward: %v", r.Period, r.Quality)
+			}
+		}
+	}
+	if len(rows) == 0 {
+		t.Fatal("no rows")
+	}
+}

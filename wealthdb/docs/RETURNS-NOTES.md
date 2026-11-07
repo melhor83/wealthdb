@@ -239,8 +239,15 @@ Guards: `TestBridgeReadsTheCommonCases`,
   value change of the same size passes the check. On an account's own
   valuation days a roll adds nothing, so a grain whose accounts value
   together chains its plain carried values. The accounts grain never rolls.
-  Only the chain does: per-period rows, `start` and `end` values, `net_flow`
-  and MWR read the carried values. Guard: `TestChainRollsAnAccountForward`.
+  Guard: `TestChainRollsAnAccountForward`.
+- **MWR reads the values the chain reads.** Its opening and closing values
+  hold what the window's edges have rolled in, so a window that ends with a
+  deposit not yet shown has an MWR beside its TWR, not behind it. `start`,
+  `end` and `net_flow` stay the carried values: they equal holdings and
+  feed the bridge's identity. So does `gain`, so a row's gain can differ
+  from what its MWR implies by the money still unshown. Such a row is
+  tagged `rolled_forward`. The per-period rows read the carried values too.
+  Guard: `TestMWRReadsTheChainsValues`.
 - **Onboarding books the debut value.** A staggered constituent's real
   debut-region flows are subsumed first (`flowSubsumed` in `entityFlows`),
   then synthetic onboarding books the first-snapshot value, less the
@@ -586,7 +593,7 @@ every approximation is tagged. Computed set:
 `dropped_while_nonzero`, `dietz_degenerate`, `nonpositive_base`,
 `mwr_no_flows`, `mwr_no_sign_change`, `mwr_nonunique`,
 `mwr_no_converge`, `mwr_incomplete_flows`, `mwr_negative_net_capital`,
-`unmatched_transfers=N`, `cross_source_netted=N`, `post_exit_residue`, `journal_present`,
+`unmatched_transfers=N`, `cross_source_netted=N`, `rolled_forward`, `post_exit_residue`, `journal_present`,
 `nav_only`, `nav_only_capital_call_risk`, `crypto_unclassified_transfers`,
 `unknown_adapter_policy`, `fx_clamped_flow`, `pre_fx_history`,
 `flows_before_inception`, `after_tax`.
@@ -597,6 +604,10 @@ A benchmark's figures have flags of their own ("Benchmarks" below):
 
 `post_exit_residue` marks a summary row whose chain left out sub-periods on
 the residue of an exit ("Post-exit residue").
+
+`rolled_forward` marks a summary row whose window starts or ends with money
+moved that a valuation has not shown yet. TWR and MWR read it rolled in;
+`start`, `end`, `net_flow` and `gain` read the carried values.
 
 `configured_inception` marks a window truncated to a configured
 inception override (DESIGN.md §5.4) rather than the data's own start.
@@ -720,7 +731,8 @@ each granularity:
 **Excess return** is the plain difference, portfolio less benchmark, in
 percentage points.
 
-**The shadow value** starts at the window's start value. Each flow of
+**The shadow value** starts at the window's start value, as MWR reads it:
+with what moved but is not shown yet rolled in. Each flow of
 the household enters at the end of its day, and every amount then grows
 with the benchmark. It is the same money on the same days in another
 investment. The benchmark's MWR is the XIRR of the household's flows
@@ -734,7 +746,8 @@ household holds. It keeps its value but has no MWR
 currency and start-year window, two series of month ends:
 
 - `portfolio`: the household's value, and its MWR from the window's
-  start to the day. It runs through the household's own window, so its
+  start to the day. The MWR reads each month end's value with what is not
+  shown yet rolled in, as the tile does. It runs through the household's own window, so its
   last point is the Return (MWR) tile where the window starts inside
   the benchmark's months.
 - `benchmark`: the shadow's value and MWR, through the benchmark's last
