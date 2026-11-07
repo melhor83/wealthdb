@@ -3,7 +3,9 @@ package gold
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -116,5 +118,53 @@ func TestMarkAgeLeavesOutCashClassPositions(t *testing.T) {
 	r := marks(t, db, ctx, "USD")["2024-01-31"]
 	if r.MarkedPct == nil || *r.MarkedPct != 0 || cents(t, r.ValueTotal) != 10000 {
 		t.Errorf("row = %+v", r)
+	}
+}
+
+// TestMarkAgeSumsInAnyOrder: the same lines written in two orders give the
+// same figures to the last digit. A float sum rounds in the order it adds:
+// beside a line near 1e16, two small lines move the total by more when added
+// one at a time than when added together first.
+func TestMarkAgeSumsInAnyOrder(t *testing.T) {
+	t.Parallel()
+	at := dy(2024, time.January, 31)
+	small := func() *canonical.Decimal {
+		v, err := canonical.NewDecimalFromString("1.0003")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &v
+	}
+	lines := []canonical.PositionChange{
+		{SnapshotAt: at, PositionKey: "BIG", MarketValue: decp(10_000_000_000_000_000)},
+		{SnapshotAt: at, PositionKey: "S1", MarketValue: small()},
+		{SnapshotAt: at, PositionKey: "S2", MarketValue: small()},
+	}
+	read := func(order []int) string {
+		db, ctx := openMigrated(t)
+		seedReturnsSource(t, db, ctx, "m", "schwab")
+		seedFX(t, db, dy(2024, time.January, 1), "USD", "CHF", "0.9")
+		for _, i := range order {
+			seedMarkPositions(t, db, ctx, "m", "A", canonical.AccountKindBrokerage, canonical.AssetClassPublicEquity,
+				[]canonical.PositionChange{lines[i]})
+		}
+		var out string
+		for _, ccy := range []string{"USD", "CHF"} {
+			r := marks(t, db, ctx, ccy)["2024-01-31"]
+			if r.MarkedPct == nil || r.ValueTotal == nil || r.ValueMarked == nil {
+				t.Fatalf("%s: %+v", ccy, r)
+			}
+			out += fmt.Sprintf("%s %v %s %s;", ccy, *r.MarkedPct, *r.ValueMarked, *r.ValueTotal)
+		}
+		return out
+	}
+	a, b := read([]int{0, 1, 2}), read([]int{1, 2, 0})
+	if a != b {
+		t.Errorf("the order moves the figures:\n%s\n%s", a, b)
+	}
+	// A double turns to a decimal through a power of ten, which is not exact
+	// near 1e16. It is the same in any order, so the totals still agree.
+	if !strings.HasPrefix(a, "USD 100 10000000000000002.") && !strings.HasPrefix(a, "USD 100 10000000000000001.") {
+		t.Errorf("figures %s, want the USD total near 1e16+2", a)
 	}
 }

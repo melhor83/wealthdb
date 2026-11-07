@@ -384,7 +384,8 @@ default, and takes `-f -C -F -x -p`:
 A row's age is the month-end day less `coalesce(valued_at, snapshot_at)`,
 in days. `-x` and `-p` reach the two money columns. `marked_pct` does
 not move. The macro is
-`report_marks` (migration 0177). A web refresh stores it in
+`report_marks` (migrations 0177 and 0178). It sums each line as a
+decimal, so a total is the same in any order. A web refresh stores it in
 `serving_marks`, and the Data Freshness dashboard's Mark age tile reads
 it.
 
