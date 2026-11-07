@@ -257,6 +257,13 @@ shares (%) instead of money. Gains has none. Its tiles are gains on
 named positions. A twin would redact the names and normalise the money,
 and what would remain is the percent columns the tables carry already.
 
+A twin never shows an address. A bank can name a mortgage by the
+property, so every twin card that shows a position's or a security's
+name reads it through `twin_name`. That drops a closing postal address
+and keeps the product name before it. `ADDRESS_PATTERN` is the pattern
+the CLI's `-p` masks ([DESIGN.md §4.6](../wealthdb/docs/DESIGN.md)). A
+test lists every twin card with a name in its output.
+
 The twins' charts are native SQL over the gold `web_*` serving views
 (migrations 0032, 0043, 0072 and 0084 — TIMESTAMP-cast reductions of the report macros to
 the grain each card reads, some folding cash in as a class of its own;
@@ -626,8 +633,9 @@ or a yield of nothing reads 0. A position with no name reads
 `(unnamed)`, unless its key is a cash balance's or an account income's:
 any other key is a holding's own, as on the issuers twin. The twin's
 calendar also matches the name the twin shows, so a click on
-`(unnamed)` lists every unnamed position's payments. No account label,
-amount, quantity or price reaches it.
+`(unnamed)` lists every unnamed position's payments. A position's name
+that closes with a postal address drops it (`twin_name`). No account
+label, address, amount, quantity or price reaches it.
 
 The **Cash Flow** dashboard has a projection section below the
 statement. It shows `wealthdb cashflow projection`

@@ -2274,6 +2274,58 @@ check("Cumulative return (TWR) draws the benchmark's rows last",
       f"ORDER BY q.source = '{p.BENCHMARK_SERIES}', series_rank DESC NULLS LAST, q.source, year"
       in sql_of(CARDS["Cumulative return (TWR)"][2]))
 
+section("a twin's name drops an address")
+
+# The example columns_privacy_test.go pins too.
+ADDRESS_NAME = "Sample Loan, Invented Way 7b, 12345 Nowhere"
+# A card a twin shows with a name in its output that needs no twin_name:
+# a stock's name, off public reference data, and no holding's own label.
+_NAME_SAFE = {"Dividend yield against payout"}
+
+
+def output_columns(sql):
+    """The select lists a query's output can come from: its top-level
+    selects, and where one takes every column of what it reads, the
+    selects of each query nested one level down."""
+    sql = re.sub(r"'[^']*'", "''", sql)
+    depth, lists, inner, start, nested = 0, [], [], None, None
+    for m in re.finditer(r"[()]|\bSELECT\b|\bFROM\b", sql):
+        t = m.group()
+        if t == "(":
+            depth += 1
+            if depth == 1:
+                nested = m.end()
+        elif t == ")":
+            depth -= 1
+            if depth == 0:
+                inner.append(sql[nested:m.start()])
+        elif depth == 0 and t == "SELECT":
+            start = m.end()
+        elif depth == 0 and t == "FROM" and start is not None:
+            lists.append(sql[start:m.start()])
+            start = None
+    if any(re.search(r"(?:^|,)\s*(?:\w+\.)?\*\s*(?:,|$)|COLUMNS\(", x) for x in lists):
+        lists += [x for q in inner if "SELECT" in q for x in output_columns(q)]
+    return lists
+
+
+_twin_natives = {n: sql_of(q) for n, (_d, _desc, q) in CARDS.items()
+                 if (n.endswith(p.PRIVACY_SUFFIX) or n in p.PRIVACY_EXEMPT_CARDS) and sql_of(q)}
+_named = {n for n, q in _twin_natives.items() if any(re.search(r"\bname\b", x) for x in output_columns(q))}
+check("the cards a twin shows with a name in their output are these",
+      _named == _NAME_SAFE | {"Top 100 positions (privacy)", "Top securities (privacy)",
+                              "Yield against duration (privacy)", "Received and expected by position (privacy)",
+                              "Expected payments (privacy)"}, sorted(_named))
+check("...and each but the safe ones wraps it in twin_name",
+      all(p.ADDRESS_PATTERN in _twin_natives[n] for n in _named - _NAME_SAFE),
+      [n for n in _named - _NAME_SAFE if p.ADDRESS_PATTERN not in _twin_natives[n]])
+check("a base card keeps the name whole",
+      not any(p.ADDRESS_PATTERN in (sql_of(q) or "") for n, (_d, _desc, q) in CARDS.items()
+              if n not in _twin_natives))
+check("-p reads the pattern the twins read",
+      p.ADDRESS_PATTERN in open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "wealthdb", "cmd",
+                                             "wealthdb", "columns.go"), encoding="utf-8").read())
+
 section("the Exposure dashboard")
 
 _ex_spec = p.base_dashboards()["Exposure"][2]
@@ -4201,6 +4253,58 @@ if duckdb is not None:
           == ["salary and earnings"]
           and sorted(r[3] for r in _run("Received and expected by position", type=_ty["Interest"]))
           == ["cash:CHF", "cash:USD", "isin:XX01"], _run("Received and expected by position", type=_ty["Interest"]))
+    # A position its bank names by a property: every twin that lists it
+    # prints the product alone, and a click on that name still lists it.
+    _db.execute("BEGIN")
+    _db.execute("UPDATE report_yield_positions SET name = ?, duration = 5 WHERE position_key = 'isin:XX01'",
+                [ADDRESS_NAME])
+    _shown = [_run("Received and expected by position (privacy)"), _run("Expected payments (privacy)"),
+              _db.execute(_render(CARDS["Yield against duration (privacy)"][2], {})).fetchall()]
+    _base = _run("Received and expected by position")
+    _clicked = _run("Expected payments (privacy)", position="Sample Loan")
+    _db.execute("ROLLBACK")
+    check("a twin's position name drops the address, the product name kept",
+          "Invented" not in str(_shown) and "Nowhere" not in str(_shown)
+          and all("Sample Loan" in str(rows) for rows in _shown), _shown)
+    check("...and the base card keeps it",
+          ADDRESS_NAME in str(_base), _base)
+    check("...and the twin's calendar takes the name the twin shows", bool(_clicked), _clicked)
+
+    def _name_book():
+        """The two table cards' views, each with a position named by a
+        property and one named plainly."""
+        db = duckdb.connect()
+        db.execute("CREATE TABLE web_positions_history (as_of_day DATE, symbol TEXT, name TEXT, asset_class TEXT,"
+                   " vehicle TEXT, line_key TEXT, silver_source_id TEXT, tax_wrapper TEXT, value_usd DOUBLE,"
+                   " value_chf DOUBLE, value_eur DOUBLE, value_gbp DOUBLE)")
+        db.execute("CREATE TABLE web_history_calendar (as_of_day DATE, history_day DATE)")
+        db.execute("INSERT INTO web_history_calendar VALUES (DATE '2026-10-21', DATE '2026-10-21')")
+        db.execute("CREATE TABLE benchmark_exposure (benchmark TEXT, dimension TEXT, bucket TEXT, label TEXT, lei TEXT,"
+                   " share_pct DOUBLE)")
+        db.execute("CREATE TABLE web_position_sizes (symbol TEXT, name TEXT, asset_class TEXT, vehicle TEXT, size TEXT)")
+        db.execute("CREATE TABLE web_exposure_securities (as_of_day DATE, currency TEXT, security TEXT, name TEXT,"
+                   " ticker TEXT, asset_class TEXT, class_weight DOUBLE, sector TEXT, sector_weight DOUBLE,"
+                   " country TEXT, country_weight DOUBLE, market_cap DOUBLE, size TEXT, value DOUBLE,"
+                   " direct_value DOUBLE, via_funds_value DOUBLE, funds TEXT[], silver_source_id TEXT,"
+                   " tax_wrapper TEXT, benchmark_share DOUBLE)")
+        for key, name in (("a", ADDRESS_NAME), ("b", "Sample Fund")):
+            db.execute("INSERT INTO web_positions_history VALUES (DATE '2026-10-21', NULL, ?, 'real_estate', 'loan', ?,"
+                       " 's', 'taxable_joint', -100, -80, -90, -70)", [name, key])
+            db.execute("INSERT INTO web_exposure_securities VALUES (DATE '2026-10-21', 'USD', ?, ?, NULL, 'debt', 1,"
+                       " NULL, 1, NULL, 1, NULL, NULL, 100, 100, 0, [], 's', 'taxable_joint', NULL)", ["isin:" + key, name])
+        return db
+
+    _names = _name_book()
+    _tables = {n: _names.execute(_render(CARDS[n][2], {})).fetchall()
+               for n in ("Top 100 positions (privacy)", "Top securities (privacy)")}
+    check("the table twins drop it too",
+          "Invented" not in str(_tables) and "Nowhere" not in str(_tables)
+          and all("Sample Loan" in str(r) and "Sample Fund" in str(r) for r in _tables.values()), _tables)
+    check("the engine's example drops to its product",
+          _names.execute(f"SELECT {p.twin_name('?')}", [ADDRESS_NAME]).fetchone()[0] == "Sample Loan"
+          and _names.execute(f"SELECT {p.twin_name('?')}", ["Sample Fund, 1234 Nowhere"]).fetchone()[0]
+          == "Sample Fund, 1234 Nowhere"
+          and _names.execute(f"SELECT {p.twin_name('NULL')}").fetchone()[0] is None)
     # A wage line older than every day the received figures cover, and
     # tax booked on an account with no income line: with no Time range
     # the one counts as Net income counts it, and a tax wrapper reaches

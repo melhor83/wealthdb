@@ -894,6 +894,21 @@ RETURNS_PRIVACY_DESC = " Money columns are redacted."
 # ensure_dashboards).
 PRIVACY_SUFFIX = " (privacy)"
 
+# A postal address closing a label: a comma, a street and a house number,
+# a comma, a postal code of four or five digits and a town, to the end of
+# the value. A bank can name a mortgage by the property. columns.go's
+# sensitiveIDPatterns holds the same pattern for -p, and both engines
+# read it as RE2.
+ADDRESS_PATTERN = r", [^,]* \d+[a-zA-Z]?, \d{4,5} .*$"
+
+
+def twin_name(column):
+    """SQL for a name `column` on a privacy card: the name less any
+    address, which keeps the product name before it. Every twin card
+    that shows a position's or a security's name goes through this."""
+    return f"regexp_replace({column}, '{ADDRESS_PATTERN}', '')"
+
+
 
 def privacy_name(name):
     """Card title for the privacy variant of card `name`: a uniform
@@ -3290,7 +3305,7 @@ def exposure_cards(db_id, privacy):
     stags = {**native_tags("web_exposure_securities", EXPOSURE_FILTERS), "benchmark": BENCHMARK_TAG}
     hidden = f"security LIKE '%{HOLDING_KEY_PREFIX}%'"
     shown = ((f"CASE WHEN {hidden} THEN '(unnamed)' ELSE security END AS security,\n"
-              f"       CASE WHEN {hidden} THEN NULL ELSE name END AS name")
+              f"       CASE WHEN {hidden} THEN NULL ELSE {twin_name('name')} END AS name")
              if privacy else "security, name")
     values = ("100 * direct / t.total AS direct_pct,\n       100 * via / t.total AS via_funds_pct"
               if privacy else "amount AS value, direct AS direct_value, via AS via_funds_value")
@@ -3565,8 +3580,9 @@ def yield_cards(db_id, privacy):
     card("Yield against duration", "scatter",
          "Each bond and rate-sensitive fund at the window's end, duration across, implied "
          f"yield up, sized by {'share' if privacy else 'value'}.",
-         end + "\nSELECT holding_currency AS currency, duration, implied_pct AS implied_yield_pct, symbol, name,\n"
-         + ("       100 * value / NULLIF(sum(value) OVER (), 0) AS share_pct" if privacy else "       value") +
+         end + "\nSELECT holding_currency AS currency, duration, implied_pct AS implied_yield_pct, symbol, "
+         + (f"{twin_name('name')} AS name,\n       100 * value / NULLIF(sum(value) OVER (), 0) AS share_pct"
+            if privacy else "name,\n       value") +
          f"\n  FROM e\n WHERE kind IN ({_sql_list(DURATION_KINDS)})\n"
          "   AND duration IS NOT NULL AND implied_pct IS NOT NULL\n ORDER BY value DESC",
          {"graph.dimensions": ["duration", "currency"], "graph.metrics": ["implied_yield_pct"],
@@ -3759,11 +3775,12 @@ def _class_band(col):
 # The keys the engine gives a cash balance (`cash:<ccy>`) and an
 # account's income (`income:<type>:<ccy>`), which name no holding.
 SHOWN_KEY_PREFIXES = ("cash:", "income:")
-# A position's name on a privacy card: its own, else its key where that
-# starts with one of SHOWN_KEY_PREFIXES. Any other key is a holding's
-# own, which can carry a contract's or an account's id, so it reads
-# (unnamed), as the issuers twin hides one.
-TWIN_POSITION_NAME = ("CASE WHEN name IS NOT NULL THEN name WHEN "
+# A position's name on a privacy card: its own less any address
+# (twin_name), else its key where that starts with one of
+# SHOWN_KEY_PREFIXES. Any other key is a holding's own, which can carry a
+# contract's or an account's id, so it reads (unnamed), as the issuers
+# twin hides one.
+TWIN_POSITION_NAME = (f"CASE WHEN name IS NOT NULL THEN {twin_name('name')} WHEN "
                       + " OR ".join(f"position_key LIKE '{k}%'" for k in SHOWN_KEY_PREFIXES)
                       + " THEN position_key ELSE '(unnamed)' END")
 
@@ -5292,7 +5309,7 @@ def privacy_card_defs(db_id, model_ids):
             f" sum({value})::DOUBLE AS v\n"
             "    FROM web_positions_history" + _asof_where(top_tags) + "\n"
             "   GROUP BY 1, 2, 3, 4, line_key)\n"
-            "SELECT p.symbol, p.name, p.asset_class, p.vehicle, z.size,\n"
+            f"SELECT p.symbol, {twin_name('p.name')} AS name, p.asset_class, p.vehicle, z.size,\n"
             "       p.v / (SELECT CASE WHEN t <> 0 THEN t END FROM tot)"
             " * 100 AS value_pct\n"
             "  FROM p" + POSITION_SIZE_JOIN + "\n ORDER BY value_pct DESC\n LIMIT 100", top_tags),
