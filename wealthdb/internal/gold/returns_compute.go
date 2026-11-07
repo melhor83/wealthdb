@@ -221,7 +221,14 @@ func summaryRow(base ReturnRow, winFrom, winTo int64, av func(int64) (float64, b
 	for i := 0; i+1 < len(bounds); i++ {
 		bv0, _ := av(bounds[i])
 		bv1, _ := av(bounds[i+1])
-		rr, ok := returns.ModifiedDietz(bv0+unvalued[i], bv1+unvalued[i+1], bounds[i], bounds[i+1], flowsIn(flows, bounds[i], bounds[i+1]))
+		bv0, bv1 = bv0+unvalued[i], bv1+unvalued[i+1]
+		bf := flowsIn(flows, bounds[i], bounds[i+1])
+		// An entity that holds nothing and moves nothing has no return to chain:
+		// a closed account's later zero valuations leave the chain where it ended.
+		if math.Abs(bv0) <= valueTol && math.Abs(bv1) <= valueTol && len(bf) == 0 {
+			continue
+		}
+		rr, ok := returns.ModifiedDietz(bv0, bv1, bounds[i], bounds[i+1], bf)
 		buckets = append(buckets, returns.Bucket{R: rr, OK: ok})
 		if !ok {
 			degenerate = true
@@ -335,6 +342,9 @@ type ownedFlow struct {
 	// closes says the leg falls into acct's closure: the closure day is the first
 	// valuation to show it, so the synthetic closure would book it again.
 	closes bool
+	// exits says the leg falls in acct's zero tail, where the value shows no
+	// change: a survivor leaves in the closure flow on the zeroing day.
+	exits bool
 }
 
 // movedLegs is what an entity's accounts moved. Netting cancels some of it, which
@@ -342,17 +352,32 @@ type ownedFlow struct {
 // it between valuations (rolled).
 type movedLegs struct {
 	funded  map[*accountData]float64        // onboarding: what the first value holds through moves, signed
-	closing map[*accountData]float64        // closure: what the last value holds that stays inside, signed
+	closing map[*accountData]float64        // closure: what the last value holds that stays inside or left already, signed
+	exits   map[*accountData]float64        // closure: what the zero tail's surviving legs moved out of the entity, signed
 	moves   map[*accountData][]returns.Flow // each account's flows and inside legs
 	// fundedFrom is the other side of funded: each partner's legs that funded a
 	// debut, signed, by the day the partner's value shows them. A sibling's drop
 	// on a per-entity-once debut day that they explain is funded already.
 	fundedFrom map[*accountData]map[int64]float64
+	// passIn is each closing account's zero-tail legs that netting cancelled
+	// against money coming in from inside: what a sibling passed through the
+	// emptied account after its zeroing, which the zeroing never showed.
+	passIn map[*accountData][]returns.Flow
 }
 
 func newMovedLegs() *movedLegs {
 	return &movedLegs{funded: map[*accountData]float64{}, closing: map[*accountData]float64{},
-		moves: map[*accountData][]returns.Flow{}, fundedFrom: map[*accountData]map[int64]float64{}}
+		exits: map[*accountData]float64{}, moves: map[*accountData][]returns.Flow{},
+		fundedFrom: map[*accountData]map[int64]float64{}, passIn: map[*accountData][]returns.Flow{}}
+}
+
+// left records a leg the entity books as a flow, or drops as a matched pair with
+// a live member, which a's closure day is the first valuation to show. Its money
+// is out of the account already, so a final-day closure must not book it again.
+func (m *movedLegs) left(a *accountData, f returns.Flow) {
+	if cd := a.closureDay(); cd != 0 && f.ValuedOn == cd {
+		m.closing[a] += f.Amount
+	}
 }
 
 func (m *movedLegs) add(a *accountData, f returns.Flow) { m.moves[a] = append(m.moves[a], f) }
@@ -378,6 +403,9 @@ func (m *movedLegs) cancel(a, b ownedFlow) {
 		}
 		if leg.closes && leg.live && (partner.live || partner.funds) {
 			m.closing[leg.acct] += leg.Amount
+		}
+		if leg.exits && leg.Amount > 0 {
+			m.passIn[leg.acct] = append(m.passIn[leg.acct], leg.Flow)
 		}
 	}
 }
@@ -455,12 +483,17 @@ func entityFlows(assets []*accountData, p ReturnParams, winFrom, winTo int64, ag
 			f.ValuedOn = a.valuedOn(f.Day)
 			if crossDrop[acctKey(acctKey(a.src, a.acct), f.ID)] {
 				moved.add(a, f)
+				moved.left(a, f)
 				continue
 			}
 			if flowSubsumed(a, f.Day, winFrom, winTo, false) {
+				if exitsAtClosure(a, f.Day, winFrom, winTo, false) {
+					moved.exits[a] += f.Amount
+				}
 				continue
 			}
 			moved.add(a, f)
+			moved.left(a, f)
 			flows = append(flows, f)
 		}
 	}
@@ -480,18 +513,24 @@ func entityFlows(assets []*accountData, p ReturnParams, winFrom, winTo int64, ag
 			f.ValuedOn = a.valuedOn(f.Day)
 			if crossDrop[acctKey(acctKey(a.src, a.acct), f.ID)] {
 				moved.add(a, f)
+				moved.left(a, f)
 				continue
 			}
 			onSpine := f.Day > a.firstDay()
 			cand = append(cand, ownedFlow{Flow: f, subsumed: flowSubsumed(a, f.Day, winFrom, winTo, true),
 				acct: a, onSpine: onSpine, live: onSpine && f.ValuedOn != 0 && f.ValuedOn <= winTo,
 				funds:  onboardsFirstValue(a) && subsumesAtDebut(a, f.Day, winFrom, winTo),
-				closes: cd > winFrom && cd <= winTo && f.ValuedOn == cd && a.rpolicy.ClosureScope != returns.ClosureLedgerExact})
+				closes: cd > winFrom && cd <= winTo && f.ValuedOn == cd && a.rpolicy.ClosureScope != returns.ClosureLedgerExact,
+				exits:  exitsAtClosure(a, f.Day, winFrom, winTo, true)})
 		}
 	}
 	keep := func(of ownedFlow) {
-		if !of.subsumed { // a survivor that is its own pre-debut/closure capital is subsumed
+		switch {
+		case of.exits: // a survivor in the zero tail leaves in the closure flow
+			moved.exits[of.acct] += of.Amount
+		case !of.subsumed: // a survivor that is its own pre-debut capital is subsumed
 			moved.add(of.acct, of.Flow)
+			moved.left(of.acct, of.Flow)
 			flows = append(flows, of.Flow)
 		}
 	}
@@ -512,9 +551,8 @@ func entityFlows(assets []*accountData, p ReturnParams, winFrom, winTo int64, ag
 	// Synthetic onboarding (the late constituent's whole arrival) + explicit
 	// closure. The real pre-debut / closure-drain flows were subsumed above, so
 	// no near-day dedup is needed: onboarding books the debut value, and the
-	// closure loop below books whatever value remains the day before the closure
-	// day (in effect only a final-day zeroing — see that loop's comment), each
-	// less what netting found moved inside the entity.
+	// closure loop below books the exit on the zeroing day (see that loop's
+	// comment), each less what netting found moved inside the entity.
 	//
 	// OnboardScope splits the onboarding GRAIN — the AMOUNT booked when a
 	// constituent debuts after winFrom:
@@ -581,21 +619,48 @@ func entityFlows(assets []*accountData, p ReturnParams, winFrom, winTo int64, ag
 		}
 	}
 
-	// Explicit closure, unchanged by OnboardScope / ConduitKinds. In effect the
-	// synthetic books value only when an account zeroes on the spine's final day
-	// (valueAt(cd-1) is ~0 anywhere inside a longer zero tail), so the zeroing
-	// value DROP is the usual exit signal and this outflow is its final-day
-	// complement. A ledger-exact closure books nothing here — its kept real flows
-	// are the exit.
+	// Explicit closure, unchanged by OnboardScope / ConduitKinds, the mirror of
+	// onboarding: dated on the zeroing day, the first valuation that shows the
+	// account empty. A ledger-exact closure books nothing here — its kept real
+	// flows are the exit.
+	//   - An account that zeroes on the spine's final day has no exit leg yet. The
+	//     closure books its carried value, less what netting found moved inside and
+	//     what already left as a flow since its last valuation.
+	//   - Inside a longer zero tail the closure books what the tail's surviving
+	//     legs moved out, so the money that moved on leaves on the day the value
+	//     shows it gone. With no such leg it books nothing: the zeroing reads as a
+	//     loss, a write-off.
 	for _, a := range assets {
 		if a.rpolicy.ClosureScope == returns.ClosureLedgerExact {
 			continue
 		}
-		if cd := a.closureDay(); cd > winFrom && cd <= winTo {
+		zd := a.zeroingDay()
+		if zd <= winFrom || zd > winTo {
+			continue
+		}
+		amount, exit := -moved.exits[a], true
+		if cd := a.closureDay(); zd == cd {
 			last, _ := a.valueAt(cd - 1)
-			if cf, ok := returns.ClosureFlow(cd, last+moved.closing[a]); ok {
-				flows = append(flows, cf)
+			amount, exit = last+moved.closing[a], false
+		} else {
+			// Money a sibling passed in after the zeroing and the exit legs paid
+			// on was never in the zeroing's value: it leaves on the day it came
+			// in, and the zeroing day books only the rest.
+			passed := passThrough(moved.passIn[a], moved.exits[a])
+			for _, f := range passed {
+				amount += f.Amount
 			}
+			flows = append(flows, passed...)
+		}
+		if cf, ok := returns.ClosureFlow(zd, amount); ok {
+			// An exit is the legs' own money on another day, so it is a real
+			// flow: the bridge reads it as money that left, not as tracking.
+			cf.Synthetic = !exit
+			flows = append(flows, cf)
+			// The zeroing valuation shows the exit, so the gap it ends weighs it
+			// with the gap's own legs (movedLegs.rolled).
+			cf.ValuedOn = zd
+			moved.add(a, cf)
 		}
 	}
 	sortFlows(flows)
@@ -607,6 +672,23 @@ func entityFlows(assets []*accountData, p ReturnParams, winFrom, winTo int64, ag
 		}
 	}
 	return flows, tags, moved.rolled(assets, winTo)
+}
+
+// passThrough is the outflows, as real flows on the days the money came in, of
+// the inside legs `in` that a closed account paid on through its surviving exit
+// legs, which moved `exits` (signed) in all: at most what those legs paid out.
+func passThrough(in []returns.Flow, exits float64) []returns.Flow {
+	left := -exits
+	var out []returns.Flow
+	for _, f := range slices.SortedStableFunc(slices.Values(in), func(x, y returns.Flow) int { return int(x.Day - y.Day) }) {
+		if left <= valueTol {
+			break
+		}
+		amt := math.Min(f.Amount, left)
+		left -= amt
+		out = append(out, returns.Flow{Day: f.Day, Amount: -amt, ID: f.ID})
+	}
+	return out
 }
 
 // groupDebutDays returns the ascending, de-duplicated set of days on which a
@@ -775,14 +857,26 @@ func subsumesAtDebut(a *accountData, day, winFrom, winTo int64) bool {
 	return debut > winFrom && debut <= winTo && day <= debut
 }
 
-// subsumesAtClosure reports whether a flow drains into a constituent's closure
-// (the flat zero-carry tail already shows no ΔV for it, so counting it would
-// book a phantom exit). Independent of OnboardScope — explicit closure fires
-// regardless. Callers bypass it under ClosureLedgerExact, where a zero-tail
-// flow is a real dated exit leg and is kept.
+// subsumesAtClosure reports whether a flow falls in a constituent's terminal
+// zero tail, which already shows no ΔV for it, so counting it there would book
+// an exit the value does not show. The closure flow on the zeroing day books it
+// instead (exitsAtClosure). Independent of OnboardScope — explicit closure fires
+// regardless. Callers bypass it under ClosureLedgerExact, where a zero-tail flow
+// is a real dated exit leg and is kept.
 func subsumesAtClosure(a *accountData, day, winFrom, winTo int64) bool {
 	cd := a.closureDay()
-	return cd > winFrom && cd <= winTo && day > a.lastNonzeroDay() && day <= cd
+	return cd > winFrom && day > a.lastNonzeroDay() && day <= cd && day <= winTo
+}
+
+// exitsAtClosure reports whether a flow on `day` is an exit leg of a's closure:
+// subsumed in the zero tail of an account that held value, past a final-day
+// zeroing (whose closure books the carried value instead). The closure flow on
+// the zeroing day books the survivors of netting among such legs, when the
+// window holds that day.
+func exitsAtClosure(a *accountData, day, winFrom, winTo int64, transferLike bool) bool {
+	zd := a.zeroingDay()
+	return zd != 0 && zd != a.closureDay() && flowSubsumed(a, day, winFrom, winTo, transferLike) &&
+		!subsumesAtDebut(a, day, winFrom, winTo)
 }
 
 // netOwnedTransfers greedily matches opposite-direction transfer legs (largest

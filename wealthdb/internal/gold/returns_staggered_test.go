@@ -235,10 +235,10 @@ func TestStaggeredClosureNoSyntheticAfterWindow(t *testing.T) {
 }
 
 // TestStaggeredPostClosureFlowSubsumed exercises the closure-drain branch of
-// flowSubsumed (and lastNonzeroDay): with the window run out to today, a closed
-// account's closureDay (today, via the 0-carry spine) is in-window, so a stray
-// flow dated in the flat zero-carry gap — after the last non-zero day — is
-// subsumed rather than booked as a spurious exit with no matching value move.
+// flowSubsumed (and lastNonzeroDay): a flow dated in the flat zero-carry tail —
+// after the last non-zero day — is subsumed rather than booked on a day with no
+// matching value move. It is the closure's exit leg, so the closure flow books
+// it on the zeroing day, where the value shows the drop.
 func TestStaggeredPostClosureFlowSubsumed(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)
@@ -259,8 +259,8 @@ func TestStaggeredPostClosureFlowSubsumed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunReturns: %v", err)
 	}
-	if nf := netFlowOf(t, rows, "clx"); math.Abs(nf) > 1e-6 {
-		t.Errorf("net_flow = %.2f, want 0 (post-closure -500 is subsumed, not a phantom exit)", nf)
+	if nf := netFlowOf(t, rows, "clx"); math.Abs(nf+500) > 1e-6 {
+		t.Errorf("net_flow = %.2f, want -500 (the post-closure leg, as the closure flow)", nf)
 	}
 }
 

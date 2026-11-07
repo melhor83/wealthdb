@@ -617,6 +617,20 @@ func (a *accountData) closureDay() int64 {
 	return 0
 }
 
+// zeroingDay is the first day of a's terminal zero tail, the valuation that shows
+// it empty: the day after lastNonzeroDay. 0 when a has no explicit closure or
+// never held value.
+func (a *accountData) zeroingDay() int64 {
+	if a.closureDay() == 0 {
+		return 0
+	}
+	last := a.lastNonzeroDay()
+	if v, _ := a.valueAt(last); math.Abs(v) < valueTol {
+		return 0
+	}
+	return last + 1
+}
+
 // lastNonzeroDay returns the day of the last carry-forward value that is still
 // non-zero — the day before the daily spine drops into its terminal zero tail.
 // A closing constituent's flows dated after this day land where the series

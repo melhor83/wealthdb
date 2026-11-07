@@ -106,10 +106,9 @@ func TestClosureLedgerExactFlowlessReadsAsLoss(t *testing.T) {
 }
 
 // TestClosureDefaultSubsumesZeroTailDrains pins the default scope on the same
-// fixture: the exit-day withdrawal lands in the zero-carry tail, is treated
-// as a stray, and is subsumed — the value drop reads as a full loss and the
-// proceeds vanish from the flow series. This contrast is exactly why the
-// complete-ledger sources opt into ClosureLedgerExact.
+// fixture: the exit-day withdrawal lands in the zero-carry tail, where the
+// value shows no change, so it is subsumed and leaves as the closure flow on
+// the zeroing day. The return reads as the ledger-exact scope reads it.
 func TestClosureDefaultSubsumesZeroTailDrains(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)
@@ -120,9 +119,9 @@ func TestClosureDefaultSubsumesZeroTailDrains(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunReturns: %v", err)
 	}
-	if nf := netFlowOf(t, rows, "sq"); nf != 0 {
-		t.Errorf("net_flow = %.2f, want 0 (zero-tail drain subsumed)", nf)
+	if nf := netFlowOf(t, rows, "sq"); nf != -1800 {
+		t.Errorf("net_flow = %.2f, want -1800 (the zero-tail drain, as the closure flow)", nf)
 	}
 	s, _ := summaryFor(rows, "sq")
-	assertTWR(t, s, -1, "default zero-tail closure")
+	assertTWR(t, s, -0.10, "default zero-tail closure")
 }

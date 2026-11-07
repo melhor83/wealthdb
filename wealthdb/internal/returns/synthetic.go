@@ -39,18 +39,16 @@ func FundedOnboardingFlow(debutDay int64, firstValue, funded float64) (Flow, boo
 	return Flow{Day: debutDay, Amount: amount, Synthetic: true}, true
 }
 
-// ClosureFlow returns the synthetic closure outflow for an explicitly-closed
-// aggregate constituent.
+// ClosureFlow returns the closure outflow for an explicitly-closed aggregate
+// constituent, dated on closureDay: the day its value first shows it empty.
 //
-// The synthetic books lastValue — the caller passes the value carried on the
-// day before the closure day, which is non-zero only when the account zeroes
-// on the spine's final day (inside a longer zero tail it is ~0 and ok is
-// false; the zeroing value drop is then the exit signal). Under
-// ClosureSubsumeDrains the caller subsumes the real closure-window flows, so
-// no near-day dedup is needed; under ClosureLedgerExact the caller keeps the
-// real flows and skips this synthesis entirely. ok is false when there is no
-// explicit closure (closureDay==0) or no value to book. Staleness/dormancy
-// must never reach here.
+// The caller passes what leaves: on a final-day zeroing the value carried the
+// day before, less what already left; inside a longer zero tail what the
+// tail's exit legs moved out. Under ClosureSubsumeDrains the caller subsumes
+// the real closure-window flows, so no near-day dedup is needed; under
+// ClosureLedgerExact the caller keeps the real flows and skips this entirely.
+// ok is false when there is no explicit closure (closureDay==0) or no value to
+// book. Staleness/dormancy must never reach here.
 func ClosureFlow(closureDay int64, lastValue float64) (Flow, bool) {
 	if closureDay == 0 {
 		return Flow{}, false
