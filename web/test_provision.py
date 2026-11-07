@@ -5199,6 +5199,87 @@ check("a card over a family's tags takes the Benchmark tag only where it reads i
        and ("benchmark" in q["native"]["template-tags"]) != ("{{benchmark}}" in sql_of(q))])
 
 
+section("a source keeps its colour")
+_pal = p.SOURCE_PALETTE
+check("the palette holds 24 distinct colours, none the fixed ones",
+      len(set(_pal)) == len(_pal) == 24 and p.ALL_SOURCES_COLOR not in _pal and p.BENCHMARK_COLOR not in _pal)
+
+
+def _contrast(a, b):
+    """The WCAG contrast ratio of two #rrggbb colours."""
+    def lum(h):
+        c = [int(h[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+        c = [x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4 for x in c]
+        return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+    hi, lo = sorted((lum(a), lum(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+check("every slot and the '(all sources)' colour read at 3:1 on a light and on a dark surface",
+      all(_contrast(c, bg) >= 3 for c in _pal + (p.ALL_SOURCES_COLOR,) for bg in ("#fcfcfb", "#1a1a19")),
+      [c for c in _pal if min(_contrast(c, "#fcfcfb"), _contrast(c, "#1a1a19")) < 3])
+_first = p.assign_source_colors({}, ["src-b", "src-a", "src-c"])
+check("first come, first served: the slots go in the order the sources come",
+      [_first[s] for s in ("src-b", "src-a", "src-c")] == list(_pal[:3]), _first)
+_more = p.assign_source_colors(_first, ["src-a", "src-new", "src-b", "src-c"])
+check("adding a source recolours none, and the new one takes the next slot",
+      all(_more[s] == _first[s] for s in _first) and _more["src-new"] == _pal[3], _more)
+check("a load in another order gives the same colours",
+      p.assign_source_colors(_more, ["src-c", "src-new", "src-a", "src-b"]) == _more)
+_gone = p.assign_source_colors({"src-gone": _pal[0]}, ["src-x"])
+check("a source gone from gold keeps its slot, so a new one does not take it",
+      _gone == {"src-gone": _pal[0], "src-x": _pal[1]}, _gone)
+_many = p.assign_source_colors({}, [f"src-{i:02d}" for i in range(26)])
+check("24 sources take 24 distinct colours",
+      len({_many[f"src-{i:02d}"] for i in range(24)}) == 24, _many)
+check("...and the 25th shares the least-held slot, the first of those",
+      _many["src-24"] == _pal[0] and _many["src-25"] == _pal[1], _many)
+_held = {f"src-{i:02d}": _pal[i] for i in range(24)}
+_held["extra"] = _pal[0]
+check("...which is the slot the fewest hold, not always the first",
+      p.assign_source_colors(_held, ["late"])["late"] == _pal[1])
+check("a kept colour outside the palette is assigned anew",
+      p.assign_source_colors({"src-a": "#000000"}, ["src-a"]) == {"src-a": _pal[0]})
+
+_tmpdir = __import__("tempfile").mkdtemp()
+_path = os.path.join(_tmpdir, "source-colors.json")
+check("no kept file reads as no assignment", p.load_source_colors(_path) == {})
+p.save_source_colors(_path, _more)
+check("the assignment round-trips through its file", p.load_source_colors(_path) == _more)
+with open(_path, "w") as _f:
+    _f.write("[1, 2]")
+check("a file that is not an object of strings reads as no assignment", p.load_source_colors(_path) == {})
+__import__("shutil").rmtree(_tmpdir)
+
+_colors = {"src-a": _pal[0], "src-b": _pal[1]}
+_by_source = {n: v for n, v in VIZ.items()
+              if len(v.get("graph.dimensions") or []) == 2 and v["graph.dimensions"][1] in p.SOURCE_SERIES_COLUMNS}
+check("the cards that draw a series per source are the ones expected",
+      set(_by_source) >= {"Cumulative return (TWR)", "Monthly returns (TWR)", "Quarterly returns (TWR)",
+                          "Annual returns (TWR)", "Net worth over time", "Net worth over time (privacy)",
+                          "Unrealized gain over time"}, sorted(_by_source))
+_colored = {n: p.with_source_colors(v, _colors) for n, v in _by_source.items()}
+check("each takes every source's colour and the fixed '(all sources)' colour",
+      all(c["series_settings"]["src-a"]["color"] == _pal[0] and c["series_settings"]["src-b"]["color"] == _pal[1]
+          and c["series_settings"][p.ALL_SOURCES_SERIES]["color"] == p.ALL_SOURCES_COLOR
+          for c in _colored.values()))
+check("...so the same source has the same colour on every such card",
+      len({json.dumps(c["series_settings"]["src-a"]) for c in _colored.values()}) == 1)
+check("...and the benchmark keeps its own grey, dashed line",
+      all(c["series_settings"][p.BENCHMARK_SERIES] == p.BENCHMARK_LINE["series_settings"][p.BENCHMARK_SERIES]
+          for n, c in _colored.items() if p.BENCHMARK_SERIES in (_by_source[n].get("series_settings") or {})))
+check("...without changing the shared benchmark style",
+      set(p.BENCHMARK_LINE["series_settings"]) == {p.BENCHMARK_SERIES})
+check("...and the rest of a card's settings as they were",
+      all({k: v for k, v in c.items() if k != "series_settings"}
+          == {k: v for k, v in _by_source[n].items() if k != "series_settings"} for n, c in _colored.items()))
+check("a card with no source breakout is left alone",
+      all(p.with_source_colors(v, _colors) is v for n, v in VIZ.items() if n not in _by_source))
+check("the '(all sources)' line every per-source card draws carries the fixed label",
+      all(p.ALL_SOURCES_SERIES in sql_of(CARDS[n][2]) for n in _by_source
+          if n.startswith(("Cumulative", "Monthly", "Quarterly", "Annual", "Unrealized"))))
+
+
 if FAILS:
     print(f"provision tests: {FAILS} failed")
 else:

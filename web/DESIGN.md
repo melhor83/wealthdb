@@ -1182,6 +1182,41 @@ whole, at the `(all sources)` line's level that year.
 Wealth Overview, Spending, Income, Cash Flow, Gains and Data Freshness
 have no benchmark.
 
+### A source keeps its colour
+
+Metabase colours a series by its place among the card's series. It also
+changes palette when a chart goes from eight series to nine. So a picked
+benchmark, or a narrowed Source picker, would recolour every line. A
+card that draws one series per source therefore names each source's
+colour in its `series_settings`:
+
+- The cards: Net worth over time and its twin, Card balances over time
+  (privacy), Cumulative, Monthly, Quarterly and Annual returns (TWR), and
+  Unrealized gain over time. Each has a source column as its breakout
+  (`SOURCE_SERIES_COLUMNS`).
+- `series_settings` keys on the series' label, the source id. The ids
+  are gold's, so provisioning reads them from the snapshot's
+  `silver_sources` that hold an account, oldest first, with `declared`
+  last.
+- `source-colors.json` in the web data directory keeps the assignment.
+  First come, first served: a kept source keeps its colour, and a new one
+  takes the first free slot of `SOURCE_PALETTE`. A source gone from gold
+  keeps its slot. So a load never recolours a source, and adding one
+  recolours none. A hash of the id could collide, and an order over the
+  sorted ids moves when a source is added.
+- `SOURCE_PALETTE` holds 24 colours, so no two of a household's first
+  24 sources share one. Each reads at 3:1 or more on a light and on a
+  dark theme. The order is farthest first: each slot is the colour
+  farthest from all slots before it, under normal vision and under
+  simulated red-green colour blindness. A household with few sources gets
+  the strongest contrast. Past 24 sources a slot is shared, the one the
+  fewest hold.
+- `(all sources)` is a fixed slate (`ALL_SOURCES_COLOR`), solid. The
+  benchmark keeps its grey, dashed line: a setting a card names for a
+  series wins over the colour.
+- A probe of the snapshot that does not answer adds no source, and the
+  cards keep the colours already kept.
+
 ## Testing
 
 [`test_web.sh`](test_web.sh) (`make test-web`) unit-tests the pure

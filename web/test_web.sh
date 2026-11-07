@@ -422,6 +422,7 @@ echo "== _provision: the admin password reaches provision.py by env, never argv 
 check_not "password not in argv"     "Synthetic-pw-1!" "$(cat "$tmp/prov-args" 2>/dev/null)"
 check_not "no --password flag"       "--password"      "$(cat "$tmp/prov-args" 2>/dev/null)"
 check     "password in the env var"  "Synthetic-pw-1!" "$(cat "$tmp/prov-env" 2>/dev/null)"
+check     "the source colours live beside the web data" "$tmp/source-colors.json" "$(cat "$tmp/prov-args" 2>/dev/null)"
 
 echo "== web start and refresh read provision.py's exit status =="
 # web_start against stubs, in a subshell: no Docker, a snapshot already

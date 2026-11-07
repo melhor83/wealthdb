@@ -70,6 +70,8 @@ def main():
     ap.add_argument("--db-name", default="gold")
     ap.add_argument("--default-currency", default="USD")
     ap.add_argument("--missing-basis", default=MISSING_BASIS_READINGS[0], choices=MISSING_BASIS_READINGS)
+    ap.add_argument("--source-colors", default="",
+                    help="the file that keeps each source's colour (SOURCE_PALETTE)")
     a = ap.parse_args()
     password = os.environ.get("WEALTHDB_WEB_ADMIN_PASSWORD", "")
     if not password:
@@ -137,7 +139,8 @@ def main():
     model_ids = ensure_models(a.base, sid, db_id, coll_id, by_name)
     if model_ids is None:
         return 1
-    saved = ensure_cards(a.base, sid, db_id, coll_id, by_name, model_ids)
+    colors = source_colors(a.base, sid, db_id, a.source_colors)
+    saved = ensure_cards(a.base, sid, db_id, coll_id, by_name, model_ids, colors)
     if saved is None:
         return 1
     card_ids, descs = saved
@@ -849,6 +852,105 @@ BENCHMARK_COLOR = "#8A99A8"
 BENCHMARK_LINE = {"series_settings": {BENCHMARK_SERIES: {
     "color": BENCHMARK_COLOR, "line.style": "dashed", "line.size": "L", "line.marker_enabled": False}}}
 BENCHMARK_PARAM_ID = "aa5df124"
+
+# A source's colour. Metabase colours a series by its place, and changes
+# palette between eight series and nine, so a picked benchmark or a
+# narrowed Source picker would recolour every line. A card that draws a
+# series per source (SOURCE_SERIES_COLUMNS) therefore names each source's
+# colour in its series_settings, which key on the series' label: the
+# source id. The ids are gold's, so provisioning reads them from the
+# snapshot, and the file --source-colors names keeps the assignment
+# (source_colors). Twenty-four colours, so no two of a household's first
+# 24 sources share one. Each reads at 3:1 or better on a light and on a
+# dark theme. The order is farthest first: each slot is the colour
+# farthest from every slot before it, under normal vision and under
+# simulated red-green colour blindness, so a household with few sources
+# gets the strongest contrast. Past 24 sources a slot is shared.
+SOURCE_PALETTE = ("#89579e", "#fd1a06", "#1955f9", "#238c0a", "#987aff", "#cf2cc8",
+                  "#bf6c5a", "#c8105c", "#197ece", "#289b7d", "#bf5ea4", "#2b7440",
+                  "#fd1f80", "#6990e2", "#5d6ff5", "#a481c1", "#972de1", "#9c5132",
+                  "#1089a0", "#b88848", "#5b65b9", "#a4476d", "#af55df", "#648746")
+# The global line beside the sources, solid where the benchmark is dashed.
+ALL_SOURCES_SERIES = "(all sources)"
+ALL_SOURCES_COLOR = "#6b7785"
+# The breakout columns that hold a source id.
+SOURCE_SERIES_COLUMNS = ("silver_source_id", "source")
+
+
+def assign_source_colors(kept, sources):
+    """Each of `sources` with a colour, first come, first served: a
+    source in `kept` keeps its colour, and a new one takes the first slot
+    of SOURCE_PALETTE no source holds, in the order `sources` lists them.
+    So a source keeps its colour on every load, and a new source never
+    recolours another. With every slot held, a new one takes the slot
+    the fewest hold, the first of those. `kept` entries for sources gone
+    from gold stay, so their slot stays theirs."""
+    out = {k: v for k, v in kept.items() if v in SOURCE_PALETTE}
+    for src in sources:
+        if src in out:
+            continue
+        held = list(out.values())
+        out[src] = min(SOURCE_PALETTE, key=lambda c: (held.count(c), SOURCE_PALETTE.index(c)))
+    return out
+
+
+def load_source_colors(path):
+    """The kept assignment in `path`, or none when it is absent or not
+    an object of strings."""
+    try:
+        with open(path) as f:
+            kept = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(kept, dict):
+        return {}
+    return {k: v for k, v in kept.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def save_source_colors(path, colors):
+    """Write the assignment to `path` whole, through a file beside it."""
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(colors, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f"provision: could not save {path}: {e}", file=sys.stderr)
+
+
+def source_colors(base, sid, db_id, path):
+    """Each source's colour: the kept assignment, with the snapshot's
+    sources that hold an account added in the order gold first loaded
+    them. A reference source, such as FX rates, draws no series. A probe that does
+    not answer adds none, and the cards keep the colours already kept."""
+    kept = load_source_colors(path) if path else {}
+    rows = probe_rows(base, sid, db_id,
+                      "SELECT silver_source_id FROM silver_sources"
+                      " WHERE silver_source_id IN (SELECT silver_source_id FROM accounts)"
+                      " ORDER BY first_loaded_at, silver_source_id")
+    sources = [r[0] for r in rows or [] if r and r[0]]
+    if rows is not None:
+        sources.append(DECLARED_SOURCE)
+    colors = assign_source_colors(kept, sources)
+    if path and colors != kept:
+        save_source_colors(path, colors)
+    return colors
+
+
+def with_source_colors(viz, colors):
+    """`viz` with each source's colour, and the fixed colour of the
+    '(all sources)' line, where its breakout is a source column. A
+    setting the card names for a series already wins over the colour, so
+    the benchmark keeps its own. Any other card comes back unchanged."""
+    dims = viz.get("graph.dimensions") or []
+    if len(dims) != 2 or dims[1] not in SOURCE_SERIES_COLUMNS:
+        return viz
+    settings = {src: {"color": c} for src, c in colors.items()}
+    settings[ALL_SOURCES_SERIES] = {"color": ALL_SOURCES_COLOR}
+    for key, value in (viz.get("series_settings") or {}).items():
+        settings[key] = {**settings.get(key, {}), **value}
+    return {**viz, "series_settings": settings}
 BENCHMARK_TAG = {"id": "benchmark-tag", "name": "benchmark", "display-name": "Benchmark",
                  "type": "text", "default": NO_BENCHMARK, "required": True}
 
@@ -1331,10 +1433,9 @@ def _series_order(sql, t, series, metric, by, largest_first=False, legend_last=N
     with no rank, whose rows come first, which puts it at the end of a
     stacked chart's legend. `rows_last` names a series whose rows come
     after every other's, NULL ranks too. So a picked benchmark keeps the
-    other series' order, and its line lies over theirs. Their colours
-    hold between two picks. Going from eight series to nine, Metabase
-    changes its palette whatever the rows' order, so a benchmark added
-    to eight series recolours them.
+    other series' order, and its line lies over theirs. The colours do
+    not follow the order where a card names them: a source's comes from
+    SOURCE_PALETTE (with_source_colors).
 
     The rank is an aggregate per series joined back, not a window: the
     DuckDB the Metabase driver bundles fails on a window partitioned by
@@ -6639,18 +6740,19 @@ def ensure_models(base, sid, db_id, coll_id, by_name):
     return ids
 
 
-def ensure_cards(base, sid, db_id, coll_id, by_name, model_ids):
+def ensure_cards(base, sid, db_id, coll_id, by_name, model_ids, colors=None):
     """Create/refresh the pre-defined questions over the models in
-    `model_ids`, and archive any retired (renamed-away) ones. Returns
-    card name -> id (the dashboards' tile lookup) and card name -> its
-    description, or None on failure."""
+    `model_ids`, and archive any retired (renamed-away) ones. A card that
+    draws a series per source takes `colors` (source id -> colour).
+    Returns card name -> id (the dashboards' tile lookup) and card name
+    -> its description, or None on failure."""
     payloads = {}
     for name, (display, desc, query, viz) in question_defs(db_id, model_ids).items():
         payloads[name] = card_payload(coll_id, name, "question", display,
-                                      desc, query, viz)
+                                      desc, query, with_source_colors(viz, colors or {}))
     for name, (ctype, display, desc, query, viz) in privacy_card_defs(db_id, model_ids).items():
         payloads[name] = card_payload(coll_id, name, ctype, display,
-                                      desc, query, viz)
+                                      desc, query, with_source_colors(viz, colors or {}))
     saved = upsert_cards(base, sid, by_name, payloads, "card")
     if saved is None:
         return None

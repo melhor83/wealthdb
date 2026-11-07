@@ -481,7 +481,8 @@ _provision() {
          --base "http://127.0.0.1:$PORT" \
          --email "$email" --gold-path /gold/wealthdb.db --db-name gold \
          --default-currency "${WEALTHDB_DEFAULT_CURRENCY:-USD}" \
-         --missing-basis "${WEALTHDB_MISSING_BASIS:-ignore}" || PROV_RC=$?
+         --missing-basis "${WEALTHDB_MISSING_BASIS:-ignore}" \
+         --source-colors "$DATA_DIR/source-colors.json" || PROV_RC=$?
     case "$PROV_RC" in
         # The schema check follows the admin login, so the login stands.
         0|"$PROV_STALE_SNAPSHOT") PROV_LOGIN="log in as $email (password $pwhint)" ;;
