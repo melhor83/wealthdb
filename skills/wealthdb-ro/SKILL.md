@@ -190,7 +190,7 @@ refused. `cashflow projection` starts at next month at the earliest.
 `-f table|json|csv` (`ndjson` on `exposure coverage`, `yield coverage`)
 · `-x CCY` output currency · `-F COND` keep matching rows · `-C COLS`
 columns (names, `all`, or `+add,-drop`) · neither on `holdings global`
-· `-p` hides amounts, ids and typed names · `--period` on `returns`,
+· `-p` hides amounts, ids and typed account names · `--period` on `returns`,
 `gains`, `spending`, `income`, `cashflow`; a series on `exposure` (not
 `securities`, `issuers`, `funds`) and on
 `yield global|sources|portfolios|accounts|curve`; of income's forward

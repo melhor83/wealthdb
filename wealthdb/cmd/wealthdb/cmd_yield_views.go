@@ -204,11 +204,11 @@ func buildYieldCoverageColumns(outCcy string, kindOf func(string) string) []colu
 			return strconv.Itoa(r.Payments)
 		}},
 		strCol("silver_source", func(r row) string { return r.Source }),
-		typedHoldingCol(columnSpec[row]{Name: "instrument", Align: output.AlignLeft, Privacy: PrivacyFreeText,
+		holdingIDCol(columnSpec[row]{Name: "instrument", Align: output.AlignLeft, Privacy: PrivacyFreeText,
 			Extract: func(r row) string { return r.Instrument }}, kindOf, holding),
 		// A holding's line names its account by id alone.
 		accountIDCol("account", kindOf, func(r row) accountRef { return accountRef{source: r.Source, id: r.Account} }),
-		typedHoldingCol(strCol("name", func(r row) string { return r.Name }), kindOf, holding),
+		strCol("name", func(r row) string { return r.Name }),
 	}
 }
 

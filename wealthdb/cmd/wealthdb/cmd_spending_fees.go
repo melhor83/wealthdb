@@ -177,7 +177,7 @@ Flags:
   -F, --filter COND keep the rows where COND holds; repeatable;
                     wealthdb help filter lists the operators
   -x, --currency    output currency (default: config.default_currency)
-  -p, --privacy     redact amounts, ids and names as the returns views do;
+  -p, --privacy     redact amounts, ids and account names as the returns views do;
                     rates and returns stay visible
 
 Available columns:

@@ -85,9 +85,10 @@ const (
 	// multi-word, so an identifier heuristic lets it straight
 	// through.
 	PrivacyFreeText
-	// PrivacyPseudonym: a name a person typed — a typed account's or
-	// portfolio's name or id, a nickname, a manual holding's name and
-	// key, a typed source's transaction or lot id, a config category.
+	// PrivacyPseudonym: a name a person typed about an account — a typed
+	// account's or portfolio's name or id, a nickname, a typed source's
+	// transaction or lot id, a config category. A holding's name is no
+	// such name and prints as it is.
 	// Rendered as a pseudonym, stable within one rendering
 	// (pseudonyms), in every output format. Shape-blind like
 	// PrivacyFreeText, but the rows stay apart: the same value reads
@@ -376,56 +377,42 @@ func typedHolding(kindOf func(string) string, source string) bool {
 	return typedHoldingKinds[kindOf(source)]
 }
 
-// typedHoldingCol is col, whose cells name a holding: under -p a typed
-// holding's (typedHolding) cell prints as the pseudonym of key, the
-// holding's key, so its name, position key and instrument id read as
-// one pseudonym. get gives the row's source and key; a blank cell stays
-// blank, and every other row keeps col's own rule.
-func typedHoldingCol[T any](col columnSpec[T], kindOf func(string) string, get func(T) (source, key string)) columnSpec[T] {
-	class, classOf, extract := col.Privacy, col.PrivacyFunc, col.Extract
-	if col.PrivacyExtract != nil {
-		extract = col.PrivacyExtract
-	}
-	typed := func(r T) (string, bool) {
-		source, key := get(r)
-		return key, key != "" && typedHolding(kindOf, source) && extract(r) != ""
-	}
+// holdingIDCol is col, whose cells identify a holding: its position key
+// or instrument id. A typed holding's (typedHolding) can carry its
+// holder's words and an account's or a contract's id, so -p redacts it
+// by its runs (redactAccountID): its words stay and any id in it masks.
+// get gives the row's source and key; every other row keeps col's own
+// rule. A holding's name needs no such column: -p hides money and
+// identifiers, never what is held, so it prints as it is.
+func holdingIDCol[T any](col columnSpec[T], kindOf func(string) string, get func(T) (source, key string)) columnSpec[T] {
+	class, classOf := col.Privacy, col.PrivacyFunc
 	col.PrivacyFunc = func(r T) PrivacyClass {
-		if _, ok := typed(r); ok {
-			return PrivacyPseudonym
+		if source, key := get(r); key != "" && typedHolding(kindOf, source) {
+			return PrivacyAccountID
 		}
 		if classOf != nil {
 			return classOf(r)
 		}
 		return class
 	}
-	col.PrivacyExtract = func(r T) string {
-		if key, ok := typed(r); ok {
-			return key
-		}
-		return extract(r)
-	}
-	col.Pseudonym = func(r T) (string, string) {
-		source, _ := get(r)
-		return typedPseudonym(kindOf, source)
-	}
 	return col
 }
 
 // holdingCols are a holding's position_key and name columns: key and
-// name read them off a row that source says the source of. -p prints a
-// typed holding's key and name as one pseudonym (typedHoldingCol).
+// name read them off a row that source says the source of. -p redacts a
+// typed holding's key as an id (holdingIDCol) and prints its name as it
+// is.
 func holdingCols[T any](kindOf func(string) string, source, key, name func(T) string) (keyCol, nameCol columnSpec[T]) {
 	holding := func(r T) (string, string) { return source(r), key(r) }
-	return typedHoldingCol(strCol("position_key", key), kindOf, holding),
-		typedHoldingCol(strCol("name", name), kindOf, holding)
+	return holdingIDCol(strCol("position_key", key), kindOf, holding),
+		strCol("name", name)
 }
 
 // holdingKeyCol is a key column. A security key is a public identifier
 // and stays legible under -p, as a public position_key does. A holding
 // no key names reads as `holding:<source>:<id>`, which -p hides: a
-// typed holding's (typedHolding) prints as the pseudonym of its id, as
-// its instrument id does, and any other's masks whole.
+// typed holding's (typedHolding) redacts as an id (holdingIDCol), as its
+// instrument id does, and any other's masks whole.
 func holdingKeyCol[T any](name string, kindOf func(string) string, get func(T) string) columnSpec[T] {
 	col := columnSpec[T]{Name: name, Align: output.AlignLeft, Extract: get,
 		PrivacyFunc: func(r T) PrivacyClass {
@@ -434,15 +421,15 @@ func holdingKeyCol[T any](name string, kindOf func(string) string, get func(T) s
 			}
 			return PrivacyNone
 		}}
-	return typedHoldingCol(col, kindOf, keyHolding(get))
+	return holdingIDCol(col, kindOf, keyHolding(get))
 }
 
 // holdingKeyCols are a holding key's column, named name (holdingKeyCol),
-// and the name column beside it, which label reads: under -p a typed
-// holding's name prints as its key's pseudonym, as in holdingCols.
+// and the name column beside it, which label reads. -p prints the name
+// as it is, as in holdingCols.
 func holdingKeyCols[T any](name string, kindOf func(string) string,
 	key, label func(T) string) (keyCol, nameCol columnSpec[T]) {
-	return holdingKeyCol(name, kindOf, key), typedHoldingCol(strCol("name", label), kindOf, keyHolding(key))
+	return holdingKeyCol(name, kindOf, key), strCol("name", label)
 }
 
 // keyHolding reads the holding a row's key names (holdingKeyParts): its

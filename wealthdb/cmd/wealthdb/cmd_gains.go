@@ -328,8 +328,8 @@ func buildRealizedLotColumnRegistry(outCcy string, kindOf func(string) string) [
 		textCol("symbol", func(r row) *string { return r.Symbol }),
 		// The document's own name for the security: a public name,
 		// legible like the holdings' name column.
-		typedHoldingCol(textCol("description", func(r row) *string { return r.Description }), kindOf, holding),
-		typedHoldingCol(textCol("instrument_id", func(r row) *string { return r.InstrumentExternalID }), kindOf, holding),
+		textCol("description", func(r row) *string { return r.Description }),
+		holdingIDCol(textCol("instrument_id", func(r row) *string { return r.InstrumentExternalID }), kindOf, holding),
 		quantityCol("quantity", func(r row) *string { return r.Quantity }),
 		{Name: "acquired", Align: output.AlignLeft,
 			Extract: func(r row) string {

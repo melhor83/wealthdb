@@ -83,7 +83,7 @@ func buildTransactionColumnRegistry(outCcy string, kindOf func(string) string,
 		{Name: "kind", Align: output.AlignLeft,
 			Extract: func(r gold.TransactionRow) string { return r.Kind }},
 		textCol("symbol", func(r gold.TransactionRow) *string { return r.Symbol }),
-		typedHoldingCol(columnSpec[gold.TransactionRow]{Name: "name", Align: output.AlignLeft,
+		{Name: "name", Align: output.AlignLeft,
 			Extract: func(r gold.TransactionRow) string {
 				// Prefer the joined instruments.name; fall back to the
 				// adapter-supplied transactions.description (Schwab
@@ -95,23 +95,24 @@ func buildTransactionColumnRegistry(outCcy string, kindOf func(string) string,
 				return strOrEmpty(r.Description)
 			},
 			// The class follows which of the two the cell holds. A
-			// joined instrument name is a public security name and
-			// stays legible, unless a person typed it; the description
-			// fallback is a statement narrative and takes the free-text
-			// class, exactly as the `description` column below does.
+			// joined instrument name is a holding's name and stays
+			// legible, a typed one too; the description fallback is a
+			// statement narrative and takes the free-text class,
+			// exactly as the `description` column below does, whoever
+			// holds the instrument.
 			PrivacyFunc: func(r gold.TransactionRow) PrivacyClass {
 				if r.Name != nil && *r.Name != "" {
 					return PrivacyNone
 				}
 				return PrivacyFreeText
-			}}, kindOf, holding),
-		typedHoldingCol(textCol("instrument_id", func(r gold.TransactionRow) *string { return r.InstrumentExternalID }),
+			}},
+		holdingIDCol(textCol("instrument_id", func(r gold.TransactionRow) *string { return r.InstrumentExternalID }),
 			kindOf, holding),
 		// What the row's instrument was looked up BY, where that lookup
 		// found nothing. `instrument_id` empty beside a value here is
 		// exactly a row a `transaction_instruments` entry can close,
 		// and this is the value such an entry is keyed by.
-		typedHoldingCol(textCol("instrument_hint", func(r gold.TransactionRow) *string { return r.InstrumentHint }),
+		holdingIDCol(textCol("instrument_hint", func(r gold.TransactionRow) *string { return r.InstrumentHint }),
 			kindOf, func(r gold.TransactionRow) (string, string) { return r.SilverSourceID, strOrEmpty(r.InstrumentHint) }),
 		// The statement narrative, verbatim: a bank line carries a
 		// counterparty's name, address and reference text, and gold

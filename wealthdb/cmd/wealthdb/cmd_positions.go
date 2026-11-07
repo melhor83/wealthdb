@@ -38,7 +38,7 @@ func buildColumnRegistry(outCcy string, kindOf func(string) string, categories t
 	}
 	// position_key is the gold-side instrument identifier (CUSIP /
 	// ISIN / ticker); a public one stays legible under -p / --privacy,
-	// but a manual holding's key and name are typed (holdingCols). See
+	// and a manual holding's key redacts as an id (holdingCols). See
 	// columns.go for the per-class contract.
 	key, name := holdingCols(kindOf, func(r gold.PositionRow) string { return r.SilverSourceID },
 		func(r gold.PositionRow) string { return r.PositionKey }, func(r gold.PositionRow) string { return strOrEmpty(r.Name) })

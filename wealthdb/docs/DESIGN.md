@@ -209,6 +209,12 @@ Prints the consolidated portfolio as of a date.
 | `--missing-basis` | `lots.missing_basis`, else `ignore` | `ignore` \| `zero`: how a missing cost basis counts ([GAINS.md §8](GAINS.md)). Under `zero` the cost basis is the part the lots know. |
 | `-p`, `--privacy` | off | Redact identifying and monetary columns (see below). |
 
+**What `-p` hides.** Money, quantities and identifiers redact. So do
+the names taken off a statement and the names a person typed about an
+account. Holdings stay legible: their names, their keys where public,
+and the composition, as shares, classes and labels. A holding's name
+prints as it is, a typed one too.
+
 **Privacy classes.** `-p` is per-column, and every read-only view
 that offers the flag draws from the same five classes (everything
 else is left alone):
@@ -279,8 +285,6 @@ These names are typed:
 - the name and id of a `cointracking` or `manual` portfolio;
 - an `angellist` account's id, its holder's portal slug, whatever its shape;
 - a nickname;
-- a manual holding's name, position key and instrument id, and an
-  issuer that takes the holding's name;
 - a transaction or lot id of a `cointracking`, `manual` or declared
   source, such as a manual exit's `exit:<position key>`;
 - an account category that `account_overrides` sets in the config.
@@ -292,12 +296,15 @@ How they print:
   `<user>:<wallet>`, so it prints as a pseudonym.
 - A typed name with no id beside it (cashflow coverage) prints as a
   pseudonym.
-- A manual holding's name prints as the pseudonym of its key, so the
-  holding reads as one pseudonym. A cash flow line carries no key, so
-  its name is a pseudonym of its own text.
+- A holding's name is not hidden, and a typed one prints as it is: a
+  manual holding's, an issuer named after it, a cash flow line's. The
+  content scrub still masks an address or a bank identifier in it.
+- A manual holding's position key and instrument id can carry its
+  holder's words and an id, so they redact as an account id: the words
+  stay and any id in them masks.
 - Exposure and yield key a holding with no public key
-  `holding:<source>:<id>`. Such a key of a manual holding prints as the
-  holding's pseudonym. Any other masks whole.
+  `holding:<source>:<id>`. Such a key of a manual holding redacts the
+  same way. Any other masks whole.
 - The `(no portfolio)` sentinel is a marker, not a name, and stays.
 - `-p` cannot tell a display name built from the holder's words from
   the bank's, so it prints display names as they are. An adapter that

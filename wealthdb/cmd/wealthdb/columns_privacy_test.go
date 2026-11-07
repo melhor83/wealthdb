@@ -449,6 +449,50 @@ func TestScrubReachesPrivacyNoneColumn(t *testing.T) {
 	}
 }
 
+// TestTypedHoldingNameColumns: a manual holding's transaction line
+// prints its instrument's name as it is, and its statement narrative,
+// the fallback where the instrument has no name, as free text. A cash
+// flow line of a manual holding prints its name as it is, and any other
+// line's as free text, since it can name a payer.
+func TestTypedHoldingNameColumns(t *testing.T) {
+	t.Parallel()
+	kinds := func(s string) string { return map[string]string{"hand": "manual", "bank": "schwab"}[s] }
+	cell := func(cols []string, rows [][]string, name string) []string {
+		i := slices.Index(cols, name)
+		out := make([]string, len(rows))
+		for j, r := range rows {
+			out[j] = r[i]
+		}
+		return out
+	}
+	txCols, err := resolveColumns("name", defaultTransactionColumns, buildTransactionColumnRegistry("USD", kinds, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := []gold.TransactionRow{
+		{SilverSourceID: "hand", InstrumentExternalID: strp("example-flat"), Name: strp("Example Flat")},
+		{SilverSourceID: "hand", InstrumentExternalID: strp("example-flat"), Description: strp("SAMPLE PAYEE REF")},
+		{SilverSourceID: "bank", Description: strp("SAMPLE PAYEE REF")},
+	}
+	table := rowsToTable(tx, txCols, true, output.FormatCSV, nil)
+	if got, want := cell(table.Columns, table.Rows, "name"), []string{"Example Flat", "***", "***"}; !slices.Equal(got, want) {
+		t.Errorf("transactions name under -p = %q, want %q", got, want)
+	}
+	cfCols, err := resolveColumns("name", defaultCashflowTransactionColumns, buildCashflowTransactionColumnRegistry("USD", kinds, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cf := []gold.CashflowTransactionRow{
+		{SilverSourceID: "hand", Name: strp("Example Flat")},
+		{SilverSourceID: "bank", Name: strp("Sample Payer")},
+		{SilverSourceID: "hand"},
+	}
+	table = rowsToTable(cf, cfCols, true, output.FormatCSV, nil)
+	if got, want := cell(table.Columns, table.Rows, "name"), []string{"Example Flat", "***", ""}; !slices.Equal(got, want) {
+		t.Errorf("cashflow name under -p = %q, want %q", got, want)
+	}
+}
+
 // TestAddressMasksInEveryClass: the scrub runs before the per-column
 // pass, so an address masks whole in a redacted column too, where a
 // five-digit postal code would otherwise star first and hide the shape.
@@ -982,12 +1026,14 @@ func typedLabelCalls(s *mcpServer, today time.Time) []typedLabelCall {
 // Neither through the MCP privacy endpoint nor through the CLI's -p, on
 // stdout or stderr, does a typed word appear anywhere, in any case: an
 // account or portfolio name, a typed source's portfolio id, a manual
-// holding's name or key (an issuer upper-cases one), an exit line's id,
-// an AngelList account's slug, a config category or a nickname. Wherever a cell shows such a word
-// without privacy, the same cell with privacy on is a pseudonym of the
-// word's prefix. Without privacy every view shows what its account and
-// portfolio columns hide, so no view passes over rows that lack them,
-// and some view shows each typed word.
+// an exit line's id, an AngelList account's slug, a config category or a
+// nickname. Wherever a cell shows such a word without privacy, the same
+// cell with privacy on is a pseudonym of the word's prefix. A manual
+// holding's name and key are no such word: -p hides money and
+// identifiers, never what is held, so some view shows each of them with
+// privacy on as it shows it without. Without privacy every view shows
+// what its account and portfolio columns hide, so no view passes over
+// rows that lack them, and some view shows each typed word.
 func TestPrivacyHidesTypedAccountNames(t *testing.T) {
 	t.Parallel()
 	cfg := setupTypedLabelGold(t)
@@ -998,21 +1044,22 @@ func TestPrivacyHidesTypedAccountNames(t *testing.T) {
 	portfolioNames := []string{"Example Person", "example-house"}
 	portfolioIDs := []string{"cu_000001", "example-house"}
 	// Each typed word that prints as a pseudonym, with the pseudonym's
-	// prefix: the portfolio ids, the manual holdings' names and keys (the
-	// exit line's id holds the plot's), the AngelList account's slug, the
+	// prefix: the portfolio ids, the AngelList account's slug, the
 	// config's category, the nickname a config set and the Plaid
 	// account's own name.
 	pseudonymOf := map[string]string{"cu_000001": "cointracking", "example-house": "manual",
-		"Example Flat": "manual", "example-flat": "manual", "Example Plot": "manual", "example-plot": "manual",
-		"Zephyr Alder Loan": "manual", "zephyr-loan": "manual", "Larch Lane Mortgage": "manual",
-		"larch-mortgage": "manual", "example-holder": "angellist", "Example Trust": "category", "Joint": "nickname",
+		"example-holder": "angellist", "Example Trust": "category", "Joint": "nickname",
 		"Rainy Day Fund": "nickname"}
 	hidden := slices.Concat(typed, slices.Sorted(maps.Keys(pseudonymOf)))
+	// The manual holdings' names and keys, which some view shows alike
+	// with privacy on and off, and the issuer the loan names.
+	legible := []string{"Example Flat", "example-flat", "Zephyr Alder Loan", "zephyr-loan",
+		"Larch Lane Mortgage", "larch-mortgage", "ZEPHYR ALDER LOAN"}
 	var shown struct {
 		sync.Mutex
-		words map[string]bool
+		words, legible map[string]bool
 	}
-	shown.words = map[string]bool{}
+	shown.words, shown.legible = map[string]bool{}, map[string]bool{}
 	leaks := func(out string, needles []string) []string {
 		var found []string
 		for _, w := range needles {
@@ -1035,6 +1082,11 @@ func TestPrivacyHidesTypedAccountNames(t *testing.T) {
 		defer shown.Unlock()
 		for i, row := range want {
 			for j, cell := range row {
+				for _, w := range legible {
+					if strings.Contains(cell, w) && j < len(got[i]) && got[i][j] == cell {
+						shown.legible[w] = true
+					}
+				}
 				for w, prefix := range pseudonymOf {
 					if !strings.Contains(strings.ToLower(cell), strings.ToLower(w)) {
 						continue
@@ -1116,6 +1168,11 @@ func TestPrivacyHidesTypedAccountNames(t *testing.T) {
 			t.Errorf("no view shows %q without privacy, which proves nothing", w)
 		}
 	}
+	for _, w := range legible {
+		if !shown.legible[w] {
+			t.Errorf("no view shows the holding's %q with privacy on as it does without", w)
+		}
+	}
 }
 
 // csvCells reads a csv result's header and rows, past any line that
@@ -1174,9 +1231,9 @@ func TestPseudonymsNumberByFirstAppearance(t *testing.T) {
 // cells number by first appearance down the rows and across the
 // columns, in every format, JSON keeping the column; a map shared by two
 // renderings names a value alike in both, and a fresh one counts anew. A
-// column with no Pseudonym prefixes by its name. A typed holding's key
-// and name read as one pseudonym, apart from another book's holding of
-// the same key. Without -p the values show.
+// column with no Pseudonym prefixes by its name. A typed holding's name
+// shows as it is, and its key redacts as an id: its words stay and an id
+// in it masks. Without -p the values show.
 func TestPseudonymColumnRendersPerRun(t *testing.T) {
 	t.Parallel()
 	type row struct{ source, key, name string }
@@ -1206,16 +1263,18 @@ func TestPseudonymColumnRendersPerRun(t *testing.T) {
 	kinds := map[string]string{"hand": "manual", "hand2": "manual"}
 	key, name := holdingCols(func(id string) string { return kinds[id] }, func(r row) string { return r.source },
 		func(r row) string { return r.key }, func(r row) string { return r.name })
-	books := []row{{"hand", "house", "Example House"}, {"hand2", "house", "Example Barn"}, {"bank", "QSTK", "Qorvant Corp"}}
-	want = [][]string{{"manual-1", "manual-1"}, {"manual-2", "manual-2"}, {"QSTK", "Qorvant Corp"}}
+	books := []row{{"hand", "house", "Example House"}, {"hand2", "house 123456", "Example Barn"},
+		{"bank", "QSTK", "Qorvant Corp"}, {"hand", "hut", "Example Hut, Invented Way 7, 1234 Nowhere"}}
+	want = [][]string{{"house", "Example House"}, {"house ***456", "Example Barn"}, {"QSTK", "Qorvant Corp"},
+		{"hut", "Example Hut, ******** *** *, **** *******"}}
 	if got := rowsToTable(books, []columnSpec[row]{key, name}, true, output.FormatTable, nil).Rows; !slices.EqualFunc(got, want, slices.Equal) {
 		t.Errorf("holdings of two books: rows = %q, want %q", got, want)
 	}
 }
 
 // TestPrivacyPseudonymsHoldWithinARun: within one rendering a typed
-// value reads one pseudonym. A manual holding's key and name read alike
-// and apart from the other holdings'; a wallet keyed by its label, and
+// value reads one pseudonym. A manual holding's key and name are no such
+// value and show as they do without -p; a wallet keyed by its label, and
 // an AngelList account keyed by its slug, read alike in their account
 // and account-id columns, and the wallet in every period of a series. A bank's category stays where the config's prints as a
 // pseudonym. On the MCP privacy endpoint the pseudonym a page shows is
@@ -1231,20 +1290,15 @@ func TestPrivacyPseudonymsHoldWithinARun(t *testing.T) {
 		}
 		return csvRows(t, so)
 	}
-	pseudonym := regexp.MustCompile(`^manual-\d+$`)
 	held := map[string]string{}
 	for _, r := range cli("holdings", "positions", "-d", "2026-06-30", "-C", "silver_source,asset_class,position_key,name") {
-		if r["silver_source"] != "hand" {
-			continue
+		if r["silver_source"] == "hand" {
+			held[r["position_key"]] = r["name"]
 		}
-		if !pseudonym.MatchString(r["position_key"]) || r["name"] != r["position_key"] {
-			t.Errorf("manual %s holding: position_key %q, name %q, want one manual pseudonym", r["asset_class"],
-				r["position_key"], r["name"])
-		}
-		held[r["asset_class"]] = r["position_key"]
 	}
-	if len(held) != 3 || len(slices.Compact(slices.Sorted(maps.Values(held)))) != 3 {
-		t.Errorf("the manual holdings read %q, want three pseudonyms", held)
+	if want := map[string]string{"QSTK": "Qorvant Corp", "example-flat": "Example Flat",
+		"larch-mortgage": "Larch Lane Mortgage", "zephyr-loan": "Zephyr Alder Loan"}; !maps.Equal(held, want) {
+		t.Errorf("the manual holdings read %q under -p, want %q", held, want)
 	}
 	categories, venture := map[string]bool{}, false
 	for _, r := range cli("holdings", "accounts", "-d", "2026-06-30", "-C", "silver_source,account,account_id,account_category") {
@@ -1279,8 +1333,8 @@ func TestPrivacyPseudonymsHoldWithinARun(t *testing.T) {
 	}
 
 	priv := onFixtureToday(newTestMCP(cfg, true))
-	// byClass calls for the manual holdings' keys, by asset class.
-	byClass := func(args map[string]any) map[string]string {
+	// byKey calls for the manual holdings' keys and classes.
+	byKey := func(args map[string]any) map[string]string {
 		t.Helper()
 		args["view"], args["as_of"], args["format"] = "positions", "2026-06-30", "csv"
 		args["columns"] = "silver_source,asset_class,position_key"
@@ -1293,26 +1347,25 @@ func TestPrivacyPseudonymsHoldWithinARun(t *testing.T) {
 		keys := map[string]string{}
 		for _, r := range csvRows(t, body) {
 			if r["silver_source"] == "hand" {
-				keys[r["asset_class"]] = r["position_key"]
+				keys[r["position_key"]] = r["asset_class"]
 			}
 		}
 		return keys
 	}
-	keys := byClass(map[string]any{})
-	flat := keys["real_estate"]
-	if !pseudonym.MatchString(flat) {
-		t.Fatalf("the flat reads %q on the privacy endpoint, want a manual pseudonym", flat)
+	keys := byKey(map[string]any{})
+	if _, ok := keys["example-flat"]; !ok {
+		t.Fatalf("the privacy endpoint shows the manual keys %q, want the flat's among them", keys)
 	}
-	if got := byClass(map[string]any{"symbol": flat}); !maps.Equal(got, map[string]string{"real_estate": flat}) {
-		t.Errorf("symbol=%s keeps %q, want the flat alone", flat, got)
+	if got := byKey(map[string]any{"symbol": "example-flat"}); !maps.Equal(got, map[string]string{"example-flat": keys["example-flat"]}) {
+		t.Errorf("symbol=example-flat keeps %q, want the flat alone", got)
 	}
 	for offset := range 2 {
-		got := byClass(map[string]any{"source": "hand", "sort": "-position_key", "limit": 1, "offset": offset})
+		got := byKey(map[string]any{"source": "hand", "sort": "-position_key", "limit": 1, "offset": offset})
 		if len(got) != 1 {
 			t.Errorf("sorted, at offset %d: %q, want one row", offset, got)
 		}
-		for class, key := range got {
-			if keys[class] != key {
+		for key := range got {
+			if _, ok := keys[key]; !ok {
 				t.Errorf("sorted, at offset %d: %q, want one of %q", offset, got, keys)
 			}
 		}

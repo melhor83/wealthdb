@@ -175,12 +175,13 @@ the model.
 `/mcp` serves full data. `/mcp/privacy` serves the same tools with the
 CLI's `-p` applied. Amounts, quantities and account numbers are hidden,
 and so are the names taken off statements: merchants, payers and
-narratives. Every name a person typed prints as a pseudonym such as
-`manual-1`, or as a redacted account number: a nickname, a manual
-holding, a crypto, manual or declared account
+narratives. Every name a person typed about an account prints as a
+pseudonym such as `manual-1`, or as a redacted account number: a
+nickname, a crypto, manual or declared account
 ([DESIGN.md §4.6](../wealthdb/docs/DESIGN.md)). Each call numbers its
-pseudonyms afresh. Other account names, public holdings, spending and
-income categories, dates and shares stay legible. A model that runs
+pseudonyms afresh. Holdings and their names stay legible, a manual
+holding's too; its key redacts as an account number. Other account
+names, spending and income categories, dates and shares stay legible. A model that runs
 elsewhere, such as a hosted one, gets the privacy URL. No tool
 parameter can turn the redaction off. `wealthdb mcp stdio --privacy` is
 the redacted stdio form.

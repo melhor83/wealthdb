@@ -514,11 +514,16 @@ func buildCashflowTransactionColumnRegistry(outCcy string, kindOf func(string) s
 		// an operating one. It takes the FREE-TEXT class for the reason
 		// the families' payer column does: a column takes the class of
 		// the worst thing it can hold, and on an inbound wire that is a
-		// person. A typed holding's line names what its holder typed,
-		// which prints as a pseudonym.
-		typedHoldingCol(columnSpec[gold.CashflowTransactionRow]{Name: "name", Align: output.AlignLeft,
-			Privacy: PrivacyFreeText, Extract: func(r gold.CashflowTransactionRow) string { return strOrEmpty(r.Name) }},
-			kindOf, func(r gold.CashflowTransactionRow) (string, string) { return r.SilverSourceID, strOrEmpty(r.Name) }),
+		// person. A typed holding's line names the holding, which -p
+		// prints as it is.
+		{Name: "name", Align: output.AlignLeft,
+			Extract: func(r gold.CashflowTransactionRow) string { return strOrEmpty(r.Name) },
+			PrivacyFunc: func(r gold.CashflowTransactionRow) PrivacyClass {
+				if typedHolding(kindOf, r.SilverSourceID) && strOrEmpty(r.Name) != "" {
+					return PrivacyNone
+				}
+				return PrivacyFreeText
+			}},
 		// The family's own value behind the node, and the two overlays
 		// it could have come from.
 		textCol("detailed", func(r gold.CashflowTransactionRow) *string { return r.Verdict }),
