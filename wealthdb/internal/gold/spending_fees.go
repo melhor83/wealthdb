@@ -4,9 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
 )
 
 // feeDaysPerYear annualizes a fee rate.
@@ -78,7 +81,7 @@ type feeEntity struct {
 }
 
 // feeGroups are the detailed groups of migration 0177's fee_group, in
-// column order.
+// column order. A test holds the two to one set.
 var feeGroups = []string{"investment", "bank", "atm", "other"}
 
 // feeLine is one spending line of primary BANK_FEES.
@@ -222,8 +225,10 @@ func (l feeLine) entityKey() string {
 	return acctKey(l.src, "account\x00"+l.acct)
 }
 
-// newEntity is the line's entity, with the accounts whose value it holds:
-// every account of the portfolio, cards and mortgages too, or the account.
+// newEntity is the line's entity, with the accounts whose value it holds: every
+// asset account of the portfolio, or the account. A portfolio's mortgages and
+// cards are left out, as its return leaves them out; an account that is a card
+// or a mortgage holds its own balance.
 func (l feeLine) newEntity(portfolioNames map[string]string, ds *returnsDataset) *feeEntity {
 	e := &feeEntity{src: l.src, kind: "account", id: l.acct, label: l.label, fees: map[string]float64{}}
 	if l.portfolio != "" {
@@ -234,7 +239,11 @@ func (l feeLine) newEntity(portfolioNames map[string]string, ds *returnsDataset)
 	}
 	for _, set := range []map[string]*accountData{ds.accts, ds.holdings.cards} {
 		for _, a := range set {
-			if a.src == l.src && (a.acct == l.acct && l.portfolio == "" || l.portfolio != "" && a.portfolio == l.portfolio) {
+			switch {
+			case a.src != l.src:
+			case l.portfolio == "" && a.acct == l.acct:
+				e.spans = append(e.spans, a)
+			case l.portfolio != "" && a.portfolio == l.portfolio && !debtKind(a.kind):
 				e.spans = append(e.spans, a)
 			}
 		}
@@ -312,8 +321,9 @@ func (e *feeEntity) meanValue(b feeBucket) (float64, int64) {
 func (e *feeEntity) row(b feeBucket, months []ReturnRow) FeeRow {
 	r := FeeRow{Period: b.label, StartDay: b.start, EndDay: b.end,
 		SilverSourceID: e.src, EntityKind: e.kind, EntityID: e.id, EntityLabel: e.label}
+	// Every group, a label fee_group may add included, in one order.
 	var total float64
-	for _, g := range feeGroups {
+	for _, g := range slices.Sorted(maps.Keys(e.fees)) {
 		total += e.fees[g]
 	}
 	r.Fees = decStr(total)
@@ -341,4 +351,9 @@ func (e *feeEntity) row(b feeBucket, months []ReturnRow) FeeRow {
 	}
 	r.Quality = append(r.Quality, tags...)
 	return r
+}
+
+// debtKind reports an account kind that is a debt: a mortgage or a card.
+func debtKind(kind string) bool {
+	return kind == string(canonical.AccountKindMortgage) || kind == string(canonical.AccountKindCard)
 }

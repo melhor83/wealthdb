@@ -1,7 +1,10 @@
 package gold
 
 import (
+	"context"
+	"database/sql"
 	"math"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -116,13 +119,11 @@ func TestPostExitResidue(t *testing.T) {
 	}
 }
 
-// TestPostExitResidueSameInEveryCurrency: a sale takes 90.5% of the value in
-// dollars and leaves 0.5%. The rate moves 2% between the valuation and the sale,
-// so in francs the same sale is 88.7% of the value, under the outflow floor.
-// Which sub-periods are residue is one decision, made in dollars, so every
-// reporting currency leaves out the same income month and carries the same tag.
-func TestPostExitResidueSameInEveryCurrency(t *testing.T) {
-	t.Parallel()
+// seedExitNearTheFloor is one account whose sale takes 90.5% of the value in
+// dollars and leaves 0.5%, and 88.7% in francs, the franc having moved 2%
+// between the valuation and the sale; the residue earns 200 in April.
+func seedExitNearTheFloor(t *testing.T) (*sql.DB, context.Context) {
+	t.Helper()
 	d := func(m time.Month, day int) int64 { return dy(2024, m, day) }
 	db, ctx := openMigrated(t)
 	seedReturnsSource(t, db, ctx, "fidx", "fidelity")
@@ -133,6 +134,18 @@ func TestPostExitResidueSameInEveryCurrency(t *testing.T) {
 	seedAcct(t, db, ctx, "fidx", "A", canonical.AccountKindBrokerage, nil,
 		[]snap{{d(time.January, 31), 10000}, {d(time.February, 29), 10000}, {d(time.March, 31), 50}, {d(time.April, 30), 250}},
 		[]txn{{d(time.March, 10), canonical.TxKindWithdrawal, -9050}})
+	return db, ctx
+}
+
+// TestPostExitResidueSameInEveryCurrency: a sale takes 90.5% of the value in
+// dollars and leaves 0.5%. The rate moves 2% between the valuation and the sale,
+// so in francs the same sale is 88.7% of the value, under the outflow floor.
+// Which sub-periods are residue is one decision, made in dollars, so every
+// reporting currency leaves out the same income month and carries the same tag.
+func TestPostExitResidueSameInEveryCurrency(t *testing.T) {
+	t.Parallel()
+	d := func(m time.Month, day int) int64 { return dy(2024, m, day) }
+	db, ctx := seedExitNearTheFloor(t)
 	for _, level := range []string{"accounts", "sources"} {
 		entity := map[string]string{"accounts": "A", "sources": "fidx"}[level]
 		for _, ccy := range []string{"USD", "CHF", "EUR", "GBP"} {
@@ -163,15 +176,7 @@ func TestPostExitResidueSameInEveryCurrency(t *testing.T) {
 func TestMaterializedResidueSameInEveryCurrency(t *testing.T) {
 	t.Parallel()
 	d := func(m time.Month, day int) int64 { return dy(2024, m, day) }
-	db, ctx := openMigrated(t)
-	seedReturnsSource(t, db, ctx, "fidx", "fidelity")
-	seedFX(t, db, d(time.January, 1), "USD", "CHF", "1.00")
-	seedFX(t, db, d(time.March, 1), "USD", "CHF", "1.02")
-	seedFX(t, db, d(time.January, 1), "USD", "EUR", "0.90")
-	seedFX(t, db, d(time.January, 1), "USD", "GBP", "0.80")
-	seedAcct(t, db, ctx, "fidx", "A", canonical.AccountKindBrokerage, nil,
-		[]snap{{d(time.January, 31), 10000}, {d(time.February, 29), 10000}, {d(time.March, 31), 50}, {d(time.April, 30), 250}},
-		[]txn{{d(time.March, 10), canonical.TxKindWithdrawal, -9050}})
+	db, ctx := seedExitNearTheFloor(t)
 	if _, err := MaterializeReturns(ctx, db, MaterializeParams{ToEpoch: d(time.April, 30) + 43199, ComputedAt: 1}); err != nil {
 		t.Fatal(err)
 	}
@@ -288,5 +293,129 @@ func TestPostExitResidueWithoutATwin(t *testing.T) {
 		if got := qualityHas(s, "post_exit_residue"); got == linked {
 			t.Errorf("linked %v: post_exit_residue = %v: %v", linked, got, s.Quality)
 		}
+	}
+}
+
+// TestPostExitResidueInEveryWindow: the residue is decided on the entity's
+// since-inception chain and applied to every window. A window that opens after
+// a December exit, or inside a three-day exit, skips the same sub-periods and
+// carries the tag; one that opens after the residue is material again does
+// not.
+func TestPostExitResidueInEveryWindow(t *testing.T) {
+	t.Parallel()
+	wd := canonical.TxKindWithdrawal
+	feb := func(day int) int64 { return dy(2024, time.February, day) }
+	daily := func(first, last int64, value func(day int64) int64) []snap {
+		var s []snap
+		for x := first; x <= last; x += 86400 {
+			s = append(s, snap{x, value(x)})
+		}
+		return s
+	}
+	cases := []struct {
+		name     string
+		snaps    []snap
+		txns     []txn
+		from, to int64
+		twr      float64
+		tagged   bool
+	}{
+		// A sale on 10 December leaves 10, which earns 50 in January. The
+		// window from January holds only the residue: a factor of 1 throughout.
+		{"a window that opens after a December exit", []snap{{dy(2023, time.November, 30), 10000},
+			{dy(2023, time.December, 31), 10}, {dy(2024, time.January, 31), 60}, {dy(2024, time.February, 29), 60}},
+			[]txn{{dy(2023, time.December, 10), wd, -9990}}, dy(2024, time.January, 1), dy(2024, time.February, 29), 0, true},
+		// The third day of a three-day sale opens the window: alone it leaves
+		// 1.7% of what it held, no exit, but the inception chain's run is one.
+		{"a window that opens inside an exit", daily(dy(2024, time.January, 31), feb(28), func(x int64) int64 {
+			switch {
+			case x < feb(1):
+				return 8000
+			case x < feb(10):
+				return 9000
+			case x < feb(11):
+				return 6000
+			case x < feb(12):
+				return 3000
+			case x < feb(20):
+				return 50
+			}
+			return 250
+		}), []txn{{feb(10), wd, -3000}, {feb(11), wd, -3000}, {feb(12), wd, -2950}}, feb(11), feb(28), 0, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			db, ctx := openMigrated(t)
+			seedReturnsSource(t, db, ctx, "fidx", "fidelity")
+			seedAcct(t, db, ctx, "fidx", "A", canonical.AccountKindBrokerage, nil, c.snaps, c.txns)
+			for _, level := range []string{"accounts", "sources"} {
+				rows, err := RunReturns(ctx, db, params(level, c.from, c.to+43199))
+				if err != nil {
+					t.Fatal(err)
+				}
+				s, ok := summaryFor(rows, map[string]string{"accounts": "A", "sources": "fidx"}[level])
+				if !ok || s.TWR == nil {
+					t.Fatalf("%s: no TWR: %+v", level, s)
+				}
+				if math.Abs(*s.TWR-c.twr) > 1e-9 || qualityHas(s, "post_exit_residue") != c.tagged {
+					t.Errorf("%s: TWR %.6f, quality %v; want %.6f, tagged %v", level, *s.TWR, s.Quality, c.twr, c.tagged)
+				}
+			}
+		})
+	}
+}
+
+// TestPostExitResidueCumulativeLine: the Returns chart's cumulative line divides
+// since-year windows, (1 + TWR since 2023) / (1 + TWR since 2024). With the
+// residue read the same in both, the line holds its level after a December
+// exit instead of falling by the residue's income.
+func TestPostExitResidueCumulativeLine(t *testing.T) {
+	t.Parallel()
+	db, ctx := openMigrated(t)
+	seedReturnsSource(t, db, ctx, "fidx", "fidelity")
+	seedAcct(t, db, ctx, "fidx", "A", canonical.AccountKindBrokerage, nil,
+		[]snap{{dy(2023, time.January, 31), 10000}, {dy(2023, time.November, 30), 11000},
+			{dy(2023, time.December, 31), 10}, {dy(2024, time.January, 31), 60}, {dy(2024, time.February, 29), 60}},
+		[]txn{{dy(2023, time.December, 10), canonical.TxKindWithdrawal, -10990}})
+	if _, err := MaterializeReturns(ctx, db, MaterializeParams{ToEpoch: dy(2024, time.February, 29) + 43199, ComputedAt: 1}); err != nil {
+		t.Fatal(err)
+	}
+	twr := func(year int) (float64, string) {
+		var v float64
+		var q string
+		if err := db.QueryRowContext(ctx, `SELECT twr, quality FROM report_returns WHERE grain = 'sources'
+			AND granularity = 'total' AND is_summary AND currency = 'USD' AND window_from_year = ?`, year).Scan(&v, &q); err != nil {
+			t.Fatalf("window %d: %v", year, err)
+		}
+		return v, q
+	}
+	y23, _ := twr(2023)
+	y24, q24 := twr(2024)
+	if !strings.Contains(q24, "post_exit_residue") || math.Abs(y24) > 1e-12 {
+		t.Errorf("since 2024: TWR %v, quality %s; want 0 and post_exit_residue", y24, q24)
+	}
+	if cum := (1+y23)/(1+y24) - 1; math.Abs(cum-y23) > 1e-12 || y23 < 0.09 {
+		t.Errorf("the line at 2024 reads %v, since 2023 %v: it must hold its level", cum, y23)
+	}
+}
+
+// TestBridgeReadsTheResidueInDollars: the bridge's months carry the same
+// residue decision as returns, made in dollars, from the CLI as from the
+// materialized table. In francs the sale is under the outflow floor, so a
+// bridge that decided in francs would not tag April.
+func TestBridgeReadsTheResidueInDollars(t *testing.T) {
+	t.Parallel()
+	db, ctx := seedExitNearTheFloor(t)
+	rows := runBridge(t, db, ctx, bridgeParams("CHF", "monthly"))
+	checkIdentity(t, "CHF", rows)
+	found := false
+	for _, r := range rows {
+		if r.Period == "2024-04" {
+			found = slices.Contains(r.Quality, "post_exit_residue")
+		}
+	}
+	if !found {
+		t.Errorf("April in francs has no post_exit_residue: %+v", rows)
 	}
 }

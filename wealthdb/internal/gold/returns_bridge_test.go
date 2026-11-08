@@ -483,7 +483,7 @@ func TestTrackingMove(t *testing.T) {
 // A debut and a closure in one month net with each other first, so a closure
 // leaves no negative onboarded behind. Its mirror, a closure with its money
 // arriving, is one movement too. The spine ends on the closure's day, the one
-// day returns books a closure flow.
+// day returns books a closure of the carried value.
 func TestBridgeClosureInTheMonth(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct {

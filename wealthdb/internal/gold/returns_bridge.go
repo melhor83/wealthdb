@@ -158,6 +158,8 @@ func loadDebtRates(ctx context.Context, db *sql.DB, outCcy string) (map[string]m
 // computeBridge is the bridge's rows: the whole history's months, then
 // those the window holds, summed into p.Period's buckets.
 func computeBridge(in bridgeInput, p ReturnParams) []BridgeRow {
+	// The window runs read the residue in residueCurrency, as returns does.
+	in.ds.ensureTwins()
 	assets := bridgeAssets(in.ds, p)
 	months := in.months(assets, p)
 	var firstDay int64
@@ -201,8 +203,8 @@ func bridgeRunParams(p ReturnParams) ReturnParams {
 }
 
 // months computes the history's months from one since-inception run of the
-// global grain. The window never reaches this far, so a month reads the
-// same in every window and months add up to quarters and years.
+// global grain. The caller's window plays no part, so a month reads the same
+// in every window and months add up to quarters and years.
 func (in bridgeInput) months(assets []*accountData, p ReturnParams) []bridgeMonth {
 	if len(assets) == 0 {
 		return nil
@@ -214,9 +216,9 @@ func (in bridgeInput) months(assets []*accountData, p ReturnParams) []bridgeMont
 	if winTo <= winFrom {
 		return nil
 	}
-	flows, _, _ := entityFlows(assets, run, winFrom, winTo, true)
+	rows, flows := computeEntityReturnFlows(assets, run, toDay, in.ds.fx)
 	bucketQuality := map[int64][]string{}
-	for _, r := range computeEntityReturn(assets, run, toDay, in.ds.fx) {
+	for _, r := range rows {
 		if !r.IsSummary {
 			bucketQuality[r.EndDay] = r.Quality
 		}
@@ -224,7 +226,7 @@ func (in bridgeInput) months(assets []*accountData, p ReturnParams) []bridgeMont
 	av := entityValue(assets)
 	var out []bridgeMonth
 	for _, b := range returns.BucketBoundaries(winFrom, winTo, returns.BucketMonthly) {
-		m := bridgeMonth{startDay: b[0], endDay: b[1], tags: bucketQuality[b[1]]}
+		m := bridgeMonth{startDay: b[0], endDay: b[1], tags: slices.Clone(bucketQuality[b[1]])}
 		m.startNW, m.endNW = toCents(in.ds.holdings.netWorth[b[0]]), toCents(in.ds.holdings.netWorth[b[1]])
 		var real, synthetic float64
 		monthFlows := flowsIn(flows, b[0], b[1])
@@ -239,11 +241,11 @@ func (in bridgeInput) months(assets []*accountData, p ReturnParams) []bridgeMont
 		if moved := trackingMove(m.netFlow, m.onboarded); moved != 0 {
 			m.netFlow += moved
 			m.onboarded -= moved
-			m.tags = append(append([]string{}, m.tags...), "tracking_netted")
+			m.tags = append(m.tags, "tracking_netted")
 		}
 		repaid, debtTags := in.debtRepaid(b[0], b[1], monthFlows)
 		m.debtRepaid = toCents(repaid)
-		m.tags = append(append([]string{}, m.tags...), debtTags...)
+		m.tags = append(m.tags, debtTags...)
 		m.gap = toCents(in.worstGap(av, b[0], b[1]))
 		if m.gap != 0 {
 			m.tags = append(m.tags, "bridge_gap")

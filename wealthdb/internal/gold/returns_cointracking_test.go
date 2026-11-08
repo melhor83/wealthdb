@@ -152,10 +152,9 @@ func TestCointrackingDeadCoinClosureSurvivesOnboardNone(t *testing.T) {
 	if !ok {
 		t.Fatal("no ctdead source row")
 	}
-	// No fiat flows crossed the boundary in-window and nothing is synthesized
-	// (the zero-carry tail ends past the window, and its interior value is ~0
-	// anyway), so net_flow is exactly 0 — the drain-to-zero LOSS surfaces in
-	// TWR through the value series, never as a phantom flow.
+	// No fiat flows crossed the boundary in-window and nothing is booked: the
+	// zero tail holds no exit leg. So net_flow is exactly 0, and the
+	// drain-to-zero LOSS surfaces in TWR through the value series.
 	if nf := netFlowOf(t, rows, "ctdead"); math.Abs(nf) > 1e-6 {
 		t.Errorf("net_flow = %.2f, want 0 (no in-window fiat flows)", nf)
 	}

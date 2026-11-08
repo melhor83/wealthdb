@@ -6,6 +6,7 @@ import (
 	"math"
 	"slices"
 	"sort"
+	"strings"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/returns"
 )
@@ -17,6 +18,13 @@ const valueTol = 1e-6
 // asset accounts. A single-account accounts-grain entity is the degenerate case:
 // no synthetic onboarding, no netting — exact.
 func computeEntityReturn(assets []*accountData, p ReturnParams, toDay int64, fx fxBounds) []ReturnRow {
+	rows, _ := computeEntityReturnFlows(assets, p, toDay, fx)
+	return rows
+}
+
+// computeEntityReturnFlows is computeEntityReturn with the entity's flow series
+// beside its rows, for a caller that reads both (the bridge).
+func computeEntityReturnFlows(assets []*accountData, p ReturnParams, toDay int64, fx fxBounds) ([]ReturnRow, []returns.Flow) {
 	// The accounts/sources/portfolios grains group by source, so every asset
 	// shares one src; the global grain spans all sources, so there is no single
 	// silver_source — assets[0].src would be a non-deterministic map pick.
@@ -28,7 +36,7 @@ func computeEntityReturn(assets []*accountData, p ReturnParams, toDay int64, fx 
 
 	winFrom, winTo, incFlags := entityWindow(assets, p, toDay)
 	if winTo <= winFrom {
-		return nil
+		return nil, nil
 	}
 	aggregate := len(assets) > 1 || p.Level != "accounts"
 
@@ -66,7 +74,7 @@ func computeEntityReturn(assets []*accountData, p ReturnParams, toDay int64, fx 
 			r.EndValue = decStr(vEnd)
 		}
 		r.Quality = append(entityQ, "nonpositive_base")
-		return []ReturnRow{r}
+		return []ReturnRow{r}, flows
 	}
 
 	var out []ReturnRow
@@ -98,18 +106,17 @@ func computeEntityReturn(assets []*accountData, p ReturnParams, toDay int64, fx 
 	}
 
 	// Since-inception summary row, cumulative TWR pinned to the canonical bucket.
-	skips := residueDecision(assets, p, winFrom, winTo, aggregate, canonicalChainBounds(winFrom, winTo, snaps), av, flows, rolled)
-	sr := summaryRow(base, winFrom, winTo, av, flows, rolled, snaps, skips, assets, p, entityQ)
+	residue := residueEnds(assets, p, toDay, aggregate)
+	sr := summaryRow(base, winFrom, winTo, av, flows, rolled, snaps, residue, assets, p, entityQ)
 	if staleAt(snaps, winTo, snapGap, snapGapOK) {
 		sr.Quality = append(sr.Quality, "stale_snapshot")
 	}
 	out = append(out, sr)
-	return out
+	return out, flows
 }
 
 // entityValue is the aggregate value at a day: each constituent's
-// carry-forward value, zeroed from its explicit-closure day (atomic with
-// the closure outflow).
+// carry-forward value, zeroed from its closure day (ZeroedValue).
 func entityValue(assets []*accountData) func(day int64) (float64, bool) {
 	return func(day int64) (float64, bool) {
 		var sum float64
@@ -199,7 +206,7 @@ func preFxHistory(assets []*accountData, outCcy string, winFrom int64, fx fxBoun
 	return false
 }
 
-func summaryRow(base ReturnRow, winFrom, winTo int64, av func(int64) (float64, bool), flows, rolled []returns.Flow, snaps []int64, skips []bool, assets []*accountData, p ReturnParams, entityQ []string) ReturnRow {
+func summaryRow(base ReturnRow, winFrom, winTo int64, av func(int64) (float64, bool), flows, rolled []returns.Flow, snaps []int64, residue map[int64]bool, assets []*accountData, p ReturnParams, entityQ []string) ReturnRow {
 	r := base
 	r.Period, r.IsSummary = summaryLabel(winFrom, winTo), true
 	v0, _ := av(winFrom)
@@ -216,22 +223,17 @@ func summaryRow(base ReturnRow, winFrom, winTo int64, av func(int64) (float64, b
 	// boundary falls inside a snapshot gap and splits a flow from its later value
 	// realisation (see RETURNS-NOTES §"snapshot-aligned headline").
 	bounds := canonicalChainBounds(winFrom, winTo, snaps)
-	unvalued := unvaluedAt(bounds, rolled)
 	var buckets []returns.Bucket
 	degenerate, skipped := false, false
-	for i := 0; i+1 < len(bounds); i++ {
-		bv0, _ := av(bounds[i])
-		bv1, _ := av(bounds[i+1])
-		bv0, bv1 = bv0+unvalued[i], bv1+unvalued[i+1]
-		bf := flowsIn(flows, bounds[i], bounds[i+1])
-		if emptySubPeriod(bv0, bv1, bf) {
+	for _, sp := range chainSubPeriods(bounds, av, rolled, flows) {
+		if sp.empty {
 			continue
 		}
-		if skips[i] {
+		if residue[sp.to] {
 			skipped = true
 			continue
 		}
-		rr, ok := returns.ModifiedDietz(bv0, bv1, bounds[i], bounds[i+1], bf)
+		rr, ok := returns.ModifiedDietz(sp.v0, sp.v1, sp.from, sp.to, sp.flows)
 		buckets = append(buckets, returns.Bucket{R: rr, OK: ok})
 		if !ok {
 			degenerate = true
@@ -241,7 +243,12 @@ func summaryRow(base ReturnRow, winFrom, winTo int64, av func(int64) (float64, b
 		q = append(q, "post_exit_residue")
 	}
 	if p.Method == "twr" || p.Method == "both" {
-		if cum, ok := returns.Chain(buckets); ok {
+		cum, ok := returns.Chain(buckets)
+		if len(buckets) == 0 && skipped {
+			// A window wholly on a residue: each sub-period a factor of 1.
+			cum, ok = 0, true
+		}
+		if ok {
 			r.TWR = f64(cum)
 			days := float64(bounds[len(bounds)-1] - bounds[0])
 			if returns.ShouldAnnualize(p.Annualize, days) {
@@ -282,52 +289,103 @@ const (
 	residueCurrency  = "USD"
 )
 
-// emptySubPeriod reports a chain sub-period in which the entity holds nothing
-// and moves nothing: it has no return to chain, so a closed account's later
-// zero valuations leave the chain where it ended.
-func emptySubPeriod(v0, v1 float64, flows []returns.Flow) bool {
-	return math.Abs(v0) <= valueTol && math.Abs(v1) <= valueTol && len(flows) == 0
+// openingValue is an entity's value at from as the chain and MWR read it: what
+// its accounts moved before from and do not show yet is in it.
+func openingValue(av func(int64) (float64, bool), from int64, rolled []returns.Flow) float64 {
+	v, _ := av(from)
+	return v + unshownValue(unvaluedAt([]int64{from}, rolled)[0])
 }
 
-// residueSkips is, for each sub-period between bounds, whether it sits on the
-// residue of an exit, read from the entity's value av, its moves rolled and
-// its flows.
-func residueSkips(bounds []int64, av func(int64) (float64, bool), rolled, flows []returns.Flow) []bool {
+// unshownValue is an unvaluedAt figure as money: float dust from moves that
+// cancel reads as nothing, so a value with nothing unshown stays as carried.
+func unshownValue(v float64) float64 {
+	if math.Abs(v) <= valueTol {
+		return 0
+	}
+	return v
+}
+
+// subPeriod is one sub-period of the chain: its edges' values with the moves
+// rolled in, and its flows.
+type subPeriod struct {
+	from, to int64
+	v0, v1   float64
+	flows    []returns.Flow
+	// empty: the entity holds nothing and moves nothing, so there is no return
+	// to chain, and a closed account's later zero valuations leave the chain
+	// where it ended.
+	empty bool
+}
+
+// chainSubPeriods are the sub-periods between bounds, read from the entity's
+// value av, its moves rolled and its flows.
+func chainSubPeriods(bounds []int64, av func(int64) (float64, bool), rolled, flows []returns.Flow) []subPeriod {
 	unvalued := unvaluedAt(bounds, rolled)
-	skips := make([]bool, len(bounds))
-	var w exitWatch
+	out := make([]subPeriod, 0, len(bounds))
 	for i := 0; i+1 < len(bounds); i++ {
-		bv0, _ := av(bounds[i])
-		bv1, _ := av(bounds[i+1])
-		bv0, bv1 = bv0+unvalued[i], bv1+unvalued[i+1]
-		bf := flowsIn(flows, bounds[i], bounds[i+1])
-		if !emptySubPeriod(bv0, bv1, bf) {
-			skips[i] = w.residue(bv0, bv1, bf)
+		sp := subPeriod{from: bounds[i], to: bounds[i+1], flows: flowsIn(flows, bounds[i], bounds[i+1])}
+		sp.v0, _ = av(bounds[i])
+		sp.v1, _ = av(bounds[i+1])
+		sp.v0, sp.v1 = sp.v0+unvalued[i], sp.v1+unvalued[i+1]
+		sp.empty = math.Abs(sp.v0) <= valueTol && math.Abs(sp.v1) <= valueTol && len(sp.flows) == 0
+		out = append(out, sp)
+	}
+	return out
+}
+
+// residueSkips is, for each sub-period, whether it sits on the residue of an
+// exit, by the day the sub-period ends.
+func residueSkips(sps []subPeriod) map[int64]bool {
+	skips := map[int64]bool{}
+	var w exitWatch
+	for _, sp := range sps {
+		if !sp.empty && w.residue(sp.v0, sp.v1, sp.flows) {
+			skips[sp.to] = true
 		}
 	}
 	return skips
 }
 
-// residueDecision is residueSkips read in residueCurrency, on the accounts'
-// twins there: every reporting currency applies what that currency decides. A
-// dataset in residueCurrency is its own twin. An account with no twin, where
-// that currency's dataset could not be loaded, leaves the reporting currency
-// to decide alone.
-func residueDecision(assets []*accountData, p ReturnParams, winFrom, winTo int64, aggregate bool,
-	bounds []int64, av func(int64) (float64, bool), flows, rolled []returns.Flow) []bool {
-	if p.OutCcy == residueCurrency {
-		return residueSkips(bounds, av, rolled, flows)
-	}
-	twins := make([]*accountData, len(assets))
-	for i, a := range assets {
-		if twins[i] = a.twin; twins[i] == nil {
-			return residueSkips(bounds, av, rolled, flows)
+// residueEnds is the entity's residue decision: the end days of the
+// sub-periods that sit on the residue of an exit. It is read once, on the
+// entity's since-inception chain, so a window that opens after an exit or
+// inside one skips the same sub-periods: a window's first sub-period ends on
+// the same day as the inception chain's. It is read in residueCurrency on the
+// accounts' twins, so every reporting currency applies one decision. An
+// account with no twin, where that currency's dataset could not be loaded,
+// leaves the reporting currency to decide alone.
+func residueEnds(assets []*accountData, p ReturnParams, toDay int64, aggregate bool) map[int64]bool {
+	dec := assets
+	if p.OutCcy != residueCurrency {
+		dec = make([]*accountData, len(assets))
+		for i, a := range assets {
+			if dec[i] = a.twin; dec[i] == nil {
+				dec = assets
+				break
+			}
 		}
 	}
-	q := p
-	q.OutCcy = residueCurrency
-	tflows, _, trolled := entityFlows(twins, q, winFrom, winTo, aggregate)
-	return residueSkips(bounds, entityValue(twins), trolled, tflows)
+	since := p
+	since.FromEpoch = 0
+	compute := func() map[int64]bool {
+		from, to, _ := entityWindow(dec, since, toDay)
+		if to <= from {
+			return nil
+		}
+		flows, _, rolled := entityFlows(dec, since, from, to, aggregate)
+		return residueSkips(chainSubPeriods(canonicalChainBounds(from, to, unionSnapshotDays(dec)), entityValue(dec), rolled, flows))
+	}
+	if dec[0].residue == nil {
+		return compute()
+	}
+	keys := make([]string, len(dec))
+	for i, a := range dec {
+		keys[i] = acctKey(a.src, a.acct)
+	}
+	slices.Sort(keys)
+	key := fmt.Sprintf("%s|%d|%t|%t|%s|%p|%s", p.Level, toDay, aggregate, p.Netting, p.Inception,
+		p.InceptionOverrides, strings.Join(keys, "|"))
+	return dec[0].residue.get(key, compute)
 }
 
 // exitWatch follows a chain's sub-periods in order and says which sit on the
@@ -691,16 +749,16 @@ func entityFlows(assets []*accountData, p ReturnParams, winFrom, winTo int64, ag
 	//     same-day sibling FUNDING drops those legs do not explain (NOT the raw
 	//     calendar aggregate delta — see groupOnboardStep: same-day external
 	//     deposits and market moves on siblings are excluded so they aren't
-	//     double-counted). An internal
-	//     cash->securities move inside a UBS
-	//     relationship debuts a securities account while its funding cash account
-	//     drops by the same amount, so the step-up nets to ~0 and NOTHING is
-	//     onboarded — the capital was already booked once (inception value + the
-	//     external cash deposit). Genuinely new external value that wasn't captured
-	//     as a same-unit deposit still steps the aggregate up and is onboarded. This
-	//     prevents the conduit double-count, and it is source-scoped: the grain is
-	//     read per constituent from a.rpolicy, so a non-UBS constituent keeps
-	//     per-constituent onboarding even in the merged global entity.
+	//     double-counted). An internal cash->securities move inside a UBS
+	//     relationship debuts a securities account while its funding cash
+	//     account drops by the same amount, so the step-up nets to ~0 and
+	//     NOTHING is onboarded — the capital was already booked once (inception
+	//     value + the external cash deposit). Genuinely new external value that
+	//     wasn't captured as a same-unit deposit still steps the aggregate up and
+	//     is onboarded. This prevents the conduit double-count, and it is
+	//     source-scoped: the grain is read per constituent from a.rpolicy, so a
+	//     non-UBS constituent keeps per-constituent onboarding even in the
+	//     merged global entity.
 	// Conduit-kind accounts never emit their OWN onboarding (ConduitKinds); under
 	// per-entity-once their value still enters the aggregate step-up (they hold the
 	// inception cash), and under the default they are simply skipped.
@@ -756,8 +814,10 @@ func entityFlows(assets []*accountData, p ReturnParams, winFrom, winTo int64, ag
 	//     what already left as a flow since its last valuation.
 	//   - Inside a longer zero tail the closure books what the tail's surviving
 	//     legs moved out, so the money that moved on leaves on the day the value
-	//     shows it gone. With no such leg it books nothing: the zeroing reads as a
-	//     loss, a write-off.
+	//     shows it gone. A window that ends before an exit leg still holds the
+	//     zeroing, so the account's own tail legs past the window's end count
+	//     too, unnetted, as confirms reads flows past winTo. With no leg the
+	//     closure books nothing: the zeroing reads as a loss, a write-off.
 	for _, a := range assets {
 		if a.rpolicy.ClosureScope == returns.ClosureLedgerExact {
 			continue
@@ -771,6 +831,7 @@ func entityFlows(assets []*accountData, p ReturnParams, winFrom, winTo int64, ag
 			last, _ := a.valueAt(cd - 1)
 			amount, exit = last+moved.closing[a], false
 		} else {
+			amount -= tailLegsAfter(a, winTo)
 			// Money a sibling passed in after the zeroing and the exit legs paid
 			// on was never in the zeroing's value: it leaves on the day it came
 			// in, and the zeroing day books only the rest.
@@ -800,6 +861,17 @@ func entityFlows(assets []*accountData, p ReturnParams, winFrom, winTo int64, ag
 		}
 	}
 	return flows, tags, moved.rolled(assets, winTo)
+}
+
+// tailLegsAfter is the signed sum of a's own legs in its zero tail dated after
+// winTo, up to the tail's end: the exit a window that ends before them holds.
+func tailLegsAfter(a *accountData, winTo int64) float64 {
+	cd := a.closureDay()
+	if cd <= winTo {
+		return 0
+	}
+	from := max(winTo, a.lastNonzeroDay())
+	return sumFlows(flowsIn(a.nonTransfer, from, cd)) + sumFlows(flowsIn(a.transferLike, from, cd))
 }
 
 // passThrough is the outflows, as real flows on the days the money came in, of
@@ -997,8 +1069,8 @@ func subsumesAtClosure(a *accountData, day, winFrom, winTo int64) bool {
 }
 
 // exitsAtClosure reports whether a flow on `day` is an exit leg of a's closure:
-// subsumed in the zero tail of an account that held value, past a final-day
-// zeroing (whose closure books the carried value instead). The closure flow on
+// subsumed in the zero tail of an account that held value and did not zero on
+// the spine's final day (whose closure books the carried value instead). The closure flow on
 // the zeroing day books the survivors of netting among such legs, when the
 // window holds that day.
 func exitsAtClosure(a *accountData, day, winFrom, winTo int64, transferLike bool) bool {

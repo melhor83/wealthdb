@@ -264,3 +264,41 @@ func TestBridgeReadsAnExitAsAFlow(t *testing.T) {
 	}
 	t.Errorf("no March row: %+v", rows)
 }
+
+// TestClosureBeforeItsExitLeg: a window that ends after the zeroing but before
+// the exit leg still holds the exit. The account's own tail legs past the
+// window's end count towards the closure flow on the zeroing day, so the
+// window reads the source's return up to the exit, not a write-off.
+func TestClosureBeforeItsExitLeg(t *testing.T) {
+	t.Parallel()
+	t0, t1 := dy(2024, time.January, 31), dy(2024, time.February, 29)
+	zero := dy(2024, time.March, 15)
+	db, ctx := openMigrated(t)
+	seedReturnsSource(t, db, ctx, "srca", "fidelity")
+	seedReturnsSource(t, db, ctx, "srcb", "fidelity")
+	seedAcct(t, db, ctx, "srca", "A1", canonical.AccountKindBrokerage, nil,
+		[]snap{{t0, 10000}, {t1, 11000}, {zero, 0}}, []txn{{zero + 3*86400, canonical.TxKindTransferOut, -11000}})
+	seedAcct(t, db, ctx, "srcb", "B1", canonical.AccountKindBrokerage, nil,
+		[]snap{{t0, 5000}, {t1, 5000}, {zero + 3*86400, 16000}}, []txn{{zero + 3*86400, canonical.TxKindTransferIn, 11000}})
+	to := zero + 86400 + 43199
+	for _, w := range []struct {
+		level, entity string
+		flow, twr     float64
+	}{
+		{"sources", "srca", -11000, 0.1},
+		{"accounts", "A1", 0, -1},
+		{"global", "", -11000, 16000.0/15000 - 1},
+	} {
+		rows, err := RunReturns(ctx, db, params(w.level, 0, to))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if nf := netFlowOf(t, rows, w.entity); math.Abs(nf-w.flow) > 1e-6 {
+			t.Errorf("%s: net_flow = %.2f, want %.2f", w.level, nf, w.flow)
+		}
+		s, _ := summaryFor(rows, w.entity)
+		if s.TWR == nil || math.Abs(*s.TWR-w.twr) > 1e-9 {
+			t.Errorf("%s: TWR = %v, want %.6f", w.level, s.TWR, w.twr)
+		}
+	}
+}

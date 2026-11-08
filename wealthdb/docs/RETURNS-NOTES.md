@@ -147,12 +147,12 @@ How the common cases read:
   leg's own money. An account that drops out with value books no flow in
   `returns`, so the fall stays in `gain` under `dropped_while_nonzero`.
 
-**A move into or out of tracking is one movement.** Money that leaves a
-tracked account for an account tracking first sees that month finds no
-partner: the netter pairs only legs it can see, and a bank can book such a
-move as a plain withdrawal. Read apart, it would be a fall in `net_saved`
-beside a rise in `onboarded`. The mirror holds for an account that closes
-into a tracked one.
+**A move into or out of tracking is one movement.** Money can move from a
+tracked account to one that tracking first sees that month. The netter
+finds no partner for it, because it pairs only legs it can see. A bank can
+also book such a move as a plain withdrawal. Read apart, it would be a
+fall in `net_saved` beside a rise in `onboarded`. The mirror holds for an
+account that closes into a tracked one.
 
 So the month's synthetic flows net first, a closure against a debut, since
 that is value going from one account to another. Then, where the month's
@@ -241,19 +241,20 @@ Guards: `TestBridgeReadsTheCommonCases`,
   together chains its plain carried values. The accounts grain never rolls.
   Guard: `TestChainRollsAnAccountForward`.
 - **MWR reads the values the chain reads.** Its opening and closing values
-  hold what the window's edges have rolled in, so a window that ends with a
-  deposit not yet shown has an MWR beside its TWR, not behind it. `start`,
-  `end` and `net_flow` stay the carried values: they equal holdings and
-  feed the bridge's identity. So does `gain`, so a row's gain can differ
-  from what its MWR implies by the money still unshown. Such a row is
-  tagged `rolled_forward`. The per-period rows read the carried values too.
-  Guard: `TestMWRReadsTheChainsValues`.
+  hold what the window's edges have rolled in, so a window that ends with
+  a deposit not yet shown has an MWR beside its TWR, not behind it.
+  `start`, `end` and `net_flow` stay the carried values. They equal
+  holdings, and `net_flow` is what the bridge reads. `gain` reads them
+  too, so a row's gain can differ from what its MWR implies by the money
+  still unshown. Such a row is tagged `rolled_forward`. The per-period
+  rows read the carried values too. Guard: `TestMWRReadsTheChainsValues`.
 - **Onboarding books the debut value.** A staggered constituent's real
   debut-region flows are subsumed first (`flowSubsumed` in `entityFlows`),
   then synthetic onboarding books the first-snapshot value, less the
   pre-debut legs netting cancelled. Under per-entity-once it books the
-  group's step (`groupOnboardStep`), less the same legs. A ~0 or
-  negative step is suppressed, never injected.
+  group's step (`groupOnboardStep`), which offsets the same legs and is
+  floored at zero. A per-constituent amount reduced by such legs can be
+  negative ("Staggered-inception subsumption").
 - **XIRR:** Newton-Raphson (analytic derivative) from a 10% guess, with a
   bisection fallback scanning `[−0.9999, 100]` at 0.01 resolution for the
   first sign-change bracket. The rate is floored at −0.9999 (never worse
@@ -333,7 +334,7 @@ macro of its own:
   The per-source `ClosureScope` knob decides how the exit is accounted:
   - `ClosureSubsumeDrains` (default): flows dated inside the flat zero-carry
     tail show no ΔV, so they are subsumed (`subsumesAtClosure`). The
-    synthetic closure flow books them instead, on the zeroing day (below).
+    closure flow books them instead, on the zeroing day (below).
     Real drains before the zeroing snapshot stay flows. Safe when the
     ledger may be missing or mis-dated around a closure.
   - `ClosureLedgerExact` (carta, equityzen, manual): zero-tail flows are
@@ -343,19 +344,22 @@ macro of its own:
     the zeroing likewise books as gain. A flow-less zeroing reads as a full
     loss under either scope, tagged via `CapitalCallRisk`.
 
-  The **synthetic closure** is the mirror of onboarding. It is dated on the
+  The **closure flow** is the mirror of onboarding. It is dated on the
   zeroing day, the first valuation that shows the account empty, and the
   window must hold that day.
 
   - **Inside a longer zero tail** it books what the tail's legs moved out,
-    once netting has run (`exitsAtClosure`). That is the legs' own money on
-    another day, so it is a real flow, not a synthetic one, and the bridge
-    reads it as money that left. An exit leg dated days after
-    the zeroing therefore leaves on the day the value shows the money
-    gone. A source or portfolio whose accounts all empty out ends its
-    chain on its return up to the exit, not on a fall to zero. A leg that
-    netting cancelled against another member is an inside move, so a grain
-    that holds both books nothing for it.
+    once netting has run (`exitsAtClosure`). That is the legs' own money
+    on another day, so it is a real flow, not a synthetic one, and the
+    bridge reads it as money that left. An exit leg dated days after the
+    zeroing therefore leaves on the day the value shows the money gone. A
+    source or portfolio whose accounts all empty out ends its chain on its
+    return up to the exit, not on a fall to zero. A leg that netting
+    cancelled against another member is an inside move, so a grain that
+    holds both books nothing for it. A window that ends after the zeroing
+    but before the exit leg still books the exit: the account's own tail
+    legs past the window's end count too, unnetted, as the roll reads
+    flows past a window's end.
   - **Money passed through an emptied account** after its zeroing, from
     a member to outside, was never in the zeroing's value. It leaves on
     the day it came in, and the zeroing day books only the rest.
@@ -364,14 +368,16 @@ macro of its own:
   - **On the spine's final day** no exit leg has arrived yet. The closure
     books the carried value, less what already left since the last
     valuation: a real flow, a cross-matched leg, or a leg netting cancelled
-    against money that stays inside. A drain then counts once.
+    against money that stays inside. A drain then counts once. Only this
+    final-day flow is synthetic, so only it moves the bridge's
+    `onboarded`.
 
   Guards: `TestClosedEntityEndsOnItsReturn`,
-  `TestFinalDayClosureBooksWhatIsLeft`. The zeroing valuation also confirms
-  the gap it ends, with the exit among that gap's moves. A sub-period in
-  which the entity holds nothing and moves nothing adds nothing to the
-  chain, so later zero valuations leave a closed entity's return where it
-  ended.
+  `TestFinalDayClosureBooksWhatIsLeft`, `TestClosureBeforeItsExitLeg`. The
+  zeroing valuation also confirms the gap it ends, with the exit among
+  that gap's moves. A sub-period in which the entity holds nothing and
+  moves nothing adds nothing to the chain, so later zero valuations leave
+  a closed entity's return where it ended.
 
   The zero tail runs to the spine's end, so its legs are subsumed in any
   window that holds them. The exit-day zero snapshot itself comes from the
@@ -403,7 +409,14 @@ sub-period would carry the whole chain.
 - **The residue** is every later sub-period that opens below 1% of the
   value before the exit. Each adds nothing to the chain. The first
   sub-period that opens at 1% or more, after new money say, ends the
-  rule, and the chain runs as before.
+  rule, and the chain runs as before. A window held wholly on the
+  residue reads 0%.
+- **Every window reads one decision.** The rule runs once, on the
+  entity's since-inception chain, and each window skips the sub-periods
+  that end on the same days. So a window that opens after an exit, or
+  inside one, leaves out the same residue and carries the tag, and the
+  Returns chart's cumulative line, which divides since-year windows,
+  holds its level after an exit.
 - The summary row then carries `post_exit_residue`. The income still
   counts in `gain` and in MWR, which read the window's own values and
   flows.
@@ -422,7 +435,8 @@ than 1% read as an exit, within one sub-period or across a run. A small
 first value that grows has no exit before it, and a partial withdrawal
 that leaves 1% or more is no exit. The rule reads the same at every
 grain and in every window. Guards: `TestPostExitResidue`,
-`TestPostExitResidueValueLeft`, `TestPostExitResidueSameInEveryCurrency`.
+`TestPostExitResidueValueLeft`, `TestPostExitResidueSameInEveryCurrency`,
+`TestPostExitResidueInEveryWindow`, `TestPostExitResidueCumulativeLine`.
 
 ## Staggered-inception subsumption
 
@@ -446,7 +460,7 @@ chained TWR below −100%.
 - The **closure mirror** (`lastNonzeroDay`): a closing constituent's flows
   dated after its last non-zero carried value — anywhere in the terminal
   zero-carry tail — land where the series shows no ΔV. Under the default
-  `ClosureScope` they are subsumed, and the synthetic closure books them on
+  `ClosureScope` they are subsumed, and the closure flow books them on
   the zeroing day; `ClosureLedgerExact` keeps them as the real exit legs.
 - **Netting interaction:** transfer/journal netting runs over the full
   candidate set (pre-debut legs included) **before** subsumption, so
@@ -593,7 +607,8 @@ every approximation is tagged. Computed set:
 `dropped_while_nonzero`, `dietz_degenerate`, `nonpositive_base`,
 `mwr_no_flows`, `mwr_no_sign_change`, `mwr_nonunique`,
 `mwr_no_converge`, `mwr_incomplete_flows`, `mwr_negative_net_capital`,
-`unmatched_transfers=N`, `cross_source_netted=N`, `rolled_forward`, `post_exit_residue`, `journal_present`,
+`unmatched_transfers=N`, `cross_source_netted=N`, `rolled_forward`,
+`post_exit_residue`, `journal_present`,
 `nav_only`, `nav_only_capital_call_risk`, `crypto_unclassified_transfers`,
 `unknown_adapter_policy`, `fx_clamped_flow`, `pre_fx_history`,
 `flows_before_inception`, `after_tax`.
@@ -747,9 +762,9 @@ currency and start-year window, two series of month ends:
 
 - `portfolio`: the household's value, and its MWR from the window's
   start to the day. The MWR reads each month end's value with what is not
-  shown yet rolled in, as the tile does. It runs through the household's own window, so its
-  last point is the Return (MWR) tile where the window starts inside
-  the benchmark's months.
+  shown yet rolled in, as the tile does. It runs through the household's
+  own window, so its last point is the Return (MWR) tile where the window
+  starts inside the benchmark's months.
 - `benchmark`: the shadow's value and MWR, through the benchmark's last
   month. Its last point is the benchmark's MWR tile.
 

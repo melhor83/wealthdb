@@ -136,11 +136,10 @@ type ClosureScope int
 
 const (
 	// ClosureSubsumeDrains is the default: flows dated inside the terminal
-	// zero-carry tail (after the last non-zero day, up to the closure day) are
-	// treated as strays and subsumed — the value series already reads 0 there,
-	// so counting them would book a phantom exit with no matching value move.
-	// The zeroing value drop itself is the loss/exit signal, offset by
-	// whatever real drains preceded the zeroing snapshot. Safe when the
+	// zero tail show no value change, so they are subsumed, and the closure
+	// flow books what netting leaves of them on the zeroing day, the day the
+	// value shows the money gone. Real drains before the zeroing snapshot stay
+	// flows. With no exit leg the zeroing reads as a loss. Safe when the
 	// ledger may be missing or mis-dated around a closure.
 	ClosureSubsumeDrains ClosureScope = iota
 	// ClosureLedgerExact: the source's ledger is authoritative at closure —
@@ -149,8 +148,8 @@ const (
 	// booked, so the realized-vs-last-mark delta shows as return: an exit
 	// above the mark is a gain, one below a loss. A flow-less zeroing still
 	// reads as a full loss (with CapitalCallRisk keeping it tagged). Set live
-	// by carta / equityzen, whose double-entry ledgers date the exit proceeds
-	// exactly.
+	// by carta and equityzen, whose double-entry ledgers date the exit
+	// proceeds exactly, and by manual.
 	ClosureLedgerExact
 )
 

@@ -192,13 +192,12 @@ func TestStaggeredJournalFundedNoPhantom(t *testing.T) {
 	}
 }
 
-// TestStaggeredClosureNoSyntheticAfterWindow guards the boundary case where a
-// constituent's zero-carry closureDay (today) falls AFTER the requested window
-// end: the closure machinery must stay out of it, so the only flow over the
-// window is the single real drain — never a drain PLUS a synthetic closure
-// outflow. (For the in-window subsumption itself, see
+// TestDrainBeforeTheZeroingIsTheOnlyFlow: a drain months before the zeroing
+// snapshot is a real flow. The zero tail holds no exit leg, so the closure
+// books nothing, and the window's only flow is the drain, never the drain plus
+// a closure. (For the zero tail's own legs, see
 // TestStaggeredPostClosureFlowSubsumed.)
-func TestStaggeredClosureNoSyntheticAfterWindow(t *testing.T) {
+func TestDrainBeforeTheZeroingIsTheOnlyFlow(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)
 	seedReturnsSource(t, db, ctx, "ubsx", "ubs")
@@ -220,11 +219,10 @@ func TestStaggeredClosureNoSyntheticAfterWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunReturns: %v", err)
 	}
-	// net_flow over the window is the single -1000 drain (A contributes no flows).
-	// The closureDay is today — past this July window end — so no synthetic closure
-	// outflow is added; counting both would give -2000.
+	// net_flow over the window is the single -1000 drain (A contributes no
+	// flows); counting a closure too would give -2000.
 	if nf := netFlowOf(t, rows, "ubsx"); math.Abs(nf-(-1000)) > 1e-6 {
-		t.Errorf("net_flow = %.2f, want -1000 (real drain only; no out-of-window synthetic)", nf)
+		t.Errorf("net_flow = %.2f, want -1000 (the drain only; no closure)", nf)
 	}
 	// A grows ~5%% and C exits ⇒ the source TWR stays close to A's return, not the
 	// spuriously-negative double-count.
@@ -254,7 +252,6 @@ func TestStaggeredPostClosureFlowSubsumed(t *testing.T) {
 		[]snap{{t0, 1000}, {zero, 0}},
 		[]txn{{post, canonical.TxKindWithdrawal, -500}})
 
-	// Far-future end ⇒ clamped to today ⇒ C.closureDay (today) is in-window.
 	rows, err := RunReturns(ctx, db, params("sources", 0, eod(2027, time.January, 1)))
 	if err != nil {
 		t.Fatalf("RunReturns: %v", err)

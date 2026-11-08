@@ -264,7 +264,7 @@ type returnsDataset struct {
 	globalMax int64 // spine's latest emitted day across all accounts (≈ today)
 
 	// twins loads the residueCurrency dataset and links each account to its
-	// twin there, once, for a dataset in another currency (residueDecision).
+	// twin there, once, for a dataset in another currency (residueEnds).
 	twins func()
 }
 
@@ -301,7 +301,8 @@ func newHoldingsSpine() *holdingsSpine {
 // (report_accounts_history) and the external flows (report_transactions), both
 // converted to outCcy, then the derived globalMax / droppedNonzero. fx is
 // currency-independent, so a caller materializing several currencies loads it
-// once and shares it.
+// once and shares it. A dataset in another currency than residueCurrency also
+// gets a loader for its twins there (ensureTwins).
 func loadReturnsDataset(ctx context.Context, db *sql.DB, outCcy string, fx fxBounds, ov map[string]ReturnsPolicyOverride, tm *TransferMatching) (*returnsDataset, error) {
 	accts, holdings, err := loadAccountData(ctx, db, outCcy, ov)
 	if err != nil {
@@ -337,10 +338,13 @@ func (ds *returnsDataset) finalize() {
 			globalMax = d
 		}
 	}
+	cache := &residueCache{m: map[string]map[int64]bool{}}
 	for _, a := range ds.accts {
 		if a.lastDay() < globalMax && math.Abs(a.lastVal()) > valueTol {
 			a.droppedNonzero = true
 		}
+		a.cacheTail()
+		a.residue = cache
 	}
 	ds.globalMax = globalMax
 }
@@ -506,6 +510,31 @@ type accountData struct {
 	// twin is the same account in residueCurrency's dataset, nil where the
 	// dataset is that currency's or none is linked (linkResidueTwins).
 	twin *accountData
+	// residue is the dataset's cache of residue decisions (residueEnds).
+	residue *residueCache
+
+	// The zero tail, cached by cacheTail: lastNonzeroDay and zeroingDay.
+	tailKnown            bool
+	lastNonzero, zeroing int64
+}
+
+// residueCache holds each entity's residue decision, read once on its
+// since-inception chain and applied to every window. The benchmarks read a
+// currency's dataset from goroutines of their own, so it locks.
+type residueCache struct {
+	mu sync.Mutex
+	m  map[string]map[int64]bool
+}
+
+func (c *residueCache) get(key string, compute func() map[int64]bool) map[int64]bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if v, ok := c.m[key]; ok {
+		return v
+	}
+	v := compute()
+	c.m[key] = v
+	return v
 }
 
 // crossLink identifies the counterparty leg of a cross-source-matched
@@ -637,9 +666,9 @@ func (a *accountData) valueAt(day int64) (float64, bool) {
 // closureDay returns the explicit-closure day (the account's value went to ~0)
 // or 0 when it merely stopped updating (staleness must NOT synthesize a
 // divestment). The daily carry-forward spine extends a zeroing row into a flat
-// zero tail reaching the spine's end, so this is the tail's END: the closure
-// machinery engages only when the window reaches it, and the subsumption
-// window (lastNonzeroDay, closureDay] spans the whole tail.
+// zero tail reaching the spine's end, so this is the tail's END. Subsumption
+// covers (lastNonzeroDay, closureDay] as far as the window reaches; the closure
+// flow keys on zeroingDay.
 func (a *accountData) closureDay() int64 {
 	if len(a.series) == 0 {
 		return 0
@@ -655,6 +684,13 @@ func (a *accountData) closureDay() int64 {
 // it empty: the day after lastNonzeroDay. 0 when a has no explicit closure or
 // never held value.
 func (a *accountData) zeroingDay() int64 {
+	if a.tailKnown {
+		return a.zeroing
+	}
+	return a.findZeroingDay()
+}
+
+func (a *accountData) findZeroingDay() int64 {
 	if a.closureDay() == 0 {
 		return 0
 	}
@@ -665,14 +701,30 @@ func (a *accountData) zeroingDay() int64 {
 	return last + 1
 }
 
+// cacheTail stores lastNonzeroDay and zeroingDay, which walk back over the
+// zero tail and are read for every flow of a closed account. The series must
+// not change afterwards (finalize calls it).
+func (a *accountData) cacheTail() {
+	a.tailKnown = false
+	a.lastNonzero, a.zeroing = a.findLastNonzeroDay(), a.findZeroingDay()
+	a.tailKnown = true
+}
+
 // lastNonzeroDay returns the day of the last carry-forward value that is still
 // non-zero — the day before the daily spine drops into its terminal zero tail.
 // A closing constituent's flows dated after this day land where the series
 // already reads ~0 (no visible ΔV), so under the default ClosureScope they are
-// subsumed as strays (the closure mirror of pre-debut); ClosureLedgerExact
+// subsumed and leave in the closure flow on the zeroing day; ClosureLedgerExact
 // keeps them as the real exit legs. Returns the first day for an all-zero
 // series.
 func (a *accountData) lastNonzeroDay() int64 {
+	if a.tailKnown {
+		return a.lastNonzero
+	}
+	return a.findLastNonzeroDay()
+}
+
+func (a *accountData) findLastNonzeroDay() int64 {
 	for i := len(a.series) - 1; i >= 0; i-- {
 		if math.Abs(a.series[i].val) >= valueTol {
 			return a.series[i].day

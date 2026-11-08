@@ -141,6 +141,8 @@ Position columns pass through:
 - `acquisition_date` is `YYYY-MM-DD`. It becomes that day's UTC
   midnight. An unparseable one is absent. A holding with lots is dated
   by its oldest lot.
+- `valued_at` is the mark's instant, unix seconds. NULL means the
+  snapshot's own instant.
 
 Open lots (`position_lots`) belong to the positions row with the same
 `snapshot_at`, `account_id` and `position_key`:

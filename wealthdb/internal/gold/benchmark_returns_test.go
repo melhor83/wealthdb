@@ -35,17 +35,6 @@ func seedBenchmark(t *testing.T, db *sql.DB, ctx context.Context, name string, f
 	}
 }
 
-func approx(t *testing.T, name string, got *float64, want float64) {
-	t.Helper()
-	if got == nil {
-		t.Errorf("%s = nil, want %v", name, want)
-		return
-	}
-	if math.Abs(*got-want) > 1e-9 {
-		t.Errorf("%s = %.12f, want %.12f", name, *got, want)
-	}
-}
-
 // day0 is a day as the benchmark tables store it: its UTC midnight.
 func day0(y int, m time.Month, d int) int64 {
 	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Unix()

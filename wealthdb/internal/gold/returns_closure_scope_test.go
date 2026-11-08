@@ -1,12 +1,9 @@
 package gold
 
-// Tests for the ClosureScope policy knob against the exit-day zero snapshot
-// the adapters now emit (silver.ClosureMarkerBatch): a ledger-exact source's
-// zero-tail flows are the real exit proceeds and are kept — the realized-vs-
-// mark delta shows as return — while the default treats them as strays and
-// subsumes them, leaving the zeroing value drop as the exit signal. Windows
-// run to today (far-future end, clamped) so the closure machinery, which keys
-// off the zero-carry tail's end, is engaged.
+// Tests for the ClosureScope knob against the exit-day zero snapshot
+// (silver.ClosureMarkerBatch): a ledger-exact source keeps its zero-tail flows
+// as the exit proceeds, so the realized-vs-mark delta shows as return; the
+// default subsumes them and books them as the closure flow on the zeroing day.
 
 import (
 	"context"

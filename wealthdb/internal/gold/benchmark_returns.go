@@ -454,22 +454,6 @@ func (c *benchmarkWindows) compare(ix *returns.Index, p ReturnParams) *benchmark
 	return w
 }
 
-// openingValue is the household's value at from as the chain and MWR read it:
-// what its accounts moved before from and do not show yet is in it.
-func openingValue(av func(int64) (float64, bool), from int64, rolled []returns.Flow) float64 {
-	v, _ := av(from)
-	return v + unshownValue(unvaluedAt([]int64{from}, rolled)[0])
-}
-
-// unshownValue is an unvaluedAt figure as money: float dust from moves that
-// cancel reads as nothing, so a value with nothing unshown stays as carried.
-func unshownValue(v float64) float64 {
-	if math.Abs(v) <= valueTol {
-		return 0
-	}
-	return v
-}
-
 // flowQuality are the row's flags a benchmark's figures inherit: the
 // household's flows are the benchmark's too.
 func flowQuality(q []string) []string {

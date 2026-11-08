@@ -1322,3 +1322,33 @@ func TestSnapshotsCarryDividendEvents(t *testing.T) {
 		}
 	}
 }
+
+// TestPositionValuedAt: a position's valued_at is the mark's instant and
+// reaches ValuedAt; a NULL reads as 0, the snapshot's own instant.
+func TestPositionValuedAt(t *testing.T) {
+	path, db := newFixture(t)
+	seed(t, db)
+	silvertest.Exec(t, db, `UPDATE positions SET valued_at = ? WHERE snapshot_at = ? AND position_key = 'inst-eq'`,
+		day(1), day(2))
+	conn := openConn(t, path)
+	batches := collectSnapshots(t, conn, window(t, conn, -1))
+	seen := 0
+	for _, b := range batches {
+		for _, p := range b.Positions {
+			if p.SnapshotAt != day(2) {
+				continue
+			}
+			seen++
+			want := int64(0)
+			if p.PositionKey == "inst-eq" {
+				want = day(1)
+			}
+			if p.ValuedAt != want {
+				t.Errorf("%s on day 2: ValuedAt = %d, want %d", p.PositionKey, p.ValuedAt, want)
+			}
+		}
+	}
+	if seen < 2 {
+		t.Fatalf("day 2 holds %d positions, want the two the fixture seeds", seen)
+	}
+}

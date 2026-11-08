@@ -33,7 +33,8 @@ func seedFeeLine(t *testing.T, db *sql.DB, ctx context.Context, src, id, acct, k
 //
 //	PF     a portfolio of a brokerage, 100000 all year, and a cash account
 //	       of 10000 that pays its fees: 1200 of management, less a 200
-//	       refund, and 50 of wire charges
+//	       refund, and 50 of wire charges; it also holds a mortgage owing
+//	       50000 and a card owing 2000, which its fee base leaves out
 //	PLAN   a retirement account outside any portfolio, 40000, whose
 //	       custody fee of 400 no household account pays
 //	CHK    a plumbing cash account outside any portfolio, 5000, with an
@@ -53,6 +54,11 @@ func seedFeeHousehold(t *testing.T, db *sql.DB, ctx context.Context) {
 	seedCashOnlyAcct(t, db, ctx, "fsrc", "PFCASH", canonical.AccountKindCash, []snap{{start, 10000}, {end, 10000}}, nil)
 	if _, err := db.ExecContext(ctx, `UPDATE accounts SET portfolio_external_id = 'PF' WHERE account_external_id = 'PFCASH'`); err != nil {
 		t.Fatalf("seed portfolio member: %v", err)
+	}
+	seedAcct(t, db, ctx, "fsrc", "PFMORT", canonical.AccountKindMortgage, &pf, []snap{{start, -50000}, {end, -50000}}, nil)
+	seedCashOnlyAcct(t, db, ctx, "fsrc", "PFCARD", canonical.AccountKindCard, []snap{{start, -2000}, {end, -2000}}, nil)
+	if _, err := db.ExecContext(ctx, `UPDATE accounts SET portfolio_external_id = 'PF' WHERE account_external_id = 'PFCARD'`); err != nil {
+		t.Fatalf("seed portfolio card: %v", err)
 	}
 	seedAcct(t, db, ctx, "fsrc", "PLAN", canonical.AccountKindBrokerage, nil, []snap{{start, 40000}, {end, 42000}}, nil)
 	seedCashOnlyAcct(t, db, ctx, "fsrc", "CHK", canonical.AccountKindCash, []snap{{start, 5000}, {end, 5000}}, nil)
@@ -113,8 +119,9 @@ func TestFeesByEntity(t *testing.T) {
 	if cents(t, pf.Fees) != 105000 || cents(t, pf.FeesInvestment) != 100000 || cents(t, pf.FeesBank) != 5000 {
 		t.Errorf("fees %s, investment %s, bank %s", *pf.Fees, *pf.FeesInvestment, *pf.FeesBank)
 	}
+	// Its mortgage and card are left out of the base, as its return leaves them out.
 	if cents(t, pf.MeanValue) != 11000000 {
-		t.Errorf("mean value %s, want 110000", *pf.MeanValue)
+		t.Errorf("mean value %s, want 110000 (assets only)", *pf.MeanValue)
 	}
 	// 2024 has 366 days: 1050 over 110000, annualized on 365.
 	want := 1050.0 / 110000 * 365 / 366
@@ -309,8 +316,8 @@ func TestWebFeesHoldsTheCLIsFigures(t *testing.T) {
 	if toCents(fees) != cents(t, pf.Fees) {
 		t.Errorf("web_fees fees %v, CLI %s", fees, *pf.Fees)
 	}
-	if toCents(sum/float64(days)) != cents(t, pf.MeanValue) {
-		t.Errorf("web_fees mean %v, CLI %s", sum/float64(days), *pf.MeanValue)
+	if toCents(sum/float64(days)) != cents(t, pf.MeanValue) || toCents(sum/float64(days)) != 11000000 {
+		t.Errorf("web_fees mean %v, CLI %s, want 110000 (assets only)", sum/float64(days), *pf.MeanValue)
 	}
 	var n int
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM web_fees WHERE line = 'return' AND entity = 'Mandate'`).Scan(&n); err != nil {
@@ -318,5 +325,73 @@ func TestWebFeesHoldsTheCLIsFigures(t *testing.T) {
 	}
 	if n == 0 {
 		t.Errorf("web_fees holds no monthly return for the portfolio")
+	}
+	// The tile chains the months as exp(sum(ln(1 + twr))), leaving out a month
+	// that lost everything, as chainMonths does.
+	var chained float64
+	if err := db.QueryRowContext(ctx, `SELECT exp(sum(ln(1 + twr))) - 1 FROM web_fees
+		WHERE line = 'return' AND entity = 'Mandate' AND currency = 'USD' AND twr > -1 AND `+window).Scan(&chained); err != nil {
+		t.Fatalf("web_fees chain: %v", err)
+	}
+	if pf.TWR == nil || math.Abs(chained-*pf.TWR) > 1e-9 {
+		t.Errorf("web_fees chains %v, CLI %v", chained, pf.TWR)
+	}
+}
+
+// TestFeeGroupsAreTheSQLLabels: fee_group (migration 0177) gives every
+// BANK_FEES detailed value of the taxonomy one of feeGroups, and every group
+// is reached.
+func TestFeeGroupsAreTheSQLLabels(t *testing.T) {
+	t.Parallel()
+	db, ctx := openMigrated(t)
+	got := map[string]bool{}
+	seen := 0
+	for _, c := range append(canonical.ModelSpendCategories(), canonical.DeltaSpendCategories()...) {
+		if c.Primary != "BANK_FEES" {
+			continue
+		}
+		seen++
+		var g string
+		if err := db.QueryRowContext(ctx, `SELECT fee_group(?)`, c.Detailed).Scan(&g); err != nil {
+			t.Fatalf("fee_group(%s): %v", c.Detailed, err)
+		}
+		got[g] = true
+	}
+	if seen == 0 {
+		t.Fatal("the taxonomy has no BANK_FEES value")
+	}
+	if want := feeGroups; len(got) != len(want) || !func() bool {
+		for _, g := range want {
+			if !got[g] {
+				return false
+			}
+		}
+		return true
+	}() {
+		t.Errorf("fee_group gives %v, feeGroups is %v", got, want)
+	}
+}
+
+// TestMigration0177DDLIsRerunnable: a replay of 0177 keeps what report_bridge
+// and serving_marks hold, and its views still answer.
+func TestMigration0177DDLIsRerunnable(t *testing.T) {
+	t.Parallel()
+	db, ctx := openMigrated(t)
+	seedFeeHousehold(t, db, ctx)
+	mustMaterializeServing(t, db, ctx)
+	p := feeParams("USD", "total")
+	if _, err := MaterializeReturns(ctx, db, MaterializeParams{ToEpoch: p.ToEpoch, ComputedAt: 1}); err != nil {
+		t.Fatalf("MaterializeReturns: %v", err)
+	}
+	bridge, marks := countRows(t, db, ctx, "report_bridge"), countRows(t, db, ctx, "serving_marks")
+	if bridge == 0 || marks == 0 {
+		t.Fatalf("the fixture materialized %d bridge and %d marks rows", bridge, marks)
+	}
+	rerunMigrationDDL(t, db, ctx, "0177_historical_analysis.sql")
+	if b, m := countRows(t, db, ctx, "report_bridge"), countRows(t, db, ctx, "serving_marks"); b != bridge || m != marks {
+		t.Errorf("after a replay: %d bridge rows (%d before), %d marks rows (%d before)", b, bridge, m, marks)
+	}
+	for _, v := range []string{"web_bridge", "web_fees", "web_marks"} {
+		countRows(t, db, ctx, v)
 	}
 }
