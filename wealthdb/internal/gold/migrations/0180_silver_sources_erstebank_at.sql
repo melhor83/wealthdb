@@ -8,7 +8,7 @@
 -- DuckDB can't widen a CHECK constraint in place — the rename-recreate
 -- workaround of 0125, carrying every column.
 
-ALTER TABLE silver_sources RENAME TO silver_sources_pre_0173;
+ALTER TABLE silver_sources RENAME TO silver_sources_pre_0180;
 
 CREATE TABLE silver_sources (
     silver_source_id    TEXT    PRIMARY KEY,
@@ -32,9 +32,9 @@ INSERT INTO silver_sources
 SELECT silver_source_id, silver_kind, silver_path,
        high_watermark, first_loaded_at, last_loaded_at, fx_priority,
        observed_snapshots_through, observed_transactions_through
-  FROM silver_sources_pre_0173;
+  FROM silver_sources_pre_0180;
 
-DROP TABLE silver_sources_pre_0173;
+DROP TABLE silver_sources_pre_0180;
 
 INSERT INTO schema_meta (gold_schema_version, applied_at)
     VALUES (173, CAST(epoch(now()) AS BIGINT));
