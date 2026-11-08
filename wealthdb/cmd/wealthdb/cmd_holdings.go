@@ -78,7 +78,7 @@ func runHoldingsView(ctx context.Context, g globalFlags, view string, args []str
 	}
 
 	open := func() (*sql.DB, error) { return openGoldForRead(g, cfg) }
-	out := rf.output(fmtChoice, "holdings", req, cfg, g.clock())
+	out := rf.output(fmtChoice, "holdings", holdingsFamily, req, cfg, g.clock())
 	out.prefix = view // a column error names the view alone
 	return writeReport(ctx, holdingsReport(req), out, open, stdout)
 }

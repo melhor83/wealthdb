@@ -43,7 +43,7 @@ func cmdTransactions(ctx context.Context, g globalFlags, subargs []string, _ io.
 		categories: overrideCategories(cfg)}
 	rep := transactionsReport(req)
 	open := func() (*sql.DB, error) { return openGoldForRead(g, cfg) }
-	return writeReport(ctx, rep, rf.output(fmtChoice, "transactions", req, cfg, g.clock()), open, stdout)
+	return writeReport(ctx, rep, rf.output(fmtChoice, "transactions", transactionsFamily, req, cfg, g.clock()), open, stdout)
 }
 
 // transactionsReport is the ledger over a window, the runner the CLI
@@ -83,7 +83,7 @@ func buildTransactionColumnRegistry(outCcy string, kindOf func(string) string,
 		{Name: "kind", Align: output.AlignLeft,
 			Extract: func(r gold.TransactionRow) string { return r.Kind }},
 		textCol("symbol", func(r gold.TransactionRow) *string { return r.Symbol }),
-		{Name: "name", Align: output.AlignLeft,
+		holdingNameCol(columnSpec[gold.TransactionRow]{Name: "name", Align: output.AlignLeft,
 			Extract: func(r gold.TransactionRow) string {
 				// Prefer the joined instruments.name; fall back to the
 				// adapter-supplied transactions.description (Schwab
@@ -96,16 +96,17 @@ func buildTransactionColumnRegistry(outCcy string, kindOf func(string) string,
 			},
 			// The class follows which of the two the cell holds. A
 			// joined instrument name is a holding's name and stays
-			// legible, a typed one too; the description fallback is a
-			// statement narrative and takes the free-text class,
-			// exactly as the `description` column below does, whoever
-			// holds the instrument.
+			// legible, a typed holding's with its ids masked
+			// (holdingNameCol); the description fallback is a statement
+			// narrative and takes the free-text class, exactly as the
+			// `description` column below does, whoever holds the
+			// instrument.
 			PrivacyFunc: func(r gold.TransactionRow) PrivacyClass {
-				if r.Name != nil && *r.Name != "" {
-					return PrivacyNone
+				if r.Name == nil || *r.Name == "" {
+					return PrivacyFreeText
 				}
-				return PrivacyFreeText
-			}},
+				return PrivacyNone
+			}}, kindOf, func(r gold.TransactionRow) (string, string) { return r.SilverSourceID, strOrEmpty(r.Name) }),
 		holdingIDCol(textCol("instrument_id", func(r gold.TransactionRow) *string { return r.InstrumentExternalID }),
 			kindOf, holding),
 		// What the row's instrument was looked up BY, where that lookup
@@ -228,11 +229,12 @@ Flags:
                            wealthdb help filter lists the operators
   -x, --currency CCY       output currency for the value column (default: config.default_currency)
   -p, --privacy            redact account / tx IDs, quantities, prices, and monetary amounts;
-                           every name a person typed prints as a pseudonym, such as manual-1,
-                           or as a redacted ID; statement narratives (description, and
-                           merchant / payer — the store's name or the line's own signature —
-                           and the name column where it falls back to one) redact as free
-                           text — the cell masks whole
+                           every name a person typed about an account prints as a pseudonym,
+                           such as manual-1, or as a redacted ID; holding names stay, and an
+                           ID typed into a manual holding's name masks; statement narratives
+                           (description, and merchant / payer — the store's name or the
+                           line's own signature — and the name column where it falls back to
+                           one) redact as free text — the cell masks whole
                            (table: visible placeholders; csv: empty cells; json: keys omitted)
 
 Available columns:

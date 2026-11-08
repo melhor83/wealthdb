@@ -78,8 +78,8 @@ Flags:
                            wealthdb help filter lists the operators
   -x, --currency CCY       output currency for the _<CCY> aggregate columns (default: config.default_currency)
   -p, --privacy            redact portfolio / account IDs and monetary amounts; every
-                           name a person typed prints as a pseudonym, such as manual-1,
-                           or as a redacted ID
+                           name a person typed about an account prints as a pseudonym,
+                           such as manual-1, or as a redacted ID
                            (table: visible placeholders; csv: empty cells; json: keys omitted)
 
 Available columns:

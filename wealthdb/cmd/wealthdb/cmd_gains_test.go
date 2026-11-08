@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/config"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/gold"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/lots"
 )
@@ -146,31 +147,18 @@ func TestGainsViewsResolveTheirDefaults(t *testing.T) {
 
 // TestReportHeadersAreIdentifiers holds every report's column names and
 // headers to letters, digits and underscores, so a JSON key or CSV
-// header never needs quoting: a percentage is _pct, never _%.
+// header never needs quoting: a percentage is _pct, never _%. Every view
+// of every report tool builds as describe builds it, and status --marks
+// beside them.
 func TestReportHeadersAreIdentifiers(t *testing.T) {
 	t.Parallel()
 	ident := regexp.MustCompile(`^[A-Za-z0-9_]+$`)
-	reports := map[string]*report{
-		"transactions": transactionsReport(request{currency: "USD"}),
-		"returns":      returnsReport(request{currency: "USD", method: "both"}, nil),
-	}
-	for _, v := range holdingsFamily.views {
-		reports["holdings "+v] = holdingsReport(request{view: v, currency: "USD"})
-	}
-	for _, v := range spendingFamily.views {
-		reports["spending "+v] = spendingReport(request{view: v, currency: "USD", period: "monthly"})
-	}
-	for _, v := range incomeFamily.views {
-		reports["income "+v] = incomeReport(request{view: v, currency: "USD", period: "monthly"})
-	}
-	for _, v := range cashflowFamily.views {
-		reports["cashflow "+v] = cashflowReport(request{view: v, currency: "USD", period: "monthly", level: "group"})
-	}
-	for _, v := range gainsViews {
-		reports["gains "+v] = gainsReport(request{view: v, currency: "USD", period: "monthly"})
-	}
-	for _, v := range exposureViews {
-		reports["exposure "+v] = exposureReport(request{view: v, currency: "USD"})
+	cfg := &config.Config{DefaultCurrency: "USD"}
+	reports := map[string]*report{"status marks": marksReport(request{view: "marks", currency: "USD"})}
+	for _, rf := range reportFamilies {
+		for _, v := range rf.fam.viewsOrOne() {
+			reports[strings.TrimSpace(rf.name+" "+v)] = rf.fam.buildDefault(cfg, defaultRequest(v, "USD"))
+		}
 	}
 	// A series adds its period column ahead of the view's own.
 	reports["exposure classes series"] = exposureReport(request{view: "classes", currency: "USD",

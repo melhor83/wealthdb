@@ -135,7 +135,7 @@ func runCashflowView(ctx context.Context, g globalFlags, view string, args []str
 		asOf: anchorToDay(now.UTC(), true).Unix(), assumptions: ff.assumptions(), lookback: cfg.CashflowLookback()}
 	rep := cashflowReport(req)
 	open := func() (*sql.DB, error) { return openGoldForRead(g, cfg) }
-	return writeReport(ctx, rep, rf.output(fmtChoice, "cashflow", req, cfg, now), open, stdout)
+	return writeReport(ctx, rep, rf.output(fmtChoice, "cashflow", cashflowFamily, req, cfg, now), open, stdout)
 }
 
 // cashflowReport is one view of the cash flow family, the runner the
@@ -514,16 +514,13 @@ func buildCashflowTransactionColumnRegistry(outCcy string, kindOf func(string) s
 		// an operating one. It takes the FREE-TEXT class for the reason
 		// the families' payer column does: a column takes the class of
 		// the worst thing it can hold, and on an inbound wire that is a
-		// person. A typed holding's line names the holding, which -p
-		// prints as it is.
-		{Name: "name", Align: output.AlignLeft,
-			Extract: func(r gold.CashflowTransactionRow) string { return strOrEmpty(r.Name) },
-			PrivacyFunc: func(r gold.CashflowTransactionRow) PrivacyClass {
-				if typedHolding(kindOf, r.SilverSourceID) && strOrEmpty(r.Name) != "" {
-					return PrivacyNone
-				}
-				return PrivacyFreeText
-			}},
+		// person. A typed holding's line names the holding, whose ids
+		// -p masks as the holding's own name column does
+		// (holdingNameCol).
+		holdingNameCol(columnSpec[gold.CashflowTransactionRow]{Name: "name", Align: output.AlignLeft,
+			Extract:     func(r gold.CashflowTransactionRow) string { return strOrEmpty(r.Name) },
+			PrivacyFunc: func(gold.CashflowTransactionRow) PrivacyClass { return PrivacyFreeText }},
+			kindOf, func(r gold.CashflowTransactionRow) (string, string) { return r.SilverSourceID, strOrEmpty(r.Name) }),
 		// The family's own value behind the node, and the two overlays
 		// it could have come from.
 		textCol("detailed", func(r gold.CashflowTransactionRow) *string { return r.Verdict }),
@@ -614,9 +611,10 @@ Flags beyond the ones every report shares:
   -x CCY        output currency (default: config.default_currency);
                 coverage refuses it - every account is reported in its own
   -p            redact account ids, statement names and amounts;
-                every name a person typed prints as a pseudonym,
-                such as manual-1, or as a redacted id; sections,
-                classes, groups and shares stay legible
+                every name a person typed about an account prints as
+                a pseudonym, such as manual-1, or as a redacted id;
+                a manual holding's name keeps its words and masks an
+                id; sections, classes, groups and shares stay legible
 
 Notes
   vehicles is every plan together — retirement, education and health;

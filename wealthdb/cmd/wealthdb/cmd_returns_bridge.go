@@ -19,24 +19,20 @@ import (
 var bridgeRefusedFlags = []string{"method", "annualize", "netting", "inception", "benchmark"}
 
 // `wealthdb returns bridge`: why net worth moved over each bucket. The
-// flags of the other views that do not apply are registered and refused
-// by name, so the error says why rather than calling them unknown.
+// flags of the other views that do not apply are refused by name
+// (refuseFlags).
 func runReturnsBridge(ctx context.Context, g globalFlags, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("wealthdb returns bridge", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	period := fs.String("period", "quarterly", "monthly | quarterly | annual | total")
-	for _, name := range bridgeRefusedFlags {
-		fs.String(name, "", "refused: the bridge has no such choice")
-	}
+	refused := refuseFlags(fs, "returns", "bridge", bridgeRefusedFlags)
 	rf := registerReportFlags(fs, true)
 	fs.Usage = func() { fmt.Fprintln(stderr, returnsBridgeUsage()) }
 	if err := parseFlags(fs, args, "returns"); err != nil {
 		return err
 	}
-	for _, name := range bridgeRefusedFlags {
-		if isSet(fs, name) {
-			return errs.Newf(errs.ExitUsage, "returns: bridge takes no --%s", name)
-		}
+	if err := refused(); err != nil {
+		return err
 	}
 	if err := checkChoice("returns", "period", *period, returnsPeriods...); err != nil {
 		return err
@@ -56,22 +52,23 @@ func runReturnsBridge(ctx context.Context, g globalFlags, args []string, stdout,
 	req := request{view: "bridge", currency: outCcy, from: fromEpoch, to: toEpoch, period: *period}
 	rep := returnsBridgeReport(req, cfg)
 	open := func() (*sql.DB, error) { return openGoldForRead(g, cfg) }
-	return writeReport(ctx, rep, rf.output(fmtChoice, "returns", req, cfg, g.clock()), open, stdout)
+	return writeReport(ctx, rep, rf.output(fmtChoice, "returns", returnsFamily, req, cfg, g.clock()), open, stdout)
 }
 
-// checkBridgeWindow refuses a window the bridge's months cannot cut: FROM
-// must be a month's first day and TO a month's last, or today or later,
-// where the last month runs to the latest data. FROM 0 is since inception.
-// today is the end of the current day.
+// checkBridgeWindow refuses a window the bridge's months cannot cut: its
+// start must be a month's first day and its end a month's last, or today
+// or later, where the last month runs to the latest data. A start of 0 is
+// since inception. today is the end of the current day. The message names
+// the bounds from and to, the MCP parameters and the CLI's FROM and TO.
 func checkBridgeWindow(fromEpoch, toEpoch, today int64) error {
 	from, to := time.Unix(fromEpoch, 0).UTC(), time.Unix(toEpoch, 0).UTC()
 	if fromEpoch > 0 && from.Day() != 1 {
-		return errs.Newf(errs.ExitUsage, "returns: bridge reads whole months: FROM %s is no month's first day",
+		return errs.Newf(errs.ExitUsage, "returns: bridge reads whole months: from %s is no month's first day",
 			from.Format(time.DateOnly))
 	}
 	lastOfMonth := to.AddDate(0, 0, 1).Day() == 1
 	if !lastOfMonth && toEpoch < today {
-		return errs.Newf(errs.ExitUsage, "returns: bridge reads whole months: TO %s is no month's last day",
+		return errs.Newf(errs.ExitUsage, "returns: bridge reads whole months: to %s is no month's last day",
 			to.Format(time.DateOnly))
 	}
 	return nil

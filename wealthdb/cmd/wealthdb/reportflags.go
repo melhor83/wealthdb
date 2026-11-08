@@ -50,9 +50,28 @@ func registerReportFlags(fs *flag.FlagSet, withColumns bool) *reportFlags {
 	}
 	rf.currency = fs.String("x", "", "output currency (default: config.default_currency)")
 	fs.StringVar(rf.currency, "currency", "", "output currency (default: config.default_currency)")
-	rf.privacy = fs.Bool("p", false, "redact identifiers, names and amounts")
-	fs.BoolVar(rf.privacy, "privacy", false, "redact identifiers, names and amounts")
+	rf.privacy = fs.Bool("p", false, "redact amounts, ids and account names")
+	fs.BoolVar(rf.privacy, "privacy", false, "redact amounts, ids and account names")
 	return rf
+}
+
+// refuseFlags registers names on fs: the flags of cmd's other views that
+// view does not take. The check it returns, run after fs.Parse, refuses
+// the first one set by name, so the error says the view takes no such
+// flag rather than calling it unknown. The MCP tool refuses the same
+// names (refuseArgs).
+func refuseFlags(fs *flag.FlagSet, cmd, view string, names []string) (check func() error) {
+	for _, name := range names {
+		fs.String(name, "", "refused: "+view+" has no such choice")
+	}
+	return func() error {
+		for _, name := range names {
+			if isSet(fs, name) {
+				return errs.Newf(errs.ExitUsage, "%s: %s takes no --%s", cmd, view, name)
+			}
+		}
+		return nil
+	}
 }
 
 // resolve validates the format, loads the config and settles the output
@@ -78,12 +97,13 @@ func (rf *reportFlags) resolve(g globalFlags, cmd string) (output.Format, *confi
 }
 
 // output is how the report is written: the -C columns, the format, -p,
-// and the -F conditions, which bind to the report tool runs for req.
-// The tool names the command in a column error ("gains").
-func (rf *reportFlags) output(format output.Format, tool string, req request, cfg *config.Config, now time.Time) reportOutput {
+// and the -F conditions, which bind as the report tool's family fam
+// binds them for req. The tool names the command in a column error
+// ("gains").
+func (rf *reportFlags) output(format output.Format, tool string, fam *family, req request, cfg *config.Config, now time.Time) reportOutput {
 	out := reportOutput{cols: *rf.cols, prefix: tool, privacy: *rf.privacy, format: format}
 	if len(rf.filters) > 0 {
-		out.filter = &cliFilter{conds: rf.filters, tool: tool, req: req, cfg: cfg, now: now}
+		out.filter = &cliFilter{conds: rf.filters, tool: tool, fam: fam, req: req, cfg: cfg, now: now}
 	}
 	return out
 }

@@ -60,7 +60,7 @@ func cmdMCPServe(ctx context.Context, g globalFlags, subargs []string, _ io.Read
 	fs.SetOutput(stderr)
 	stdio := fs.Bool("stdio", false, "serve one session on stdin/stdout")
 	httpAddr := fs.String("http", "", "serve streamable HTTP on ADDR (e.g. :3300)")
-	privacy := fs.Bool("privacy", false, "with --stdio: redact amounts, identifiers and names")
+	privacy := fs.Bool("privacy", false, "with --stdio: redact as -p does")
 	auth := fs.String("auth", config.MCPAuthToken, "HTTP auth: token | none")
 	tokenFile := fs.String("token-file", "", "file holding the bearer token (HTTP with --auth token)")
 	insecure := fs.Bool("insecure", false, "acknowledge --auth none")
@@ -416,10 +416,10 @@ the last load and a load is never locked out for long.
 --stdio serves one session on stdin and stdout, for a client that
 starts the server itself. --http serves streamable HTTP with two
 endpoints: /mcp with full data and /mcp/privacy with amounts,
-identifiers and names redacted. HTTP requires the bearer token in the
-file --token-file names; --auth none turns it off and is refused
-without --insecure. Requests must come with a loopback Host (or one
---allow-host names) and no foreign Origin.
+identifiers and account names redacted. HTTP requires the bearer
+token in the file --token-file names; --auth none turns it off and is
+refused without --insecure. Requests must come with a loopback Host
+(or one --allow-host names) and no foreign Origin.
 
 Flags:
   --stdio               serve one session on stdin/stdout

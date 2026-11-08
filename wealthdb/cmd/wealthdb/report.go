@@ -220,11 +220,13 @@ type reportOutput struct {
 }
 
 // cliFilter is a command's -F conditions and what they bind to: the
-// report tool's view and options, so a column the view lacks names the
+// report tool's family, view and options, so a generic word names the
+// column it names on the server, and a column the view lacks names the
 // views that print it.
 type cliFilter struct {
 	conds []string
 	tool  string
+	fam   *family
 	req   request
 	cfg   *config.Config
 	now   time.Time
@@ -240,13 +242,7 @@ func (f *cliFilter) label() string {
 // parameter.
 func (f *cliFilter) bind(rep *report, privacy bool) ([]condition, error) {
 	front := filterFront{prefix: f.label() + ":", cli: true}
-	lookup := columnLookup{cols: rep.columns, currency: f.req.currency}
-	for _, rf := range reportFamilies {
-		if rf.name == f.tool {
-			lookup = rf.fam.lookup(rep, f.req)
-		}
-	}
-	target := filterTarget{view: f.req.view, lookup: lookup, privacy: privacy, now: f.now, front: front,
+	target := filterTarget{view: f.req.view, lookup: f.fam.lookup(rep, f.req), privacy: privacy, now: f.now, front: front,
 		elsewhere: func(col string) string { return columnElsewhere(f.cfg, f.tool, f.req.view, col, true) }}
 	raws, bad := parseConditions(f.conds, front)
 	conds, err := target.bind(raws, bad)

@@ -11,12 +11,16 @@ import (
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/config"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/errs"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/gold"
-	"github.com/smartpointer-com/wealthdb/wealthdb/internal/output"
 )
 
 // feePeriods are the fee view's buckets: a return and a rate need more
 // than a day or a week to mean anything.
 var feePeriods = returnsPeriods
+
+// feesRefusedFlags are the spending flags that have no meaning on the
+// fee view: its rows are entities, not categories. A category filter is
+// refused as every view's filters are (filterViewError).
+var feesRefusedFlags = []string{"level"}
 
 // `wealthdb spending fees`: what each portfolio cost, in money and as a
 // share of the value it held, beside its return. It reads the spending
@@ -25,9 +29,13 @@ func runSpendingFees(ctx context.Context, g globalFlags, args []string, stdout, 
 	fs := flag.NewFlagSet("wealthdb spending fees", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	period := fs.String("period", "total", strings.Join(feePeriods, " | "))
+	refused := refuseFlags(fs, "spending", "fees", feesRefusedFlags)
 	rf := registerReportFlags(fs, true)
 	fs.Usage = func() { fmt.Fprintln(stderr, spendingFeesUsage()) }
 	if err := parseFlags(fs, args, "spending"); err != nil {
+		return err
+	}
+	if err := refused(); err != nil {
 		return err
 	}
 	if err := checkChoice("spending", "period", *period, feePeriods...); err != nil {
@@ -45,7 +53,7 @@ func runSpendingFees(ctx context.Context, g globalFlags, args []string, stdout, 
 	req := request{view: "fees", currency: outCcy, from: fromEpoch, to: toEpoch, period: *period}
 	rep := spendingFeesReport(req, cfg)
 	open := func() (*sql.DB, error) { return openGoldForRead(g, cfg) }
-	return writeReport(ctx, rep, rf.output(fmtChoice, "spending", req, cfg, g.clock()), open, stdout)
+	return writeReport(ctx, rep, rf.output(fmtChoice, "spending", spendingFamily, req, cfg, g.clock()), open, stdout)
 }
 
 // spendingFeesReport is the fee view, the runner the CLI and the MCP
@@ -69,60 +77,27 @@ var defaultFeeColumns = []string{"period", "silver_source", "entity", "fees", "m
 // portfolio or an account, and -p shows each as its own report does.
 func buildFeeColumnRegistry(outCcy string, kindOf func(string) string, nicknames accountNicknames) []columnSpec[gold.FeeRow] {
 	asPortfolio := func(r gold.FeeRow) bool { return r.EntityKind == "portfolio" }
-	ref := func(r gold.FeeRow) accountRef {
-		return accountRef{source: r.SilverSourceID, name: &r.EntityLabel,
-			nickname: nicknames.of(r.SilverSourceID, r.EntityID), id: r.EntityID}
-	}
-	entity := eitherCol("entity", asPortfolio,
-		portfolioCol("entity", kindOf, func(r gold.FeeRow) (string, string, *string) {
-			return r.SilverSourceID, r.EntityID, &r.EntityLabel
-		}), accountCol(kindOf, ref))
-	entityID := eitherCol("entity_id", asPortfolio,
-		typedIDCol("entity_id", kindOf, func(r gold.FeeRow) (string, string) {
-			return r.SilverSourceID, r.EntityID
-		}), accountIDCol("entity_id", kindOf, ref))
+	account, portfolio := entityCols(kindOf, nicknames, func(r gold.FeeRow) (string, string, string) {
+		return r.SilverSourceID, r.EntityID, r.EntityLabel
+	})
 	return []columnSpec[gold.FeeRow]{
 		asDate(strCol("period", func(r gold.FeeRow) string { return r.Period })),
 		asDate(strCol("start_date", func(r gold.FeeRow) string { return formatEpochDay(r.StartDay) })),
 		asDate(strCol("end_date", func(r gold.FeeRow) string { return formatEpochDay(r.EndDay) })),
 		strCol("silver_source", func(r gold.FeeRow) string { return r.SilverSourceID }),
 		strCol("entity_kind", func(r gold.FeeRow) string { return r.EntityKind }),
-		entity,
-		entityID,
+		eitherCol("entity", asPortfolio, portfolio[0], account[0]),
+		eitherCol("entity_id", asPortfolio, portfolio[1], account[1]),
 		outCcyCol("fees", outCcy, func(r gold.FeeRow) *string { return r.Fees }),
 		outCcyCol("fees_investment", outCcy, func(r gold.FeeRow) *string { return r.FeesInvestment }),
 		outCcyCol("fees_bank", outCcy, func(r gold.FeeRow) *string { return r.FeesBank }),
 		outCcyCol("fees_atm", outCcy, func(r gold.FeeRow) *string { return r.FeesATM }),
 		outCcyCol("fees_other", outCcy, func(r gold.FeeRow) *string { return r.FeesOther }),
 		outCcyCol("mean_value", outCcy, func(r gold.FeeRow) *string { return r.MeanValue }),
-		{Name: "fee_rate_pct", Align: output.AlignRight,
-			Extract: func(r gold.FeeRow) string { return formatPctOrBlank(r.FeeRate) }},
-		{Name: "twr_pct", Align: output.AlignRight,
-			Extract: func(r gold.FeeRow) string { return formatPctOrBlank(r.TWR) }},
+		ratioOrBlankCol("fee_rate_pct", "", func(r gold.FeeRow) *float64 { return r.FeeRate }),
+		ratioOrBlankCol("twr_pct", "", func(r gold.FeeRow) *float64 { return r.TWR }),
 		qualityCol(func(r gold.FeeRow) string { return strings.Join(r.Quality, ";") }),
 	}
-}
-
-// eitherCol is a column that reads as a where first holds and as b
-// elsewhere: a row's entity is one of two kinds, each with its own
-// redaction. Both columns set PrivacyFunc and Pseudonym.
-func eitherCol[T any](name string, first func(T) bool, a, b columnSpec[T]) columnSpec[T] {
-	pick := func(r T) columnSpec[T] {
-		if first(r) {
-			return a
-		}
-		return b
-	}
-	return columnSpec[T]{Name: name, Align: output.AlignLeft, Privacy: PrivacyAccountID,
-		Extract:     func(r T) string { return pick(r).Extract(r) },
-		PrivacyFunc: func(r T) PrivacyClass { return pick(r).PrivacyFunc(r) },
-		PrivacyExtract: func(r T) string {
-			if c := pick(r); c.PrivacyExtract != nil {
-				return c.PrivacyExtract(r)
-			}
-			return pick(r).Extract(r)
-		},
-		Pseudonym: func(r T) (string, string) { return pick(r).Pseudonym(r) }}
 }
 
 func spendingFeesUsage() string {
@@ -137,7 +112,9 @@ first.
   fees             the spending lines in primary BANK_FEES, net of refunds
   fees_investment, fees_bank, fees_atm, fees_other
                    the same lines by detailed group; they sum to fees
-  mean_value       the entity's mean daily value, over the days it held one
+  mean_value       the entity's mean daily value, over the days it held one.
+                   A portfolio's leaves out its mortgages and cards, as its
+                   twr_pct does
   fee_rate_pct     fees over mean_value, annualized (365 days). Blank where
                    the mean value is not above zero
   twr_pct          the entity's monthly returns from 'returns portfolios' or

@@ -1026,7 +1026,7 @@ func typedLabelCalls(s *mcpServer, today time.Time) []typedLabelCall {
 // Neither through the MCP privacy endpoint nor through the CLI's -p, on
 // stdout or stderr, does a typed word appear anywhere, in any case: an
 // account or portfolio name, a typed source's portfolio id, a manual
-// an exit line's id, an AngelList account's slug, a config category or a
+// exit line's id, an AngelList account's slug, a config category or a
 // nickname. Wherever a cell shows such a word without privacy, the same
 // cell with privacy on is a pseudonym of the word's prefix. A manual
 // holding's name and key are no such word: -p hides money and
@@ -1231,9 +1231,9 @@ func TestPseudonymsNumberByFirstAppearance(t *testing.T) {
 // cells number by first appearance down the rows and across the
 // columns, in every format, JSON keeping the column; a map shared by two
 // renderings names a value alike in both, and a fresh one counts anew. A
-// column with no Pseudonym prefixes by its name. A typed holding's name
-// shows as it is, and its key redacts as an id: its words stay and an id
-// in it masks. Without -p the values show.
+// column with no Pseudonym prefixes by its name. A typed holding's key
+// and name redact as an id: their words stay and an id in them masks.
+// Without -p the values show.
 func TestPseudonymColumnRendersPerRun(t *testing.T) {
 	t.Parallel()
 	type row struct{ source, key, name string }
@@ -1272,13 +1272,109 @@ func TestPseudonymColumnRendersPerRun(t *testing.T) {
 	}
 }
 
+// TestTypedHoldingNamesMaskTheirIDs: under -p a manual holding's name
+// keeps its words and masks an id typed into it wherever the name
+// prints: a holding's name column, an issuer named after it, a cash
+// flow or a transaction line that names it. A year, a short number or a
+// single id-shaped word in such a name stays, for a name is never one
+// id. Any other holding's name prints as it is, digits and all. A key
+// redacts as an account id, so the same id-shaped word masks there. A
+// key with no public identifier masks its typed holding's id alone, its
+// source id kept, and any other's whole.
+func TestTypedHoldingNamesMaskTheirIDs(t *testing.T) {
+	t.Parallel()
+	kinds := map[string]string{"hand": "manual", "hand2": "manual"}
+	kindOf := func(id string) string { return kinds[id] }
+	cases := []struct{ source, name, want string }{
+		{"hand", "Example Loan XY-1234-5678", "Example Loan **-****-5678"},
+		{"hand", "Example Loan 12345678", "Example Loan ****5678"},
+		{"hand", "Example Plot 2024 Lot 12", "Example Plot 2024 Lot 12"},
+		{"hand", "Unit7", "Unit7"},
+		{"hand2", "Example Barn", "Example Barn"},
+		{"bank", "Qorvant 4.125% 15.01.2030", "Qorvant 4.125% 15.01.2030"},
+		{"bank", "Qorvant Corp", "Qorvant Corp"},
+	}
+
+	type row struct{ source, key, name string }
+	key, name := holdingCols(kindOf, func(r row) string { return r.source },
+		func(r row) string { return r.key }, func(r row) string { return r.name })
+	type keyed struct{ key, name string }
+	keyCol, keyName := holdingKeyCols("security", kindOf, func(r keyed) string { return r.key },
+		func(r keyed) string { return r.name })
+	issuers := typedIssuers{}
+	var issuerRows []gold.ExposureIssuerRow
+	var flows []gold.CashflowTransactionRow
+	var lines []gold.TransactionRow
+	for _, c := range cases {
+		if typedHolding(kindOf, c.source) {
+			issuers[strings.ToUpper(c.name)] = true
+		}
+		issuerRows = append(issuerRows, gold.ExposureIssuerRow{Issuer: c.name})
+		flows = append(flows, gold.CashflowTransactionRow{SilverSourceID: c.source, Name: &c.name})
+		lines = append(lines, gold.TransactionRow{SilverSourceID: c.source, Name: &c.name})
+	}
+	pick := func(t *testing.T, name string, cols []string) int {
+		t.Helper()
+		if i := slices.Index(cols, name); i >= 0 {
+			return i
+		}
+		t.Fatalf("no %s column in %q", name, cols)
+		return -1
+	}
+	issuerCols := buildExposureIssuerColumns("USD", kindOf, issuers)
+	flowCols := buildCashflowTransactionColumnRegistry("USD", kindOf, typedCategories{})
+	lineCols := buildTransactionColumnRegistry("USD", kindOf, typedCategories{})
+	for i, c := range cases {
+		views := map[string]string{
+			"holding name": rowsToTable([]row{{c.source, "k", c.name}}, []columnSpec[row]{name}, true, output.FormatTable, nil).Rows[0][0],
+			"issuer":       rowsToTable(issuerRows[i:i+1], issuerCols[:1], true, output.FormatTable, nil).Rows[0][0],
+			"cash flow line": rowsToTable(flows[i:i+1], []columnSpec[gold.CashflowTransactionRow]{
+				flowCols[pick(t, "name", columnNames(flowCols))]}, true, output.FormatCSV, nil).Rows[0][0],
+			"transaction line": rowsToTable(lines[i:i+1], []columnSpec[gold.TransactionRow]{
+				lineCols[pick(t, "name", columnNames(lineCols))]}, true, output.FormatCSV, nil).Rows[0][0],
+		}
+		if c.source != "bank" {
+			views["security name"] = rowsToTable([]keyed{{"holding:" + c.source + ":k", c.name}},
+				[]columnSpec[keyed]{keyName}, true, output.FormatTable, nil).Rows[0][0]
+		}
+		for view, got := range views {
+			want := c.want
+			if view == "cash flow line" && c.source == "bank" {
+				// Another source's line names whatever the statement says.
+				want = freeTextPlaceholder
+			}
+			if got != want {
+				t.Errorf("%s %q of %s: -p prints %q, want %q", view, c.name, c.source, got, want)
+			}
+		}
+	}
+	for _, c := range []struct{ key, want string }{
+		{"holding:hand2:house 123456", "holding:hand2:house ***456"},
+		{"holding:hand:example-flat", "holding:hand:example-flat"},
+		{"holding:hand:unit7", "holding:hand:***t7"},
+		{"holding:bank:QSTK-PRIVATE", freeTextPlaceholder},
+		{"US0000000001", "US0000000001"},
+	} {
+		if got := rowsToTable([]keyed{{c.key, ""}}, []columnSpec[keyed]{keyCol}, true, output.FormatTable, nil).Rows[0][0]; got != c.want {
+			t.Errorf("key %q: -p prints %q, want %q", c.key, got, c.want)
+		}
+	}
+	for k, want := range map[string]string{"house 123456": "house ***456", "unit7": "***t7"} {
+		if got := rowsToTable([]row{{"hand", k, "Example House"}}, []columnSpec[row]{key}, true,
+			output.FormatTable, nil).Rows[0][0]; got != want {
+			t.Errorf("position_key %q: -p prints %q, want %q", k, got, want)
+		}
+	}
+}
+
 // TestPrivacyPseudonymsHoldWithinARun: within one rendering a typed
 // value reads one pseudonym. A manual holding's key and name are no such
 // value and show as they do without -p; a wallet keyed by its label, and
 // an AngelList account keyed by its slug, read alike in their account
-// and account-id columns, and the wallet in every period of a series. A bank's category stays where the config's prints as a
-// pseudonym. On the MCP privacy endpoint the pseudonym a page shows is
-// the one a filter reads, whatever the call's filter or sort.
+// and account-id columns, and the wallet in every period of a series. A
+// bank's category stays where the config's prints as a pseudonym. On
+// the MCP privacy endpoint the pseudonym a page shows is the one a
+// filter reads, whatever the call's filter or sort.
 func TestPrivacyPseudonymsHoldWithinARun(t *testing.T) {
 	t.Parallel()
 	cfg := setupTypedLabelGold(t)
@@ -1333,40 +1429,46 @@ func TestPrivacyPseudonymsHoldWithinARun(t *testing.T) {
 	}
 
 	priv := onFixtureToday(newTestMCP(cfg, true))
-	// byKey calls for the manual holdings' keys and classes.
-	byKey := func(args map[string]any) map[string]string {
+	// bySource calls for the typed accounts' names: the wallet's and the
+	// AngelList account's, each a pseudonym.
+	typedSources := []string{"venture", "wallets"}
+	bySource := func(args map[string]any) map[string]string {
 		t.Helper()
-		args["view"], args["as_of"], args["format"] = "positions", "2026-06-30", "csv"
-		args["columns"] = "silver_source,asset_class,position_key"
+		args["view"], args["as_of"], args["format"] = "accounts", "2026-06-30", "csv"
+		args["columns"] = "silver_source,account,base_currency"
 		out, err := callTool(t, priv, "holdings", args)
 		if err != nil {
 			t.Fatal(err)
 		}
 		_, body, _ := strings.Cut(out, "\n")
 		body, _, _ = strings.Cut(body, "\nshowing rows")
-		keys := map[string]string{}
+		names := map[string]string{}
 		for _, r := range csvRows(t, body) {
-			if r["silver_source"] == "hand" {
-				keys[r["position_key"]] = r["asset_class"]
+			if slices.Contains(typedSources, r["silver_source"]) {
+				names[r["silver_source"]] = r["account"]
 			}
 		}
-		return keys
+		return names
 	}
-	keys := byKey(map[string]any{})
-	if _, ok := keys["example-flat"]; !ok {
-		t.Fatalf("the privacy endpoint shows the manual keys %q, want the flat's among them", keys)
+	names := bySource(map[string]any{})
+	if len(names) != len(typedSources) || !strings.HasPrefix(names["wallets"], "cointracking-") ||
+		!strings.HasPrefix(names["venture"], "angellist-") {
+		t.Fatalf("the privacy endpoint names the typed accounts %q, want a pseudonym each", names)
 	}
-	if got := byKey(map[string]any{"symbol": "example-flat"}); !maps.Equal(got, map[string]string{"example-flat": keys["example-flat"]}) {
-		t.Errorf("symbol=example-flat keeps %q, want the flat alone", got)
+	for source, name := range names {
+		if got := bySource(map[string]any{"account": name}); !maps.Equal(got, map[string]string{source: name}) {
+			t.Errorf("account=%s keeps %q, want the %s account alone", name, got, source)
+		}
 	}
-	for offset := range 2 {
-		got := byKey(map[string]any{"source": "hand", "sort": "-position_key", "limit": 1, "offset": offset})
+	for offset := range len(typedSources) {
+		got := bySource(map[string]any{"source": strings.Join(typedSources, ","), "sort": "-account",
+			"limit": 1, "offset": offset})
 		if len(got) != 1 {
 			t.Errorf("sorted, at offset %d: %q, want one row", offset, got)
 		}
-		for key := range got {
-			if _, ok := keys[key]; !ok {
-				t.Errorf("sorted, at offset %d: %q, want one of %q", offset, got, keys)
+		for source, name := range got {
+			if names[source] != name {
+				t.Errorf("sorted, at offset %d: %s reads %q, want %q as unpaged", offset, source, name, names[source])
 			}
 		}
 	}

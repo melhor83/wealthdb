@@ -208,7 +208,8 @@ func buildYieldCoverageColumns(outCcy string, kindOf func(string) string) []colu
 			Extract: func(r row) string { return r.Instrument }}, kindOf, holding),
 		// A holding's line names its account by id alone.
 		accountIDCol("account", kindOf, func(r row) accountRef { return accountRef{source: r.Source, id: r.Account} }),
-		strCol("name", func(r row) string { return r.Name }),
+		// -p masks an id typed into a typed holding's name.
+		holdingNameCol(strCol("name", func(r row) string { return r.Name }), kindOf, holding),
 	}
 }
 

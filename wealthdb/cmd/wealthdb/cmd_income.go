@@ -90,7 +90,7 @@ func runIncomeView(ctx context.Context, g globalFlags, view string, args []strin
 		asOf: anchorToDay(now.UTC(), true).Unix(), assumptions: ff.assumptions(), categories: overrideCategories(cfg)}
 	rep := incomeReport(req)
 	open := func() (*sql.DB, error) { return openGoldForRead(g, cfg) }
-	return writeReport(ctx, rep, rf.output(fmtChoice, "income", req, cfg, now), open, stdout)
+	return writeReport(ctx, rep, rf.output(fmtChoice, "income", incomeFamily, req, cfg, now), open, stdout)
 }
 
 // incomeReport is one view of the income family, the runner the CLI
@@ -291,9 +291,10 @@ Flags
                 wealthdb help filter lists the operators
   -x CCY        output currency (default: config.default_currency)
   -p            redact account ids, payers and amounts; every name a
-                person typed prints as a pseudonym, such as manual-1,
-                or as a redacted id; types, shares and provenance stay
-                legible
+                person typed about an account prints as a pseudonym,
+                such as manual-1, or as a redacted id; holding names,
+                types, shares and provenance stay legible, and an id
+                typed into a manual holding's name or key masks
 
 Notes
   Income is GROSS as booked. Tax withheld at source is the spending

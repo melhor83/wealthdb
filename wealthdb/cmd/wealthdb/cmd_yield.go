@@ -100,7 +100,7 @@ func cmdYield(ctx context.Context, g globalFlags, subargs []string, _ io.Reader,
 	}
 	req := request{view: view, currency: outCcy, asOf: asOfEpoch, series: series, converted: *converted}
 	rep := yieldReport(req)
-	return writeReport(ctx, rep, rf.output(fmtChoice, "yield", req, cfg, now), open, stdout)
+	return writeReport(ctx, rep, rf.output(fmtChoice, "yield", yieldFamily, req, cfg, now), open, stdout)
 }
 
 // yieldBook computes the book of one instant.
@@ -141,7 +141,8 @@ func yieldReport(req request) *report {
 //
 // A rate prints with a _pct suffix, a value as value_<CCY>. -p hides the
 // value, dv01, every income amount, a price and a key that is a holding's
-// own, and prints a name a person typed as a pseudonym (docs/DESIGN.md
+// own, masks an id typed into a manual holding's name, and prints a
+// name a person typed about an account as a pseudonym (docs/DESIGN.md
 // §4.6); rates, durations, shares, labels and public keys stay
 // (docs/YIELD.md §2).
 
@@ -403,10 +404,12 @@ Flags
                      wealthdb help filter lists the operators
   -x CCY             output currency (default: config.default_currency)
   -p                 hide values, dv01, income amounts, prices and
-                     account ids; every name a person typed prints as a
-                     pseudonym, such as manual-1, or as a redacted id;
-                     rates, durations, shares, labels and public keys
-                     stay
+                     account ids; every name a person typed about an
+                     account prints as a pseudonym, such as manual-1,
+                     or as a redacted id; holding names, rates,
+                     durations, shares, labels and public keys stay,
+                     and an id typed into a manual holding's name or
+                     key masks
 
 Notes
   A rate prints with a _pct suffix (income_yield_pct), a value as

@@ -84,11 +84,11 @@ func runSpendingView(ctx context.Context, g globalFlags, view string, args []str
 		categories: overrideCategories(cfg)}
 	rep := spendingReport(req)
 	open := func() (*sql.DB, error) { return openGoldForRead(g, cfg) }
-	return writeReport(ctx, rep, rf.output(fmtChoice, "spending", req, cfg, g.clock()), open, stdout)
+	return writeReport(ctx, rep, rf.output(fmtChoice, "spending", spendingFamily, req, cfg, g.clock()), open, stdout)
 }
 
-// spendingReport is one view of the spending family, the runner the
-// CLI and the MCP server share.
+// spendingReport is one view of the spending family but fees, the
+// runner the CLI and the MCP server share.
 func spendingReport(req request) *report {
 	part := reportPeriods[req.period]
 	switch req.view {
@@ -102,7 +102,7 @@ func spendingReport(req request) *report {
 			func(ctx context.Context, db *sql.DB) ([]gold.SpendCategoryRow, error) {
 				return gold.SpendingCategories(ctx, db, req.from, req.to, req.currency, part, req.level)
 			})
-	default:
+	case "transactions":
 		kindOf, loadKinds := sourceKinds()
 		return withLoads(newReport(buildSpendTransactionColumnRegistry(req.currency, kindOf, req.categories),
 			defaultSpendTransactionColumns,
@@ -110,6 +110,9 @@ func spendingReport(req request) *report {
 				return gold.SpendingTransactions(ctx, db, req.from, req.to, req.currency)
 			}), loadKinds)
 	}
+	// fees has a runner of its own (spendingFeesReport); a view that
+	// reaches here unrouted is a wiring fault, never the transactions.
+	panic(fmt.Sprintf("spending: no report for view %q", req.view))
 }
 
 // periodStart renders the bucket's opening date, empty for the
@@ -317,9 +320,9 @@ Flags:
   -x, --currency    output currency (default: config.default_currency)
   -p, --privacy     redact account IDs, amounts, and every name taken off
                     a statement line — merchant, signature, counterparty;
-                    every name a person typed prints as a pseudonym, such
-                    as manual-1, or as a redacted ID (categories,
-                    provenance and shares stay visible)
+                    every name a person typed about an account prints as
+                    a pseudonym, such as manual-1, or as a redacted ID
+                    (categories, provenance and shares stay visible)
 
 There are no row-filter flags. To slice by merchant, category or
 account, grep the table or take -f json and filter in jq.

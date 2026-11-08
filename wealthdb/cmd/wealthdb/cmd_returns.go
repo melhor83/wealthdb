@@ -96,7 +96,7 @@ func runReturnsView(ctx context.Context, g globalFlags, view string, args []stri
 		benchmark: *benchmark}
 	rep := returnsReport(req, cfg)
 	open := func() (*sql.DB, error) { return openGoldForRead(g, cfg) }
-	return writeReport(ctx, rep, rf.output(fmtChoice, "returns", req, cfg, g.clock()), open, stdout)
+	return writeReport(ctx, rep, rf.output(fmtChoice, "returns", returnsFamily, req, cfg, g.clock()), open, stdout)
 }
 
 // returnsReport is one view of the returns family, the runner the CLI
@@ -236,22 +236,14 @@ func buildReturnColumnRegistry(outCcy, level string, kindOf func(string) string,
 		Extract: func(r gold.ReturnRow) string { return r.EntityLabel }}
 	entityID := columnSpec[gold.ReturnRow]{Name: "entity_id", Align: output.AlignLeft, Privacy: PrivacyAccountID,
 		Extract: func(r gold.ReturnRow) string { return r.EntityID }}
+	account, portfolio := entityCols(kindOf, nicknames, func(r gold.ReturnRow) (string, string, string) {
+		return r.SilverSourceID, r.EntityID, r.EntityLabel
+	})
 	switch level {
 	case "accounts":
-		ref := func(r gold.ReturnRow) accountRef {
-			return accountRef{source: r.SilverSourceID, name: &r.EntityLabel,
-				nickname: nicknames.of(r.SilverSourceID, r.EntityID), id: r.EntityID}
-		}
-		entity = accountCol(kindOf, ref)
-		entity.Name = "entity"
-		entityID = accountIDCol("entity_id", kindOf, ref)
+		entity, entityID = account[0], account[1]
 	case "portfolios":
-		entity = portfolioCol("entity", kindOf, func(r gold.ReturnRow) (string, string, *string) {
-			return r.SilverSourceID, r.EntityID, &r.EntityLabel
-		})
-		entityID = typedIDCol("entity_id", kindOf, func(r gold.ReturnRow) (string, string) {
-			return r.SilverSourceID, r.EntityID
-		})
+		entity, entityID = portfolio[0], portfolio[1]
 	}
 	return []columnSpec[gold.ReturnRow]{
 		{Name: "silver_source", Align: output.AlignLeft,
@@ -427,8 +419,8 @@ Flags:
                     wealthdb help filter lists the operators
   -x, --currency    output currency (default: config.default_currency)
   -p, --privacy     redact entity IDs and amounts; every name a person
-                    typed prints as a pseudonym, such as manual-1, or as
-                    a redacted ID
+                    typed about an account prints as a pseudonym, such
+                    as manual-1, or as a redacted ID
                     (returns % stay visible)
 
 The quality column is load-bearing: n/a returns always carry a reason

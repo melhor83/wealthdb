@@ -28,7 +28,22 @@ type toolSpec struct {
 	// family is set for the tools that run a report through the row
 	// layer; run is set for the one that answers otherwise (describe).
 	family *family
-	run    func(ctx context.Context, a *toolArgs) (toolOutput, error)
+	// alt are the tool's other shapes, by the boolean parameter that
+	// asks for one: status's marks. A call with that parameter true
+	// runs the shape in place of family.
+	alt map[string]*family
+	run func(ctx context.Context, a *toolArgs) (toolOutput, error)
+}
+
+// familyFor is the family a call runs: the shape one of the tool's
+// boolean parameters asks for (alt), else its own.
+func (t toolSpec) familyFor(a *toolArgs) *family {
+	for name, fam := range t.alt {
+		if a.flag(name, false) {
+			return fam
+		}
+	}
+	return t.family
 }
 
 // windowRule is how a family reads its dates: a window over from/to
@@ -170,8 +185,9 @@ func (s *mcpServer) tools() []toolSpec {
 			name: "returns", title: "Returns",
 			description: "How investments performed over a window (default: since the first snapshot), as twr and mwr %, after fees and taxes. " +
 				"view=global: the whole portfolio. sources, portfolios: per entity, best-effort. accounts: per account, exact. " +
-				"stated: a document's stated periods beside the engine's figures; it takes no method, period, annualize, netting, inception or currency. " +
-				"bridge: why net worth moved, for the whole household: end_net_worth = start_net_worth + net_saved + onboarded + gain; whole months; it takes no method, annualize, netting, inception, benchmark, source or account. " +
+				"stated: a document's stated periods beside the engine's figures; it takes no " + orList(append(slices.Clone(statedRefusedFlags), "currency")) + ". " +
+				"bridge: why net worth moved, for the whole household: end_net_worth = start_net_worth + net_saved + onboarded + gain; whole months; it takes no " +
+				orList(append(slices.Clone(bridgeRefusedFlags), "source", "account")) + ". " +
 				"One row per entity for the whole window unless period adds buckets. quality names the reason for every n/a. " +
 				`Example: {view: "accounts", from: "2025", to: "2025"}.`,
 			params: s.rowParams(true,
@@ -339,6 +355,7 @@ func (s *mcpServer) tools() []toolSpec {
 				stringParam("currency", "marks only: the output currency of value_marked and value_total."),
 			}, s.shapeParams()...),
 			family: statusFamily,
+			alt:    map[string]*family{"marks": marksFamily},
 		},
 		{
 			name: "snapshots", title: "Snapshots",
@@ -532,18 +549,12 @@ var returnsFamily = &family{
 	prepare: func(a *toolArgs, req *request, _ *[]string) error {
 		if req.view == "stated" {
 			// The document fixes the periods and the currency.
-			for _, name := range []string{"currency", "method", "period", "annualize", "netting", "inception", "benchmark"} {
-				if a.has(name) {
-					return fmt.Errorf("returns: stated takes no %s — the periods and the currency are the document's", name)
-				}
-			}
-			return nil
+			return refuseArgs(a, "returns", "stated", append([]string{"currency"}, statedRefusedFlags...),
+				" — the periods and the currency are the document's")
 		}
 		if req.view == "bridge" {
-			for _, name := range bridgeRefusedFlags {
-				if a.has(name) {
-					return fmt.Errorf("returns: bridge takes no %s", name)
-				}
+			if err := refuseArgs(a, "returns", "bridge", bridgeRefusedFlags, ""); err != nil {
+				return err
 			}
 			req.period = orDefault(a.str("period"), "total")
 			return checkBridgeWindow(req.from, req.to, req.asOf)
@@ -707,10 +718,8 @@ var spendingFamily = &family{
 	prepare: func(a *toolArgs, req *request, notes *[]string) error {
 		req.period = orDefault(a.str("period"), "total")
 		if req.view == "fees" {
-			for _, name := range []string{"level", "category"} {
-				if a.has(name) {
-					return fmt.Errorf("spending: fees takes no %s", name)
-				}
+			if err := refuseArgs(a, "spending", "fees", feesRefusedFlags, ""); err != nil {
+				return err
 			}
 			return checkChoice("spending", "period", req.period, feePeriods...)
 		}
@@ -914,7 +923,10 @@ var statusFamily = &family{
 
 // marksFamily is the status tool's `marks` shape: month ends, not sources.
 var marksFamily = &family{
-	principal: func(request) string { return "marked_pct" },
+	// The money words name value_total, as the sort parameter says a
+	// "-value" sort reads the main money column; marked_pct goes by its
+	// own name.
+	principal: func(request) string { return "value_total" },
 	window:    sinceInception,
 	currency:  true,
 	narrow:    "from/to",
@@ -926,7 +938,8 @@ var marksFamily = &family{
 		}
 		return nil
 	},
-	build: func(_ *config.Config, req request, _ *toolArgs) *report { return marksReport(req) },
+	build:  func(_ *config.Config, req request, _ *toolArgs) *report { return marksReport(req) },
+	header: func(request) []string { return []string{"marks"} },
 }
 
 var snapshotsFamily = &family{
@@ -955,6 +968,18 @@ var categorizationsFamily = &family{
 }
 
 func noOptions(*toolArgs, *request, *[]string) error { return nil }
+
+// refuseArgs refuses a call that sets one of names: the options of the
+// tool's other views that view does not take, as the CLI refuses them
+// (refuseFlags). why follows the refusal.
+func refuseArgs(a *toolArgs, tool, view string, names []string, why string) error {
+	for _, name := range names {
+		if a.has(name) {
+			return fmt.Errorf("%s: %s takes no %s%s", tool, view, name, why)
+		}
+	}
+	return nil
+}
 
 // byRule is a total rule per view, def for the views it does not name.
 func byRule(m map[string]totalRule, def totalRule) func(string) totalRule {
@@ -994,16 +1019,14 @@ func orDefault(v, def string) string {
 // read-only handle held for the fetch alone, then filter, sort, page
 // and render.
 func (s *mcpServer) runFamily(ctx context.Context, spec toolSpec, a *toolArgs) (toolOutput, error) {
+	spec.family = spec.familyFor(a)
 	tool, fam := spec.name, spec.family
 	cfg, err := s.loadConfig()
 	if err != nil {
 		return toolOutput{}, err
 	}
-	if tool == "status" && a.flag("marks", false) {
-		fam = marksFamily
-	}
 	// status for one source is a different shape: its detail block.
-	if tool == "status" && fam == statusFamily && a.has("source") {
+	if fam == statusFamily && a.has("source") {
 		var text string
 		err := s.withGold(ctx, cfg, func(db *sql.DB) (err error) {
 			text, err = statusDetail(ctx, db, cfg, a.str("source"), a.flag("verbose", false))

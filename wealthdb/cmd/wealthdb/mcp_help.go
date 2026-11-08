@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strings"
@@ -37,7 +38,7 @@ Pick the tool by the question:
 - what was spent, on what -> spending; what each portfolio cost in fees -> spending (view=fees)
 - what was received, from whom; what the holdings will pay and when -> income (view=projection or calendar)
 - where the household's cash came from and went; mortgage and loan payments; money into retirement, education or health plans -> cashflow (view=flows for one class)
-- is the data current -> status; how far a month's return can be trusted -> status (marks); which dates have data -> snapshots
+- is the data current -> status; how far a month's return can be trusted -> status (marks=true); which dates have data -> snapshots
 - help on a tool, its columns, or a term -> describe
 
 Conventions:
@@ -162,12 +163,7 @@ func (s *mcpServer) toolHelp(t toolSpec) (string, error) {
 		fmt.Fprintf(&b, "  %-12s %s\n", p.name, doc)
 	}
 	fam := t.family
-	views := fam.views
-	if views == nil {
-		views = []string{""}
-	}
-	b.WriteString("\nColumns (* = shown by default; columns=all shows every one):\n")
-	for _, v := range views {
+	columns := func(fam *family, v string) string {
 		req := defaultRequest(v, cfg.DefaultCurrency)
 		if level := map[string]string{"cashflow": "group", "income": "detailed"}[t.name]; level != "" {
 			req.level = level
@@ -181,11 +177,20 @@ func (s *mcpServer) toolHelp(t toolSpec) (string, error) {
 			}
 			cols = append(cols, name)
 		}
+		return strings.Join(cols, ", ")
+	}
+	b.WriteString("\nColumns (* = shown by default; columns=all shows every one):\n")
+	for _, v := range fam.viewsOrOne() {
 		label := "  "
 		if v != "" {
 			label = "  " + v + ": "
 		}
-		b.WriteString(label + strings.Join(cols, ", ") + "\n")
+		b.WriteString(label + columns(fam, v) + "\n")
+	}
+	// A shape a boolean parameter asks for lists its columns after the
+	// tool's own.
+	for _, name := range slices.Sorted(maps.Keys(t.alt)) {
+		b.WriteString("  " + name + "=true: " + columns(t.alt[name], "") + "\n")
 	}
 	if fam.views != nil {
 		b.WriteString("\nFilters each view takes (a filter the view lacks moves the call to the first finer view that has it):\n")
@@ -353,10 +358,10 @@ func cashflowPlanQualityHelp() string {
 
 func (s *mcpServer) privacyHelp() string {
 	if s.privacy {
-		return privacyNotice + ` Amounts and quantities print as *****.** and ***, account numbers keep only their last digits, and merchant, payer and narrative text prints as ***. A name a person typed about an account prints as a pseudonym: a nickname, an account category the config sets, and the names and ids of crypto, manual and declared accounts and portfolios and their line ids. The name of an account its bank names by its nickname is typed too. An account whose name is typed shows its account number instead, redacted, where that number is letters and digits with at least one digit; so does such an id. A pseudonym is a prefix and a number: the source's kind (manual-1, cointracking-2), or category-1 and nickname-1. Within one result a value always reads the same pseudonym, and two values read apart. Each call numbers afresh: manual-1 in two different calls need not be one value, so join results on other columns. A call numbers over all its rows before filters and paging, so the same call with a filter added names a row as before. A source id names a config entry and stays legible, as does a name another provider builds from the holder's words. A holding's name stays legible, a hand-entered one's too; a hand-entered holding's key and instrument id redact as an account number, their words kept. Other account names, holdings and their symbols, dates, categories, types, classes and shares stay legible.
+		return privacyNotice + ` Amounts and quantities print as *****.** and ***, account numbers keep only their last digits, and merchant, payer and narrative text prints as ***. A name a person typed about an account prints as a pseudonym: a nickname, an account category the config sets, and the names and ids of crypto, manual and declared accounts and portfolios and their line ids. The name of an account its bank names by its nickname is typed too. An account whose name is typed shows its account number instead, redacted, where that number is letters and digits with at least one digit; so does such an id. A pseudonym is a prefix and a number: the source's kind (manual-1, cointracking-2), or category-1 and nickname-1. Within one result a value always reads the same pseudonym, and two values read apart. Each call numbers afresh: manual-1 in two different calls need not be one value, so join results on other columns. A call numbers over all its rows before filters and paging, so the same call with a filter added names a row as before. A source id names a config entry and stays legible, as does a name another provider builds from the holder's words. A holding's name stays legible. A hand-entered holding's key and instrument id redact as an account number, their words kept; an id typed into its name, or into an issuer or a cash flow line named after it, masks, and the name's words stay. Other account names, holdings and their symbols, dates, categories, types, classes and shares stay legible.
 Filters and sorts read what is shown: a money column cannot order the rows here, a merchant filter matches nothing, and a filter or search matches a typed name by its pseudonym, the whole cell (manual-1 never matches manual-10).`
 	}
-	return `This endpoint serves full data. The server's /mcp/privacy endpoint (or a stdio server started with --privacy) serves the same tools with amounts, quantities, account numbers and the names taken off statements redacted, and every name a person typed about an account shown as a pseudonym; other account names, holdings and their names, categories, types, dates and shares stay legible.
+	return `This endpoint serves full data. The server's /mcp/privacy endpoint (or a stdio server started with --privacy) serves the same tools with amounts, quantities, account numbers and the names taken off statements redacted, and every name a person typed about an account, an account category the config sets included, shown as a pseudonym; other account names, holdings and their names, spending and income categories, types, dates and shares stay legible.
 Which endpoint a client is given is the operator's choice; no parameter changes it.`
 }
 

@@ -63,13 +63,14 @@ const (
 	// PrivacyNone: never redacted (default).
 	PrivacyNone PrivacyClass = iota
 	// PrivacyAccountID: account / portfolio / relationship /
-	// transaction identifiers. Redacted by redactAccountID: every
-	// id in the value, however it is spaced or punctuated, turns to
-	// stars but for its last 2-4 chars (length-dependent so very
-	// short IDs don't reveal too much) and an IBAN-style 2-letter
-	// country code at the front. Words and groups of up to four
-	// digits stay, since at this layer they are bank-assigned
-	// taxonomic labels (UBS "Savings" / "Brokerage").
+	// transaction identifiers, and a manual holding's keys
+	// (holdingIDCol). Redacted by redactAccountID: every id in the
+	// value, however it is spaced or punctuated, turns to stars but
+	// for its last 2-4 chars (length-dependent so very short IDs don't
+	// reveal too much) and an IBAN-style 2-letter country code at the
+	// front. Words and runs of up to four digits stay, since at this
+	// layer they are bank-assigned taxonomic labels (UBS "Savings" /
+	// "Brokerage") or the words a manual holding's key spells.
 	PrivacyAccountID
 	// PrivacyFreeText: free-form strings that can carry a person's
 	// name and that the household did not type — a statement
@@ -88,7 +89,8 @@ const (
 	// PrivacyPseudonym: a name a person typed about an account — a typed
 	// account's or portfolio's name or id, a nickname, a typed source's
 	// transaction or lot id, a config category. A holding's name is no
-	// such name and prints as it is.
+	// such name: it prints as it is, a manual holding's with any id in
+	// it masked (holdingNameCol).
 	// Rendered as a pseudonym, stable within one rendering
 	// (pseudonyms), in every output format. Shape-blind like
 	// PrivacyFreeText, but the rows stay apart: the same value reads
@@ -355,6 +357,55 @@ func typedIDCol[T any](name string, kindOf func(string) string, get func(T) (sou
 	return col
 }
 
+// entityCols are a report's entity and entity_id columns, read off the
+// row's source, entity id and label (get): account where the entity is
+// an account, which -p shows as accountCol and accountIDCol do, its
+// nickname from nicknames; portfolio where it is a portfolio, as
+// portfolioCol and typedIDCol do.
+func entityCols[T any](kindOf func(string) string, nicknames accountNicknames,
+	get func(T) (source, id, label string)) (account, portfolio [2]columnSpec[T]) {
+	ref := func(r T) accountRef {
+		source, id, label := get(r)
+		return accountRef{source: source, name: &label, nickname: nicknames.of(source, id), id: id}
+	}
+	entity := accountCol(kindOf, ref)
+	entity.Name = "entity"
+	account = [2]columnSpec[T]{entity, accountIDCol("entity_id", kindOf, ref)}
+	portfolio = [2]columnSpec[T]{
+		portfolioCol("entity", kindOf, func(r T) (string, string, *string) {
+			source, id, label := get(r)
+			return source, id, &label
+		}),
+		typedIDCol("entity_id", kindOf, func(r T) (string, string) {
+			source, id, _ := get(r)
+			return source, id
+		}),
+	}
+	return account, portfolio
+}
+
+// eitherCol is a column that reads as a where first holds and as b
+// elsewhere: a row's entity is one of two kinds, each with its own
+// redaction. Both columns set PrivacyFunc and Pseudonym.
+func eitherCol[T any](name string, first func(T) bool, a, b columnSpec[T]) columnSpec[T] {
+	pick := func(r T) columnSpec[T] {
+		if first(r) {
+			return a
+		}
+		return b
+	}
+	return columnSpec[T]{Name: name, Align: output.AlignLeft, Privacy: PrivacyAccountID,
+		Extract:     func(r T) string { return pick(r).Extract(r) },
+		PrivacyFunc: func(r T) PrivacyClass { return pick(r).PrivacyFunc(r) },
+		PrivacyExtract: func(r T) string {
+			if c := pick(r); c.PrivacyExtract != nil {
+				return c.PrivacyExtract(r)
+			}
+			return pick(r).Extract(r)
+		},
+		Pseudonym: func(r T) (string, string) { return pick(r).Pseudonym(r) }}
+}
+
 // typedPseudonym is a Pseudonym of a value a source's holder typed: its
 // prefix is the source's kind, or the source itself where gold holds no
 // kind for it, as for the declared accounts. The source keeps the same
@@ -380,10 +431,9 @@ func typedHolding(kindOf func(string) string, source string) bool {
 // holdingIDCol is col, whose cells identify a holding: its position key
 // or instrument id. A typed holding's (typedHolding) can carry its
 // holder's words and an account's or a contract's id, so -p redacts it
-// by its runs (redactAccountID): its words stay and any id in it masks.
-// get gives the row's source and key; every other row keeps col's own
-// rule. A holding's name needs no such column: -p hides money and
-// identifiers, never what is held, so it prints as it is.
+// as an account id (redactAccountID): its words stay and any id in it
+// masks. get gives the row's source and key; every other row keeps
+// col's own rule. A holding's name takes holdingNameCol instead.
 func holdingIDCol[T any](col columnSpec[T], kindOf func(string) string, get func(T) (source, key string)) columnSpec[T] {
 	class, classOf := col.Privacy, col.PrivacyFunc
 	col.PrivacyFunc = func(r T) PrivacyClass {
@@ -398,38 +448,102 @@ func holdingIDCol[T any](col columnSpec[T], kindOf func(string) string, get func
 	return col
 }
 
+// holdingNameCol is col, whose cells name a holding. -p hides money and
+// identifiers, never what is held, so a name prints as it is. A typed
+// holding's (typedHolding) name can carry an account's or a contract's
+// id, so -p masks the runs of it that can be one (redactIDRuns) and
+// keeps the rest: a name is never one id, so a single word such as
+// `Unit7` stays whole. get gives the row's source and key; every other
+// row keeps col's own rule.
+func holdingNameCol[T any](col columnSpec[T], kindOf func(string) string, get func(T) (source, key string)) columnSpec[T] {
+	return typedNameCol(col, func(r T) bool {
+		source, key := get(r)
+		return key != "" && typedHolding(kindOf, source)
+	})
+}
+
+// typedNameCol is col with the rows typed reports masked by their id
+// runs under -p (holdingNameCol); every other row keeps col's own rule.
+func typedNameCol[T any](col columnSpec[T], typed func(T) bool) columnSpec[T] {
+	class, classOf := col.Privacy, col.PrivacyFunc
+	shown := col.Extract
+	if col.PrivacyExtract != nil {
+		shown = col.PrivacyExtract
+	}
+	col.PrivacyFunc = func(r T) PrivacyClass {
+		switch {
+		case typed(r):
+			return PrivacyNone // PrivacyExtract masks its ids
+		case classOf != nil:
+			return classOf(r)
+		}
+		return class
+	}
+	col.PrivacyExtract = func(r T) string {
+		if !typed(r) {
+			return shown(r)
+		}
+		// The content scrub runs ahead of the runs, as in rowsToTable,
+		// so an address in the name still reads as one.
+		return redactIDRuns(scrubSensitiveIDs(shown(r)))
+	}
+	return col
+}
+
 // holdingCols are a holding's position_key and name columns: key and
 // name read them off a row that source says the source of. -p redacts a
-// typed holding's key as an id (holdingIDCol) and prints its name as it
-// is.
+// typed holding's key as an account id (holdingIDCol) and masks an id
+// typed into its name (holdingNameCol).
 func holdingCols[T any](kindOf func(string) string, source, key, name func(T) string) (keyCol, nameCol columnSpec[T]) {
 	holding := func(r T) (string, string) { return source(r), key(r) }
 	return holdingIDCol(strCol("position_key", key), kindOf, holding),
-		strCol("name", name)
+		holdingNameCol(strCol("name", name), kindOf, holding)
 }
 
 // holdingKeyCol is a key column. A security key is a public identifier
 // and stays legible under -p, as a public position_key does. A holding
-// no key names reads as `holding:<source>:<id>`, which -p hides: a
-// typed holding's (typedHolding) redacts as an id (holdingIDCol), as its
-// instrument id does, and any other's masks whole.
+// no key names reads as `holding:<source>:<id>`, which -p hides. A typed
+// holding's (typedHolding) id redacts as an account id, as its
+// instrument id does, and the prefix and the source id before it stay;
+// any other's masks whole.
 func holdingKeyCol[T any](name string, kindOf func(string) string, get func(T) string) columnSpec[T] {
-	col := columnSpec[T]{Name: name, Align: output.AlignLeft, Extract: get,
+	// typedID splits a typed holding's key into the legible prefix and
+	// the id; ok is false for any other key.
+	typedID := func(r T) (prefix, id string, ok bool) {
+		key := get(r)
+		source, id, holding := holdingKeyParts(key)
+		if !holding || id == "" || !typedHolding(kindOf, source) {
+			return "", "", false
+		}
+		return strings.TrimSuffix(key, id), id, true
+	}
+	return columnSpec[T]{Name: name, Align: output.AlignLeft, Extract: get,
 		PrivacyFunc: func(r T) PrivacyClass {
-			if _, _, ok := holdingKeyParts(get(r)); ok {
+			_, _, holding := holdingKeyParts(get(r))
+			if _, _, typed := typedID(r); holding && !typed {
 				return PrivacyFreeText
 			}
+			// A security key stays, and PrivacyExtract redacts a typed
+			// holding's id.
 			return PrivacyNone
+		},
+		PrivacyExtract: func(r T) string {
+			prefix, id, ok := typedID(r)
+			if !ok {
+				return get(r)
+			}
+			// The content scrub runs ahead of the redaction, as in
+			// rowsToTable, so an address in the id still reads as one.
+			return prefix + redactAccountID(scrubSensitiveIDs(id))
 		}}
-	return holdingIDCol(col, kindOf, keyHolding(get))
 }
 
 // holdingKeyCols are a holding key's column, named name (holdingKeyCol),
-// and the name column beside it, which label reads. -p prints the name
-// as it is, as in holdingCols.
+// and the name column beside it, which label reads. -p masks an id typed
+// into a typed holding's name, as in holdingCols.
 func holdingKeyCols[T any](name string, kindOf func(string) string,
 	key, label func(T) string) (keyCol, nameCol columnSpec[T]) {
-	return holdingKeyCol(name, kindOf, key), strCol("name", label)
+	return holdingKeyCol(name, kindOf, key), holdingNameCol(strCol("name", label), kindOf, keyHolding(key))
 }
 
 // keyHolding reads the holding a row's key names (holdingKeyParts): its
@@ -686,6 +800,14 @@ func ratioCol[T any](name string, get func(T) *float64) columnSpec[T] {
 		Extract: func(r T) string { return formatPct(get(r)) }}
 }
 
+// ratioOrBlankCol is a ratio in percent, blank for nil, whose name
+// already says it is one: header "" prints the name. Like ratioCol it
+// survives -p.
+func ratioOrBlankCol[T any](name, header string, get func(T) *float64) columnSpec[T] {
+	return columnSpec[T]{Name: name, Header: header, Align: output.AlignRight,
+		Extract: func(r T) string { return formatPctOrBlank(get(r)) }}
+}
+
 // formatPercent is a figure already in percent with two decimals, blank
 // for nil.
 func formatPercent(p *float64) string { return fixedOrBlank(p, 2) }
@@ -940,6 +1062,8 @@ func redactAccountID(s string) string {
 	return b.String()
 }
 
+// redactIDPart masks one part of a composite value: as one id where it
+// is wholly id-shaped, else by its runs.
 func redactIDPart(s string) string {
 	if isLikelyAccountID(s) {
 		return maskID(s)
@@ -1110,10 +1234,11 @@ func startsWithTwoLetters(s string) bool {
 //
 // The shape test is deliberately narrow, and stays that way:
 // accountRef.lineClass reads it to decide whether an id of a typed
-// source redacts at all. A value that needs hiding whatever its shape
-// belongs to a class that asks no shape question at all, rather than to
-// a widened test here: a statement narrative to PrivacyFreeText, a
-// customer-chosen label to PrivacyPseudonym.
+// source redacts as an id or prints as a pseudonym, and redactIDPart to
+// mask a wholly id-shaped part as one id. A value that needs hiding
+// whatever its shape belongs to a class that asks no shape question at
+// all, rather than to a widened test here: a statement narrative to
+// PrivacyFreeText, a customer-chosen label to PrivacyPseudonym.
 func isLikelyAccountID(s string) bool {
 	if len(s) < 3 {
 		return false
@@ -1138,20 +1263,20 @@ func isASCIILetter(c byte) bool {
 }
 
 // sensitiveIDPatterns are the shapes that scrubSensitiveIDs masks
-// wherever they appear in a cell, independent of the
-// column's PrivacyClass. Each entry pairs a tight shape regex with a
-// masker that preserves the match's length + separators so column
-// widths and scan-shape survive (matching redactAccountID's contract).
+// wherever they appear in a cell, independent of the column's
+// PrivacyClass: a bank's identifier shapes and a closing postal address.
+// Each entry pairs a tight shape regex with a masker that preserves the
+// match's length + separators so column widths and scan-shape survive
+// (matching redactAccountID's contract).
 //
 // This is a content-based defence-in-depth layer over the per-column
-// privacy machinery. The per-column pass only redacts columns whose
-// whole value IS an identifier (account_id, relationship_id, …); it
-// can't reach an identifier that leaks inside a column that's
-// PrivacyNone by design — notably position_key / symbol, which stay
-// legible under -p because they normally hold public ISIN/ticker
-// instrument ids. A UBS mortgage uses its (private) account number as
-// the instrument identity, so it surfaces there raw; this pass catches
-// it by shape regardless of which column carries it.
+// privacy machinery. The per-column pass reaches only the columns whose
+// class asks for it. It cannot reach an identifier or an address inside
+// a column that is PrivacyNone by design, notably position_key and
+// symbol, which stay legible under -p because they normally hold public
+// ISIN or ticker ids. A UBS mortgage uses its (private) account number
+// as the instrument identity, so it surfaces there raw; this pass
+// catches it by shape regardless of which column carries it.
 var sensitiveIDPatterns = []struct {
 	re   *regexp.Regexp
 	mask func(string) string

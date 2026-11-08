@@ -98,7 +98,7 @@ func runGainsView(ctx context.Context, g globalFlags, view string, args []string
 		categories: overrideCategories(cfg)}
 	rep := gainsReport(req)
 	open := func() (*sql.DB, error) { return openGoldForRead(g, cfg) }
-	return writeReport(ctx, rep, rf.output(fmtChoice, "gains", req, cfg, g.clock()), open, stdout)
+	return writeReport(ctx, rep, rf.output(fmtChoice, "gains", gainsFamily, req, cfg, g.clock()), open, stdout)
 }
 
 // gainsReport is one view of the gains family, the runner the CLI and
@@ -238,8 +238,7 @@ func buildGainsBucketColumnRegistry(outCcy, period string, grain gold.GainsGrain
 		countCol("sells", func(r row) int64 { return r.Sells }),
 		countCol("positions", func(r row) int64 { return r.Positions }),
 		countCol("positions_without_basis", func(r row) int64 { return r.PositionsWithoutBasis }),
-		col{Name: "basis_coverage", Header: "basis_coverage_pct", Align: output.AlignRight,
-			Extract: func(r row) string { return formatPctOrBlank(r.BasisCoverage) }},
+		ratioOrBlankCol("basis_coverage", "basis_coverage_pct", func(r row) *float64 { return r.BasisCoverage }),
 		col{Name: "quality", Align: output.AlignLeft, Extract: func(r row) string { return r.Quality }},
 	)
 }
@@ -295,8 +294,7 @@ func buildGainsPositionColumnRegistry(outCcy string, kindOf func(string) string)
 		outCcyCol("unrealized_change", outCcy, func(r row) *string { return r.UnrealizedChange }),
 		outCcyCol("realized", outCcy, func(r row) *string { return r.Realized }),
 		outCcyCol("gain", outCcy, func(r row) *string { return r.Gain }),
-		{Name: "unrealized_pct", Align: output.AlignRight,
-			Extract: func(r row) string { return formatPctOrBlank(r.UnrealizedRatio) }},
+		ratioOrBlankCol("unrealized_pct", "", func(r row) *float64 { return r.UnrealizedRatio }),
 		textCol("basis_stamp", func(r row) *string { return r.BasisStamp }),
 		asDate(textCol("acquisition_date", func(r row) *string { return r.AcquisitionDate })),
 		countCol("lots", func(r row) int64 { return r.OpenLots }),
@@ -398,8 +396,7 @@ func buildOpenLotColumnRegistry(outCcy string, kindOf func(string) string) []col
 		moneyCol("market_value", "", func(r row) *string { return r.MarketValue }),
 		textCol("value_origin", func(r row) *string { return r.ValueOrigin }),
 		moneyCol("unrealized_gain", "", func(r row) *string { return r.UnrealizedGain }),
-		{Name: "unrealized_pct", Align: output.AlignRight,
-			Extract: func(r row) string { return formatPctOrBlank(r.UnrealizedRatio) }},
+		ratioOrBlankCol("unrealized_pct", "", func(r row) *float64 { return r.UnrealizedRatio }),
 		{Name: "currency", Align: output.AlignLeft, Extract: func(r row) string { return r.Currency }},
 		outCcyTwin("cost_basis", outCcy, func(r row) *string { return r.BookValueOutCcy }),
 		outCcyCol("value", outCcy, func(r row) *string { return r.ValueOutCcy }),
@@ -429,8 +426,7 @@ func buildGainsCoverageColumnRegistry(outCcy string, kindOf func(string) string)
 		textCol("tax_wrapper", func(r row) *string { return r.TaxWrapper }),
 		outCcyCol("value", outCcy, func(r row) *string { return r.Value }),
 		outCcyCol("value_with_basis", outCcy, func(r row) *string { return r.ValueWithBasis }),
-		{Name: "basis_coverage", Header: "basis_coverage_pct", Align: output.AlignRight,
-			Extract: func(r row) string { return formatPctOrBlank(r.BasisCoverage) }},
+		ratioOrBlankCol("basis_coverage", "basis_coverage_pct", func(r row) *float64 { return r.BasisCoverage }),
 		textCol("basis_stamps", func(r row) *string { return r.BasisStamps }),
 		countCol("open_lots", func(r row) int64 { return r.OpenLots }),
 		countCol("sells", func(r row) int64 { return r.Sells }),
@@ -537,9 +533,10 @@ Flags
                   wealthdb help filter lists the operators
   -x CCY          output currency (default: config.default_currency)
   -p              redact account ids, quantities and amounts; every name
-                  a person typed prints as a pseudonym, such as manual-1,
-                  or as a redacted id; percentages, stamps, dates and
-                  security names stay legible
+                  a person typed about an account prints as a pseudonym,
+                  such as manual-1, or as a redacted id; percentages,
+                  stamps, dates and holding names stay legible, and an
+                  id typed into a manual holding's name or key masks
 
 Notes
   gain = realized + unrealized_change. A sale moves gain from unrealized

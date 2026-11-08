@@ -38,8 +38,9 @@ func buildColumnRegistry(outCcy string, kindOf func(string) string, categories t
 	}
 	// position_key is the gold-side instrument identifier (CUSIP /
 	// ISIN / ticker); a public one stays legible under -p / --privacy,
-	// and a manual holding's key redacts as an id (holdingCols). See
-	// columns.go for the per-class contract.
+	// a manual holding's key redacts as an id, and an id typed into its
+	// name masks (holdingCols).
+	// See columns.go for the per-class contract.
 	key, name := holdingCols(kindOf, func(r gold.PositionRow) string { return r.SilverSourceID },
 		func(r gold.PositionRow) string { return r.PositionKey }, func(r gold.PositionRow) string { return strOrEmpty(r.Name) })
 	return []columnSpec[gold.PositionRow]{
@@ -77,8 +78,7 @@ func buildColumnRegistry(outCcy string, kindOf func(string) string, categories t
 		outCcyTwin("cost_basis", outCcy, func(r gold.PositionRow) *string { return r.BookValueOutCcy }),
 		moneyCol("unrealized_gain", "", func(r gold.PositionRow) *string { return r.UnrealizedGain }),
 		outCcyTwin("unrealized_gain", outCcy, func(r gold.PositionRow) *string { return r.UnrealizedOutCcy }),
-		{Name: "unrealized_pct", Align: output.AlignRight,
-			Extract: func(r gold.PositionRow) string { return formatPctOrBlank(r.UnrealizedRatio) }},
+		ratioOrBlankCol("unrealized_pct", "", func(r gold.PositionRow) *float64 { return r.UnrealizedRatio }),
 		textCol("basis_stamp", func(r gold.PositionRow) *string { return r.BasisStamp }),
 		quantityCol("quantity_without_basis", func(r gold.PositionRow) *string { return r.QuantityWithoutBasis }),
 		asDate(textCol("acquisition_date", func(r gold.PositionRow) *string { return r.AcquisitionDate })),
@@ -141,8 +141,10 @@ Flags:
                            wealthdb help filter lists the operators
   -x, --currency CCY       output currency for the value column (default: config.default_currency)
   -p, --privacy            redact account IDs, share quantities, and monetary amounts;
-                           every name a person typed prints as a pseudonym, such as
-                           manual-1, or as a redacted ID
+                           every name a person typed about an account prints as a
+                           pseudonym, such as manual-1, or as a redacted ID; holding
+                           names stay, and an ID typed into a manual holding's name
+                           or key masks
                            (table: visible placeholders; csv: empty cells; json: keys omitted)
       --with-cash          also emit one row per account+currency with non-zero cash
       --missing-basis M    ignore (default) | zero: how a missing cost basis counts;
