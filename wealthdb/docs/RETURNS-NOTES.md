@@ -375,6 +375,48 @@ macro of its own:
   It is the closure mirror of an inception anchor: the track record ends
   at a real, dated zero.
 
+## Post-exit residue
+
+An entity can sell nearly everything and keep a small residue, on which
+the sold positions' last income lands weeks later. Against so small a
+base, that income reads as a gain of many thousand percent, and one such
+sub-period would carry the whole chain.
+
+- **An exit** is a sub-period, or a run of them, after which the value
+  left is below 1% of the value before it, outflows having taken at
+  least 90% of that value. The value left makes the test robust to fees
+  and to rates: the outflows of a sale can come to less than its value.
+  The outflow floor keeps a write-off, value lost with no outflow, a
+  loss.
+- **A run** is consecutive sub-periods that each move money out, or move
+  none. It holds the opening value of the first plus the run's inflows.
+  A sub-period with a net inflow ends it. So a sale spread over several
+  days is one exit. A sub-period is measured alone as well, so a run
+  that opened higher cannot hide an exit.
+- **The residue** is every later sub-period that opens below 1% of the
+  value before the exit. Each adds nothing to the chain. The first
+  sub-period that opens at 1% or more, after new money say, ends the
+  rule, and the chain runs as before.
+- The summary row then carries `post_exit_residue`. The income still
+  counts in `gain` and in MWR, which read the window's own values and
+  flows.
+- **One decision, in USD.** Flows convert at their own day's rate and
+  values at the valuation's, so a share near a threshold can fall on
+  either side of it in another currency. Which sub-periods are residue
+  is decided in USD, the engine's canonical currency, on the accounts'
+  USD figures, and every reporting currency leaves out the same ones and
+  carries the same tag. Where the USD figures cannot be loaded, the
+  reporting currency decides alone.
+- The two shares are `residueShare` (1%) and `exitOutflowShare` (90%),
+  beside `residueCurrency`, in `internal/gold/returns_compute.go`.
+
+A known edge: a withdrawal of 90% and a market fall that leave less
+than 1% read as an exit, within one sub-period or across a run. A small
+first value that grows has no exit before it, and a partial withdrawal
+that leaves 1% or more is no exit. The rule reads the same at every
+grain and in every window. Guards: `TestPostExitResidue`,
+`TestPostExitResidueValueLeft`, `TestPostExitResidueSameInEveryCurrency`.
+
 ## Staggered-inception subsumption
 
 *(referenced by DESIGN.md §10.9)* At coarse grains a constituent that
@@ -544,7 +586,7 @@ every approximation is tagged. Computed set:
 `dropped_while_nonzero`, `dietz_degenerate`, `nonpositive_base`,
 `mwr_no_flows`, `mwr_no_sign_change`, `mwr_nonunique`,
 `mwr_no_converge`, `mwr_incomplete_flows`, `mwr_negative_net_capital`,
-`unmatched_transfers=N`, `cross_source_netted=N`, `journal_present`,
+`unmatched_transfers=N`, `cross_source_netted=N`, `post_exit_residue`, `journal_present`,
 `nav_only`, `nav_only_capital_call_risk`, `crypto_unclassified_transfers`,
 `unknown_adapter_policy`, `fx_clamped_flow`, `pre_fx_history`,
 `flows_before_inception`, `after_tax`.
@@ -552,6 +594,9 @@ every approximation is tagged. Computed set:
 A benchmark's figures have flags of their own ("Benchmarks" below):
 `benchmark_gap`, `benchmark_partial_period`, `benchmark_start_clipped`,
 `benchmark_end_clipped`, `benchmark_no_overlap` and `shadow_nonpositive`.
+
+`post_exit_residue` marks a summary row whose chain left out sub-periods on
+the residue of an exit ("Post-exit residue").
 
 `configured_inception` marks a window truncated to a configured
 inception override (DESIGN.md §5.4) rather than the data's own start.

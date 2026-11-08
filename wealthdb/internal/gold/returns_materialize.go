@@ -373,6 +373,11 @@ func loadReturnsDatasetsMulti(ctx context.Context, db *sql.DB, fx fxBounds, ov m
 		ds.finalize()
 		out[ccy] = ds
 	}
+	for ccy, ds := range out {
+		if dec := out[residueCurrency]; dec != nil && ccy != residueCurrency {
+			linkResidueTwins(ds, dec)
+		}
+	}
 	return out, nil
 }
 

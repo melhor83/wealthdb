@@ -98,7 +98,8 @@ func computeEntityReturn(assets []*accountData, p ReturnParams, toDay int64, fx 
 	}
 
 	// Since-inception summary row, cumulative TWR pinned to the canonical bucket.
-	sr := summaryRow(base, winFrom, winTo, av, flows, rolled, snaps, assets, p, entityQ)
+	skips := residueDecision(assets, p, winFrom, winTo, aggregate, canonicalChainBounds(winFrom, winTo, snaps), av, flows, rolled)
+	sr := summaryRow(base, winFrom, winTo, av, flows, rolled, snaps, skips, assets, p, entityQ)
 	if staleAt(snaps, winTo, snapGap, snapGapOK) {
 		sr.Quality = append(sr.Quality, "stale_snapshot")
 	}
@@ -198,7 +199,7 @@ func preFxHistory(assets []*accountData, outCcy string, winFrom int64, fx fxBoun
 	return false
 }
 
-func summaryRow(base ReturnRow, winFrom, winTo int64, av func(int64) (float64, bool), flows, rolled []returns.Flow, snaps []int64, assets []*accountData, p ReturnParams, entityQ []string) ReturnRow {
+func summaryRow(base ReturnRow, winFrom, winTo int64, av func(int64) (float64, bool), flows, rolled []returns.Flow, snaps []int64, skips []bool, assets []*accountData, p ReturnParams, entityQ []string) ReturnRow {
 	r := base
 	r.Period, r.IsSummary = summaryLabel(winFrom, winTo), true
 	v0, _ := av(winFrom)
@@ -217,15 +218,17 @@ func summaryRow(base ReturnRow, winFrom, winTo int64, av func(int64) (float64, b
 	bounds := canonicalChainBounds(winFrom, winTo, snaps)
 	unvalued := unvaluedAt(bounds, rolled)
 	var buckets []returns.Bucket
-	degenerate := false
+	degenerate, skipped := false, false
 	for i := 0; i+1 < len(bounds); i++ {
 		bv0, _ := av(bounds[i])
 		bv1, _ := av(bounds[i+1])
 		bv0, bv1 = bv0+unvalued[i], bv1+unvalued[i+1]
 		bf := flowsIn(flows, bounds[i], bounds[i+1])
-		// An entity that holds nothing and moves nothing has no return to chain:
-		// a closed account's later zero valuations leave the chain where it ended.
-		if math.Abs(bv0) <= valueTol && math.Abs(bv1) <= valueTol && len(bf) == 0 {
+		if emptySubPeriod(bv0, bv1, bf) {
+			continue
+		}
+		if skips[i] {
+			skipped = true
 			continue
 		}
 		rr, ok := returns.ModifiedDietz(bv0, bv1, bounds[i], bounds[i+1], bf)
@@ -233,6 +236,9 @@ func summaryRow(base ReturnRow, winFrom, winTo int64, av func(int64) (float64, b
 		if !ok {
 			degenerate = true
 		}
+	}
+	if skipped {
+		q = append(q, "post_exit_residue")
 	}
 	if p.Method == "twr" || p.Method == "both" {
 		if cum, ok := returns.Chain(buckets); ok {
@@ -253,6 +259,121 @@ func summaryRow(base ReturnRow, winFrom, winTo int64, av func(int64) (float64, b
 
 	r.Quality = dedupeStrings(q)
 	return r
+}
+
+// The post-exit residue rule (RETURNS-NOTES, "Post-exit residue"). An exit is
+// a sub-period, or a run of them, after which the value left is below
+// residueShare of the value before it, outflows having taken at least
+// exitOutflowShare of that value. The residue is every later sub-period that
+// opens below residueShare of it. Which sub-periods are residue is decided in
+// residueCurrency alone and applied in every reporting currency: flows and
+// values convert at their own days' rates, so a share near a threshold could
+// fall on either side of it in another currency.
+const (
+	residueShare     = 0.01
+	exitOutflowShare = 0.90
+	residueCurrency  = "USD"
+)
+
+// emptySubPeriod reports a chain sub-period in which the entity holds nothing
+// and moves nothing: it has no return to chain, so a closed account's later
+// zero valuations leave the chain where it ended.
+func emptySubPeriod(v0, v1 float64, flows []returns.Flow) bool {
+	return math.Abs(v0) <= valueTol && math.Abs(v1) <= valueTol && len(flows) == 0
+}
+
+// residueSkips is, for each sub-period between bounds, whether it sits on the
+// residue of an exit, read from the entity's value av, its moves rolled and
+// its flows.
+func residueSkips(bounds []int64, av func(int64) (float64, bool), rolled, flows []returns.Flow) []bool {
+	unvalued := unvaluedAt(bounds, rolled)
+	skips := make([]bool, len(bounds))
+	var w exitWatch
+	for i := 0; i+1 < len(bounds); i++ {
+		bv0, _ := av(bounds[i])
+		bv1, _ := av(bounds[i+1])
+		bv0, bv1 = bv0+unvalued[i], bv1+unvalued[i+1]
+		bf := flowsIn(flows, bounds[i], bounds[i+1])
+		if !emptySubPeriod(bv0, bv1, bf) {
+			skips[i] = w.residue(bv0, bv1, bf)
+		}
+	}
+	return skips
+}
+
+// residueDecision is residueSkips read in residueCurrency, on the accounts'
+// twins there: every reporting currency applies what that currency decides. A
+// dataset in residueCurrency is its own twin. An account with no twin, where
+// that currency's dataset could not be loaded, leaves the reporting currency
+// to decide alone.
+func residueDecision(assets []*accountData, p ReturnParams, winFrom, winTo int64, aggregate bool,
+	bounds []int64, av func(int64) (float64, bool), flows, rolled []returns.Flow) []bool {
+	if p.OutCcy == residueCurrency {
+		return residueSkips(bounds, av, rolled, flows)
+	}
+	twins := make([]*accountData, len(assets))
+	for i, a := range assets {
+		if twins[i] = a.twin; twins[i] == nil {
+			return residueSkips(bounds, av, rolled, flows)
+		}
+	}
+	q := p
+	q.OutCcy = residueCurrency
+	tflows, _, trolled := entityFlows(twins, q, winFrom, winTo, aggregate)
+	return residueSkips(bounds, entityValue(twins), trolled, tflows)
+}
+
+// exitWatch follows a chain's sub-periods in order and says which sit on the
+// residue of an exit, so they add nothing to the chain. A run is consecutive
+// sub-periods that each move money out, or move none; it holds the opening
+// value of its first plus its inflows, and a sub-period with a net inflow ends
+// it. A sale spread over several days is one exit. A sub-period is also
+// measured alone, so a run that opened higher cannot hide an exit.
+type exitWatch struct {
+	running      bool
+	held, out    float64 // the run's opening value plus its inflows, and its outflows
+	residueBelow float64 // > 0 after an exit: the opening value below which a sub-period is residue
+}
+
+// residue reports whether the sub-period from v0 to v1 with flows sits on an
+// exit's residue, and otherwise records it towards the next exit.
+func (w *exitWatch) residue(v0, v1 float64, flows []returns.Flow) bool {
+	if w.residueBelow > 0 {
+		if v0 < w.residueBelow {
+			return true
+		}
+		w.residueBelow = 0
+	}
+	var in, out float64
+	for _, f := range flows {
+		if f.Amount > 0 {
+			in += f.Amount
+		} else {
+			out -= f.Amount
+		}
+	}
+	if in > out {
+		w.running = false
+		return false
+	}
+	if !w.running {
+		w.running, w.held, w.out = true, v0, 0
+	}
+	w.held += in
+	w.out += out
+	exit := func(held, out float64) bool {
+		return held > valueTol && v1 < residueShare*held && out >= exitOutflowShare*held
+	}
+	switch {
+	case exit(w.held, w.out):
+		w.residueBelow = residueShare * w.held
+	case exit(v0+in, out):
+		w.residueBelow = residueShare * (v0 + in)
+	default:
+		return false
+	}
+	w.running = false
+	return false
 }
 
 func computeMWR(v0, v1 float64, winFrom, winTo int64, flows []returns.Flow, assets []*accountData, p ReturnParams, q []string) (*float64, *float64, []string) {

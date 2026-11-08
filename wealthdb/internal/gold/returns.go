@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/lots"
@@ -261,6 +262,27 @@ type returnsDataset struct {
 	holdings  *holdingsSpine
 	fx        fxBounds
 	globalMax int64 // spine's latest emitted day across all accounts (≈ today)
+
+	// twins loads the residueCurrency dataset and links each account to its
+	// twin there, once, for a dataset in another currency (residueDecision).
+	twins func()
+}
+
+// linkResidueTwins links each account of ds to the same account in dec, the
+// residueCurrency dataset.
+func linkResidueTwins(ds, dec *returnsDataset) {
+	for k, a := range ds.accts {
+		a.twin = dec.accts[k]
+	}
+}
+
+// ensureTwins links ds to its residueCurrency twins when it has a loader for
+// them. A load that fails leaves them unlinked, and the reporting currency
+// then decides the residue alone.
+func (ds *returnsDataset) ensureTwins() {
+	if ds.twins != nil {
+		ds.twins()
+	}
 }
 
 // holdingsSpine is what the value spine holds beyond the returns engine's
@@ -290,6 +312,13 @@ func loadReturnsDataset(ctx context.Context, db *sql.DB, outCcy string, fx fxBou
 	}
 	ds := &returnsDataset{accts: accts, holdings: holdings, fx: fx}
 	ds.finalize()
+	if outCcy != residueCurrency {
+		ds.twins = sync.OnceFunc(func() {
+			if dec, err := loadReturnsDataset(ctx, db, residueCurrency, fx, ov, tm); err == nil {
+				linkResidueTwins(ds, dec)
+			}
+		})
+	}
 	return ds, nil
 }
 
@@ -329,6 +358,7 @@ func computeReturns(ds *returnsDataset, p ReturnParams) []ReturnRow {
 		toDay = ds.globalMax
 	}
 
+	ds.ensureTwins()
 	groups, order := groupAccounts(p.Level, ds.accts, p.ReturnsExclude)
 	var out []ReturnRow
 	for _, key := range order {
@@ -472,6 +502,10 @@ type accountData struct {
 	// so per-window liveness checks resolve a partner leg's slice in O(1).
 	crossLinks      map[string]crossLink
 	transferLikeIDs map[string]bool
+
+	// twin is the same account in residueCurrency's dataset, nil where the
+	// dataset is that currency's or none is linked (linkResidueTwins).
+	twin *accountData
 }
 
 // crossLink identifies the counterparty leg of a cross-source-matched
