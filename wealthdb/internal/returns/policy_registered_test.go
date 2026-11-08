@@ -23,6 +23,7 @@ import (
 	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/cointracking"
 	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/curves"
 	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/equityzen"
+	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/erstebank_at"
 	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/fidelity"
 	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/firstcitizens"
 	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/fred"
@@ -165,7 +166,7 @@ func TestRegisteredFlowPolicies(t *testing.T) {
 	// The cash-conduit deposit banks: complete ledgers on the shared bank set,
 	// but the accounts are pure plumbing — no rows of their own anywhere,
 	// values and flows still aggregate.
-	for _, k := range []string{"chase", "firstcitizens", "raiffeisen_at"} {
+	for _, k := range []string{"chase", "erstebank_at", "firstcitizens", "raiffeisen_at"} {
 		rp, _ := returns.ReturnsPolicyFor(k)
 		if !rp.Flow.Known {
 			t.Errorf("%s: policy must be Known (registered)", k)
