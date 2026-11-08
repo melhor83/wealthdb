@@ -20,9 +20,10 @@ connection flags.
    (`wealthdb -r holdings global`); an `-r` after `transactions` or
    `gains realized` means newest first instead.
 2. **One figure for a whole window: `--period total`.** The default is
-   one row per month (per quarter for `returns`); never add rows up
-   yourself. Income's forward views and `cashflow projection` refuse it
-   and print a `total` row already; `cashflow sankey` takes no `--period`.
+   one row per month (per quarter for `returns`; `spending fees` gives
+   the whole window); never add rows up yourself. Income's forward views
+   and `cashflow projection` refuse it and print a `total` row already;
+   `cashflow sankey` takes no `--period`.
 3. **Row filters: `-F "column op value"`**, once per condition, every one
    holding (`-F "tax_wrapper = roth_ira" -F "value > 100000"`) on any
    column the view has. `wealthdb -r help filter` lists the operators.
@@ -175,9 +176,10 @@ series instead.
 Every other command takes the window as positionals, never `-d`: `2026`,
 `2026-06`, `2026-06-15`, `2026-01-01 2026-06-30`, `2026-01-01 -` (to
 today), `- 2026-06-30` (from the start), `- today` (all time). Defaults:
-`transactions` the past 30 days; `returns` since the first snapshot; the
-rest the trailing twelve months. Resolve "last year" and "this year" from
-today's date (`2025`, `2026-01-01 today`).
+`transactions` the past 30 days; `returns` since the first snapshot;
+`status --marks` every month end; the rest the trailing twelve months.
+Resolve "last year" and "this year" from today's date (`2025`,
+`2026-01-01 today`).
 
 Income's forward views (`projection`, `calendar`, `sources`, `portfolios`,
 `accounts`, `positions`) and `cashflow projection` take a window that may

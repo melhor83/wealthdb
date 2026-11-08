@@ -146,10 +146,10 @@ Fourteen tools, every parameter optional:
 | `exposure` | what is really owned once every fund is looked through, by class, sector, country, currency, credit, maturity and issuer; and where each holding legally sits |
 | `yield` | what the holdings earn, and how they move with interest rates, on a date |
 | `transactions` | the individual booked lines over a window |
-| `spending` | what was spent, on what |
+| `spending` | what was spent, on what, and what each portfolio paid in fees (`view: fees`) |
 | `income` | what was received, from whom, and what the holdings are expected to pay |
 | `cashflow` | where the cash came from and went |
-| `status`, `snapshots` | whether the data is current, and which dates it covers |
+| `status`, `snapshots` | whether the data is current, how far a month's return can be trusted (`marks`), and which dates it covers |
 | `resolutions`, `categorizations` | the stored ticker and category answers |
 | `describe` | help on any tool, column or term |
 

@@ -105,6 +105,8 @@ On the host:
 $XDG_DATA_HOME/wealthdb/web/
 ├── metabase/                  # Metabase's H2 metadata DB (dashboards, users)
 ├── snapshot/wealthdb.db       # read-only gold snapshot Metabase serves
+├── spill/                     # DuckDB spill space for capped queries
+├── source-colors.json         # each source's chart colour, kept across refreshes
 └── admin-password.txt         # generated admin password (chmod 600), unless set via env
 ```
 

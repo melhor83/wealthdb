@@ -28,6 +28,7 @@ import math
 import os
 import re
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import provision as p                                   # noqa: E402
@@ -3272,6 +3273,13 @@ check("the fee rate is the CLI's: fees over the summed daily value, on 365 days,
       "CASE WHEN value_days > 0 THEN 100 * fees * 365 / value_days END AS fee_rate_pct" in _rate)
 check("...beside the monthly returns chained in the picked currency",
       "exp(sum(ln(1 + twr))) - 1" in _rate and "currency = {{currency}}" in _rate)
+# The groups are gold's fee_group values: a group gold adds and the
+# tiles leave out would drop out of the stacked bars, so the bars would
+# stop summing to the fees.
+_fee_groups = set(re.findall(r"(?:THEN|ELSE) '(\w+)'", _latest_definition("fee_group")))
+check("the fee tiles' groups are the values of gold's fee_group",
+      bool(_fee_groups) and set(p.FEE_GROUP_COLORS) == _fee_groups, (sorted(p.FEE_GROUP_COLORS), sorted(_fee_groups)))
+check("...each with a title", list(p.FEE_GROUP_TITLES) == list(p.FEE_GROUP_COLORS))
 
 _mark = next(t for t in p.base_dashboards()["Data Freshness"][2] if t[0] == "Mark age")
 check("Mark age is on Data Freshness, and its twin shows the same card",
@@ -5065,6 +5073,127 @@ if duckdb is not None:
     check("...the unrealized gain's the gain at the window's end over the cost basis held there",
           _near(_run("Unrealized gain (privacy)")[0][0], 300 / 1000), _run("Unrealized gain (privacy)"))
 
+if duckdb is not None:
+    section("the cash flow statement and the fee tiles, run on invented rows")
+
+    # Two months of every section, in dollars: January nets 100, February
+    # 400. Its gross movement by statement section is 700 in January
+    # (400 operating, 300 investing) and 600 in February.
+    _cf = duckdb.connect()
+    _cf.execute("CREATE TABLE web_cashflow (occurred_at TIMESTAMP, silver_source_id TEXT, section TEXT,"
+                " value_usd DOUBLE, value_chf DOUBLE, value_eur DOUBLE, value_gbp DOUBLE)")
+    _cf.executemany("INSERT INTO web_cashflow VALUES (?, 'src-1', ?, ?, 0, 0, 0)", [
+        ("2026-01-05", "operating_in", 1000.0), ("2026-01-20", "operating_out", -600.0),
+        ("2026-01-25", "investing", -300.0), ("2026-02-05", "operating_in", 1000.0),
+        ("2026-02-10", "operating_out", -700.0), ("2026-02-12", "financing", -100.0),
+        ("2026-02-20", "investing", 200.0)])
+
+    def _statement(name, **values):
+        """(month, series) -> value of a statement card on the rows."""
+        return {(r[0].strftime("%Y-%m"), r[1]): r[2]
+                for r in _cf.execute(_render(CARDS[name][2], values)).fetchall()}
+
+    def _net(rows):
+        return {m: v for (m, s), v in rows.items() if s == p.NET_CASH_FLOW}
+
+    _st, _st_inv = _statement("Cash flow statement by month"), _statement("Cash flow statement by month",
+                                                                          section=["investing"])
+    check("the statement's net is each month's net cash flow",
+          _net(_st) == {"2026-01": 100, "2026-02": 400}
+          and _st[("2026-01", "operating")] == 400 and _st[("2026-02", "financing")] == -100, _st)
+    check("...and a picked Section narrows the bars, never the net",
+          _net(_st_inv) == _net(_st)
+          and {k: v for k, v in _st_inv.items() if k[1] != p.NET_CASH_FLOW}
+          == {("2026-01", "investing"): -300, ("2026-02", "investing"): 200}, _st_inv)
+    _tw = "Cash flow statement by month (privacy)"
+    _tw_all, _tw_inv = _statement(_tw), _statement(_tw, section=["investing"])
+    check("on the twin each figure is the base's over the biggest month's gross movement",
+          _tw_all.keys() == _st.keys() and all(_near(_tw_all[k], _st[k] * 100 / 700) for k in _st), _tw_all)
+    check("...and a picked Section narrows its bars alone too",
+          _tw_inv.keys() == _st_inv.keys() and all(_near(_tw_inv[k], _st_inv[k] * 100 / 700) for k in _st_inv),
+          _tw_inv)
+
+    # The fee lines of three entities over January and February 2026:
+    # - src-a's portfolio Growth, on a brokerage and a cash account: an
+    #   investment fee of 30, a bank fee of 12 and a refund of 2 on the
+    #   cash account, 40 in all; a value of 10,000 and 2,000 at each month
+    #   end; returns of 2% and 3% in dollars, 1% and -1% in francs, on
+    #   each of its accounts;
+    # - src-b's account Everyday: an ATM fee of 5 and another of 3; 1,000
+    #   at each month end; 1% in dollars in January;
+    # - src-b's account Savings: a value, no fee line.
+    # A franc is 0.8 of each dollar figure.
+    _fees = duckdb.connect()
+    _fees.execute("CREATE TABLE web_fees (day TIMESTAMP, line TEXT, silver_source_id TEXT, account_label TEXT,"
+                  " entity_key TEXT, entity_kind TEXT, entity TEXT, fee_group TEXT, currency TEXT,"
+                  " value_usd DOUBLE, value_chf DOUBLE, value_eur DOUBLE, value_gbp DOUBLE, twr DOUBLE)")
+    _broker, _cash = ("src-a", "Broker (src-a brokerage)", "a-p", "portfolio", "Growth"), \
+        ("src-a", "Cash (src-a checking)", "a-p", "portfolio", "Growth")
+    _everyday = ("src-b", "Everyday (src-b checking)", "b-a", "account", "Everyday")
+    _savings = ("src-b", "Savings (src-b savings)", "c-a", "account", "Savings")
+
+    def _line(day, line, who, group=None, ccy=None, usd=None, twr=None):
+        return (day, line, *who, group, ccy, usd, None if usd is None else usd * 0.8, 0, 0, twr)
+
+    _fee_rows = [_line("2026-01-10", "fee", _broker, "investment", usd=30.0),
+                 _line("2026-01-15", "fee", _cash, "bank", usd=12.0),
+                 _line("2026-02-03", "fee", _cash, "bank", usd=-2.0),
+                 _line("2026-01-20", "fee", _everyday, "atm", usd=5.0),
+                 _line("2026-02-14", "fee", _everyday, "atm", usd=3.0)]
+    for _day in ("2026-01-31", "2026-02-28"):
+        _fee_rows += [_line(_day, "value", _broker, usd=10000.0), _line(_day, "value", _cash, usd=2000.0),
+                      _line(_day, "value", _everyday, usd=1000.0), _line(_day, "value", _savings, usd=5000.0)]
+    for _day, _usd, _chf in (("2026-01-31", 0.02, 0.01), ("2026-02-28", 0.03, -0.01)):
+        _fee_rows += [_line(_day, "return", w, ccy=c, twr=t) for w in (_broker, _cash)
+                      for c, t in (("USD", _usd), ("CHF", _chf))]
+    _fee_rows.append(_line("2026-01-31", "return", _everyday, ccy="USD", twr=0.01))
+    _fees.executemany("INSERT INTO web_fees VALUES (" + ", ".join("?" * 14) + ")", _fee_rows)
+
+    def _fee_card(name, **values):
+        return _fees.execute(_render(CARDS[name][2], values)).fetchall()
+
+    _jan = ["2026-01-01", "2026-01-31"]
+    check("the fees by portfolio sum each group, a refund netted, an entity with no fee left out",
+          _fee_card("Fees by portfolio") == [("Growth (src-a portfolio)", 30, 10, 0, 0),
+                                             ("Everyday (src-b account)", 0, 0, 8, 0)],
+          _fee_card("Fees by portfolio"))
+    check("...each entity named with its source and kind, as the account tiles name an account",
+          [r[0] for r in _fee_card("Fee rate by portfolio")] == ["Growth (src-a portfolio)",
+                                                                  "Everyday (src-b account)"])
+    _r = {r[0]: r[1:] for r in _fee_card("Fee rate by portfolio")}
+    check("the fee rate is the fees over the summed daily value, on 365 days, beside the mean value",
+          _r["Growth (src-a portfolio)"][0] == 12000 and _near(_r["Growth (src-a portfolio)"][1], 40 * 36500 / 24000)
+          and _near(_r["Everyday (src-b account)"][1], 8 * 36500 / 2000), _r)
+    check("...and the return chains the months of the picked currency, each month once",
+          _near(_r["Growth (src-a portfolio)"][2], (1.02 * 1.03 - 1) * 100)
+          and _near(_r["Everyday (src-b account)"][2], 1.0), _r)
+    _chf = {r[0]: r[1:] for r in _fee_card("Fee rate by portfolio", currency="CHF")}
+    check("...in francs the francs' returns, blank where an entity has none",
+          _near(_chf["Growth (src-a portfolio)"][2], (1.01 * 0.99 - 1) * 100)
+          and _chf["Everyday (src-b account)"][2] is None
+          and _near(_chf["Growth (src-a portfolio)"][1], 40 * 36500 / 24000), _chf)
+    _acct = _fee_card("Fee rate by portfolio", account=["Cash (src-a checking)"])
+    check("a picked account narrows the fees and the value, never the return",
+          len(_acct) == 1 and _acct[0][1] == 2000 and _near(_acct[0][2], 10 * 36500 / 4000)
+          and _near(_acct[0][3], (1.02 * 1.03 - 1) * 100), _acct)
+    check("a picked source keeps its entities alone",
+          [r[0] for r in _fee_card("Fees by portfolio", source=["src-b"])] == ["Everyday (src-b account)"])
+    _jr = {r[0]: r[1:] for r in _fee_card("Fee rate by portfolio", time_range=_jan)}
+    check("a picked window keeps its fees, values and month ends",
+          _jr["Growth (src-a portfolio)"][0] == 12000
+          and _near(_jr["Growth (src-a portfolio)"][1], 42 * 36500 / 12000)
+          and _near(_jr["Growth (src-a portfolio)"][2], 2.0), _jr)
+    _tg = _fee_card("Fees by portfolio (privacy)")
+    check("the twin names an entity by its source, kind and rank, its groups shares of the fees",
+          [r[0] for r in _tg] == ["src-a / portfolio 1", "src-b / account 1"]
+          and _near(sum(sum(r[1:]) for r in _tg), 100) and _near(_tg[0][1], 30 * 100 / 48), _tg)
+    _tr = _fee_card("Fee rate by portfolio (privacy)")
+    check("...its fees shares that sum to 100, beside the same rates and returns",
+          _near(sum(r[1] for r in _tr), 100) and _near(_tr[0][1], 40 * 100 / 48)
+          and all(_near(t[2], b[1]) and _near(t[3], b[2]) for t, b in zip(_tr, _r.values(), strict=True)), _tr)
+    check("...and with one source picked its entities hold all the fees",
+          _near(_fee_card("Fee rate by portfolio (privacy)", source=["src-b"])[0][1], 100))
+
 section("the benchmarks")
 
 # The small return tiles draw no legend: the benchmark's look is all that
@@ -5241,23 +5370,97 @@ check("...which is the slot the fewest hold, not always the first",
 check("a kept colour outside the palette is assigned anew",
       p.assign_source_colors({"src-a": "#000000"}, ["src-a"]) == {"src-a": _pal[0]})
 
-_tmpdir = __import__("tempfile").mkdtemp()
-_path = os.path.join(_tmpdir, "source-colors.json")
-check("no kept file reads as no assignment", p.load_source_colors(_path) == {})
-p.save_source_colors(_path, _more)
-check("the assignment round-trips through its file", p.load_source_colors(_path) == _more)
-with open(_path, "w") as _f:
-    _f.write("[1, 2]")
-check("a file that is not an object of strings reads as no assignment", p.load_source_colors(_path) == {})
-__import__("shutil").rmtree(_tmpdir)
+with tempfile.TemporaryDirectory() as _tmpdir:
+    _path = os.path.join(_tmpdir, "source-colors.json")
+    check("no kept file reads as no assignment", p.load_source_colors(_path) == {})
+    p.save_source_colors(_path, _more)
+    check("the assignment round-trips through its file", p.load_source_colors(_path) == _more)
+    with open(_path, "w") as _f:
+        _f.write("[1, 2]")
+    check("a file that is not an object of strings reads as no assignment", p.load_source_colors(_path) == {})
+    # A directory in the file's place: the save fails at the rename.
+    _blocked = os.path.join(_tmpdir, "blocked")
+    os.mkdir(_blocked)
+    _err = io.StringIO()
+    with contextlib.redirect_stderr(_err):
+        p.save_source_colors(_blocked, _more)
+    check("a save that fails says so and leaves no file beside it",
+          "could not save" in _err.getvalue() and not os.path.exists(_blocked + ".tmp"), _err.getvalue())
+
+
+def _probe_answer(answer):
+    """A stand-in for provision.req that answers every call with
+    `answer`, (status, body), and the list of paths it was called on."""
+    calls = []
+
+    def fake(_base, path, *_a, **_k):
+        calls.append(path)
+        return answer
+    return fake, calls
+
+
+def _colors_from(answer, path):
+    """source_colors over a probe answering `answer`, and the paths
+    called; provision.req is restored after."""
+    fake, calls = _probe_answer(answer)
+    real, p.req = p.req, fake
+    try:
+        return p.source_colors("b", "s", 1, path), calls
+    finally:
+        p.req = real
+
+
+def _probe(answer):
+    """probe_rows over a stand-in answering `answer`."""
+    fake, _calls = _probe_answer(answer)
+    real, p.req = p.req, fake
+    try:
+        return p.probe_rows("b", "s", 1, "SELECT 1")
+    finally:
+        p.req = real
+
+
+# Metabase answers a failed query with 202 too.
+_FAILED = (202, {"status": "failed", "error": "Binder Error: no such table", "data": {"rows": []}})
+check("a probe reads the rows a query answers, none included",
+      _probe((202, {"status": "completed", "data": {"rows": [[1]]}})) == [[1]]
+      and _probe((202, {"data": {"rows": []}})) == [])
+for _answer, _what in ((_FAILED, "a query that fails"), ((202, {"error": "boom"}), "an error"),
+                       ((500, {}), "a server error")):
+    check(f"{_what} is no answer, never an answer of no rows", _probe(_answer) is None, _probe(_answer))
+
+with tempfile.TemporaryDirectory() as _tmpdir:
+    _path = os.path.join(_tmpdir, "source-colors.json")
+    _got, _calls = _colors_from((202, {"data": {"rows": [["src-b"], ["src-a"], [None]]}}), _path)
+    check("the probe's sources take the slots in the order it lists them, declared last",
+          _got == {"src-b": _pal[0], "src-a": _pal[1], p.DECLARED_SOURCE: _pal[2]}
+          and _calls == ["/api/dataset"], (_got, _calls))
+    check("...and the assignment is kept in the file", p.load_source_colors(_path) == _got)
+    os.utime(_path, (1, 1))
+    _again, _ = _colors_from((202, {"data": {"rows": [["src-a"], ["src-b"]]}}), _path)
+    check("an assignment that does not change is not written again",
+          _again == _got and os.stat(_path).st_mtime == 1, _again)
+    for _answer, _what in ((_FAILED, "a probe whose query fails"), ((500, {}), "a probe that does not answer")):
+        _kept, _ = _colors_from(_answer, _path)
+        check(f"{_what} adds no source, not even declared, and leaves the kept file alone",
+              _kept == _got and os.stat(_path).st_mtime == 1, _kept)
+    _fresh = os.path.join(_tmpdir, "fresh.json")
+    _none, _ = _colors_from(_FAILED, _fresh)
+    check("...and on a first run it gives declared no slot and writes no file",
+          _none == {} and not os.path.exists(_fresh), _none)
+    _unkept, _ = _colors_from((202, {"data": {"rows": [["src-a"]]}}), "")
+    check("with no file named, the colours are assigned and nothing is written",
+          _unkept == {"src-a": _pal[0], p.DECLARED_SOURCE: _pal[1]} and os.listdir(_tmpdir) == ["source-colors.json"],
+          (_unkept, os.listdir(_tmpdir)))
 
 _colors = {"src-a": _pal[0], "src-b": _pal[1]}
 _by_source = {n: v for n, v in VIZ.items()
               if len(v.get("graph.dimensions") or []) == 2 and v["graph.dimensions"][1] in p.SOURCE_SERIES_COLUMNS}
+# DESIGN.md §6 lists them.
 check("the cards that draw a series per source are the ones expected",
-      set(_by_source) >= {"Cumulative return (TWR)", "Monthly returns (TWR)", "Quarterly returns (TWR)",
+      set(_by_source) == {"Cumulative return (TWR)", "Monthly returns (TWR)", "Quarterly returns (TWR)",
                           "Annual returns (TWR)", "Net worth over time", "Net worth over time (privacy)",
-                          "Unrealized gain over time"}, sorted(_by_source))
+                          "Card balances over time (privacy)", "Unrealized gain over time"}, sorted(_by_source))
 _colored = {n: p.with_source_colors(v, _colors) for n, v in _by_source.items()}
 check("each takes every source's colour and the fixed '(all sources)' colour",
       all(c["series_settings"]["src-a"]["color"] == _pal[0] and c["series_settings"]["src-b"]["color"] == _pal[1]
@@ -5278,6 +5481,29 @@ check("a card with no source breakout is left alone",
 check("the '(all sources)' line every per-source card draws carries the fixed label",
       all(p.ALL_SOURCES_SERIES in sql_of(CARDS[n][2]) for n in _by_source
           if n.startswith(("Cumulative", "Monthly", "Quarterly", "Annual", "Unrealized"))))
+
+# The colours reach the payloads ensure_cards saves.
+_saved = {}
+
+
+def _record(_base, _sid, _by_name, payloads, _label):
+    _saved.update(payloads)
+    return {n: i for i, n in enumerate(payloads, start=1)}, len(payloads), 0, 0
+
+
+_real_upsert, p.upsert_cards = p.upsert_cards, _record
+try:
+    with quiet():
+        p.ensure_cards("b", "s", 1, 7, {}, MID, _colors)
+finally:
+    p.upsert_cards = _real_upsert
+_nw = _saved.get("Net worth over time", {}).get("visualization_settings", {}).get("series_settings", {})
+check("ensure_cards saves each per-source card with the sources' colours",
+      _nw.get("src-a", {}).get("color") == _pal[0] and _nw.get("src-b", {}).get("color") == _pal[1]
+      and all(_saved[n]["visualization_settings"]["series_settings"]["src-a"]["color"] == _pal[0]
+              for n in _by_source), _nw)
+check("...and any other card's settings as its definition gives them",
+      all(_saved[n]["visualization_settings"] == VIZ[n] for n in VIZ if n not in _by_source))
 
 
 if FAILS:

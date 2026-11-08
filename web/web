@@ -399,9 +399,10 @@ _gen_password() {
     printf '%sAa1!' "$rand"
 }
 
-# _materialize refreshes the serving tables and the report_returns,
-# report_gains, report_exposure*, report_yield_* and report_cashflow_plan
-# tables in LIVE gold via the engine's hidden web-materialize subcommand,
+# _materialize refreshes the serving tables and the report_returns (with
+# report_bridge and the benchmark tables), report_gains,
+# report_exposure*, report_yield_* and report_cashflow_plan tables in
+# LIVE gold via the engine's hidden web-materialize subcommand,
 # so the snapshot taken next carries them as fresh as the holdings. An
 # engine-owned write, mutually exclusive with `wealthdb load` under the
 # engine's write mutex (a concurrent load makes it fail, not wait); it
@@ -415,7 +416,7 @@ _gen_password() {
 # its inputs did not change, so an unchanged gold keeps its mtime and
 # the snapshot is not copied again.
 _materialize() {
-    echo "web: materializing serving tables, returns, gains, exposure, yield and the cash flow projection into gold …" >&2
+    echo "web: materializing serving tables, returns and the bridge, gains, exposure, yield and the cash flow projection into gold …" >&2
     local log rc=0 cfg=()
     log="$(mktemp "${TMPDIR:-/tmp}/wealthdb-web-materialize.XXXXXX")" || return 1
     trap 'rm -f "$log"; trap - RETURN' RETURN

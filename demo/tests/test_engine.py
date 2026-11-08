@@ -592,15 +592,18 @@ class TestToToday(unittest.TestCase):
     def test_the_vehicles_fee_is_on_the_fee_view_and_not_the_statement(self):
         """The plan's fee is a spending line outside the pool: the fee view
         has it, and the statement does not."""
+        household = spec.load().spec
+        f = household["plan_fee"]
+        (name,) = [a["name"] for src in household["sources"] for a in src["accounts"] if a["id"] == f["account"]]
+        fee = Decimal(f["amount"])
         last = TODAY.year - 1
-        rows = {r["entity"]: r for r in report(self.root, "spending", "fees", str(last), "--period", "total")}
-        self.assertTrue([r for name, r in rows.items() if "401(k) - Sam" in name
-                         and amount(r, "fees_USD") == Decimal("180.00")], rows)
+        rows = report(self.root, "spending", "fees", str(last), "--period", "total")
+        self.assertTrue([r for r in rows if name in r["entity"] and amount(r, "fees_USD") == fee], rows)
         (cat,) = [r for r in report(self.root, "spending", "categories", str(last), "--period", "total")
                   if r["category"] == "Bank fees"]
-        self.assertEqual(sum(amount(r, "fees_USD") for r in rows.values()), amount(cat, "net_spend_USD"))
+        self.assertEqual(sum(amount(r, "fees_USD") for r in rows), amount(cat, "net_spend_USD"))
         (statement,) = report(self.root, "cashflow", "summary", str(last), "--period", "total", "-C", "+fees")
-        self.assertGreaterEqual(amount(cat, "net_spend_USD") - amount(statement, "fees_USD"), Decimal("180.00"))
+        self.assertGreaterEqual(amount(cat, "net_spend_USD") - amount(statement, "fees_USD"), fee)
 
     def test_the_fund_and_the_home_lower_the_marked_share(self):
         rows = report(self.root, "status", "--marks")

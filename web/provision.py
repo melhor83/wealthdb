@@ -15,6 +15,7 @@ and 1 on any other failure.
 """
 import argparse
 import concurrent.futures
+import contextlib
 import json
 import os
 import sys
@@ -853,6 +854,23 @@ BENCHMARK_LINE = {"series_settings": {BENCHMARK_SERIES: {
     "color": BENCHMARK_COLOR, "line.style": "dashed", "line.size": "L", "line.marker_enabled": False}}}
 BENCHMARK_PARAM_ID = "aa5df124"
 
+BENCHMARK_TAG = {"id": "benchmark-tag", "name": "benchmark", "display-name": "Benchmark",
+                 "type": "text", "default": NO_BENCHMARK, "required": True}
+
+EXCESS_CARDS = ("Excess return (TWR)", "Excess return (MWR)", "Excess annualized return (TWR)")
+# The cards that exist only beside a benchmark. Each reads no row under
+# None, and its tile hides then (card.hide_empty), so a dashboard with no
+# benchmark picked reads as it does without them: Metabase closes the gap
+# a hidden tile leaves, wherever the tile sits.
+BENCHMARK_CARDS = {"Benchmark return (TWR)", "Benchmark return (MWR)", "Benchmark annualized return (TWR)",
+                   *EXCESS_CARDS,
+                   "Money-weighted return over time", "Value against the benchmark",
+                   "Largest country deviations"}
+# Those of them a twin reuses as they are: shares and returns, no amount.
+# The others have a privacy card of their own.
+PRIVACY_EXEMPT_CARDS |= BENCHMARK_CARDS - {"Value against the benchmark"}
+
+
 # A source's colour. Metabase colours a series by its place, and changes
 # palette between eight series and nine, so a picked benchmark or a
 # narrowed Source picker would recolour every line. A card that draws a
@@ -916,14 +934,17 @@ def save_source_colors(path, colors):
             f.write("\n")
         os.replace(tmp, path)
     except OSError as e:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
         print(f"provision: could not save {path}: {e}", file=sys.stderr)
 
 
 def source_colors(base, sid, db_id, path):
     """Each source's colour: the kept assignment, with the snapshot's
     sources that hold an account added in the order gold first loaded
-    them. A reference source, such as FX rates, draws no series. A probe that does
-    not answer adds none, and the cards keep the colours already kept."""
+    them, then `declared`. A reference source, such as FX rates, holds
+    no account and draws no series. A probe that does not answer adds
+    none, and the cards keep the colours already kept."""
     kept = load_source_colors(path) if path else {}
     rows = probe_rows(base, sid, db_id,
                       "SELECT silver_source_id FROM silver_sources"
@@ -951,21 +972,7 @@ def with_source_colors(viz, colors):
     for key, value in (viz.get("series_settings") or {}).items():
         settings[key] = {**settings.get(key, {}), **value}
     return {**viz, "series_settings": settings}
-BENCHMARK_TAG = {"id": "benchmark-tag", "name": "benchmark", "display-name": "Benchmark",
-                 "type": "text", "default": NO_BENCHMARK, "required": True}
 
-EXCESS_CARDS = ("Excess return (TWR)", "Excess return (MWR)", "Excess annualized return (TWR)")
-# The cards that exist only beside a benchmark. Each reads no row under
-# None, and its tile hides then (card.hide_empty), so a dashboard with no
-# benchmark picked reads as it does without them: Metabase closes the gap
-# a hidden tile leaves, wherever the tile sits.
-BENCHMARK_CARDS = {"Benchmark return (TWR)", "Benchmark return (MWR)", "Benchmark annualized return (TWR)",
-                   *EXCESS_CARDS,
-                   "Money-weighted return over time", "Value against the benchmark",
-                   "Largest country deviations"}
-# Those of them a twin reuses as they are: shares and returns, no amount.
-# The others have a privacy card of their own.
-PRIVACY_EXEMPT_CARDS |= BENCHMARK_CARDS - {"Value against the benchmark"}
 
 # Denominator-neutral by design: a twin card's own text says what its
 # shares are of (latest total, chosen day's total, peak month, the
@@ -1009,7 +1016,6 @@ def twin_name(column):
     address, which keeps the product name before it. Every twin card
     that shows a position's or a security's name goes through this."""
     return f"regexp_replace({column}, '{ADDRESS_PATTERN}', '')"
-
 
 
 def privacy_name(name):
@@ -1099,8 +1105,8 @@ INVESTING_TAG = {"id": "inv-tag", "name": "investing",
 
 # The gold columns backing the native cards' field filters: the returns
 # charts filter report_returns; every other native card filters the
-# web_* serving views (gold migrations 0032, 0043, 0072, 0084, 0113,
-# 0117, 0127 and 0132). Field ids are per-Metabase-instance (assigned when
+# web_* serving views (each entry names the gold migration that adds
+# it). Field ids are per-Metabase-instance (assigned when
 # the DB syncs), so main() resolves them at provision time into FIELD_IDS,
 # and ensure_synced refuses to build a card while any is missing.
 FILTER_FIELD_COLUMNS = {
@@ -1134,17 +1140,19 @@ FILTER_FIELD_COLUMNS = {
     # cards matching them against vendored values — every tile empty.
     "web_spending": ("occurred_at", "silver_source_id", "account_label",
                      "spend_primary_label"),
-    # The cashflow view. No account column is bound: the Cash Flow
-    # dashboard carries no account picker, because a picker that moved
-    # accounts in and out of the cash pool would turn every crossing it
-    # split into an unexplained disappearance.
+    # The cashflow view (migration 0084). No account column is bound:
+    # the Cash Flow dashboard carries no account picker, because a
+    # picker that moved accounts in and out of the cash pool would turn
+    # every crossing it split into an unexplained disappearance.
     "web_cashflow": ("occurred_at", "silver_source_id", "section"),
-    # The income view. `income_label`, not `income_primary_label`: the
-    # income taxonomy has ONE vendored primary, so a primary-level
-    # dropdown would offer a handful of values and hide every distinction
-    # a reader opens the dashboard to filter by.
+    # The income view (migration 0072). `income_label`, not
+    # `income_primary_label`: the income taxonomy has ONE vendored
+    # primary, so a primary-level dropdown would offer a handful of
+    # values and hide every distinction a reader opens the dashboard to
+    # filter by.
     "web_income": ("occurred_at", "silver_source_id", "account_label",
                    "income_label", "tax_wrapper"),
+    # The card balances, a spending view (migration 0043).
     "web_card_balances_history": ("as_of_day", "silver_source_id",
                                   "account_label"),
     # The gains view (migration 0117). Its currency is a row filter
@@ -1176,7 +1184,8 @@ FILTER_FIELD_COLUMNS = {
     # narrows them to the holdings web_yield selects, an Income card
     # through the views its pickers list (INCOME_PROJECTED_SELECTION).
     "web_yield_parts": (),
-    # The Benchmark picker's values. No field filter binds them.
+    # The Benchmark picker's values (migration 0176). No field filter
+    # binds them.
     "web_benchmarks": (),
     "web_yield_rates": (),
     "web_yield_events": (),
@@ -1197,8 +1206,8 @@ FILTER_FIELD_COLUMNS = {
     "web_bridge": ("month_end",),
     # The fee tiles' lines, values and returns (migration 0177), by day.
     "web_fees": ("day", "silver_source_id", "account_label"),
-    # Each month end's marked share. The Data Freshness dashboard has no
-    # pickers, so no field filter binds it.
+    # Each month end's marked share (migration 0177). The Data Freshness
+    # dashboard has no pickers, so no field filter binds it.
     "web_marks": (),
     # A stock position's size (migration 0154), joined onto the Top 100
     # positions cards by label. No field filter binds it.
@@ -1265,7 +1274,7 @@ def _returns_source_union(granularity, value_col):
         "   WHERE grain = 'sources' AND granularity = '" + granularity + "'\n"
         "     AND NOT is_summary" + RETURNS_CCY_CLAUSE + RETURNS_SOURCE_CLAUSE + "\n"
         "  UNION ALL\n"
-        "  SELECT '(all sources)', currency, end_day, " + value_col + "\n"
+        f"  SELECT '{ALL_SOURCES_SERIES}', currency, end_day, " + value_col + "\n"
         "    FROM report_returns\n"
         "   WHERE grain = 'global' AND granularity = '" + granularity + "'\n"
         "     AND NOT is_summary" + RETURNS_CCY_CLAUSE + "\n"
@@ -1285,7 +1294,7 @@ def returns_period_sql(granularity):
     inconsistency (every chart shows sources and the global line together).
     The benchmark's rows come last: Metabase draws series in the order their
     rows first appear, so its line lies over the sources'. The source breaks
-    a day's ties, so a load keeps each series' place and colour."""
+    a day's ties, so a load keeps each series' place."""
     return ("SELECT source, epoch_ms(end_day * 1000) AS period, v AS twr\n"
             "  FROM (\n" + _returns_source_union(granularity, "twr") + "\n) u\n"
             f" ORDER BY source = '{BENCHMARK_SERIES}', end_day, source")
@@ -1324,7 +1333,7 @@ def returns_growth_sql():
         "   WHERE grain = 'sources' AND granularity = 'total' AND is_summary\n"
         "     AND window_from_year > 0" + RETURNS_CCY_CLAUSE + RETURNS_SOURCE_CLAUSE + "\n"
         "  UNION ALL\n"
-        "  SELECT '(all sources)', currency, window_from_year, twr\n"
+        f"  SELECT '{ALL_SOURCES_SERIES}', currency, window_from_year, twr\n"
         "    FROM report_returns\n"
         "   WHERE grain = 'global' AND granularity = 'total' AND is_summary\n"
         "     AND window_from_year > 0" + RETURNS_CCY_CLAUSE + "),\n"
@@ -1344,7 +1353,7 @@ def returns_growth_sql():
         + BENCHMARK_CCY_CLAUSE + "),\n"
         "o AS (\n"
         "  SELECT COALESCE((SELECT cumulative_return FROM c\n"
-        "                    WHERE source = '(all sources)' AND yr = (SELECT min(yr) FROM b)), 0) AS level)\n"
+        f"                    WHERE source = '{ALL_SOURCES_SERIES}' AND yr = (SELECT min(yr) FROM b)), 0) AS level)\n"
         "SELECT source, make_date(yr, 1, 1) AS year, cumulative_return\n"
         "  FROM c\n"
         "UNION ALL\n"
@@ -1473,7 +1482,7 @@ STACKED_VIZ = {"stackable.stack_type": "stacked", "legend.is_reversed": False}
 NET_CASH_FLOW = "net cash flow"
 STATEMENT_SERIES = {"series_settings": {**{s: {"display": "bar"}
                                            for s in ("operating", "investing", "financing", "vehicles")},
-                                        NET_CASH_FLOW: {"display": "line", "color": "#8A99A8"}}}
+                                        NET_CASH_FLOW: {"display": "line", "color": BENCHMARK_COLOR}}}
 
 
 def _series_viz(time_col, series_col, metric, *, percent=False):
@@ -2087,6 +2096,8 @@ def question_defs(db_id, mid):
              # with one change: a node with no outgoing edge moves to
              # the last level, where every other ending sits.
              "sankey.node_align": "justify"}, section=False),
+        # The Section picker narrows the bars. The net is the
+        # household's whatever it picks, as the Net cash flow tile is.
         "Cash flow statement by month": cashflow_native(
             "Cash flow statement by month", "combo",
             "Operating, investing, financing and vehicles per month as signed "
@@ -2098,7 +2109,7 @@ def question_defs(db_id, mid):
                      "  FROM web_cashflow" + cf_where + "\n GROUP BY 1, 2\n"
                      f"UNION ALL\nSELECT {OCCURRED_MONTH},\n       '{NET_CASH_FLOW}',\n"
                      f"       {cf_val}\n"
-                     "  FROM web_cashflow" + cf_where + "\n GROUP BY 1",
+                     "  FROM web_cashflow" + cf_where_nosec + "\n GROUP BY 1",
                      "month", "statement_section", "value", "total", legend_last=NET_CASH_FLOW),
             {"graph.dimensions": ["month", "statement_section"],
              "graph.metrics": ["value"], **STACKED_VIZ, **STATEMENT_SERIES}),
@@ -2452,7 +2463,7 @@ def gains_question_defs(db_id, privacy=False):
                 "       sum(unrealized_end) AS unrealized\n"
                 "  FROM web_gains" + where + "\n     AND at_end\n GROUP BY 1, 2\n"
                 "UNION ALL\n"
-                "SELECT period, '(all sources)', sum(unrealized_end)\n"
+                f"SELECT period, '{ALL_SOURCES_SERIES}', sum(unrealized_end)\n"
                 "  FROM web_gains" + where_all + "\n     AND at_end\n GROUP BY 1",
                 "month", "source", "unrealized", "latest", largest_first=True),
             {**_series_viz("month", "source", "unrealized"), **LINES_VIZ}),
@@ -2632,9 +2643,8 @@ INCOME_DASHBOARDS = {"Income", "Income" + PRIVACY_SUFFIX}
 CASHFLOW_DASHBOARDS = {"Cash Flow", "Cash Flow" + PRIVACY_SUFFIX}
 
 # The Gains dashboard, which has no privacy twin. Its tiles are gains on
-# named positions; a twin would redact the names and normalise the
-# money, and what would remain is the percent columns the tables carry
-# already.
+# named positions; a twin would normalise the money, and what would
+# remain is the percent columns the tables carry already.
 GAINS_DASHBOARDS = {"Gains"}
 NO_PRIVACY_TWIN = GAINS_DASHBOARDS
 
@@ -2862,9 +2872,9 @@ def base_dashboards():
             # side — the primary tile drills through to the lines behind
             # a bar, the detailed tile holds the same window one level
             # down. Merchants and accounts answer "to whom" and "from
-            # where"; the card-balances chart is the only tile off
-            # web_card_balances_history, and the transaction list is the
-            # bottom of the drill-down.
+            # where", the fee tiles what each portfolio paid (web_fees);
+            # the card-balances chart reads web_card_balances_history,
+            # and the transaction list is the bottom of the drill-down.
             ("Spend — monthly trend", 0, 0, 8, 3, "occurred_at"),
             ("Net spend", 0, 8, 8, 3, "occurred_at"),
             ("Uncategorized share", 0, 16, 8, 3, "occurred_at"),
@@ -4473,7 +4483,7 @@ def bridge_cards(db_id, privacy):
     A twin card shows the same as shares of the starting net worth: the
     window's, or by month that month's."""
     tags = native_tags("web_bridge", BRIDGE_FILTERS)
-    tail = " Shares of the start." if privacy else ""
+    tail = " It covers the whole household." + (" Shares of the start." if privacy else "")
     pickers = [(CASHFLOW_CURRENCY_PARAM_ID, "currency"), (TIME_PARAM_ID, "time_range")]
     out = {}
     card = _card_maker(out, db_id, privacy, pickers, tags, tail)
@@ -4507,7 +4517,7 @@ def bridge_cards(db_id, privacy):
     arms = [("Net saved", "saved", ""), ("Tracking changes", "tracked", " WHERE tracked <> 0"),
             ("Investment gain", "gained", "")]
     card("Why net worth moved", "waterfall",
-         "What moved net worth: saved, moved in or out of tracking, and gained, by whole months.",
+         "What moved net worth, by whole months: saving, tracking changes and gain.",
          steps + "\nUNION ALL\n".join(
              f"SELECT {i} AS i, '{label}' AS step, {col + ' / NULLIF(abs(start), 0)' if privacy else col}"
              f" AS {amount} FROM s{where}"
@@ -4530,7 +4540,7 @@ def bridge_cards(db_id, privacy):
               for c, (title, color) in BRIDGE_MONTH_SERIES.items()}
     series[names["change"]] = {"display": "line", "color": BENCHMARK_COLOR, "title": "Change in net worth"}
     card("Saved and gained by month", "combo",
-         "Each month's net saved, tracking changes and gain, with the change in net worth as a line.",
+         "Saving, tracking changes and gain per month. The line is net worth's change.",
          window + "\nSELECT CAST(date_trunc('month', month_end) AS TIMESTAMP) AS month,\n       " +
          ",\n       ".join(f"({share(e, 'start_net_worth')})::DOUBLE AS {names[c]}" for c, e in parts.items()) +
          "\n  FROM w\n ORDER BY month",
@@ -4544,9 +4554,6 @@ def bridge_cards(db_id, privacy):
 # and their colours.
 FEE_GROUP_COLORS = {"investment": "#2A78D6", "bank": "#EB6834", "atm": "#1BAF7A", "other": "#8A99A8"}
 FEE_GROUP_TITLES = {"investment": "Investment", "bank": "Bank", "atm": "ATM", "other": "Other"}
-FEE_FILTERS = {"time_range": ("day", "date/all-options"), "source": ("silver_source_id", "string/="),
-               "account": ("account_label", "string/=")}
-PRIVACY_FEE_FILTERS = {k: v for k, v in FEE_FILTERS.items() if k != "account"}
 
 
 def fee_cards(db_id, privacy):
@@ -4555,7 +4562,8 @@ def fee_cards(db_id, privacy):
     `wealthdb spending fees` over web_fees, gold migration 0177: the
     spending lines of primary BANK_FEES, so a vehicle's fees show, and the
     daily values, each entity a portfolio, else an account outside any.
-    They take the card balance tile's pickers: a fee has no Category.
+    They take the card balance tile's pickers: fees are one category, so
+    a Category picker has nothing to split.
 
     The return is the CLI's: the entity's monthly returns chained over
     the months that end inside the window. A picked account narrows the
@@ -4565,7 +4573,7 @@ def fee_cards(db_id, privacy):
     window's fees, and an entity is its source, its kind and its rank, as
     the Spend by account twin names a group, with no name of its own."""
     tags = native_tags("web_fees", PRIVACY_FEE_FILTERS if privacy else FEE_FILTERS)
-    tail = PRIVACY_DESC if privacy else ""
+    tail = " Fees are one category." + (PRIVACY_DESC if privacy else "")
     out = {}
     card = _card_maker(out, db_id, privacy, CARD_BALANCE_PICKERS, tags, tail)
     val = _ccy_case("value")
@@ -4583,17 +4591,21 @@ def fee_cards(db_id, privacy):
             "           WHERE line = 'return' AND currency = {{currency}} AND twr > -1)\n"
             "   GROUP BY 1),\n"
             "t AS (SELECT NULLIF(sum(fees), 0) AS total FROM e),\n"
-            "n AS (\n  SELECT *, silver_source_id || ' / ' || entity_kind || ' ' ||\n"
+            "n AS (\n  SELECT *, entity || ' (' || silver_source_id || ' ' || entity_kind || ')' AS entity_label,\n"
+            "         silver_source_id || ' / ' || entity_kind || ' ' ||\n"
             "         row_number() OVER (PARTITION BY silver_source_id, entity_kind ORDER BY fees DESC) AS entity_group\n"
             "    FROM e)\n")
+    # A name alone can repeat across sources, so the base names an
+    # entity as the account tiles name an account: name (source kind).
     label = "entity_group" if privacy else "entity"
+    pick = "entity_group" if privacy else "entity_label AS entity"
     group_cols = [f"{g}_pct" if privacy else g for g in FEE_GROUP_COLORS]
     groups = (", ".join(f"100 * {g} / (SELECT total FROM t) AS {g}_pct" for g in FEE_GROUP_COLORS) if privacy
               else ", ".join(FEE_GROUP_COLORS))
     card("Fees by portfolio", "row",
          "What each portfolio, or account outside one, paid in fees, net of refunds, by group. Trading "
          "and fund costs are not fee lines.",
-         rows + f"SELECT {label}, {groups}\n  FROM n\n ORDER BY fees DESC",
+         rows + f"SELECT {pick}, {groups}\n  FROM n\n ORDER BY fees DESC",
          {"graph.dimensions": [label], "graph.metrics": group_cols, "stackable.stack_type": "stacked",
           "graph.x_axis.title_text": "", "graph.y_axis.title_text": "",
           "series_settings": {c: {"color": FEE_GROUP_COLORS[g], "title": FEE_GROUP_TITLES[g]}
@@ -4604,9 +4616,9 @@ def fee_cards(db_id, privacy):
     money = ("100 * fees / (SELECT total FROM t) AS fees_pct" if privacy
              else "value_days / NULLIF(days, 0) AS mean_value")
     card("Fee rate by portfolio", "table",
-         "Fees as an annualized share of the value held, beside the return over the months that end in "
-         "the window. Blank with no value or return.",
-         rows + f"SELECT {label}, {money},\n       {rate},\n       {twr}\n"
+         "The yearly fee rate on the value held, beside the return of the months ending in the window. "
+         "Blank with no value or return.",
+         rows + f"SELECT {pick}, {money},\n       {rate},\n       {twr}\n"
          "  FROM n LEFT JOIN r USING (entity_key)\n ORDER BY fees DESC",
          _share_viz("fees_pct", "fee_rate_pct", "twr_pct", decimals=2) if privacy
          else {"column_settings": {**_share_viz("fee_rate_pct", "twr_pct", decimals=2)["column_settings"],
@@ -4672,13 +4684,15 @@ def range_filters(col):
 # The field filters a native spending card may carry, and the pickers
 # they answer to. web_spending is the transaction grain (a category
 # filter applies); web_card_balances_history is the per-account daily
-# carry-forward of card balances, which has no category dimension. The
-# privacy variants below are what the twin's cards actually take.
+# carry-forward of card balances, and web_fees the fee tiles' lines
+# (fee_cards); neither has a category dimension. The privacy variants
+# below are what the twin's cards actually take.
 SPEND_FILTERS = {**range_filters("occurred_at"),
                  "account": ("account_label", "string/="),
                  "category": ("spend_primary_label", "string/=")}
 CARD_BALANCE_FILTERS = {**range_filters("as_of_day"),
                         "account": ("account_label", "string/=")}
+FEE_FILTERS = {**range_filters("day"), "account": ("account_label", "string/=")}
 # The same specs for the privacy twin, WITHOUT the account filter. A
 # field filter's widget is a dropdown of the values its column takes, so
 # an account filter on a privacy card offers account labels — which is
@@ -4691,6 +4705,7 @@ PRIVACY_SPEND_FILTERS = {k: v for k, v in SPEND_FILTERS.items()
                          if k != "account"}
 PRIVACY_CARD_BALANCE_FILTERS = {k: v for k, v in CARD_BALANCE_FILTERS.items()
                                 if k != "account"}
+PRIVACY_FEE_FILTERS = {k: v for k, v in FEE_FILTERS.items() if k != "account"}
 # The income dashboards' own picker ids. Distinct from the spending
 # ones because a Metabase parameter id is per-dashboard-parameter, and
 # the two dashboards carry different filter sets over different views.
@@ -5503,8 +5518,11 @@ def cashflow_privacy_defs(db_id):
     hub_cte_nosec = _cashflow_atoms_cte(where_nosec, val) + "\n"
     # The statement's bars are signed both ways, so a month's size is its
     # gross movement rather than PEAK_CTE's positive sum.
-    peak_cte = ("p AS (SELECT max(t) AS peak FROM"
-                " (SELECT sum(abs(v)) AS t FROM m GROUP BY month))\n")
+    def gross_peak(rows="m"):
+        return ("p AS (SELECT max(t) AS peak FROM"
+                f" (SELECT sum(abs(v)) AS t FROM {rows} GROUP BY month))\n")
+
+    peak_cte = gross_peak()
 
     def month_cte(extra="", filt="", sign=""):
         # `sign` is built in rather than applied to the finished SQL: a
@@ -5538,17 +5556,23 @@ def cashflow_privacy_defs(db_id):
         {"sankey.source": "source", "sankey.target": "target",
          "sankey.value": "value", "sankey.node_align": "justify"}, section=False)
 
+    # The Section picker narrows the bars, `m`. The net and the biggest
+    # month read every section, `a`, so the net is the household's
+    # whatever is picked, and the twin is the base card scaled by one
+    # number.
+    statement_section = ("CASE WHEN section IN ('operating_in', 'operating_out')\n"
+                         "              THEN 'operating' ELSE section END"
+                         " AS statement_section,\n         ")
     cashflow_card(privacy_name("Cash flow statement by month"), "combo",
         "The statement per month, each section and the net a share of the "
         "biggest month's gross movement.",
         _series_order(
-            month_cte("CASE WHEN section IN ('operating_in', 'operating_out')\n"
-                      "              THEN 'operating' ELSE section END"
-                      " AS statement_section,\n         ")
-            + "   GROUP BY 1, 2),\n" + peak_cte +
+            month_cte(statement_section) + "   GROUP BY 1, 2),\n"
+            f"a AS (\n  SELECT {OCCURRED_MONTH},\n         {statement_section}{val} AS v\n"
+            "    FROM web_cashflow" + where_nosec + "\n   GROUP BY 1, 2),\n" + gross_peak("a") +
             f"SELECT month, statement_section,\n       {PEAK_DIV} AS share_pct\n"
             f"  FROM m\nUNION ALL\nSELECT month, '{NET_CASH_FLOW}',\n       sum(v) / {PEAK} * 100\n"
-            "  FROM m\n GROUP BY 1", "month", "statement_section", "share_pct", "total",
+            "  FROM a\n GROUP BY 1", "month", "statement_section", "share_pct", "total",
             legend_last=NET_CASH_FLOW),
         {"graph.dimensions": ["month", "statement_section"],
          "graph.metrics": ["share_pct"], **STACKED_VIZ, **STATEMENT_SERIES})
@@ -5931,8 +5955,8 @@ def dashboard_defs():
         "the window's end. Other figures are their dashboard's privacy "
         "figures, gains a percent of cost basis. "),
         "Spending": (
-        "Values are shares (%) of the window's net spend or of its biggest "
-        "month. Merchant and account labels are redacted. "),
+        "Values are shares (%) of the window's net spend, of its biggest "
+        "month or of its fees. Merchant and account labels are redacted. "),
         "Income": (
         "Income as shares of the window's income, the holdings' income as a yield on their "
         "value. No payer or account is named. "),
@@ -5944,9 +5968,9 @@ def dashboard_defs():
         "basis point, expected income a yield on its value. Account labels "
         "are redacted. "),
         "Cash Flow": (
-        "Values are shares (%) of the window's hub, the total the diagram "
-        "flows through, or of its biggest month. Projection figures are shares of what the "
-        "holdings are expected to pay. ")}
+        "Values are shares (%) of the diagram's hub or of the biggest month. "
+        "The bridge shows shares of the starting net worth. The projection "
+        "shows shares of what the holdings are expected to pay. ")}
     out = {}
     for name, (desc, mode, tiles) in base_dashboards().items():
         if name in NO_PRIVACY_TWIN:
@@ -6309,11 +6333,15 @@ def web_views_wanted():
 
 def probe_rows(base, sid, db_id, sql):
     """The rows native `sql` returns through the driver, or None when the
-    probe does not answer."""
+    probe does not answer. Metabase answers a query that fails with 202
+    as well, its status `failed` and an error beside empty rows: that is
+    no answer, not an answer of no rows."""
     st, res = req(base, "/api/dataset", "POST",
                   {"type": "native", "database": db_id,
                    "native": {"query": sql, "template-tags": {}}}, session=sid)
-    return (res.get("data") or {}).get("rows") if st == 202 else None
+    if st != 202 or res.get("status") == "failed" or "error" in res:
+        return None
+    return (res.get("data") or {}).get("rows")
 
 
 def missing_web_views(base, sid, db_id):
@@ -6341,7 +6369,7 @@ def missing_web_views(base, sid, db_id):
 # The oldest gold schema the cards can read. A test holds it at or above
 # the newest migration that defines a view or table a card reads.
 # DESIGN.md §6 says what each older snapshot lacks.
-MIN_GOLD_SCHEMA = 177
+MIN_GOLD_SCHEMA = 179
 
 # main()'s exit status for a snapshot older than MIN_GOLD_SCHEMA; every
 # other failure exits 1. web/web tells the two apart, because only
