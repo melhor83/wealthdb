@@ -547,10 +547,10 @@ holdings, and `securities` lists its legs (§5). `securities` and
 declaration describes reads `via` `declared`, with the record's
 `declaration_date` and the dimensions it `declared`.
 
-`-p` hides every amount and every instrument id a holding is named by.
-A manual holding's key redacts as an account id: its words stay and any
-id in it masks (DESIGN.md §4.6). Names, an issuer named after a manual
-holding too, shares, labels and public identifiers stay.
+`-p` hides every amount. It also redacts every key that is a holding's
+own rather than a public identifier: a `holding:<source>:<id>` key and
+`coverage`'s `instrument`. Shares, labels and public identifiers stay.
+Names and keys follow [DESIGN.md](DESIGN.md) §4.6, *What `-p` hides*.
 
 `--period` shows how a view changes over a window. It runs the view at
 the last second of every period in the window and puts a `period`

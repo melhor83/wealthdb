@@ -890,12 +890,10 @@ Behind `-C`:
   plus `savings_rate`, plus the reconciliation memo below.
 
 `-p` redacts as the families do: account ids, amounts, and every name
-taken off a statement line. Every name a person typed prints as a
-pseudonym, such as `manual-1`, or as a redacted id
-([DESIGN.md](DESIGN.md) §4.6). Sections, classes, groups and shares
-stay legible. So the diagram's privacy twin needs **normalisation
-alone**: no node is ever a merchant, a payer, an account or an
-instrument.
+taken off a statement line. Other names follow [DESIGN.md](DESIGN.md)
+§4.6, *What `-p` hides*. Sections, classes, groups and shares stay
+legible. So the diagram's privacy twin needs **normalisation alone**:
+no node is ever a merchant, a payer, an account or an instrument.
 
 `wealthdb transactions` carries `cashflow_section`, `cashflow_class`
 and `cashflow_group` behind `-C`, beside the spending and income trios.
@@ -1072,13 +1070,10 @@ household's whole statement.
 
 The four bridge tiles take the currency and the time range. They decline
 Source, Section and Investing: returns do not add across grains, so a
-bridge exists for the whole household only. They read
-`wealthdb returns bridge` month by month, so a picked window holds the
-whole months that end inside it
-([RETURNS-NOTES.md](RETURNS-NOTES.md), "The net worth bridge"). The
-bridge starts from `returns`, not from this statement: the statement's
-boundary leaves out money that reaches a plan without passing through
-household cash.
+bridge exists for the whole household only. They read `web_bridge`, the
+months of `wealthdb returns bridge` a web refresh stores. So a picked
+window holds the whole months that end inside it
+([RETURNS-NOTES.md](RETURNS-NOTES.md), "The net worth bridge").
 
 **The Section picker is narrower than the statement's other four.**
 It reaches the by-month charts and `Largest flows`. The headline
@@ -1089,6 +1084,9 @@ figures and the diagram decline it:
   leg of its own ratio;
 - a one-section diagram draws a `Cash savings` node that absorbs the
   whole section, not the residual it names.
+
+On the statement by month the picker narrows the bars only. Its net
+cash flow line stays the household's.
 
 A by-month chart already scoped to one section (Inflows, Outflows,
 Investing) goes empty when a different section is picked, which is what
@@ -1115,11 +1113,13 @@ household's own accounts is invisible only while both are in the pool.
 | the lines | Largest flows: the fifty largest lines of the window |
 | the projection | the months ahead (§12): income parts against outflow parts by month, the net and the vehicles' income as lines; its table |
 
-Every tile is a **native query over `web_cashflow`**, the line-grain
-serving view. The Sankey card computes its nets, its sides and its hub
-**in the query**. A node's side is the sign of its net over the
-filtered window. A pre-netted table would be netted over the wrong
-window the moment a reader moved a picker.
+Every statement tile is a **native query over `web_cashflow`**, the
+line-grain serving view. The projection section reads
+`web_cashflow_plan` and the income projection's tables (§12). The
+bridge tiles read `web_bridge`. The Sankey card computes its nets, its
+sides and its hub **in the query**. A node's side is the sign of its
+net over the filtered window. A pre-netted table would be netted over
+the wrong window the moment a reader moved a picker.
 
 The twin is **normalisation, not redaction**. With the hub at 100 there
 is nothing left to hide, because no node is ever a merchant, a payer,

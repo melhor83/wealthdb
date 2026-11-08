@@ -89,8 +89,8 @@ The commands fall into four groups, the same as in `wealthdb help`:
 
 Every report prints a table, CSV or JSON. Money is shown in the
 configured currency or another one, at historic FX rates, and a report
-can hide amounts for a screen others may see. `wealthdb help <command>`
-gives a command's views and flags.
+can hide amounts and account numbers for a screen others may see.
+`wealthdb help <command>` gives a command's views and flags.
 
 An adapter ships for every collected source: Swiss and US banks and
 brokerages, pension providers, crypto, private markets, and reference
@@ -118,7 +118,7 @@ wealthdb holdings positions -x CHF     # the same, in CHF
 wealthdb holdings positions -f csv     # CSV for scripting
 wealthdb returns accounts 2025         # per-account TWR for 2025, by quarter
 wealthdb returns global --method both  # whole-portfolio TWR and MWR since the first snapshot
-wealthdb returns bridge 2025 --period annual  # why net worth moved in 2025
+wealthdb returns bridge 2025           # why net worth moved in 2025, by quarter
 wealthdb gains summary 2025            # realized and unrealized gains in 2025, by month
 wealthdb gains check 2025              # the rebuilt cost basis against what the statements say
 wealthdb exposure sectors              # sector weights, every fund looked through

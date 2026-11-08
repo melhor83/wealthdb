@@ -1892,53 +1892,6 @@ one.
 filter`). It reads the printed rows after the report has run. So a
 share stays a share of its whole bucket.
 
-### Fees by portfolio
-
-`wealthdb spending fees` says what each portfolio cost, in money and as
-a share of the value it held. A row is a bucket and an entity with a
-fee line: a portfolio, else an account outside any portfolio.
-
-| column | reads |
-|---|---|
-| `fees` | the spending lines in primary `BANK_FEES`, net of refunds |
-| `fees_investment`, `fees_bank`, `fees_atm`, `fees_other` | the same lines by detailed group: `BANK_FEES_INVESTMENT_FEES`; other bank fees, overdraft and insufficient funds; ATM fees; the rest |
-| `mean_value` | the entity's mean daily value, over the days it held one |
-| `fee_rate_pct` | `fees` over `mean_value`, annualized on 365 days. Blank where the mean value is not above zero |
-| `twr_pct` | the entity's monthly returns from a since-inception run of `returns portfolios` or `returns accounts`, chained over the months that end inside the window. Blank where `returns` has no month, as for plumbing cash accounts |
-| `quality` | `no_mean_value`, `part_window_value`, `no_return`, `unpriced_fees=N`, and the tags of the months chained |
-
-`--period` is `monthly`, `quarterly`, `annual` or `total`, the default.
-A return and a rate need more than a day or a week to mean anything.
-
-**It reads the spending lines, never the cash flow statement.** The
-statement's boundary leaves out what a vehicle pays
-([CASHFLOW.md](CASHFLOW.md), "What follows from the boundary"), so a
-trust's or a pension plan's fees are not on it. The spending report
-counts them, and over one window the rows sum to its `Bank fees` row.
-
-`twr_pct` can differ from `returns accounts FROM TO --period total`. That
-run chains Modified Dietz on the valuation days of the window and sees
-only the window's flows. This view chains calendar months of one run from
-inception, because the dashboard needs a figure it can build for any
-picked window, and a run per window cannot be stored. For a thin or sparsely
-valued entity the two can be far apart. Read the `returns` run for a
-return in its own right, this one beside the fee.
-
-Returns stay net of fees. This view states the cost and adds no
-gross-of-fees mode.
-
-Limits:
-
-- Only booked fee lines count. Trading costs sit inside the trades.
-- Fund costs sit inside fund prices.
-- A fee debited from another account lands on that account. Grouping by
-  portfolio fixes this where a portfolio exists.
-- A yearly fee in a short window annualizes as if it recurred.
-
-The Spending dashboard's fee tiles read `web_fees` (migration 0177), the
-same lines, daily values and monthly returns at day grain, so every
-figure on them is this view's over any window.
-
 ### The provenance column
 
 `provenance` names the tier that decided the category, in the
@@ -2120,6 +2073,57 @@ pseudonym otherwise. A typed name, such as the nickname or a category
 from the config, prints as a pseudonym such as `nickname-1`
 ([DESIGN.md §4.6](DESIGN.md), *Typed names*). Spending categories,
 provenance and `share_pct` stay legible, like the returns percentages.
+
+### Fees by portfolio
+
+`wealthdb spending fees` says what each portfolio cost, in money and as
+a share of the value it held. A row is a bucket and an entity with a
+fee line: a portfolio, else an account outside any portfolio.
+
+| column | reads |
+|---|---|
+| `fees` | the spending lines in primary `BANK_FEES`, net of refunds |
+| `fees_investment`, `fees_bank`, `fees_atm`, `fees_other` | the same lines by detailed group: `BANK_FEES_INVESTMENT_FEES`; other bank fees, overdraft and insufficient funds; ATM fees; the rest |
+| `mean_value` | the entity's mean daily value, over the days it held one. A portfolio's leaves out its mortgages and cards, as its `twr_pct` does |
+| `fee_rate_pct` | `fees` over `mean_value`, annualized over the days the entity held a value, on a 365-day year. Blank where the mean value is not above zero |
+| `twr_pct` | the entity's monthly returns from a since-inception run of `returns portfolios` or `returns accounts`, chained over the months that end inside the window. Blank where `returns` has no month, as for plumbing cash accounts |
+| `quality` | `no_mean_value`, `part_window_value`, `no_return`, `unpriced_fees=N`, and the tags of the months chained |
+
+`--period` is `monthly`, `quarterly`, `annual` or `total`, the default.
+A return and a rate need more than a day or a week to mean anything.
+
+**It reads the spending lines, never the cash flow statement.** The
+statement's boundary leaves out what a vehicle pays
+([CASHFLOW.md](CASHFLOW.md), "What follows from the boundary"), so a
+trust's or a pension plan's fees are not on it. The spending report
+counts them, and over one window the rows sum to its `Bank fees` row.
+
+`twr_pct` can differ from `returns accounts FROM TO --period total`.
+That run chains Modified Dietz on the valuation days of the window and
+sees only the window's flows. This view chains calendar months of one
+run from inception, because the dashboard needs a figure it can build
+for any picked window, and a run per window cannot be stored. For a
+thin or sparsely valued entity the two can be far apart. Read the
+`returns` run for a return in its own right, this one beside the fee.
+
+Returns stay net of fees. This view states the cost and adds no
+gross-of-fees mode.
+
+`-p` redacts the amounts, the ids and the entity's name, as the returns
+views do. Rates and returns stay legible.
+
+Limits:
+
+- Only booked fee lines count. Trading costs sit inside the trades.
+- Fund costs sit inside fund prices.
+- A fee debited from another account lands on that account. Grouping by
+  portfolio fixes this where a portfolio exists.
+- A yearly fee in a short window annualizes as if it recurred.
+
+The Spending dashboard's fee tiles read `web_fees` (migrations 0177 and 0179):
+the same lines, daily values and monthly returns, at day grain. A
+portfolio's value there leaves out its mortgages and cards too. So
+every figure on them is this view's over any window.
 
 ## 8. Storage and lifecycle
 

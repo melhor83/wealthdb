@@ -123,10 +123,10 @@ wealthdb gains   <view> [flags]       (RO)    Realized and unrealized gains: sum
 wealthdb exposure <view> [flags]      (RO)    What is really owned, every fund looked through: classes, sectors, sizes, countries, currencies, credit, maturities, coupons, cycles, situs, securities, issuers, funds, coverage.
 wealthdb yield   <view> [flags]       (RO)    What the holdings earn and how they move with rates: global, sources, portfolios, accounts, positions, securities, funds, cash, curve, coverage.
 wealthdb transactions [FROM [TO]] [flags] (RO) Print transactions over a date range.
-wealthdb spending <view> [flags]      (RO)    Spending reports: summary, categories, transactions.
+wealthdb spending <view> [flags]      (RO)    Spending reports: summary, categories, transactions; and fees, what each portfolio cost.
 wealthdb income   <view> [flags]      (RO)    Income received and expected: summary, types, transactions, projection, calendar, sources, portfolios, accounts, positions.
 wealthdb cashflow <view> [flags]      (RO)    Cash flow statement: summary, flows, sankey, transactions, coverage; projection for the months ahead.
-wealthdb status  [<id>] [-v]          (RO)    Report gold state vs each silver source.
+wealthdb status  [<id>] [-v] | --marks (RO)   Report gold state vs each silver source; --marks: how fresh the marks were at each month end.
 wealthdb snapshots <id> | -a [--latest] (RO)  List snapshots gold has loaded (one silver, or all).
 wealthdb resolve-symbols              (RW)    Back-fill missing instrument ticker symbols via the configured LLM; skips hinted rows and cash-class instruments.
 wealthdb resolutions [-s <id>]        (RO)    Dump the symbol_resolutions table (LLM + manual-override tickers), optionally for one source.
@@ -209,11 +209,13 @@ Prints the consolidated portfolio as of a date.
 | `--missing-basis` | `lots.missing_basis`, else `ignore` | `ignore` \| `zero`: how a missing cost basis counts ([GAINS.md §8](GAINS.md)). Under `zero` the cost basis is the part the lots know. |
 | `-p`, `--privacy` | off | Redact identifying and monetary columns (see below). |
 
-**What `-p` hides.** Money, quantities and identifiers redact. So do
-the names taken off a statement and the names a person typed about an
-account. Holdings stay legible: their names, their keys where public,
-and the composition, as shares, classes and labels. A holding's name
-prints as it is, a typed one too.
+**What `-p` hides.** Money, quantities and identifiers redact. An id
+inside any value redacts too, however it is punctuated. So does a
+postal address that closes a value. The names taken off a statement
+and the names a person typed about an account redact as well. Holdings
+stay legible: their names, their keys where public, and the
+composition, as shares, classes and labels. A manual holding's name
+stays too. An id typed inside it masks, and its words stay.
 
 **Privacy classes.** `-p` is per-column, and every read-only view
 that offers the flag draws from the same five classes (everything
@@ -221,9 +223,9 @@ else is left alone):
 
 | Class | Renders as | Carries |
 | --- | --- | --- |
-| account-id | `****1234` — length preserved, a short tail and an IBAN country code left legible so rows stay distinguishable | account / portfolio / relationship / transaction / lot ids, and the labels built on them. Every id in the value redacts (below). Words and short numbers stay. |
+| account-id | `****1234` — length preserved, a short tail and an IBAN country code left legible so rows stay distinguishable | account / portfolio / relationship / transaction / lot ids, the labels built on them, and a manual holding's keys. Every id in the value redacts (below). Words and short numbers stay. |
 | free-text | `***` — the whole cell, in every format | values that can carry a person's name, never look like an identifier, and were not typed by the household: statement narratives and their folds (`counterparty`, `description`, `merchant_signature` and the `merchant` built from it in §4.12). Also the instrument id of a holding no public key names, unless a person typed it. Shape-blind by design — the narratives worth hiding are multi-word, so a shape test would pass exactly them. |
-| pseudonym | `manual-1` — the same value reads the same in every row and column of a run, in every format | the names a person typed (below). Shape-blind like free-text. |
+| pseudonym | `manual-1` — the same value reads the same in every row and column of a run, in every format | the names and ids a person typed about an account (below). Shape-blind like free-text. |
 | quantity | `***` (table) / empty (csv) / key dropped (json) | share counts. |
 | money | `*****.**` (table) / empty (csv) / key dropped (json) | every monetary amount. |
 
@@ -242,7 +244,8 @@ those letters, an IBAN's country code. A value reads like this:
 
 - `:`, `@` and `#` split a composite value into parts. Each part reads
   alone, so each id keeps its own tail.
-- A part of letters and digits only, with at least one digit, is one id.
+- A part of three or more ASCII letters and digits, with at least one
+  digit, is one id.
 - Any other part reads as runs. A run is groups of letters and digits
   joined by separators:
   - Two groups join through a dash or a dot.
@@ -262,22 +265,22 @@ those letters, an IBAN's country code. A value reads like this:
 A filter under `-p` reads the printed cell. It matches the masked text,
 never the id behind it.
 
-**Typed names.** Every name a person typed is hidden. It prints as a
-pseudonym, or as a redacted id where an account column shows the
-account's identifier-shaped id in its place (below). A pseudonym is a
-prefix and a number. The prefix is the kind of the source the value
-comes from, such as `manual` or `cointracking`, and `declared` for a
-declared account (§5.1). A category prints as `category-1` and a
-nickname as `nickname-1`. The numbers count values in the order they
-first appear in one CLI run or one MCP call, and each run counts
-afresh. So a source's value reads the same in every row and column of a
-run, and rows stay apart. The same text of two sources reads as two
-pseudonyms; a category or a nickname reads as one. Public names stay as
-they are: a bank's product label, a security's name. A merchant or
-payer taken off a statement keeps `***`. The `silver_source` id names a
-config entry and stays legible.
+**Typed names.** Every name a person typed about an account is hidden.
+It prints as a pseudonym, or as a redacted id where an account column
+shows the account's identifier-shaped id in its place (below). A
+pseudonym is a prefix and a number. The prefix is the kind of the
+source the value comes from, such as `manual` or `cointracking`, and
+`declared` for a declared account (§5.1). A category prints as
+`category-1` and a nickname as `nickname-1`. The numbers count values
+in the order they first appear in one CLI run or one MCP call, and each
+run counts afresh. So a source's value reads the same in every row and
+column of a run, and rows stay apart. The same text of two sources
+reads as two pseudonyms; a category or a nickname reads as one. Public
+names stay as they are: a bank's product label, a security's name. A
+merchant or payer taken off a statement keeps `***`. The
+`silver_source` id names a config entry and stays legible.
 
-These names are typed:
+These names and ids are typed:
 - an account's name, when its source is a `cointracking` or a `manual`
   silver, when the account is a declared one, when its bank names an
   account by its roster's nickname (`chase`, `firstcitizens`,
@@ -296,12 +299,15 @@ How they print:
   `<user>:<wallet>`, so it prints as a pseudonym.
 - A typed name with no id beside it (cashflow coverage) prints as a
   pseudonym.
-- A holding's name is not hidden, and a typed one prints as it is: a
-  manual holding's, an issuer named after it, a cash flow line's. The
-  content scrub still masks an address or a bank identifier in it.
-- A manual holding's position key and instrument id can carry its
-  holder's words and an id, so they redact as an account id: the words
-  stay and any id in them masks.
+- A holding's name is never hidden. Any but a manual holding's prints
+  as it is.
+- A manual holding's name can carry an id its holder typed. Only the
+  id masks: a run of more than four digits, or a long group of letters
+  and digits. The words stay, and so does a one-word name such as
+  `Unit7`. An issuer named after such a holding and a cash flow line
+  that names it read the same way.
+- A manual holding's position key and instrument id redact as an
+  account id: the words stay and any id in them masks.
 - Exposure and yield key a holding with no public key
   `holding:<source>:<id>`. Such a key of a manual holding redacts the
   same way. Any other masks whole.
@@ -378,16 +384,16 @@ default, and takes `-f -C -F -x -p`:
 | `month_end` | the month's last day |
 | `marked_pct` | the share of `value_total` marked within five days, weighted by USD value in every currency, so the figure has one definition |
 | `value_marked` | that part of the value, in the output currency |
-| `value_total` | the rows of the daily position history that day with a value above zero. Liabilities and cash are out |
-| `quality` | `no_positions` at a month-end with no such row; `unpriced_lines=N` where N rows have no rate and leave the sums |
+| `value_total` | the lines of the daily position history that day with a value above zero. Liabilities and cash are out |
+| `quality` | `no_positions` at a month-end with no such line; `unpriced_lines=N` where N lines have no rate and leave the sums |
 
-A row's age is the month-end day less `coalesce(valued_at, snapshot_at)`,
-in days. `-x` and `-p` reach the two money columns. `marked_pct` does
-not move. The macro is
+A line's age is the month-end day less
+`coalesce(valued_at, snapshot_at)`, in days. `-x` and `-p` reach the
+two money columns. `marked_pct` does not move. The macro is
 `report_marks` (migrations 0177 and 0178). It sums each line as a
-decimal, so a total is the same in any order. A web refresh stores it in
-`serving_marks`, and the Data Freshness dashboard's Mark age tile reads
-it.
+decimal, so a total is the same in any order. A web refresh stores it
+in `serving_marks`, and the Data Freshness dashboard's Mark age tile
+reads it.
 
 ### 4.8 `wealthdb snapshots <id> | -a`
 
@@ -688,7 +694,7 @@ flag. A fourth view, `fees`, states what each portfolio cost. It takes
 | --- | --- | --- |
 | `[FROM [TO]]` | trailing twelve months | Positional window, same grammar as `transactions` (`YYYY` / `YYYY-MM` / `YYYY-MM-DD`, an explicit pair, `-` for an open bound). |
 | `--period` | `monthly` | `daily` \| `weekly` \| `monthly` \| `quarterly` \| `annual` \| `total`. Maps onto the `date_trunc` part `report_spending_*` buckets by; `total` collapses the window into one bucket. |
-| `--level` | `primary` | `primary` \| `detailed` — the category vocabulary `categories` groups by. The other views ignore it. |
+| `--level` | `primary` | `primary` \| `detailed` — the category vocabulary `categories` groups by. `summary` and `transactions` ignore it; `fees` refuses it. |
 | `-f`, `--format` | `table` | `table` \| `csv` \| `csv_plain` \| `json`. |
 | `-C`, `--columns` | `default` | Per-view column set: columns by name or printed header, `default`, `all`, or a `+ADD,-REMOVE` delta. |
 | `-F`, `--filter` | none | Repeatable. Keeps the rows where every condition holds. It reads the printed columns after the report has run. `wealthdb help filter` lists the operators. |
@@ -730,7 +736,7 @@ expected to pay over a window that may reach into the future
 | `--maturing` | `cash` | `cash` \| `idle` \| `roll`: what a maturing principal earns. Forward views only. |
 | `--shift` | `0` | A parallel shift of the floating rates, in whole basis points. Forward views only. |
 | `-C/--columns` | `default` | `withheld` is available on `summary` and off by default: tax deducted at source, shown beside the income it was taken from and never subtracted from `net_income`. On the forward views `withheld` is the withholding table's model, a default column of `projection`. |
-| `-f`, `-F`, `-x`, `-p` | as §4.12 | `-p` masks `payer`, `payer_signature`, `counterparty` and `description` whole; types, provenance and `share` stay legible. On the forward views it stars amounts, quantities, prices and account ids. A name a person typed prints as a pseudonym (§4.6). |
+| `-f`, `-F`, `-x`, `-p` | as §4.12 | `-p` masks `payer`, `payer_signature`, `counterparty` and `description` whole; types, provenance and `share` stay legible. On the forward views it stars amounts, quantities, prices and account ids. Names follow §4.6, *What `-p` hides*. |
 
 The views of what was received refuse `--rates`, `--maturing` and
 `--shift`. The MCP `income` tool takes the same window and flags
@@ -767,7 +773,7 @@ and assumptions instead.
 | `--investing` | `whole` | `whole` \| `class` — net the investing section as one `Investments` node, or per asset class. Honoured by `flows` and `sankey`; the summary is always whole. **Refused** on `projection`. |
 | `--rates`, `--maturing`, `--shift` | `constant`, `cash`, 0 | `projection` only, as on `wealthdb income`'s forward views (§4.13); **refused** on the other views. |
 | `-C/--columns` | `default` | `summary` carries `yield`, `taxes`, `fees`, `giving`, `savings_rate` and the reconciliation memo (`cash_measured`, `fx_effect`, `cash_flow_measured`, `unexplained`) off by default; `flows` and `sankey` carry the dotted node keys; `projection` carries the operating-out classes `consumption`, `fees`, `taxes`, `giving` and `uncategorized`. |
-| `-f`, `-F`, `-x`, `-p` | as §4.12 | `-p` masks account ids, amounts and the `name` column; sections, classes, groups and shares stay legible, which is what makes the diagram's privacy twin normalisation alone. A name a person typed prints as a pseudonym (§4.6). |
+| `-f`, `-F`, `-x`, `-p` | as §4.12 | `-p` masks account ids, amounts and a statement line's `name`; sections, classes, groups and shares stay legible, which is what makes the diagram's privacy twin normalisation alone. Names follow §4.6, *What `-p` hides*. |
 
 The MCP `cashflow` tool takes the same views and flags. On
 `projection` its period defaults to `monthly` and refuses `total`. Its
@@ -796,7 +802,7 @@ views, and the shared `-f`, `-C`, `-F`, `-x`, `-p`.
 | `--documents` | `primary` | `primary` \| `all`, on `realized` only: `all` lists every document's copy of a sale. Refused on the other views. |
 | `-r`, `--reverse` | off | `realized` only: newest first. Refused on the other views. |
 | `--missing-basis` | `lots.missing_basis`, else `ignore` | `ignore` \| `zero`: how a missing cost basis counts ([GAINS.md §8](GAINS.md)). Refused on `coverage` and `check`, which count a missing cost rather than read it. |
-| `-f`, `-C`, `-F`, `-x`, `-p` | as §4.12 | `-p` masks account ids, quantities and amounts; percentages, basis stamps, dates and public security names stay legible. A name a person typed prints as a pseudonym (§4.6). |
+| `-f`, `-C`, `-F`, `-x`, `-p` | as §4.12 | `-p` masks account ids, quantities and amounts; percentages, basis stamps, dates and public security names stay legible. Names follow §4.6, *What `-p` hides*. |
 
 Every aggregate and positions row carries a `quality` column naming
 each way its figures can be incomplete, and `coverage` gives a verdict
@@ -831,7 +837,7 @@ positional view, `-d` for the day, and the shared `-f`, `-C`, `-F`,
 | `--country` | `risk` | `risk` \| `domicile`: the country a security counts in, on `countries` and `securities`. Refused on the other views. |
 | `--benchmark` | none | A benchmark's weight of each row, and the row's share less it (EXPOSURE.md, "Benchmarks"). Not on `situs`, `funds` or `coverage`; no `--period`; no `--country domicile`. |
 | `--period` | none | `monthly` \| `quarterly` \| `annual`: the view at the end of every period of the window `[FROM [TO]]`, a `period` column first (EXPOSURE.md §7). Refused on `securities`, `issuers` and `funds`, and with `-d`. |
-| `-f`, `-C`, `-F`, `-x`, `-p` | as §4.12 | `-C` takes a share column by its name (`share`) or its header (`share_pct`). `-p` hides every amount and every instrument id (EXPOSURE.md §7). A name a person typed prints as a pseudonym (§4.6). On `coverage`, `-f ndjson` prints the declarations ledger's skeleton records still to fill in (EXPOSURE.md §9); it takes no `-C`, `-p` or `--period`. |
+| `-f`, `-C`, `-F`, `-x`, `-p` | as §4.12 | `-C` takes a share column by its name (`share`) or its header (`share_pct`). `-p` hides every amount and redacts every key that is a holding's own rather than a public identifier (EXPOSURE.md §7). Names and keys follow §4.6, *What `-p` hides*. On `coverage`, `-f ndjson` prints the declarations ledger's skeleton records still to fill in (EXPOSURE.md §9); it takes no `-C`, `-p` or `--period`. |
 
 Every view sums to `holdings global`, and every row carries a
 `quality` column naming what its figure rests on.
@@ -849,7 +855,7 @@ series, and the shared `-f`, `-C`, `-F`, `-x`, `-p`.
 | `-d`, `--as-of` | today | The day. |
 | `--converted` | off | The aggregate views at one row per entity, every currency together (YIELD.md §5). Refused on the other views. |
 | `--period` | none | `monthly` \| `quarterly` \| `annual`: the aggregate views and `curve` at the end of every period of the window `[FROM [TO]]`, a `period` column first. Refused on the other views, and with `-d`. |
-| `-f`, `-C`, `-F`, `-x`, `-p` | as §4.12 | `-C` takes a rate column by its name (`income_yield`) or its header (`income_yield_pct`). `-p` hides every amount, a price, every account id, and a security or fund key that is a holding's own (YIELD.md §2). A name a person typed prints as a pseudonym (§4.6). On `coverage`, `-f ndjson` prints the ledger's yield records still to fill in (YIELD.md §10); it takes no `-C`, `-p` or `--period`. |
+| `-f`, `-C`, `-F`, `-x`, `-p` | as §4.12 | `-C` takes a rate column by its name (`income_yield`) or its header (`income_yield_pct`). `-p` hides every amount, a price and every account id (YIELD.md §2). Names and keys follow §4.6, *What `-p` hides*. On `coverage`, `-f ndjson` prints the ledger's yield records still to fill in (YIELD.md §10); it takes no `-C`, `-p` or `--period`. |
 
 An aggregate row is one entity in one currency, and the total row
 weighs the currencies by value. Every row but `curve`'s and
@@ -3085,9 +3091,14 @@ flow, and the stated ending value against its end value. The stated
 figures create no flow. `wealthdb returns stated -h` lists its
 columns.
 
+`returns bridge` is the other side view. It says why net worth moved
+in each period, for the whole household
+([RETURNS-NOTES.md](RETURNS-NOTES.md), "The net worth bridge").
+
 [RETURNS-NOTES.md](RETURNS-NOTES.md) owns the method: the snapshot-aligned
 headline, flow classification per source, card invisibility, staggered
-inception and closure, netting, the policy knobs and every quality flag.
+inception and closure, the post-exit residue, netting, the policy
+knobs, the bridge and every quality flag.
 Three facts matter to the rest of gold:
 
 - **Historic FX.** Values and flows convert at their own day's rate

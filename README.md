@@ -97,13 +97,13 @@ for each account, each portfolio, each provider and the whole, over any
 period. Money moved between the household's own accounts is not counted
 as gain or loss, and every figure carries its own caveats. A bridge
 says why net worth moved: what was saved, what was gained, and what
-entered or left tracking. A benchmark,
-a plain mix of public funds, can stand beside the returns, the
-allocation, the exposure and the yield. Realized and
-unrealized gains come from the cost basis and tax lots the providers
-state. A crypto exchange or an old brokerage statement often states
-none. There a lot engine rebuilds them from the trades, first in first
-out by default. Every rebuilt figure says so.
+joined or left the tracked accounts. A benchmark, a plain mix of
+public funds, can stand beside the returns, the allocation, the
+exposure and the yield. Realized and unrealized gains come from the
+cost basis and tax lots the providers state. A crypto exchange or an
+old brokerage statement often states none. There a lot engine rebuilds
+them from the trades, first in first out by default. Every rebuilt
+figure says so.
 
 **Exposure.** What is really owned: every fund looked through to the
 stocks and bonds it holds, added to what is held directly, by asset
@@ -153,9 +153,10 @@ Every report is available in three places:
   returns, gains, spending, income, cash flow, exposure and yield;
 - AI agents, over MCP (`wealthdb mcp`).
 
-A privacy mode hides amounts, for a screen others may see. The CLI's
-`-p` redacts them, and most dashboards have a twin that shows shares
-instead.
+A privacy mode hides amounts and account numbers, for a screen others
+may see. The CLI's `-p` redacts them, and most dashboards have a twin
+that shows shares instead. What is held stays legible.
+
 `wealthdb help` lists every command with its flags; the topic documents
 under [Documentation](#documentation) cover each feature in depth.
 
@@ -198,9 +199,10 @@ for irreversible damage. wealthdb keeps the two apart:
 
 The result is a clean separation. An agent runs the same reports a
 person does, through the MCP server or `wealthdb --read-only`. The
-server's privacy endpoint, or `-p` on the CLI, keeps amounts out of a
-transcript. No agent is ever given write access to the financial data,
-let alone the banking credentials that produced it.
+server's privacy endpoint, or `-p` on the CLI, keeps amounts and
+account numbers out of a transcript. No agent is ever given write
+access to the financial data, let alone the banking credentials that
+produced it.
 
 ## Data sources
 
