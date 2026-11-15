@@ -1,8 +1,13 @@
 package spending
 
 import (
+	"context"
+	"database/sql"
+	"fmt"
+	"regexp"
 	"testing"
 
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/gold"
 )
 
@@ -20,7 +25,8 @@ func TestMatchedPairsListsBothLegs(t *testing.T) {
 		txn{"bank", "T-LONE", "CASH1", "withdrawal", day(30), -9000, "Wire Out", "", ""},
 	)
 
-	pairs, unmatched, err := MatchedPairs(ctx, db, 5, 0.5, nil, nil)
+	runPass(t, db, ctx, Options{})
+	pairs, unmatched, err := MatchedPairs(ctx, db)
 	if err != nil {
 		t.Fatalf("MatchedPairs: %v", err)
 	}
@@ -57,7 +63,8 @@ func TestMatchedPairsSortsUnmatchedByMagnitude(t *testing.T) {
 		txn{"bank", "T-MID", "CASH1", "deposit", day(40), 300, "", "Inbound", ""},
 	)
 
-	_, unmatched, err := MatchedPairs(ctx, db, 5, 0.5, nil, nil)
+	runPass(t, db, ctx, Options{})
+	_, unmatched, err := MatchedPairs(ctx, db)
 	if err != nil {
 		t.Fatalf("MatchedPairs: %v", err)
 	}
@@ -90,7 +97,8 @@ func TestMatchedPairsCannotPairCrossCurrencyUnasserted(t *testing.T) {
 		t.Fatalf("seed cross-currency legs: %v", err)
 	}
 
-	pairs, unmatched, err := MatchedPairs(ctx, db, 5, 0.5, nil, nil)
+	runPass(t, db, ctx, Options{})
+	pairs, unmatched, err := MatchedPairs(ctx, db)
 	if err != nil {
 		t.Fatalf("MatchedPairs: %v", err)
 	}
@@ -130,7 +138,8 @@ func TestMatchedPairsFlagsPopulationLegs(t *testing.T) {
 		txn{"bank", "T-LONE", "CASH1", "withdrawal", day(60), -9000, "Wire Out", "", ""},
 	)
 
-	pairs, unmatched, err := MatchedPairs(ctx, db, 5, 0.5, nil, nil)
+	runPass(t, db, ctx, Options{})
+	pairs, unmatched, err := MatchedPairs(ctx, db)
 	if err != nil {
 		t.Fatalf("MatchedPairs: %v", err)
 	}
@@ -171,12 +180,12 @@ func TestMatchedPairsFlagsPopulationLegs(t *testing.T) {
 	}
 }
 
-// TestLiftPairsListsAssertedPhasesFirst pins the listing order the pair cap
+// TestSortPairsListsAssertedPhasesFirst pins the listing order the pair cap
 // relies on: override, reference and stated-counter pairs lead, in that
 // order and whatever their day, and the named and amount pairs follow
 // together in day order. A named pair is banded on amount like an amount
 // pair, so it must not outrank an asserted one.
-func TestLiftPairsListsAssertedPhasesFirst(t *testing.T) {
+func TestSortPairsListsAssertedPhasesFirst(t *testing.T) {
 	type spec struct {
 		id  string
 		day int64
@@ -193,17 +202,16 @@ func TestLiftPairsListsAssertedPhasesFirst(t *testing.T) {
 		{"REFERENCE", 5, gold.MatchedByReference},
 		{"NAMED-LATE", 7, gold.MatchedByName},
 	}
-	raw := make([]gold.TransferMatchPair, 0, len(specs))
-	byKey := map[txKey]Leg{}
+	got := make([]Pair, 0, len(specs))
 	for _, sp := range specs {
-		d := gold.TransferLeg{Group: "bank", Owner: "CASH1", ID: sp.id + "-D", Day: sp.day}
-		c := gold.TransferLeg{Group: "bank", Owner: "CASH2", ID: sp.id + "-C", Day: sp.day}
-		raw = append(raw, gold.TransferMatchPair{Debit: d, Credit: c, By: sp.by})
-		byKey[txKey{d.Group, d.ID}] = Leg{Source: d.Group, TxID: d.ID, Account: d.Owner, Day: d.Day}
-		byKey[txKey{c.Group, c.ID}] = Leg{Source: c.Group, TxID: c.ID, Account: c.Owner, Day: c.Day}
+		got = append(got, Pair{
+			Debit:  Leg{Source: "bank", TxID: sp.id + "-D", Account: "CASH1", Day: sp.day},
+			Credit: Leg{Source: "bank", TxID: sp.id + "-C", Account: "CASH2", Day: sp.day},
+			By:     sp.by,
+		})
 	}
 
-	got := liftPairs(raw, byKey)
+	sortPairs(got)
 	want := []string{
 		"OVERRIDE-D", "REFERENCE-D", "STATED-D",
 		"NAMED-EARLY-D", "AMOUNT-EARLY-D", "NAMED-LATE-D", "AMOUNT-LATE-D",
@@ -215,5 +223,143 @@ func TestLiftPairsListsAssertedPhasesFirst(t *testing.T) {
 		if p.Debit.TxID != want[i] {
 			t.Errorf("pair %d = %s (%s), want %s", i, p.Debit.TxID, p.By, want[i])
 		}
+	}
+}
+
+// linkRows reads transfer_links as comparable lines, pairs and
+// one-legged rows alike.
+func linkRows(t *testing.T, db *sql.DB, ctx context.Context) []string {
+	t.Helper()
+	rows, err := db.QueryContext(ctx, `
+        SELECT silver_source_id, transaction_external_id,
+               COALESCE(far_silver_source_id, '(null)'),
+               COALESCE(far_account_external_id, '(null)'),
+               COALESCE(far_transaction_external_id, '(null)'),
+               COALESCE(far_class, '(null)'), evidence, measure
+          FROM transfer_links
+         ORDER BY silver_source_id, transaction_external_id`)
+	if err != nil {
+		t.Fatalf("read transfer links: %v", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var src, id, farSrc, farAcct, farTx, farClass, evidence, measure string
+		if err := rows.Scan(&src, &id, &farSrc, &farAcct, &farTx, &farClass, &evidence, &measure); err != nil {
+			t.Fatalf("scan transfer links: %v", err)
+		}
+		out = append(out, fmt.Sprintf("%s/%s far=%s/%s tx=%s class=%s by=%s measure=%s",
+			src, id, farSrc, farAcct, farTx, farClass, evidence, measure))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate transfer links: %v", err)
+	}
+	return out
+}
+
+// TestMatchedPairsListsOneLeggedLinksAsUnpaired: a link that names only
+// a far account (a stated counter account, a far rule) has no partner,
+// so its leg is still unpaired. A pair one leg of which is pinned is
+// still a pair, and neither leg is unpaired.
+func TestMatchedPairsListsOneLeggedLinksAsUnpaired(t *testing.T) {
+	db, ctx := openGold(t)
+	if _, err := db.ExecContext(ctx, `
+        INSERT INTO accounts (silver_source_id, account_external_id, account_kind,
+                              tax_wrapper, display_name, first_seen_at, last_seen_at)
+             VALUES (?, 'savings-bank', 'cash', 'taxable_personal', 'Example Savings', 1, 1)`,
+		canonical.DeclaredSourceID); err != nil {
+		t.Fatalf("declare an account: %v", err)
+	}
+	opts := seedFrozenFixture(t, db, ctx)
+	seedTxns(t, db, ctx,
+		txn{"bank", "T-STATED", "CASH1", "withdrawal", day(40), -333, "", "Wire to own account", ""},
+		txn{"bank", "T-FAR", "CASH1", "withdrawal", day(41), -3007, "", "Transfer to Example Savings Bank", ""},
+	)
+	seedCounterAccount(t, db, ctx, "bank", "T-STATED", "CUST2")
+	opts.Rules = append(opts.Rules, Rule{Match: regexp.MustCompile(`(?i)EXAMPLE SAVINGS BANK`),
+		Category: canonical.SpendDetailedInternalTransfer, Far: "savings-bank"})
+	runPass(t, db, ctx, opts)
+
+	oneLegged := scanPairs(t, db, `
+        SELECT transaction_external_id, evidence FROM transfer_links
+         WHERE far_transaction_external_id IS NULL AND far_account_external_id IS NOT NULL`)
+	if oneLegged["T-STATED"] != evidenceStatedAccount || oneLegged["T-FAR"] != evidenceRule {
+		t.Fatalf("one-legged links = %v, want T-STATED by %s and T-FAR by %s",
+			oneLegged, evidenceStatedAccount, evidenceRule)
+	}
+	pairs, unmatched, err := MatchedPairs(ctx, db)
+	if err != nil {
+		t.Fatalf("MatchedPairs: %v", err)
+	}
+	unpaired := map[string]bool{}
+	for _, l := range unmatched {
+		unpaired[l.TxID] = true
+	}
+	for _, id := range []string{"T-STATED", "T-FAR"} {
+		if !unpaired[id] {
+			t.Errorf("%s has no partner and is not listed as unpaired", id)
+		}
+	}
+	for _, id := range []string{"T-PIN-OVER-MATCH", "T-PIN-PAIR"} {
+		if unpaired[id] {
+			t.Errorf("%s is half of a pair and is listed as unpaired", id)
+		}
+	}
+	found := false
+	for _, p := range pairs {
+		found = found || p.Debit.TxID == "T-PIN-OVER-MATCH" && p.Credit.TxID == "T-PIN-PAIR"
+	}
+	if !found {
+		t.Errorf("the pinned pair is not listed: %+v", pairs)
+	}
+}
+
+// TestACategorizeRunMatchesOnce: a real categorize run is the pass and
+// then the audit listing, and only the pass runs the matcher.
+func TestACategorizeRunMatchesOnce(t *testing.T) {
+	db, ctx := openGold(t)
+	opts := seedFrozenFixture(t, db, ctx)
+	runs := 0
+	t.Cleanup(func() { matchTransferLegs = gold.MatchTransferLegs })
+	matchTransferLegs = func(legs []gold.TransferLeg, o gold.TransferMatchOpts) []gold.TransferMatchPair {
+		runs++
+		return gold.MatchTransferLegs(legs, o)
+	}
+
+	runPass(t, db, ctx, opts)
+	pairs, _, err := MatchedPairs(ctx, db)
+	if err != nil {
+		t.Fatalf("MatchedPairs: %v", err)
+	}
+	if runs != 1 {
+		t.Errorf("the matcher ran %d time(s), want 1", runs)
+	}
+	if len(pairs) != 3 {
+		t.Errorf("the listing holds %d pair(s), want the pass's 3", len(pairs))
+	}
+}
+
+// TestMatchedPairsWithoutTheTable: a gold no build with transfer_links
+// has migrated reads as one with no stored pairs. The listing goes on,
+// every pool leg unpaired, and does not fail.
+func TestMatchedPairsWithoutTheTable(t *testing.T) {
+	db, ctx := openGold(t)
+	seedTxns(t, db, ctx,
+		txn{"bank", "T-OUT", "CASH1", "withdrawal", day(20), -400, "Autopay", "", ""},
+		txn{"bank", "T-IN", "CARD1", "card_payment", day(20), 400, "", "Card Payment", ""},
+	)
+	runPass(t, db, ctx, Options{})
+	if _, err := db.ExecContext(ctx, `DROP TABLE transfer_links`); err != nil {
+		t.Fatalf("drop the table: %v", err)
+	}
+	if stored, err := TransferLinksStored(ctx, db); err != nil || stored {
+		t.Fatalf("TransferLinksStored = (%v, %v), want (false, nil)", stored, err)
+	}
+	pairs, unmatched, err := MatchedPairs(ctx, db)
+	if err != nil {
+		t.Fatalf("MatchedPairs: %v", err)
+	}
+	if len(pairs) != 0 || len(unmatched) != 2 {
+		t.Errorf("pairs = %d, unmatched = %d, want 0 and both legs", len(pairs), len(unmatched))
 	}
 }

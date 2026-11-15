@@ -8,12 +8,6 @@ import (
 	"time"
 )
 
-// bucketAt is the epoch second at UTC midnight, which is what
-// spend_period_bucket emits for the period a date opens.
-func bucketAt(y int, m time.Month, d int) int64 {
-	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Unix()
-}
-
 // seedSpendingReportFixture lays down two months of spending across
 // three accounts and two currencies, with every category-resolution
 // path represented: merchant-store, transaction-scope, an own-account
@@ -188,8 +182,8 @@ func TestSpendingSummaryBuckets(t *testing.T) {
 		count                 int64
 		spend, refunds, netSp float64
 	}{
-		{bucketAt(2026, time.January, 1), 5, 380, 20, 360},
-		{bucketAt(2026, time.February, 1), 2, 104, 0, 104},
+		{utcMidnight(2026, time.January, 1), 5, 380, 20, 360},
+		{utcMidnight(2026, time.February, 1), 2, 104, 0, 104},
 	}
 	for i, w := range want {
 		got := months[i]
@@ -515,7 +509,7 @@ func TestSpendingInBaseDeltasAreLines(t *testing.T) {
 }
 
 // TestSpendingDeltaLinesCarryNoMerchant pins the merchant column's
-// second condition (migration 0048): the store's name for a signature
+// second condition: the store's name for a signature
 // is published only on a row whose resolved category is vendored. The
 // store is reached through the signature, so a narrative the fence let
 // through can hold a name for a row that is no merchant transaction —
@@ -525,7 +519,7 @@ func TestSpendingInBaseDeltasAreLines(t *testing.T) {
 // very signature a pinned gift shares with them: the rule is per row,
 // not per signature, and the resolution underneath it does not move.
 //
-// And the one exception (migration 0052): a card bill the built-in
+// And the one exception: a card bill the built-in
 // rule labelled with the issuer it was paid to shows that ISSUER,
 // which comes off the enrichment row rather than the store. Two card
 // bills share one signature here, one labelled and one not, so the
@@ -739,7 +733,7 @@ func TestSpendingDeltaLinesCarryNoMerchant(t *testing.T) {
 }
 
 // TestSpendingLinesFallBackToTheirSignature pins the merchant column's
-// third step (migration 0054). The merchant store is written by the
+// third step. The merchant store is written by the
 // model tier alone, and the model tier is the weakest scope: a line a
 // stronger tier placed — the provider filing a card row under its
 // merchant category, a rule, a pin — is never a model candidate and
@@ -1022,7 +1016,7 @@ func TestSpendingTransactionsMacro(t *testing.T) {
 // month is simply, silently, cheaper. So the property worth proving is
 // not the identity but that the removal is still VISIBLE somewhere.
 //
-// It is: the enrichment population (migration 0041) is deliberately
+// It is: the enrichment population is deliberately
 // the layer BEFORE the internal-transfer exclusion, so the rows the
 // matcher took out are still there, still carrying the tier that took
 // them. The test wrongly pairs a real purchase with an unrelated
@@ -1183,19 +1177,19 @@ func TestTransactionsBetweenCarriesSpendCategory(t *testing.T) {
 	}
 }
 
-// TestMigration0042DDLIsRerunnable holds the spending report migration
-// to the replay bar: it drops and re-creates web_transactions around the
-// report_transactions_multi swap, and 0158 drops the view again after it.
-func TestMigration0042DDLIsRerunnable(t *testing.T) {
+// TestSpendingReportsAnswer: report_transactions_multi exposes
+// account_kind, every spending report answers over the fixture, and so
+// does web_spending, which reads one of them.
+func TestSpendingReportsAnswer(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)
 	seedSpendingReportFixture(t, db, ctx)
 
-	rerunMigrationDDL(t, db, ctx, "0042_report_spending.sql")
-	assertTransactionsMacroAfterReplay(t, db, ctx)
-	// The macros still answer, including the one the re-run replaced
-	// underneath a view that reads it.
 	var n int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(account_kind) FROM report_transactions_multi(0, 9223372036854775807)`).Scan(&n); err != nil {
+		t.Fatalf("report_transactions_multi.account_kind: %v", err)
+	}
 	from, to := spendWindow()
 	for _, q := range []string{
 		`SELECT COUNT(*) FROM report_spending_summary(?, ?, 'USD', 'month')`,
@@ -1204,23 +1198,21 @@ func TestMigration0042DDLIsRerunnable(t *testing.T) {
 		`SELECT COUNT(*) FROM spending_lines_base(?, ?)`,
 	} {
 		if err := db.QueryRowContext(ctx, q, from, to).Scan(&n); err != nil {
-			t.Errorf("after re-run: %s: %v", q, err)
+			t.Errorf("%s: %v", q, err)
 		}
 	}
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM web_spending`).Scan(&n); err != nil {
-		t.Errorf("web_spending after the macro re-issue: %v", err)
+		t.Errorf("web_spending: %v", err)
 	}
 }
 
-// TestSpendReportColumnsSurviveAReissue pins the column set every
-// spending report publishes.
+// TestSpendReportsKeepTheirColumns pins the column set every spending
+// report publishes.
 //
-// A macro is re-issued whole, so a migration that adds one column has to
-// retype every other. Twice now that has silently dropped columns a
-// later migration had added — and nothing failed until a caller went
-// looking for one. This is the cheap guard: it does not care what a
-// column means, only that the report still has it.
-func TestSpendReportColumnsSurviveAReissue(t *testing.T) {
+// Every reader scans these reports by name or by position, so a body
+// edit that drops a column breaks a caller far away. The guard checks
+// only that each report still has its columns.
+func TestSpendReportsKeepTheirColumns(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)
 	cols := func(q string) map[string]bool {

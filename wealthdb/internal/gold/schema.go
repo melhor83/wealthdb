@@ -9,127 +9,158 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
-// Migrate applies every migration in migrations/ whose number is
-// strictly greater than MAX(gold_schema_version) in schema_meta.
-// Treats a missing schema_meta table as version 0.
+// Migrate brings the database to this binary's schema. It applies every
+// migration in migrations/ whose number is strictly greater than
+// MAX(gold_schema_version) in schema_meta, then the derived set
+// (derived.go) where the database is below the binary's version or
+// carries another set's hash. It treats a missing schema_meta table as
+// version 0, and it leaves a database above the binary's version alone.
 //
-// Each migration file is executed in its entirety inside a single
-// transaction; a failure mid-file rolls back. The last statement
-// of every migration must be an INSERT INTO schema_meta(...) so
-// that "what's the current version" stays accurate.
-//
-// REPLAY. Nothing at runtime replays a migration: the go-duckdb
-// driver executes each statement of a multi-statement Exec exactly
-// once (TestMultiStatementExecRunsEachOnce holds that), a version
-// at-or-below schema_meta is skipped above, and a file that fails
-// rolls back whole. Additive migrations are nevertheless written
-// replay-safe — IF NOT EXISTS on DDL, OR REPLACE on a seed or a macro
-// — so the TestMigrationNNNNDDLIsRerunnable tests can re-execute a
-// migration's pre-stamp body against an already-migrated database and
-// pin that it is safe to.
-//
-// A replay can undo a later migration. A later one may delete a row an
-// earlier seed inserts (0111 deletes five that 0069 seeds), and
-// replaying the seed brings the row back. A rerun test of such a seed
-// therefore replays the later migration after it, as Migrate would,
-// before it asserts anything about the current schema. A replayed macro
-// or view a later migration re-issues is back at its older body too,
-// and one a later migration drops is back at all: the tests' rerun
-// replays every such later migration after it.
-//
-// The CHECK-widening rename-swap migrations, each of which renames its
-// table to <table>_pre_NNNN (0007-0011, 0013-0018, 0033-0037, 0053,
-// 0107, 0109, 0125, 0139), are exempt and deliberately carry no rerun
-// test: replaying one rebuilds its table from that migration's own
-// column list, which would drop columns later migrations added, so a
-// rerun test there would commit a truncated table.
+// A migration file runs once, in one transaction: a failure mid-file
+// rolls back. It holds tables and data moves only; macros and views are
+// the derived set. Its last statement is an INSERT INTO
+// schema_meta(...), so that "what's the current version" stays
+// accurate.
 func Migrate(ctx context.Context, db *sql.DB) error {
+	ms, err := migrations()
+	if err != nil {
+		return err
+	}
+	set, err := derived()
+	if err != nil {
+		return err
+	}
+	return migrate(ctx, db, ms, set)
+}
+
+// migrate is Migrate over the migrations ms and the derived set set.
+func migrate(ctx context.Context, db *sql.DB, ms []migration, set derivedSet) error {
 	current, err := currentSchemaVersion(ctx, db)
 	if err != nil {
 		return fmt.Errorf("read current schema version: %w", err)
 	}
-
-	migrations, err := listMigrations()
-	if err != nil {
-		return err
+	want := wantVersion(ms, set)
+	if current > want {
+		return nil
 	}
 
-	for _, m := range migrations {
+	ran := false
+	for _, m := range ms {
 		if m.version <= current {
 			continue
 		}
 		if err := applyMigration(ctx, db, m); err != nil {
 			return fmt.Errorf("apply migration %04d: %w", m.version, err)
 		}
+		ran = true
+	}
+	if ran {
+		if current, err = currentSchemaVersion(ctx, db); err != nil {
+			return fmt.Errorf("read current schema version: %w", err)
+		}
+	}
+	hash, err := derivedHash(ctx, db)
+	if err != nil {
+		return fmt.Errorf("read the derived hash: %w", err)
+	}
+	if current == want && hash == set.hash {
+		return nil
+	}
+	if err := applyDerived(ctx, db, set, current, want); err != nil {
+		return fmt.Errorf("apply the derived set %d: %w", set.version, err)
 	}
 	return nil
 }
 
-// MigrationsPending reports whether this binary carries a migration the
-// database has not applied. A read-only open applies none, so such a
-// database still lacks what they add.
+// MigrationsPending reports whether this binary carries a migration or a
+// derived set the database has not applied. A read-only open applies
+// neither, so such a database still lacks what they add.
 func MigrationsPending(ctx context.Context, db *sql.DB) (bool, error) {
-	current, latest, err := schemaVersions(ctx, db)
-	return current < latest, err
+	current, want, err := schemaVersions(ctx, db)
+	if err != nil || current != want {
+		return current < want, err
+	}
+	set, err := derived()
+	if err != nil {
+		return false, err
+	}
+	hash, err := derivedHash(ctx, db)
+	return hash != set.hash, err
 }
 
 // CheckSchemaKnown returns ErrStaleBinary, wrapped, when the database's
-// schema is newer than the newest migration this binary carries: a later
-// build has written the database, and this one may misread it. Unlike
-// Open's stale-binary check it needs no build stamp, so it also holds a
-// binary built without VCS information, such as the engine image's —
-// which is what a long-running server needs after the image is rebuilt
-// and a load migrates the database under it.
+// schema is newer than this binary's version: a later build has written
+// the database, and this one may misread it. Open runs it in every mode.
+// Unlike Open's build-stamp check it needs no build stamp, so it also
+// holds a binary built without VCS information, such as the engine
+// image's: an older image is refused on a newer database, and so is a
+// long-running server after the image is rebuilt and a load migrates
+// the database under it.
 func CheckSchemaKnown(ctx context.Context, db *sql.DB) error {
-	current, latest, err := schemaVersions(ctx, db)
+	current, want, err := schemaVersions(ctx, db)
 	if err != nil {
 		return err
 	}
-	if current > latest {
+	if current > want {
 		return fmt.Errorf("%w: the database is at schema %d, and this binary knows schema %d at most",
-			ErrStaleBinary, current, latest)
+			ErrStaleBinary, current, want)
 	}
 	return nil
 }
 
-// schemaVersions is the database's schema version and the newest
-// migration this binary carries. A binary that carries none reports the
-// database's version as its newest, so neither check above fires.
-func schemaVersions(ctx context.Context, db *sql.DB) (current, latest int, err error) {
+// schemaVersions is the database's schema version and this binary's
+// (binaryVersion).
+func schemaVersions(ctx context.Context, db *sql.DB) (current, want int, err error) {
 	if current, err = currentSchemaVersion(ctx, db); err != nil {
 		return 0, 0, err
 	}
-	migrations, err := listMigrations()
+	want, err = binaryVersion()
+	return current, want, err
+}
+
+// binaryVersion is the schema version this binary brings a database to:
+// the newer of its newest migration and its derived set's version.
+func binaryVersion() (int, error) {
+	ms, err := migrations()
 	if err != nil {
-		return 0, 0, err
+		return 0, err
 	}
-	if len(migrations) == 0 {
-		return current, current, nil
+	set, err := derived()
+	if err != nil {
+		return 0, err
 	}
-	return current, migrations[len(migrations)-1].version, nil
+	return wantVersion(ms, set), nil
 }
 
 // currentSchemaVersion returns MAX(gold_schema_version) or 0 if
-// schema_meta does not exist.
+// schema_meta does not exist. Any other failure to read it is returned.
 func currentSchemaVersion(ctx context.Context, db *sql.DB) (int, error) {
-	var v sql.NullInt64
-	row := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(gold_schema_version), 0) FROM schema_meta`)
-	if err := row.Scan(&v); err != nil {
-		// DuckDB raises a Catalog Error when the table is missing.
-		// The message includes "Table with name schema_meta does
-		// not exist"; rather than string-matching, treat any error
-		// at this point as "schema_meta absent ⇒ version 0".
-		return 0, nil
+	var v int
+	err := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(gold_schema_version), 0) FROM schema_meta`).Scan(&v)
+	if err != nil {
+		// Only on a failure does the catalog say whether the table is
+		// missing, so a database that has it pays one query.
+		if ok, cerr := hasTable(ctx, db, "schema_meta"); cerr == nil && !ok {
+			return 0, nil
+		}
+		return 0, err
 	}
-	if !v.Valid {
-		return 0, nil
-	}
-	return int(v.Int64), nil
+	return v, nil
+}
+
+// hasTable reports whether the database's own main schema holds a
+// table of that name.
+func hasTable(ctx context.Context, q querier, name string) (bool, error) {
+	var n int
+	err := q.QueryRowContext(ctx, `SELECT count(*) FROM duckdb_tables()
+	    WHERE database_name = current_database() AND schema_name = 'main' AND table_name = ?`, name).Scan(&n)
+	return n > 0, err
 }
 
 type migration struct {
@@ -138,6 +169,10 @@ type migration struct {
 	body    string
 }
 
+// migrations reads the embedded migrations once per process.
+var migrations = sync.OnceValues(listMigrations)
+
+// listMigrations is the embedded migrations, in version order.
 func listMigrations() ([]migration, error) {
 	entries, err := fs.ReadDir(migrationsFS, "migrations")
 	if err != nil {

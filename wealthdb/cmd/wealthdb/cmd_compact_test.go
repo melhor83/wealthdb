@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/gold"
 )
 
 // bloatGold grows the on-disk gold file by writing then dropping a
@@ -121,19 +124,17 @@ func fileSizeT(t *testing.T, path string) int64 {
 func TestCompactShrinksAndPreservesRows(t *testing.T) {
 	t.Parallel()
 	cfg := setupCLITest(t)
-	if _, _, code := run(t, "-c", cfg, "init"); code != 0 {
-		t.Fatal("init failed")
-	}
+	freshGoldFor(t, cfg)
 	if _, _, code := run(t, "-c", cfg, "load", "schwab-test"); code != 0 {
 		t.Fatal("load failed")
 	}
 	goldPath := goldPathFromCfg(cfg)
 
-	// init writes the pinned format already; rewritten in DuckDB's own
-	// newest, the source shows compact writes the pinned one from a
-	// newer file. The rewrite copies live rows alone, so the bloat comes
-	// after it: compact then has dead blocks to reclaim, whatever the
-	// format change alone would save.
+	// A fresh gold is in the pinned format already; rewritten in
+	// DuckDB's own newest, the source shows compact writes the pinned
+	// one from a newer file. The rewrite copies live rows alone, so
+	// the bloat comes after it: compact then has dead blocks to
+	// reclaim, whatever the format change alone would save.
 	rewriteInNewestFormat(t, goldPath)
 	bloatGold(t, goldPath)
 	if got := storageHeader(t, goldPath); got == v15Header {
@@ -175,9 +176,7 @@ func TestCompactShrinksAndPreservesRows(t *testing.T) {
 func TestCompactDryRunChangesNothing(t *testing.T) {
 	t.Parallel()
 	cfg := setupCLITest(t)
-	if _, _, code := run(t, "-c", cfg, "init"); code != 0 {
-		t.Fatal("init failed")
-	}
+	freshGoldFor(t, cfg)
 	if _, _, code := run(t, "-c", cfg, "load", "schwab-test"); code != 0 {
 		t.Fatal("load failed")
 	}
@@ -248,9 +247,7 @@ func TestReloadFreshEqualsInPlace(t *testing.T) {
 	cfgFresh := writeCfg(goldFresh)
 
 	for _, c := range []string{cfgInPlace, cfgFresh} {
-		if _, _, code := run(t, "-c", c, "init"); code != 0 {
-			t.Fatalf("init failed for %s", c)
-		}
+		freshGoldFor(t, c)
 		if _, _, code := run(t, "-c", c, "load", "schwab-test"); code != 0 {
 			t.Fatalf("load failed for %s", c)
 		}
@@ -287,9 +284,7 @@ func TestReloadFreshEqualsInPlace(t *testing.T) {
 func TestReloadFreshFailedBuildLeavesLiveUntouched(t *testing.T) {
 	t.Parallel()
 	cfg := setupCLITest(t)
-	if _, _, code := run(t, "-c", cfg, "init"); code != 0 {
-		t.Fatal("init failed")
-	}
+	freshGoldFor(t, cfg)
 	if _, _, code := run(t, "-c", cfg, "load", "schwab-test"); code != 0 {
 		t.Fatal("load failed")
 	}
@@ -320,5 +315,41 @@ func TestReloadFreshFailedBuildLeavesLiveUntouched(t *testing.T) {
 	matches, _ := filepath.Glob(goldPath + ".rebuild-*")
 	if len(matches) != 0 {
 		t.Errorf("failed build left rebuild temp files: %v", matches)
+	}
+}
+
+// TestTableListsAgreeWithTheRegistry: the compaction's parity check
+// covers every per-source fact table, and the per-source stores a
+// rebuild carries are the registry's store class.
+func TestTableListsAgreeWithTheRegistry(t *testing.T) {
+	t.Parallel()
+	class := map[string]gold.TableClass{}
+	for _, st := range gold.SourceTables {
+		class[st.Name] = st.Class
+	}
+	for _, table := range compactParityTables {
+		if c := class[table]; c != gold.ClassFact && c != gold.ClassDimension {
+			t.Errorf("parity table %s is of class %q, want a fact or a dimension", table, c)
+		}
+	}
+	for _, st := range gold.SourceTables {
+		if st.Class == gold.ClassFact && !slices.Contains(compactParityTables, st.Name) {
+			t.Errorf("fact table %s is not in compactParityTables", st.Name)
+		}
+	}
+	var carried []string
+	for _, store := range paidStores {
+		if _, ok := class[store.table]; ok {
+			carried = append(carried, store.table)
+		}
+	}
+	var stores []string
+	for _, st := range gold.SourceTables {
+		if st.Class == gold.ClassStore {
+			stores = append(stores, st.Name)
+		}
+	}
+	if !slices.Equal(carried, stores) {
+		t.Errorf("per-source paid stores = %v, store class = %v", carried, stores)
 	}
 }

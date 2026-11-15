@@ -22,8 +22,7 @@ import (
 // wrong.
 //
 // The lists are literal, so this is what a generator pin can reach: it
-// asks the deployed macro whether it names each delta. Migration 0160
-// replays to the same bodies.
+// asks the deployed macro whether it names each delta.
 func TestEveryDeltaLeavesTheFamilyBases(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)
@@ -39,7 +38,7 @@ func TestEveryDeltaLeavesTheFamilyBases(t *testing.T) {
 	check := func(when string) {
 		t.Helper()
 		// spending_lines_base is spending_lines_own and the linked
-		// repayments (0160); the exclusions live in the first, and a
+		// repayments; the exclusions live in the first, and a
 		// repayment's category is held to them in spend_reimbursements.
 		spending, income := body("spending_lines_own"), body("income_lines_base")
 		repaid := body("spend_reimbursements")
@@ -71,7 +70,5 @@ func TestEveryDeltaLeavesTheFamilyBases(t *testing.T) {
 			t.Fatalf("found %d crossings in the vocabulary; this guard reads too little", crossings)
 		}
 	}
-	check("at head")
-	rerunMigrationDDL(t, db, ctx, "0160_reimbursement_netting.sql")
-	check("after replaying 0160")
+	check("the bases")
 }

@@ -22,7 +22,7 @@ func day(n int64) int64 { return n * gold.SecondsPerDay }
 // the silver kind with a provider-category map, so a fixture can
 // exercise that tier.
 //
-// NO account kind is out of the spending scope: since migration 0068
+// NO account kind is out of the spending scope:
 // the default is `include` for every account and `spend_account_scope`
 // is the only thing that takes one out. A fixture that wants an
 // out-of-scope account therefore has to EXCLUDE it through the config,
@@ -703,7 +703,7 @@ func inEnrichmentPopulation(t *testing.T, db *sql.DB, ctx context.Context, sourc
 }
 
 // TestPassMatchesOntoAnAccountOutsideTheSpendingScope is the
-// regression the widened matcher pool (migration 0044) exists for.
+// regression the widened matcher pool exists for.
 //
 // Money moved out of a cash account into an investment account is
 // booked as a withdrawal on one side and a credit on the other, and
@@ -943,6 +943,39 @@ func TestPassAppliesConfigRules(t *testing.T) {
 	}
 	if !sameOnRerun(res, second) {
 		t.Errorf("pass result changed on re-run: %+v then %+v", *res, *second)
+	}
+}
+
+// TestTheLaterPinOnARowWins: a pin by nickname and a pin by id name one
+// row under two identities, so the ledger parse lets both through. The
+// row takes the verdict of the pin later in the ledger, whichever form
+// it names the account in.
+func TestTheLaterPinOnARowWins(t *testing.T) {
+	byNickname := Pin{Source: "bank", Account: "Everyday Cash", Day: day(80), Amount: -2500, Currency: "USD",
+		Detailed: canonical.SpendDetailedInvestment}
+	byID := Pin{Source: "bank", Account: "CASH1", Day: day(80), Amount: -2500, Currency: "USD",
+		Detailed: canonical.SpendDetailedGift}
+	for _, tc := range []struct {
+		name string
+		pins []Pin
+		want string
+	}{
+		{"nickname then id", []Pin{byNickname, byID}, canonical.SpendDetailedGift},
+		{"id then nickname", []Pin{byID, byNickname}, canonical.SpendDetailedInvestment},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, ctx := openGold(t)
+			if _, err := db.ExecContext(ctx, `
+                UPDATE accounts SET nickname = 'Everyday Cash'
+                 WHERE silver_source_id = 'bank' AND account_external_id = 'CASH1'`); err != nil {
+				t.Fatalf("nickname the cash account: %v", err)
+			}
+			seedTxns(t, db, ctx, txn{"bank", "T-TWICE", "CASH1", "withdrawal", day(80), -2500, "", "", ""})
+			runPass(t, db, ctx, Options{Pins: tc.pins})
+			if detailed, prov := verdictOf(t, db, ctx, "bank", "T-TWICE"); detailed != tc.want || prov != ProvenanceManual {
+				t.Errorf("T-TWICE = (%q, %q), want (%q, manual)", detailed, prov, tc.want)
+			}
+		})
 	}
 }
 
@@ -1791,7 +1824,7 @@ func TestPassOwnsManualRows(t *testing.T) {
 // it — the population macros read the table the pass just wrote.
 func TestPassStampsAccountScope(t *testing.T) {
 	db, ctx := openGold(t)
-	// Since migration 0068 every account is in scope by default, so
+	// Every account is in scope by default, so
 	// EXCLUDE is the direction that carries the proof: an include is a
 	// no-op on an account already in, and only a removed exclude can
 	// show that the re-stamp is whole.

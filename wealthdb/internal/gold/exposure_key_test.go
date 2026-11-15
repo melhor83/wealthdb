@@ -2,7 +2,7 @@ package gold
 
 import "testing"
 
-// TestExposureKeyBindsTheCallersColumn pins migration 0142: an
+// TestExposureKeyBindsTheCallersColumn pins exposure_key's binding: an
 // unqualified security_key passed to exposure_key() in a WHERE clause or a
 // join condition binds to the caller's row, so its alias resolves there as
 // it does in a select list, and a caller's qualified column binds there
@@ -39,5 +39,4 @@ func TestExposureKeyBindsTheCallersColumn(t *testing.T) {
 		t.Errorf("the alias resolves in a WHERE clause %d time(s), a select list %d, a join %d, qualified %d; want 1 each",
 			where, selected, joined, aliased)
 	}
-	rerunMigrationDDL(t, db, ctx, "0142_exposure_key_columns.sql")
 }

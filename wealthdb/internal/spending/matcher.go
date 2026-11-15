@@ -20,11 +20,11 @@ import (
 //     own account (SameAccountReversals, with TransferLeg.Signature and
 //     Reversal from reversalRe);
 //   - the pool spans every account in gold, and its kind filter is the
-//     spend_matcher_pool macro's own (migration 0044);
+//     spend_matcher_pool macro's own;
 //   - amounts and currencies are native, converted only in the converted
 //     phase, for a pair a narrative names (gold.MatchedByConversion);
 //   - legs carry the reference a source stamped on both halves
-//     (`payload.$.bank_ref`, loadMovementReferences), the other leg a
+//     (`payload.$.bank_ref`, loadPassEvidence), the other leg a
 //     source describes (`payload.$.counter_currency` / `$.counter_amount`),
 //     the card rail (legRail) and the accounts a narrative names
 //     (legNames, from spending.internal_transfer_matching.names).
@@ -82,11 +82,15 @@ func legNames(names []CounterpartyName, group, owner, counterparty, description 
 // bank's own fixing cost a conversion between two own accounts.
 const convertedTolerancePct = 1.0
 
-// matchTransferPairs is the call into the shared core, in one place so
-// the pass (which wants the flattened leg set) and the audit surface
-// (which wants the pairs themselves) cannot drift on the options.
+// matchTransferLegs is the shared core, behind a variable so a test can
+// count its runs: the pass runs it once, and nothing else in this
+// package runs it.
+var matchTransferLegs = gold.MatchTransferLegs
+
+// matchTransferPairs is the pass's call into the shared core, with the
+// options this caller decides.
 func matchTransferPairs(legs []gold.TransferLeg, windowDays int, tolerancePct float64, overrides gold.TransferOverrides, rates *gold.DailyRates) []gold.TransferMatchPair {
-	return gold.MatchTransferLegs(legs, gold.TransferMatchOpts{
+	return matchTransferLegs(legs, gold.TransferMatchOpts{
 		WindowDays:            windowDays,
 		TolerancePct:          tolerancePct,
 		ToleranceMaxAbs:       gold.DefaultTransferFeeCap,
@@ -98,18 +102,37 @@ func matchTransferPairs(legs []gold.TransferLeg, windowDays int, tolerancePct fl
 	})
 }
 
-// countPairsBy counts the pairs one phase asserted. What it is for is the
-// load summary: a road whose traffic nobody can see is a road nobody can tell
-// has stopped carrying any.
-func countPairsBy(pairs []gold.TransferMatchPair, by gold.TransferMatchPhase) int {
-	n := 0
-	for _, p := range pairs {
-		if p.By == by {
-			n++
-		}
+// The evidence a transfer_links row carries (gold migration 0182). A
+// pair carries its phase's name, and an override pair carries `ledger`:
+// the override ledger's word. A one-legged row carries the road that
+// named its far side: the source's stated counter account, or a rule.
+const (
+	evidenceStatedAccount = "stated-account"
+	evidenceRule          = "rule"
+	// measureCash is a link's measure for a movement of money.
+	measureCash = "cash"
+)
+
+// phaseEvidence is the evidence each matcher phase writes, and
+// evidencePhase the reverse, for the audit surface's listing.
+var (
+	phaseEvidence = map[gold.TransferMatchPhase]string{
+		gold.MatchedByOverride:      "ledger",
+		gold.MatchedByReference:     string(gold.MatchedByReference),
+		gold.MatchedByStatedCounter: string(gold.MatchedByStatedCounter),
+		gold.MatchedByName:          string(gold.MatchedByName),
+		gold.MatchedByAmount:        string(gold.MatchedByAmount),
+		gold.MatchedByReversal:      string(gold.MatchedByReversal),
+		gold.MatchedByConversion:    string(gold.MatchedByConversion),
 	}
-	return n
-}
+	evidencePhase = func() map[string]gold.TransferMatchPhase {
+		out := make(map[string]gold.TransferMatchPhase, len(phaseEvidence))
+		for phase, evidence := range phaseEvidence {
+			out[evidence] = phase
+		}
+		return out
+	}()
+)
 
 // matchedPartners flattens pairs to a map from each matched leg to the
 // leg it was paired with. Membership answers "was this an own-account

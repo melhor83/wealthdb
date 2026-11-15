@@ -761,32 +761,21 @@ func TestNodeLabelsReadAsVocabulary(t *testing.T) {
 	}
 }
 
-// TestMigration0081DDLIsRerunnable holds the resolution to the replay
-// bar: three OR REPLACE macros and nothing else.
-func TestMigration0081DDLIsRerunnable(t *testing.T) {
+// TestCashflowBaseResolvesASalaryToEarnings: a salary line is in the
+// base, and it resolves under earnings.
+func TestCashflowBaseResolvesASalaryToEarnings(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)
 	seedResolutionFixture(t, db, ctx)
 	seedLines(t, db, ctx, []line{
 		{id: "R-WAGE", account: "CASH", kind: "deposit", amount: 100, income: "INCOME_SALARY"},
 	})
-	// 0081 puts the macros back at their first shape: the rerun replays
-	// forward, as Migrate would.
-	rerunMigrationDDL(t, db, ctx, "0081_cashflow_resolution.sql")
 	if _, ok := macroTxnIDs(t, db, ctx, "cashflow_lines_base", 0, 3500000)["R-WAGE"]; !ok {
-		t.Error("the replayed base lost a line")
+		t.Error("the base lost a line")
 	}
-	assertAtHead(t, db, ctx, "R-WAGE")
-}
-
-// assertAtHead checks that a seeded salary line resolves as the head
-// macros place it. A macro left at an older body names an older
-// vocabulary, and the line lands elsewhere.
-func assertAtHead(t *testing.T, db *sql.DB, ctx context.Context, id string) {
-	t.Helper()
 	const want = "operating_in.earnings.INCOME_SALARY"
-	if got := seedLines(t, db, ctx, nil)[id]; got != want {
-		t.Errorf("after the forward replay %s resolves to %q, want %q", id, got, want)
+	if got := seedLines(t, db, ctx, nil)["R-WAGE"]; got != want {
+		t.Errorf("R-WAGE resolves to %q, want %q", got, want)
 	}
 }
 
@@ -866,22 +855,6 @@ func TestElsewhereIsForARowWithNoInstrument(t *testing.T) {
 	}
 }
 
-// TestMigration0085DDLIsRerunnable holds the corrected resolution to the
-// replay bar: two OR REPLACE macros and nothing else.
-func TestMigration0085DDLIsRerunnable(t *testing.T) {
-	t.Parallel()
-	db, ctx := openMigrated(t)
-	seedResolutionFixture(t, db, ctx)
-	seedLines(t, db, ctx, []line{
-		{id: "R85-WAGE", account: "CASH", kind: "deposit", amount: 100, income: "INCOME_SALARY"},
-	})
-	rerunMigrationDDL(t, db, ctx, "0085_cashflow_resolution_fixes.sql")
-	if _, ok := macroTxnIDs(t, db, ctx, "cashflow_lines_base", 0, 3500000)["R85-WAGE"]; !ok {
-		t.Error("the replayed base lost a line")
-	}
-	assertAtHead(t, db, ctx, "R85-WAGE")
-}
-
 // TestAConsumptionLeafIsItsPrimaryUnlessThePrimarySaysNothing pins the
 // one exception to "the outflow leaves are the spending PRIMARIES".
 //
@@ -913,19 +886,19 @@ func TestAConsumptionLeafIsItsPrimaryUnlessThePrimarySaysNothing(t *testing.T) {
 	check(t, seedLines(t, db, ctx, lines), lines)
 }
 
-// ---- migration 0102: the holder may say what the capital went into ------
+// ---- the holder may say what the capital went into ---------------------
 
-// TestAStatedExposureNamesTheInvestingClass walks the whole of 0102.
+// TestAStatedExposureNamesTheInvestingClass walks the whole of it.
 // The investing class is otherwise the instrument's, and a bank payment
 // order names none — so capital deployed into a destination the product
 // holds, in a source that carries no transactions to pair against, drew
 // as `elsewhere`: "Untracked investments", for a book gold holds.
 //
 // The GROUP is asserted alongside the class on every row, and that is
-// the point of asserting the whole triple: until 0102 the verdict
-// reached the group only while the class was still `elsewhere`, so
-// giving a row its class would have cost it its group and a house
-// purchase would have read `Real estate · Private capital`.
+// the point of asserting the whole triple: a verdict that reached the
+// group only while the class was still `elsewhere` would cost a row its
+// group once it had its class, and a house purchase would read
+// `Real estate · Private capital`.
 func TestAStatedExposureNamesTheInvestingClass(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)
@@ -1022,23 +995,4 @@ func TestTheExposureTravelsWithTheVerdictThatWon(t *testing.T) {
 			why:  "a deposit reads income's verdict, so it must read income's exposure"},
 	}
 	check(t, seedLines(t, db, ctx, lines), lines)
-}
-
-// TestMigration0101DDLIsRerunnable pins the contract 0101's own header
-// claims and no test held it to: three macros, an INSERT OR REPLACE and
-// an UPDATE guarded on a NULL, all replayable against a database that
-// already has them.
-func TestMigration0101DDLIsRerunnable(t *testing.T) {
-	t.Parallel()
-	db, ctx := openMigrated(t)
-	rerunMigrationDDL(t, db, ctx, "0101_cashflow_mortgage_transfer.sql")
-}
-
-// TestMigration0102DDLIsRerunnable pins the replay contract: both
-// ALTERs are IF NOT EXISTS and the macro is OR REPLACE, so applying the
-// file twice is a no-op rather than an error.
-func TestMigration0102DDLIsRerunnable(t *testing.T) {
-	t.Parallel()
-	db, ctx := openMigrated(t)
-	rerunMigrationDDL(t, db, ctx, "0102_cashflow_stated_exposure.sql")
 }

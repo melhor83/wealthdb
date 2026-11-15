@@ -3,55 +3,12 @@ package gold
 import (
 	"context"
 	"database/sql"
-	"errors"
-	"fmt"
 	"regexp"
 	"slices"
-	"strings"
+	"strconv"
 	"testing"
+	"time"
 )
-
-// rerunMigrationDDL re-executes everything in a migration ahead of its
-// schema_meta stamp — that INSERT would collide on the version primary
-// key, and schema.go's Migrate contract puts it last. It pins that an
-// additive migration's DDL can be replayed against an already-migrated
-// database. A replayed macro or view goes back to that migration's body,
-// so each later migration that re-issues one replays after it, in
-// version order, as Migrate applied them: a rerun test asserts against
-// the schema at head. A later migration that drops a replayed macro or
-// view replays after it too, so the dropped object is gone again. The
-// re-issues and drops are read off the embedded migrations, so a new
-// one replays with no edit here. A later migration that only undoes a
-// seed (0111 deletes rows 0069 seeds) re-issues nothing: the seed's
-// rerun test replays it itself.
-func rerunMigrationDDL(t *testing.T, db *sql.DB, ctx context.Context, file string) {
-	t.Helper()
-	ms, err := listMigrations()
-	if err != nil {
-		t.Fatalf("list migrations: %v", err)
-	}
-	i := slices.IndexFunc(ms, func(m migration) bool { return m.name == file })
-	if i < 0 {
-		t.Fatalf("no embedded migration %s", file)
-	}
-	replayed := map[string]bool{}
-	for j, m := range ms[i:] {
-		ddl, _, found := strings.Cut(m.body, "INSERT INTO schema_meta")
-		if !found {
-			t.Fatalf("migration %s has no schema_meta stamp", m.name)
-		}
-		issued := reissuedNames(ddl)
-		if j > 0 && !slices.ContainsFunc(issued, func(n string) bool { return replayed[n] }) {
-			continue
-		}
-		if _, err := db.ExecContext(ctx, ddl); err != nil {
-			t.Errorf("re-applying %s DDL: %v", m.name, err)
-		}
-		for _, n := range issued {
-			replayed[n] = true
-		}
-	}
-}
 
 // mustExec runs one statement and fails the test on an error.
 func mustExec(t *testing.T, db *sql.DB, q string, args ...any) {
@@ -67,6 +24,28 @@ func execEach(t *testing.T, db *sql.DB, stmts ...string) {
 	for _, q := range stmts {
 		mustExec(t, db, q)
 	}
+}
+
+// utcMidnight is the epoch second of the day's UTC midnight.
+func utcMidnight(y int, m time.Month, d int) int64 {
+	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Unix()
+}
+
+// fmtFloatPtr is a nullable float for a failure message, "-" for NULL.
+// It keeps every digit, so two renders compare bit for bit.
+func fmtFloatPtr(v *float64) string {
+	if v == nil {
+		return "-"
+	}
+	return strconv.FormatFloat(*v, 'g', 17, 64)
+}
+
+// fmtStrPtr is a nullable string for a failure message, "-" for NULL.
+func fmtStrPtr(s *string) string {
+	if s == nil {
+		return "-"
+	}
+	return *s
 }
 
 // scanStrings is the one column q reads, a string a row.
@@ -116,23 +95,6 @@ func rowsDigest(t *testing.T, ctx context.Context, q querier, sqlText string) st
 	return s.String
 }
 
-// reissueRE matches a macro or a view a migration's DDL creates,
-// replaces or drops, and sqlCommentRE a comment, which names none.
-var (
-	reissueRE    = regexp.MustCompile(`(?i)\b(?:CREATE\s+OR\s+REPLACE\s+(?:MACRO|VIEW)|DROP\s+(?:MACRO\s+TABLE|MACRO|VIEW)\s+IF\s+EXISTS)\s+(\w+)`)
-	sqlCommentRE = regexp.MustCompile(`--[^\n]*`)
-)
-
-// reissuedNames are the macros and views ddl creates, replaces or
-// drops, lower case.
-func reissuedNames(ddl string) []string {
-	var out []string
-	for _, m := range reissueRE.FindAllStringSubmatch(sqlCommentRE.ReplaceAllString(ddl, ""), -1) {
-		out = append(out, strings.ToLower(m[1]))
-	}
-	return out
-}
-
 // openAtVersion opens an in-memory gold database migrated through
 // version and no further: the database the next migration meets. Open
 // would carry it to the latest version, so the migrations are applied
@@ -146,7 +108,7 @@ func openAtVersion(t *testing.T, version int) (*sql.DB, context.Context) {
 	t.Cleanup(func() { db.Close() })
 	ctx := context.Background()
 
-	ms, err := listMigrations()
+	ms, err := migrations()
 	if err != nil {
 		t.Fatalf("list migrations: %v", err)
 	}
@@ -166,93 +128,14 @@ func openAtVersion(t *testing.T, version int) (*sql.DB, context.Context) {
 	return db, ctx
 }
 
-// latestSchemaVersion returns the version number of the highest
-// embedded migration. Used by tests to assert post-Migrate state
-// without hardcoding a version that drifts as new migrations land.
-func latestSchemaVersion() (int, error) {
-	ms, err := listMigrations()
-	if err != nil {
-		return 0, err
-	}
-	if len(ms) == 0 {
-		return 0, fmt.Errorf("no migrations embedded")
-	}
-	return ms[len(ms)-1].version, nil
-}
-
-// TestMigrateAppliesSchema is the smoke test that proves the
-// DuckDB driver loads, the embedded migrations run end-to-end,
-// and schema_meta records the latest applied version.
-func TestMigrateAppliesSchema(t *testing.T) {
-	t.Parallel()
-	db, err := Open(":memory:", ModeReadWrite)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer db.Close()
-
-	ctx := context.Background()
-	if err := Migrate(ctx, db); err != nil {
-		t.Fatalf("Migrate: %v", err)
-	}
-
-	want, err := latestSchemaVersion()
-	if err != nil {
-		t.Fatalf("latestSchemaVersion: %v", err)
-	}
-
-	var version int
-	if err := db.QueryRowContext(ctx,
-		`SELECT MAX(gold_schema_version) FROM schema_meta`).Scan(&version); err != nil {
-		t.Fatalf("read schema_meta: %v", err)
-	}
-	if version != want {
-		t.Errorf("schema version = %d, want %d", version, want)
-	}
-}
-
-// TestMigrateIdempotent verifies that a second Migrate call against
-// an already-migrated database is a no-op (no re-application of
-// already-applied migrations).
-func TestMigrateIdempotent(t *testing.T) {
-	t.Parallel()
-	db, err := Open(":memory:", ModeReadWrite)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer db.Close()
-
-	ctx := context.Background()
-	if err := Migrate(ctx, db); err != nil {
-		t.Fatalf("first Migrate: %v", err)
-	}
-
-	var before int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_meta`).Scan(&before); err != nil {
-		t.Fatalf("count schema_meta (before): %v", err)
-	}
-
-	if err := Migrate(ctx, db); err != nil {
-		t.Fatalf("second Migrate (should be no-op): %v", err)
-	}
-
-	var after int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_meta`).Scan(&after); err != nil {
-		t.Fatalf("count schema_meta (after): %v", err)
-	}
-	if after != before {
-		t.Errorf("schema_meta row count = %d, want %d (idempotent)", after, before)
-	}
-}
-
-// TestMultiStatementExecRunsEachOnce pins the driver behaviour
-// Migrate's replay contract rests on: one Exec of several statements
-// runs each of them exactly once.
+// TestMultiStatementExecRunsEachOnce pins the driver behaviour Migrate
+// rests on: one Exec of several statements runs each of them exactly
+// once.
 func TestMultiStatementExecRunsEachOnce(t *testing.T) {
 	t.Parallel()
-	db, err := Open(":memory:", ModeReadWrite)
+	db, err := sql.Open("duckdb", "")
 	if err != nil {
-		t.Fatalf("Open: %v", err)
+		t.Fatal(err)
 	}
 	defer db.Close()
 
@@ -269,17 +152,7 @@ func TestMultiStatementExecRunsEachOnce(t *testing.T) {
 // docs/DESIGN.md §7.2 is present after migration.
 func TestMigrateCreatesAllTables(t *testing.T) {
 	t.Parallel()
-	db, err := Open(":memory:", ModeReadWrite)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer db.Close()
-
-	ctx := context.Background()
-	if err := Migrate(ctx, db); err != nil {
-		t.Fatalf("Migrate: %v", err)
-	}
-
+	db, ctx := openEmpty(t)
 	want := []string{
 		"schema_meta",
 		"silver_sources",
@@ -304,6 +177,29 @@ func TestMigrateCreatesAllTables(t *testing.T) {
 		if n != 0 && table != "schema_meta" {
 			t.Errorf("expected table %q to be empty, got %d rows", table, n)
 		}
+	}
+}
+
+// currentSchemaVersion reads a database with no schema_meta as version
+// 0, and returns any other failure to read it: a schema_meta it cannot
+// read is no version 0, which would have Migrate replay every
+// migration over it.
+func TestCurrentSchemaVersionReturnsAnUnreadableSchemaMeta(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if v, err := currentSchemaVersion(ctx, db); v != 0 || err != nil {
+		t.Errorf("no schema_meta: version %d, err %v; want 0, nil", v, err)
+	}
+	if _, err := db.ExecContext(ctx, `CREATE TABLE schema_meta (applied_at BIGINT)`); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := currentSchemaVersion(ctx, db); err == nil {
+		t.Errorf("a schema_meta without its version column: version %d, err nil; want an error", v)
 	}
 }
 
@@ -361,64 +257,6 @@ func TestTransactionEnrichmentColumns(t *testing.T) {
 		if nullable != "YES" {
 			t.Errorf("transactions.%s is_nullable = %q, want YES", col, nullable)
 		}
-	}
-}
-
-// TestMigration0038DDLIsRerunnable proves the IF NOT EXISTS on 0038's
-// ALTERs is load-bearing rather than decorative: a bare ADD COLUMN
-// would raise "column already exists" when the body is replayed.
-// Re-executing the migration's DDL against an already-migrated DB must
-// stay clean.
-func TestMigration0038DDLIsRerunnable(t *testing.T) {
-	t.Parallel()
-	db, ctx := openMigrated(t)
-	rerunMigrationDDL(t, db, ctx, "0038_transactions_enrichment_columns.sql")
-}
-
-// TestMigration0039DDLIsRerunnable holds 0039 to the same bar: it drops and
-// re-creates web_transactions around the macro swap, so the DROP must be
-// IF EXISTS and the CREATEs OR REPLACE for a replay to be harmless. 0158
-// drops the view again after it.
-func TestMigration0039DDLIsRerunnable(t *testing.T) {
-	t.Parallel()
-	db, ctx := openMigrated(t)
-	rerunMigrationDDL(t, db, ctx, "0039_report_transactions_account_kind.sql")
-	assertTransactionsMacroAfterReplay(t, db, ctx)
-}
-
-// assertTransactionsMacroAfterReplay checks the schema at head after a
-// replay of a migration that swaps the transaction macros around
-// web_transactions: the macro still exposes account_kind, and nothing
-// names the view 0158 drops.
-func assertTransactionsMacroAfterReplay(t *testing.T, db *sql.DB, ctx context.Context) {
-	t.Helper()
-	var n int
-	if err := db.QueryRowContext(ctx,
-		`SELECT COUNT(account_kind) FROM report_transactions_multi(0, 9223372036854775807)`).Scan(&n); err != nil {
-		t.Fatalf("report_transactions_multi.account_kind: %v", err)
-	}
-	assertNothingNames(t, db, ctx, "web_transactions")
-}
-
-// TestCheckSchemaKnown: a database a later build has migrated past this
-// binary's newest migration reads as stale, with or without a build
-// stamp; one at the binary's own schema does not.
-func TestCheckSchemaKnown(t *testing.T) {
-	t.Parallel()
-	db, ctx := openMigrated(t)
-	if err := CheckSchemaKnown(ctx, db); err != nil {
-		t.Fatalf("a database at this binary's schema: %v", err)
-	}
-	ms, err := listMigrations()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.ExecContext(ctx, `INSERT INTO schema_meta (gold_schema_version, applied_at) VALUES (?, 0)`,
-		ms[len(ms)-1].version+1); err != nil {
-		t.Fatal(err)
-	}
-	if err := CheckSchemaKnown(ctx, db); !errors.Is(err, ErrStaleBinary) {
-		t.Errorf("a database one migration ahead: err = %v, want ErrStaleBinary", err)
 	}
 }
 
@@ -539,12 +377,4 @@ func TestMigration0124DropsOverRows(t *testing.T) {
 	if symbol != "VTI" || vehicle != "etf" {
 		t.Errorf("rows after the drop = %s/%s, want VTI/etf", symbol, vehicle)
 	}
-}
-
-// TestMigration0124DDLIsRerunnable holds the drops to the replay bar.
-func TestMigration0124DDLIsRerunnable(t *testing.T) {
-	t.Parallel()
-	db, ctx := openMigrated(t)
-	rerunMigrationDDL(t, db, ctx, "0124_drop_unread_reports.sql")
-	assertGone0124(t, db, ctx)
 }

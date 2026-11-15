@@ -40,7 +40,7 @@ from pathlib import Path
 
 import pytest
 
-from collectorkit import bronze, prune
+from collectorkit import prune
 
 OLD_TS = "20260101T010000Z"          # older than any guard by slug
 STALE_S = 3 * 3600                    # comfortably past the 1h default
@@ -314,6 +314,16 @@ def test_corrupt_json_run_json_kept(tmp_path):
     assert (d / "positions").exists()
 
 
+def test_undecodable_run_json_kept(tmp_path):
+    # Bytes that are not UTF-8 are a corrupt manifest → UNKNOWN, not a crash.
+    d = make_dump(tmp_path, OLD_TS, screenshots=False, terminal=False,
+                  age_s=STALE_S)
+    (d / "run.json").write_bytes(b"\xff\xfe{")
+    assert run_main(CFG, tmp_path) == 0
+    assert d.exists()
+    assert prune.classify(d, CFG)[0] == prune.UNKNOWN
+
+
 def test_non_object_json_run_json_kept(tmp_path):
     # A JSON array/scalar is not a manifest object → UNKNOWN, never deleted.
     d = make_dump(tmp_path, OLD_TS, screenshots=False, terminal=False,
@@ -437,20 +447,6 @@ def test_validate_target_is_a_config_method(tmp_path):
     CFG.validate_target(tmp_path / OLD_TS / "screenshots", tmp_path)
     with pytest.raises(SystemExit):
         CFG.validate_target(tmp_path / OLD_TS / "positions", tmp_path)
-
-
-def test_lenient_classification_matches_manifest_is_complete(tmp_path):
-    # The prune predicate and the loader's boolean are one rule.
-    cases = {"complete": {"status": "complete"}, "statusless": {},
-             "running": {"status": "in-progress"},
-             "dry": {"status": "dry-run"}, "missing": None}
-    for name, meta in cases.items():
-        run = tmp_path / name
-        run.mkdir()
-        if meta is not None:
-            (run / "run.json").write_text(json.dumps(meta))
-        state, _ = prune.lenient_classification(run, meta)
-        assert (state == prune.COMPLETE) == bronze.manifest_is_complete(run), name
 
 
 def test_validate_target_refuses_symlink(tmp_path):

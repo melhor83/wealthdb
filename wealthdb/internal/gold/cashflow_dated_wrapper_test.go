@@ -5,9 +5,9 @@ import (
 	"testing"
 )
 
-// TestADatedWrapperMovesTheBoundaryOnItsDay covers migration 0162: a trust
-// that was the household's (grantor) until a day and a separate taxpayer
-// (non-grantor) after it. Before the day a move into it is pool-internal
+// TestADatedWrapperMovesTheBoundaryOnItsDay covers a dated wrapper: an account
+// whose wrapper changes on a day, inside the household's pool before it and
+// a vehicle after it. Before the day a move into it is pool-internal
 // and its own spending is a line; after it the move is a vehicles
 // crossing and its spending is the vehicle's. Every figure is invented.
 func TestADatedWrapperMovesTheBoundaryOnItsDay(t *testing.T) {
@@ -63,9 +63,7 @@ func TestADatedWrapperMovesTheBoundaryOnItsDay(t *testing.T) {
 			t.Errorf("%s: %d nodes for %d transactions (%v): a span join fanned out", when, nodes, txns, err)
 		}
 	}
-	check("at head")
-	rerunMigrationDDL(t, db, ctx, "0162_dated_wrapper_override.sql")
-	check("after replaying 0162")
+	check("dated")
 
 	// Without a history row the account has one span: the current wrapper
 	// throughout, as before the migration.

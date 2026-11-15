@@ -21,7 +21,7 @@ func seedCashHistoryFixture(t *testing.T, db *sql.DB, ctx context.Context) (day1
 	seedFX(t, db, day1, "CHF", "USD", "1.10")
 	seedFX(t, db, day1, "USD", "EUR", "0.90")
 	seedFX(t, db, day1, "USD", "GBP", "0.80")
-	for _, q := range []string{
+	execEach(t, db,
 		`INSERT INTO accounts (silver_source_id, account_external_id, account_kind,
                                display_name, base_currency, tax_wrapper, management_style,
                                first_seen_at, last_seen_at) VALUES
@@ -29,11 +29,7 @@ func seedCashHistoryFixture(t *testing.T, db *sql.DB, ctx context.Context) (day1
             ('bank-src', 'BANK2', 'cash', 'Bank two', 'CHF', 'taxable_joint', NULL, 1, 1),
             ('bank-src', 'BANK3', 'cash', 'Metal', 'CHF', NULL, NULL, 1, 1),
             ('brk-src', 'BRK1', 'brokerage', 'Brokerage', 'USD', NULL, NULL, 1, 1)`,
-	} {
-		if _, err := db.ExecContext(ctx, q); err != nil {
-			t.Fatalf("seed accounts: %v", err)
-		}
-	}
+	)
 	for _, snap := range []int64{day1, day3} {
 		chf := "1000"
 		if snap == day3 {
@@ -248,21 +244,14 @@ func TestHoldingsLinesCarryCashByCurrency(t *testing.T) {
 	}
 }
 
-// TestMigration0171DDLIsRerunnable: a replay keeps what the table holds,
-// and every view on it still answers.
-func TestMigration0171DDLIsRerunnable(t *testing.T) {
+// TestCashHistoryViewsAnswer: the fixture materializes cash history, and
+// every view on it answers.
+func TestCashHistoryViewsAnswer(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)
 	seedCashHistoryFixture(t, db, ctx)
-	before := countRows(t, db, ctx, "serving_cash_history")
-	if before == 0 {
+	if countRows(t, db, ctx, "serving_cash_history") == 0 {
 		t.Fatal("the fixture materialized no cash history")
-	}
-
-	rerunMigrationDDL(t, db, ctx, "0171_cash_history_by_currency.sql")
-
-	if after := countRows(t, db, ctx, "serving_cash_history"); after != before {
-		t.Errorf("serving_cash_history holds %d rows after a replay, %d before", after, before)
 	}
 	for _, v := range []string{"holdings_lines_history", "web_positions_history", "web_currencies_history",
 		"web_sources_history", "web_asset_classes_history"} {

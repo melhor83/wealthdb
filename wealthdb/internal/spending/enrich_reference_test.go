@@ -109,10 +109,8 @@ func TestAReferenceSharedWithARowOutsideThePoolPairsNothing(t *testing.T) {
 		stampMovementReference(t, db, ctx, "bank", id, "TXNO-2")
 	}
 
-	refs, ambiguous, err := loadMovementReferences(ctx, db)
-	if err != nil {
-		t.Fatalf("loadMovementReferences: %v", err)
-	}
+	evidence := passEvidenceOf(t, db, ctx)
+	refs, ambiguous := evidence.refs, evidence.ambiguousRefs
 	if len(refs) != 0 {
 		t.Errorf("a reference on three rows was offered anyway: %v", refs)
 	}
@@ -153,10 +151,8 @@ func TestMovementReferencesAreOfferedOnlyWhereTheyNameOneMovement(t *testing.T) 
 	stampMovementReference(t, db, ctx, "bank", "T-COLLIDE", "TXNO-5")
 	stampMovementReference(t, db, ctx, "other-bank", "T-COLLIDE-TOO", "TXNO-5")
 
-	refs, ambiguous, err := loadMovementReferences(ctx, db)
-	if err != nil {
-		t.Fatalf("loadMovementReferences: %v", err)
-	}
+	evidence := passEvidenceOf(t, db, ctx)
+	refs, ambiguous := evidence.refs, evidence.ambiguousRefs
 	// None of the refusals here is a reference naming MORE than one
 	// movement: the lone leg and each half of the cross-source collision
 	// carry one row apiece, which is the ordinary shape of a row whose
@@ -179,8 +175,8 @@ func TestMovementReferencesAreOfferedOnlyWhereTheyNameOneMovement(t *testing.T) 
 }
 
 // The pool is the one place the legs are built, so the reference travels with
-// them and the pass and the audit surface cannot disagree about a pairing.
-func TestTheMatcherPoolCarriesTheReferenceToEveryCaller(t *testing.T) {
+// them, and the pair it forms is the one the audit surface lists.
+func TestTheMatcherPoolCarriesTheReference(t *testing.T) {
 	db, ctx := openGold(t)
 	seedTxns(t, db, ctx,
 		txn{source: "bank", id: "T-REF-OUT", account: "CASH1", kind: "withdrawal",
@@ -191,7 +187,8 @@ func TestTheMatcherPoolCarriesTheReferenceToEveryCaller(t *testing.T) {
 	stampMovementReference(t, db, ctx, "bank", "T-REF-OUT", "TXNO-6")
 	stampMovementReference(t, db, ctx, "bank", "T-REF-IN", "TXNO-6")
 
-	legs, _, _, err := loadMatcherPool(ctx, db, nil)
+	evidence := passEvidenceOf(t, db, ctx)
+	legs, _, err := loadMatcherPool(ctx, db, nil, evidence)
 	if err != nil {
 		t.Fatalf("loadMatcherPool: %v", err)
 	}
@@ -203,7 +200,8 @@ func TestTheMatcherPoolCarriesTheReferenceToEveryCaller(t *testing.T) {
 			t.Errorf("leg %s reached the matcher with Ref %q, want TXNO-6", l.ID, l.Ref)
 		}
 	}
-	pairs, _, err := MatchedPairs(ctx, db, 5, 0.5, nil, nil)
+	runPass(t, db, ctx, Options{})
+	pairs, _, err := MatchedPairs(ctx, db)
 	if err != nil {
 		t.Fatalf("MatchedPairs: %v", err)
 	}
@@ -225,4 +223,18 @@ func TestTheReturnsCallersSettingsLeaveTheReferencePhaseInert(t *testing.T) {
 	if len(got) != 0 {
 		t.Errorf("the returns caller's options paired a same-source reference twin: %+v", got)
 	}
+}
+
+// passEvidenceOf is the payload evidence a pass would read from db.
+func passEvidenceOf(t *testing.T, db *sql.DB, ctx context.Context) passEvidence {
+	t.Helper()
+	held, err := loadHeldAccounts(ctx, db)
+	if err != nil {
+		t.Fatalf("loadHeldAccounts: %v", err)
+	}
+	evidence, err := loadPassEvidence(ctx, db, held.byNorm)
+	if err != nil {
+		t.Fatalf("loadPassEvidence: %v", err)
+	}
+	return evidence
 }

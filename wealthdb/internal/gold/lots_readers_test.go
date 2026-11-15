@@ -244,19 +244,6 @@ func TestCheckCountsAHandoverOnce(t *testing.T) {
 	}
 }
 
-func TestMigration0118DDLIsRerunnable(t *testing.T) {
-	t.Parallel()
-	db, ctx := lotFixture(t, tradesSeed)
-	rebuild(t, db, ctx, fillCfg(lots.FIFO), false)
-	rerunMigrationDDL(t, db, ctx, "0118_lot_engine.sql")
-	if n := queryFloat(t, db, `SELECT count(*) FROM lots`); n != 2 {
-		t.Errorf("a replay must keep the ledger: %v lots", n)
-	}
-	if !rebuild(t, db, ctx, fillCfg(lots.FIFO), false).Unchanged {
-		t.Error("a replay changes no input")
-	}
-}
-
 func TestOpenLotsStandAtTheirPositionsSnapshot(t *testing.T) {
 	t.Parallel()
 	// A buy after the last snapshot is not in the lots of the position

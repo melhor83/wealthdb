@@ -100,14 +100,12 @@ func merchantRow(t *testing.T, goldPath string) map[string]string {
 // derived from the transactions the rebuild re-projects.
 //
 // The row is compared column by column, whole: the carry-across
-// derives its column list from the schema, and a comparison naming
-// only a couple of columns would pass while the rest went missing.
+// copies by name, and a comparison naming only a couple of columns
+// would pass while the rest went missing.
 func TestReloadFreshCarriesMerchantStore(t *testing.T) {
 	t.Parallel()
 	cfg := setupCLITest(t)
-	if _, _, code := run(t, "-c", cfg, "init"); code != 0 {
-		t.Fatal("init failed")
-	}
+	freshGoldFor(t, cfg)
 	if _, _, code := run(t, "-c", cfg, "load", "schwab-test"); code != 0 {
 		t.Fatal("load failed")
 	}
@@ -150,9 +148,7 @@ func TestReloadFreshCarriesMerchantStore(t *testing.T) {
 func TestReloadInPlaceKeepsMerchantStore(t *testing.T) {
 	t.Parallel()
 	cfg := setupCLITest(t)
-	if _, _, code := run(t, "-c", cfg, "init"); code != 0 {
-		t.Fatal("init failed")
-	}
+	freshGoldFor(t, cfg)
 	if _, _, code := run(t, "-c", cfg, "load", "schwab-test"); code != 0 {
 		t.Fatal("load failed")
 	}
@@ -180,9 +176,7 @@ func TestReloadInPlaceKeepsMerchantStore(t *testing.T) {
 func TestCompactPreservesSpendOverlay(t *testing.T) {
 	t.Parallel()
 	cfg := setupCLITest(t)
-	if _, _, code := run(t, "-c", cfg, "init"); code != 0 {
-		t.Fatal("init failed")
-	}
+	freshGoldFor(t, cfg)
 	if _, _, code := run(t, "-c", cfg, "load", "schwab-test"); code != 0 {
 		t.Fatal("load failed")
 	}
@@ -210,9 +204,7 @@ func TestCompactPreservesSpendOverlay(t *testing.T) {
 func TestSpendingPassRunsOnEveryLoadPath(t *testing.T) {
 	t.Parallel()
 	cfg := setupCLITest(t)
-	if _, _, code := run(t, "-c", cfg, "init"); code != 0 {
-		t.Fatal("init failed")
-	}
+	freshGoldFor(t, cfg)
 	for _, tc := range []struct {
 		name string
 		args []string
@@ -232,67 +224,12 @@ func TestSpendingPassRunsOnEveryLoadPath(t *testing.T) {
 	}
 }
 
-// dropMerchantColumn removes one column from the live gold's merchant
-// store, standing in for the state a live file is left in by an
-// additive migration nothing has applied to it yet: 'reload -a' never
-// opens the live file read-write, so it never migrates it.
-func dropMerchantColumn(t *testing.T, goldPath, column string) {
-	t.Helper()
-	execGold(t, goldPath, `ALTER TABLE spend_merchant_categories DROP COLUMN `+column)
-}
-
-// TestReloadFreshNamesTheColumnTheLiveFileLacks covers the drift
-// direction the derived column list makes silent rather than safe.
-//
-// The intersection drops a column the outgoing file has not got, and
-// every column of the merchant store is NOT NULL — so the INSERT would
-// die on the target table's constraint, mid-rebuild, with a message
-// naming no file, no command and no way forward. The refusal has to
-// come first and name the column.
-func TestReloadFreshNamesTheColumnTheLiveFileLacks(t *testing.T) {
+// TestReloadFreshSaysWhenAStoreIsEmpty: a rebuild over an empty store
+// says so, rather than staying silent about the store.
+func TestReloadFreshSaysWhenAStoreIsEmpty(t *testing.T) {
 	t.Parallel()
 	cfg := setupCLITest(t)
-	if _, _, code := run(t, "-c", cfg, "init"); code != 0 {
-		t.Fatal("init failed")
-	}
-	if _, _, code := run(t, "-c", cfg, "load", "schwab-test"); code != 0 {
-		t.Fatal("load failed")
-	}
-	goldPath := goldPathFromCfg(cfg)
-	seedMerchantStore(t, goldPath)
-	dropMerchantColumn(t, goldPath, "model_name")
-
-	_, se, code := run(t, "-c", cfg, "reload", "-a")
-	if code == 0 {
-		t.Fatal("reload -a succeeded against a live merchant store missing a required column")
-	}
-	if !strings.Contains(se, "model_name") {
-		t.Errorf("the refusal does not name the missing column:\n%s", se)
-	}
-	if !strings.Contains(se, "wealthdb load") {
-		t.Errorf("the refusal does not name the command that migrates the live file:\n%s", se)
-	}
-	if strings.Contains(se, "NOT NULL constraint failed") {
-		t.Errorf("the raw constraint error surfaced instead of the named-column refusal:\n%s", se)
-	}
-
-	// The live file is untouched: a refused rebuild swaps nothing.
-	merchants, _, _, _ := readMerchantStore(t, goldPath)
-	if merchants != 1 {
-		t.Errorf("merchant store rows after the refused reload = %d, want 1", merchants)
-	}
-}
-
-// TestReloadFreshDistinguishesAnEmptyStoreFromNoStore pins the two
-// nothing-carried cases apart. A file with an empty merchant store and
-// a file predating the store entirely are different states, and one
-// line for both reads as the schema being absent when it is not.
-func TestReloadFreshDistinguishesAnEmptyStoreFromNoStore(t *testing.T) {
-	t.Parallel()
-	cfg := setupCLITest(t)
-	if _, _, code := run(t, "-c", cfg, "init"); code != 0 {
-		t.Fatal("init failed")
-	}
+	freshGoldFor(t, cfg)
 	if _, _, code := run(t, "-c", cfg, "load", "schwab-test"); code != 0 {
 		t.Fatal("load failed")
 	}
@@ -304,4 +241,59 @@ func TestReloadFreshDistinguishesAnEmptyStoreFromNoStore(t *testing.T) {
 	if !strings.Contains(so, "merchant store is empty") {
 		t.Errorf("reload -a over an empty (but present) merchant store did not say so:\n%s", so)
 	}
+}
+
+// TestReloadFreshMigratesTheOutgoingFile: a live file with a migration
+// still to apply is migrated before the build, so every paid store
+// carries whole from a file of the rebuilt one's schema, and the
+// swapped-in file is at the head version.
+func TestReloadFreshMigratesTheOutgoingFile(t *testing.T) {
+	t.Parallel()
+	cfg := setupCLITest(t)
+	freshGoldFor(t, cfg)
+	if _, _, code := run(t, "-c", cfg, "load", "schwab-test"); code != 0 {
+		t.Fatal("load failed")
+	}
+	goldPath := goldPathFromCfg(cfg)
+	seedMerchantStore(t, goldPath)
+	execGold(t, goldPath, `
+        INSERT INTO income_payer_categories (payer_signature, payer_name, income_detailed,
+                                             signature_version, assigned_at, model_name) VALUES
+            ('sig-payroll', 'Blue Harbour Payroll', 'INCOME_SALARY', 1, 100, 'test-model');
+        INSERT INTO symbol_resolutions (silver_source_id, lookup_kind, lookup_value,
+                                        symbol, resolved_at, model_name) VALUES
+            ('schwab-test', 'name', 'Example Growth Fund', 'EXGF', 100, 'test-model');`)
+	head := schemaVersionOf(t, goldPath)
+	execGold(t, goldPath, `DELETE FROM schema_meta WHERE gold_schema_version = (SELECT max(gold_schema_version) FROM schema_meta)`)
+	if got := schemaVersionOf(t, goldPath); got >= head {
+		t.Fatalf("schema version %d after the delete, want one below %d", got, head)
+	}
+
+	so, se, code := run(t, "-c", cfg, "reload", "-a")
+	if code != 0 {
+		t.Fatalf("reload -a failed: code=%d stderr=%s", code, se)
+	}
+	for _, store := range paidStores {
+		if want := fmt.Sprintf("carried 1 %s verdict(s) across the rebuild", store.noun); !strings.Contains(so, want) {
+			t.Errorf("stdout lacks %q:\n%s", want, so)
+		}
+	}
+	if got := schemaVersionOf(t, goldPath); got != head {
+		t.Errorf("the rebuilt file is at schema version %d, want the head %d", got, head)
+	}
+}
+
+// schemaVersionOf reads a gold file's newest applied migration.
+func schemaVersionOf(t *testing.T, goldPath string) int {
+	t.Helper()
+	db, err := sql.Open("duckdb", goldPath+"?access_mode=read_only")
+	if err != nil {
+		t.Fatalf("open gold read-only: %v", err)
+	}
+	defer db.Close()
+	var v int
+	if err := db.QueryRow(`SELECT max(gold_schema_version) FROM schema_meta`).Scan(&v); err != nil {
+		t.Fatalf("read the schema version: %v", err)
+	}
+	return v
 }

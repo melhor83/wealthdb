@@ -22,18 +22,19 @@ import (
 
 // ErrStaleBinary is returned from Open when the binary's VCS
 // commit timestamp is older than the latest binary timestamp
-// recorded in the database's binary_versions table. The caller
-// (cmd/wealthdb) prints the wrapped message and exits non-zero —
-// the database has been written by a newer wealthdb, so the
-// current binary may misread its schema.
+// recorded in the database's binary_versions table, or when the
+// database's schema is newer than the binary's (CheckSchemaKnown).
+// The caller (cmd/wealthdb) prints the wrapped message and exits
+// non-zero — the database has been written by a newer wealthdb, so
+// the current binary may misread its schema.
 var ErrStaleBinary = errors.New("binary is older than the database's last writer")
 
 // StorageVersion is the storage format of a gold file DuckDB creates:
 // the newest that Metabase's DuckDB driver reads (web/Dockerfile pins
-// the driver; a web test holds the two together). Left to itself, DuckDB writes its own newest format, which that
-// driver cannot open, so a fresh `init`, a full reload or a compaction
-// would take the dashboards down. A file keeps the format it was
-// created in.
+// the driver; a web test holds the two together). Left to itself,
+// DuckDB writes its own newest format, which that driver cannot open,
+// so a fresh `init`, a full reload or a compaction would take the
+// dashboards down. A file keeps the format it was created in.
 const StorageVersion = "v1.5.0"
 
 // Mode controls whether the gold DB is opened read-write or
@@ -132,25 +133,36 @@ func open(path string, mode Mode, audit bool, options map[string]string) (*sql.D
 		_ = db.Close()
 		return nil, fmt.Errorf("ping duckdb %q: %w", path, err)
 	}
-	// Apply outstanding migrations on every RW open so the schema
-	// always matches the binary's expectations. Idempotent: a DB
-	// already at the latest version is a fast MAX(version) scan
-	// and zero ExecContexts. Skipped for read-only opens (can't
-	// write DDL) — RO callers rely on prior RW callers (init,
-	// load, reset) having brought the schema up to date.
+	// Apply outstanding migrations and the derived set on every RW
+	// open so the schema always matches the binary's expectations.
+	// Idempotent: a DB already at the binary's version and hash costs
+	// a MAX(version) scan, a one-row hash read and zero ExecContexts;
+	// CheckSchemaKnown below scans MAX(version) once more.
+	// Skipped for read-only opens (can't write DDL) — RO callers rely
+	// on prior RW callers (init, load, reset) having brought the
+	// schema up to date.
 	if mode == ModeReadWrite {
 		if err := Migrate(context.Background(), db); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("migrate gold %q: %w", path, err)
 		}
 	}
-	// Staleness check — runs on every Open (RO and RW). After
-	// migration so a brand-new DB has the binary_versions table
-	// in place; RO callers tolerate older databases that haven't
-	// yet been migrated (no table → skip).
+	// Staleness checks — both run on every Open (RO and RW), after
+	// migration so a brand-new DB has its tables in place. The first
+	// compares build stamps, which a binary built without VCS
+	// information (the engine image's) lacks; RO callers tolerate
+	// older databases that haven't yet been migrated (no table →
+	// skip). The second compares schema versions, which every binary
+	// carries: a database a later build has migrated past this one's
+	// schema has no migration path down, so it is refused in every
+	// mode. An older database passes it.
 	if err := checkBinaryNotStale(context.Background(), db, path); err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	if err := CheckSchemaKnown(context.Background(), db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("gold %q: %w", path, err)
 	}
 	// RW opens record themselves on the way in, so the next RW or
 	// RO Open knows what the most-recent writer was. Best-effort:

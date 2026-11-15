@@ -3,7 +3,6 @@ package gold
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -104,13 +103,13 @@ func TestWebGainsLabelsTheAccount(t *testing.T) {
 	}
 }
 
-// web_gains reads a row with no asset class as `unknown` (0170): BBB, a
+// web_gains reads a row with no asset class as `unknown`: BBB, a
 // sale within a month no snapshot shows it at the start or the end of,
 // and ZZZ, sold with no snapshot at all, leave report_gains' class blank;
 // every other row, DDD's among them, keeps its class. So the gains of
 // every class picked add up to the whole, realized and unrealized, as
 // the Gains dashboard's Asset class picker sums them: a picked class is
-// never blank. Replaying 0170 changes nothing.
+// never blank.
 func TestWebGainsReadsAMissingClassAsUnknown(t *testing.T) {
 	t.Parallel()
 	db, ctx := openGainsFixture(t)
@@ -143,20 +142,18 @@ func TestWebGainsReadsAMissingClassAsUnknown(t *testing.T) {
 		}
 	}
 	check()
-	rerunMigrationDDL(t, db, ctx, "0170_gains_unknown_class.sql")
-	check()
 }
 
-func TestMigration0117DDLIsRerunnable(t *testing.T) {
+// TestWebGainsAnswers: over a materialized gold, web_gains holds rows.
+func TestWebGainsAnswers(t *testing.T) {
 	t.Parallel()
 	db, ctx := openGainsFixture(t)
 	if _, err := MaterializeGains(ctx, db, gainsTo, 1); err != nil {
 		t.Fatal(err)
 	}
-	rerunMigrationDDL(t, db, ctx, "0117_gains_dashboard.sql")
 	var n int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM web_gains`).Scan(&n); err != nil || n == 0 {
-		t.Errorf("after replay: %d rows, err %v", n, err)
+		t.Errorf("%d rows, err %v", n, err)
 	}
 }
 
@@ -231,20 +228,6 @@ func TestMaterializeGainsCopiesAReadingThatChangesNothing(t *testing.T) {
 	}
 	if ignore == 0 || zero != ignore {
 		t.Fatalf("ignore rows %d, zero rows %d", ignore, zero)
-	}
-	matchesBuckets(t, ctx, db)
-}
-
-func TestMigrations0119To0157DDLAreRerunnable(t *testing.T) {
-	t.Parallel()
-	db, ctx := openGainsFixture(t)
-	rerunMigrationDDL(t, db, ctx, "0119_gains_one_pass.sql")
-	rerunMigrationDDL(t, db, ctx, "0120_gains_held_sold.sql")
-	rerunMigrationDDL(t, db, ctx, "0121_private_exits.sql")
-	rerunMigrationDDL(t, db, ctx, "0133_deterministic_labels.sql")
-	rerunMigrationDDL(t, db, ctx, "0157_gains_start_rate.sql")
-	if _, err := MaterializeGains(ctx, db, gainsTo, 42); err != nil {
-		t.Fatal(err)
 	}
 	matchesBuckets(t, ctx, db)
 }
@@ -335,7 +318,7 @@ func TestMaterializedGainSplitsHeldAndSold(t *testing.T) {
 		}
 		heldOK := held == nil && math.IsNaN(c.held) || held != nil && near(*held, c.held)
 		if !heldOK || sold == nil || !near(*sold, c.sold) {
-			t.Errorf("%s %s %s: held %s sold %s, want %v %v", c.ccy, c.month, c.key, floatText(held), floatText(sold), c.held, c.sold)
+			t.Errorf("%s %s %s: held %s sold %s, want %v %v", c.ccy, c.month, c.key, fmtFloatPtr(held), fmtFloatPtr(sold), c.held, c.sold)
 		}
 	}
 }
@@ -400,15 +383,8 @@ func TestMaterializedSplitTakesTheNewestStartRate(t *testing.T) {
 			soldOK := sold == nil && math.IsNaN(c.sold) || sold != nil && near(*sold, c.sold)
 			if held == nil || !near(*held, c.held) || !soldOK {
 				t.Errorf("run %d, %s %s: held %s sold %s, want %v %v",
-					run, c.ccy, c.acct, floatText(held), floatText(sold), c.held, c.sold)
+					run, c.ccy, c.acct, fmtFloatPtr(held), fmtFloatPtr(sold), c.held, c.sold)
 			}
 		}
 	}
-}
-
-func floatText(f *float64) string {
-	if f == nil {
-		return "NULL"
-	}
-	return fmt.Sprint(*f)
 }

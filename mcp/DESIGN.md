@@ -8,7 +8,7 @@ to use it; [AGENTS.md](AGENTS.md) holds the rules for changing it.
 | Piece | Where | What |
 | --- | --- | --- |
 | Server | `wealthdb/cmd/wealthdb/mcp_*.go`, `cmd_mcp_serve.go` | the `mcp-serve` subcommand: protocol, tools, rows, rendering, auth |
-| Settings | `cmd_mcp_config.go`, `internal/config` | the `mcp` block, read back by the hidden `mcp-config` |
+| Settings | `cmd_config_env.go`, `internal/config` | the `mcp` block, read back by the hidden `config-env mcp` |
 | Lifecycle | `mcp/mcp` | `docker run` geometry, token, status, the stdio launcher |
 
 The server is a second front-end over the reports the CLI runs. Each
@@ -44,7 +44,7 @@ calls:
 - A command that opens gold read-write retries on the same ladder when
   a reader is in the way: a write command, and a read command where the
   file is writable, since it opens read-write to apply a pending
-  migration. A reader holds its handle for one report, seconds at most.
+  schema change. A reader holds its handle for one report, seconds at most.
   The write mutex between writers stays non-blocking: another writer
   may run for an hour.
 - `compact` and `reload -a` rename a new file over the path. The next
@@ -56,7 +56,7 @@ size itself to the host, and the default spill path beside the
 database is on a read-only mount.
 
 After a rebuild of the image, a running server keeps the old binary.
-Once a load migrates gold past the newest migration that binary
+Once a load migrates gold past the schema version that binary
 carries, every call answers "run `wealthdb mcp restart`":
 `gold.CheckSchemaKnown` compares gold's schema version with the
 binary's own, which needs no build stamp (the image binary carries
@@ -88,9 +88,10 @@ resolved dates, for a stdio session that outlives the day.
 
 `wealthdb mcp start|stop|status|restart|logs|stdio|url`, modelled on
 `wealthdb web`: the wrapper delegates to `mcp/mcp`, which reads the
-settings back through the hidden `mcp-config`, the engine being the one
-JSON reader. There is no `build` (it is the engine image) and no
-`refresh` (live gold).
+settings back through the hidden `config-env mcp`
+([DESIGN.md §4.1](../wealthdb/docs/DESIGN.md#41-subcommands)), the
+engine being the one JSON reader. There is no `build` (it is the engine
+image) and no `refresh` (live gold).
 
 ```
 docker run -d --name wealthdb-mcp --restart unless-stopped \
@@ -224,7 +225,7 @@ narrow ones:
 
 Not exposed, because they write or prompt: `config`, `init`, `load`,
 `reset`, `reload`, `compact`, `lots`, `categorize`, `resolve-symbols`,
-`categorizations --forget`, `web-*`, `mcp-config`. There is no SQL tool
+`categorizations --forget`, `web-*`, `config-env`. There is no SQL tool
 and no grouping beyond what the reports do.
 
 `describe` and the resources (`wealthdb://guide`,

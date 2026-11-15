@@ -4,7 +4,7 @@ import (
 	"testing"
 )
 
-// TestASignPinnedCashLegJoinsInvesting covers migration 0161: a
+// TestASignPinnedCashLegJoinsInvesting covers this case: a
 // corporate action's cash leg, on a source whose kind the sign table
 // pins, is investing and in the coverage ledger; the same kind moving
 // shares, the same cash leg on an unpinned source, and an FX leg stay
@@ -77,15 +77,13 @@ func TestASignPinnedCashLegJoinsInvesting(t *testing.T) {
 			if r.SourceID != "cf" || r.Account != "Brokerage" {
 				continue
 			}
-			if show(r.Ledger) != "15.5" || show(r.UnsignedVolume) != "900" {
+			if fmtStrPtr(r.Ledger) != "15.5" || fmtStrPtr(r.UnsignedVolume) != "900" {
 				t.Errorf("%s: brokerage coverage: ledger %v, unsigned %v; want the two cash legs in the ledger, "+
-					"the share leg unsigned", when, show(r.Ledger), show(r.UnsignedVolume))
+					"the share leg unsigned", when, fmtStrPtr(r.Ledger), fmtStrPtr(r.UnsignedVolume))
 			}
 			return
 		}
 		t.Errorf("%s: no coverage row for the brokerage account", when)
 	}
-	check("at head")
-	rerunMigrationDDL(t, db, ctx, "0161_cash_signed_kinds.sql")
-	check("after replaying 0161")
+	check("the cash leg")
 }

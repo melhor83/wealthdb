@@ -13,7 +13,7 @@ import (
 )
 
 // The point-in-time readers take each key's active snapshot at their
-// instant by the history's rule (migration 0140): a snapshot speaks
+// instant by the history's rule (pos_active_at): a snapshot speaks
 // only for the accounts it names. These tests hold every point-in-time
 // report to the daily history on a book of partial runs, pin the
 // history's own answer, and check the readers that pick in Go. All
@@ -539,23 +539,6 @@ func TestRefdataWantedHoldsWhatItsAccountCarries(t *testing.T) {
 	}
 }
 
-// TestRefdataWantedBeforeMigration0140: a gold at migration 0139 (a
-// read-only open of an older file) has no pos_active_at and reads its
-// source's newest snapshot as every account's, so the fund ends at its
-// own last snapshot.
-func TestRefdataWantedBeforeMigration0140(t *testing.T) {
-	t.Parallel()
-	db, ctx := openAtVersion(t, 139)
-	seedCarriedFund(t, db, ctx)
-	w, err := RefdataWanted(ctx, db, ymd(2026, 4, 10))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if f := wantedFund(w, "symbol:FUNDQ"); f == nil || f.HeldTo == nil || *f.HeldTo != "2026-01-15" {
-		t.Errorf("FUNDQ %+v of %+v", f, w.Funds)
-	}
-}
-
 // TestCheckReadsEachAccountsActiveSnapshot: B's own run lands after
 // A's last snapshot in the window; the positions check still compares A
 // at its own.
@@ -576,20 +559,5 @@ func TestCheckReadsEachAccountsActiveSnapshot(t *testing.T) {
 	if len(rows) != 1 || rows[0].Check != "positions" || rows[0].AccountExternalID != "A" ||
 		!near(num(t, rows[0].EngineCost), 400) || !near(num(t, rows[0].StatedCost), 410) {
 		t.Fatalf("check rows %+v", rows)
-	}
-}
-
-// TestMigration0140DDLIsRerunnable holds the migration to the replay bar:
-// a second application changes no answer.
-func TestMigration0140DDLIsRerunnable(t *testing.T) {
-	t.Parallel()
-	db, ctx := openMigrated(t)
-	seedPartialRuns(t, db, ctx)
-	const accounts = `SELECT * FROM report_accounts_multi(9223372036854775807)`
-	const history = `SELECT * FROM hist_active_pos() UNION ALL BY NAME SELECT * FROM hist_active_cash()`
-	before, beforeHistory := rowsDigest(t, ctx, db, accounts), rowsDigest(t, ctx, db, history)
-	rerunMigrationDDL(t, db, ctx, "0140_snapshots_per_account.sql")
-	if rowsDigest(t, ctx, db, accounts) != before || rowsDigest(t, ctx, db, history) != beforeHistory || before == "" {
-		t.Error("the replay changed an answer")
 	}
 }

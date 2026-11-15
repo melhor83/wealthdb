@@ -19,6 +19,7 @@ accepts a payload — that needs a live instance.
 Prints the same "  ok / FAIL" lines web/test_web.sh does and exits with
 the number of failures.
 """
+import concurrent.futures
 import contextlib
 import datetime as dt
 import importlib.util
@@ -32,6 +33,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import provision as p                                   # noqa: E402
+import tile_timings as tt                                # noqa: E402
 
 FAILS = 0
 
@@ -314,7 +316,7 @@ check("...as stacked bands over a continuous axis",
 # The merchant rankings rank merchants. A line resolved to a delta — a
 # gift, a card bill, cash out of an ATM — is not a merchant
 # transaction, and a card bill carries the issuer it was paid to as its
-# merchant (migration 0052), so a blank merchant does not stand for
+# merchant, so a blank merchant does not stand for
 # "not a delta". Both rankings exclude the delta CATEGORIES — a
 # delta is primary-level, so the two category columns are equal on one
 # — and still require a name to rank by. Only the rankings filter: a
@@ -753,19 +755,24 @@ section("gold's spending label and the provisioner's constant")
 # The provisioner does not merely DISPLAY this label, it FILTERS on it
 # (the "Uncategorized share" card). Re-spelling either side would make
 # that card return zero and read as "nothing is uncategorised" — the most
-# reassuring possible way to be wrong. Scanning every migration rather
-# than one by number keeps this correct when a later migration re-issues
-# the view; set equality fails from either direction, and from a third
-# spelling appearing.
+# reassuring possible way to be wrong. Scanning every derived file rather
+# than one view keeps this correct when another view renders the label;
+# set equality fails from either direction, and from a third spelling
+# appearing.
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GOLD_MIGRATIONS = os.path.join(_REPO, "wealthdb", "internal", "gold", "migrations")
-MIGRATION_SQL = "\n".join(
-    open(os.path.join(GOLD_MIGRATIONS, f), encoding="utf-8").read()
-    for f in sorted(os.listdir(GOLD_MIGRATIONS)) if f.endswith(".sql"))
+# Every macro and view lives in gold's derived files, each object once;
+# the LOCK lists the derived versions.
+GOLD_DERIVED = os.path.join(_REPO, "wealthdb", "internal", "gold", "derived")
+DERIVED_SQL = "\n".join(
+    open(os.path.join(GOLD_DERIVED, f), encoding="utf-8").read()
+    for f in sorted(os.listdir(GOLD_DERIVED)) if f.endswith(".sql"))
+DERIVED_VERSIONS = [int(line.split()[0]) for line in
+                    open(os.path.join(GOLD_DERIVED, "LOCK"), encoding="utf-8").read().split("\n") if line.strip()]
 COALESCED = set(re.findall(
     r"COALESCE\(\s*(?:CASE\b[^()]*?END|spend_(?:primary|detailed))\s*,\s*"
-    r"'([^']*)'\s*\)", MIGRATION_SQL, re.S))
-check("the migrations really do render a label for an unresolved category",
+    r"'([^']*)'\s*\)", DERIVED_SQL, re.S))
+check("the derived views really do render a label for an unresolved category",
       bool(COALESCED), "the COALESCE shape moved; this check went vacuous")
 check("gold's spending views render exactly the label the "
       "uncategorized-share card filters on",
@@ -807,13 +814,15 @@ def _go_list(text, var, type_name=None):
         return None
 
 
-# The guard's version is a migration that exists, and no older than the
-# newest one that (re)defines an object the cards read: a web_* view in
-# the registry or a serving_* table a model names. A snapshot older than
-# that can carry every view by name; only the version tells it apart.
+# The guard's version is a migration that exists or a derived version,
+# and no older than the newest one that (re)defines an object the cards
+# read: a web_* view in the registry or a serving_* table a model names.
+# A snapshot older than that can carry every view by name; only the
+# version tells it apart.
 _MIG_FILES = sorted(f for f in os.listdir(GOLD_MIGRATIONS) if f.endswith(".sql"))
-check("the cards' minimum gold schema is a migration on disk",
-      any(f.startswith(f"{p.MIN_GOLD_SCHEMA:04d}_") for f in _MIG_FILES),
+check("the cards' minimum gold schema is a migration on disk or a derived version",
+      any(f.startswith(f"{p.MIN_GOLD_SCHEMA:04d}_") for f in _MIG_FILES)
+      or p.MIN_GOLD_SCHEMA in DERIVED_VERSIONS,
       p.MIN_GOLD_SCHEMA)
 _MIG_TEXT = {int(f[:4]): open(os.path.join(GOLD_MIGRATIONS, f), encoding="utf-8").read()
              for f in _MIG_FILES}
@@ -822,10 +831,19 @@ _SERVED = sorted(set(re.findall(r"\bserving_\w+", "\n".join(
 
 
 def _latest_definition(name):
-    """The text of the last migration statement that (re)defines `name`."""
-    found = re.findall(rf"CREATE OR REPLACE (?:VIEW|MACRO) {name}\b.*?;\n",
-                       MIGRATION_SQL, re.S)
-    return found[-1] if found else ""
+    """The derived statement that defines view or macro `name`, as a
+    CREATE OR REPLACE, so it runs over a stand-in of the same name. It
+    ends, as gold splits the files, at the first line that ends with `;`
+    and is no comment."""
+    found = re.search(rf"^CREATE ((?:VIEW|MACRO) {name}\b.*)", DERIVED_SQL, re.S | re.M)
+    if not found:
+        return ""
+    lines = []
+    for line in found.group(1).splitlines(keepends=True):
+        lines.append(line)
+        if line.rstrip().endswith(";") and not line.lstrip().startswith("--"):
+            break
+    return "CREATE OR REPLACE " + "".join(lines)
 
 
 def _defined_in(obj):
@@ -834,7 +852,47 @@ def _defined_in(obj):
     return [n for n, text in _MIG_TEXT.items() if re.search(pat, text)]
 
 
-_NEWEST = {o: max(_defined_in(o), default=None) for o in p.web_views_wanted() + _SERVED}
+def _statement_code(text):
+    """The code of the statement `text` starts with: comments left out,
+    white space collapsed, up to its first `;` outside a quote."""
+    out, i, quote = [], 0, None
+    while i < len(text):
+        c = text[i]
+        if quote:
+            quote = None if c == quote else quote
+        elif text.startswith("--", i):
+            i = text.find("\n", i)
+            i = len(text) if i < 0 else i
+            continue
+        elif c in "'\"":
+            quote = c
+        elif c == ";":
+            break
+        out.append(c)
+        i += 1
+    return " ".join("".join(out).split())
+
+
+def _last_migration_code(obj):
+    """The code of the last migration statement that defines `obj`, its
+    head left out."""
+    text = "\n".join(_MIG_TEXT.values())
+    heads = list(re.finditer(rf"CREATE OR REPLACE (?:VIEW|MACRO) {obj}\b", text))
+    return _statement_code(text[heads[-1].end():]) if heads else None
+
+
+def _newest(obj):
+    """The newest version that (re)defines `obj`. A derived object whose
+    code is its last migration's dates from that migration; one whose
+    code moved past it from the newest derived version, as the LOCK does
+    not say which version changed which object."""
+    derived = re.search(rf"^CREATE (?:VIEW|MACRO) {obj}\b", DERIVED_SQL, re.M)
+    if derived and _statement_code(DERIVED_SQL[derived.end():]) != _last_migration_code(obj):
+        return DERIVED_VERSIONS[-1]
+    return max(_defined_in(obj), default=None)
+
+
+_NEWEST = {o: _newest(o) for o in p.web_views_wanted() + _SERVED}
 check("the cards' minimum gold schema is no older than any view or table they read",
       bool(_SERVED) and all(n is not None and n <= p.MIN_GOLD_SCHEMA for n in _NEWEST.values()),
       {o: n for o, n in _NEWEST.items() if n is None or n > p.MIN_GOLD_SCHEMA})
@@ -846,10 +904,22 @@ check("the registry names exactly the web_* views the cards and models read",
       _READ_VIEWS == set(p.web_views_wanted()), sorted(_READ_VIEWS ^ set(p.web_views_wanted())))
 
 
+def _migration_objects(*ns):
+    """The tables of migrations ns, as they create or alter them, then the
+    derived definitions of the views and macros they define, in the
+    derived files' order: what a test database needs to stand in for that
+    part of gold."""
+    tables, names = [], set()
+    for n in ns:
+        tables += re.findall(r"^(?:CREATE TABLE|ALTER TABLE)\b.*?;\n", _MIG_TEXT[n], re.S | re.M)
+        names |= set(re.findall(r"^CREATE OR REPLACE (?:VIEW|MACRO) (\w+)", _MIG_TEXT[n], re.M))
+    ordered = sorted(names, key=lambda o: re.search(rf"^CREATE (?:VIEW|MACRO) {o}\b", DERIVED_SQL, re.M).start())
+    return "".join(tables + [_latest_definition(o) for o in ordered])
+
+
 def _view_body(view):
-    """The newest migration's CREATE statement for `view`, up to its `;`."""
-    text = _MIG_TEXT.get(_NEWEST.get(view), "")
-    m = re.search(rf"CREATE (?:OR REPLACE )?VIEW {view} AS(.*?);", text, re.S)
+    """The derived CREATE statement for `view`, up to its `;`."""
+    m = re.search(rf"VIEW {view} AS(.*);", _latest_definition(view), re.S)
     return m.group(1) if m else ""
 
 
@@ -1362,8 +1432,12 @@ _GO_SERVING = set(re.findall(r'\{"(serving_\w+)",', _sm_list.group(0))) if _sm_l
 check("every serving table a model reads is one web-materialize rewrites",
       bool(_SERVED) and set(_SERVED) <= _GO_SERVING,
       sorted(set(_SERVED) - _GO_SERVING) if _GO_SERVING else "servingTables not found")
-check("...and one a migration creates",
-      all(_defined_in(t) for t in _SERVED), [t for t in _SERVED if not _defined_in(t)])
+# gold creates each listed table from its macro's columns, so the macro
+# is a derived one.
+_GO_SERVING_MACROS = dict(re.findall(r'\{"(serving_\w+)", "(\w+)\(', _sm_list.group(0))) if _sm_list else {}
+check("...and one gold creates from a derived macro",
+      bool(_SERVED) and all(_latest_definition(_GO_SERVING_MACROS.get(t, "-")) for t in _SERVED),
+      [t for t in _SERVED if not _latest_definition(_GO_SERVING_MACROS.get(t, "-"))])
 
 
 # ---- Income dashboards ----------------------------------------------
@@ -2031,7 +2105,7 @@ check("...the Asset class picker's values those of the gains rows, `unknown` amo
       _gn_class["values_source_config"]["card_id"] == MID["report_gains_classes"]
       and _gn_class["values_source_config"]["value_field"][1] == "asset_class"
       and MODELS["report_gains_classes"][0] == "SELECT DISTINCT asset_class FROM web_gains"
-      and "COALESCE(g.asset_class, 'unknown') AS asset_class" in _MIG_TEXT[170]
+      and "COALESCE(g.asset_class, 'unknown') AS asset_class" in _latest_definition("web_gains")
       and all(q["values_source_config"]["card_id"] == MID["report_asset_classes_history"]
               for d in ("Wealth Overview", "Exposure")
               for q in p.dashboard_parameters(MID, "range", d) if q["slug"] == "asset_class"),
@@ -2622,7 +2696,7 @@ section("the Allocation dashboard's day")
 
 # Every Allocation card, on the base and the twin, reads the last day of
 # the history on or before the As of day: the picker binds the calendar
-# view (gold migration 0166), whose history day the card reads.
+# view (web_history_calendar), whose history day the card reads.
 _al_cards = [n for n, *_ in DEFS["Allocation"][3]] + [n for n, *_ in DEFS["Allocation" + p.PRIVACY_SUFFIX][3]]
 _history_day = ("(SELECT max(history_day) FROM web_history_calendar WHERE TRUE\n"
                 "     [[AND {{as_of_day}}]])")
@@ -3129,12 +3203,12 @@ check("...and a label of any other type mapping to none",
       "INCOME_SALARY" not in _py_map and "INCOME_OTHER" not in _py_map)
 
 # The classes the other lines band by are the cash flow statement's
-# operating-in classes (cashflow_txn_nodes, as its newest migration
-# defines it), as gold keeps the plan's other income by them: a class per
+# operating-in classes (cashflow_txn_nodes, as the derived files
+# define it), as gold keeps the plan's other income by them: a class per
 # detailed type its CASE names, the projected types left to the
 # holdings' cards.
 _in_case = re.search(r"WHEN 'in' THEN\s*CASE(.*?)\bEND\b",
-                     _MIG_TEXT[max(_defined_in("cashflow_txn_nodes"))], re.S).group(1)
+                     _latest_definition("cashflow_txn_nodes"), re.S).group(1)
 _sql_classes = {}
 for _ds, _c in re.findall(r"WHEN p\.verdict IN \(([^)]*)\)\s*(?:--[^\n]*\n\s*)*THEN '(\w+)'", _in_case):
     for _d in re.findall(r"'(\w+)'", _ds):
@@ -3636,10 +3710,8 @@ check("both sources models render valued_at as a timestamp",
       all("epoch_ms(valued_at * 1000) AS valued_at" in MODELS[m][0]
           for m in ("report_sources_latest", "report_sources_latest_pct")),
       [MODELS[m][0][:200] for m in ("report_sources_latest", "report_sources_latest_pct")])
-_mig = open(os.path.join(GOLD_MIGRATIONS, "0122_observed_through.sql"), encoding="utf-8").read()
-check("source_observed is a gold view", "CREATE OR REPLACE VIEW source_observed" in _mig)
-_mig = open(os.path.join(GOLD_MIGRATIONS, "0123_valued_at.sql"), encoding="utf-8").read()
-check("the sources reports carry valued_at", "AS valued_at" in _mig and "report_sources_multi" in _mig)
+check("source_observed is a gold view", _latest_definition("source_observed").startswith("CREATE OR REPLACE VIEW"))
+check("the sources reports carry valued_at", "AS valued_at" in _latest_definition("report_sources_multi"))
 
 section("an API call that fails is never read as an empty answer")
 
@@ -3764,11 +3836,8 @@ finally:
     p.req = real_req
 # The one card that reads a list column reads it in native SQL, which a
 # sensitive field leaves as it is: no picker and no model may bind one.
-_list_cols = {m.group(1) for f in sorted(os.listdir(os.path.join(_REPO, "wealthdb", "internal", "gold", "migrations")))
-              if f.endswith(".sql")
-              for m in re.finditer(r"^\s+(\w+)\s+\w+(?:\(\d+(?:,\s*\d+)?\))?\[\]",
-                                   open(os.path.join(_REPO, "wealthdb", "internal", "gold", "migrations", f),
-                                        encoding="utf-8").read(), re.M)}
+_list_cols = {m.group(1) for text in list(_MIG_TEXT.values()) + [DERIVED_SQL]
+              for m in re.finditer(r"^\s+(\w+)\s+\w+(?:\(\d+(?:,\s*\d+)?\))?\[\]", text, re.M)}
 check("the gold's list columns are found", "tags" in _list_cols, _list_cols)
 check("no picker binds a list column",
       not _list_cols & {c for cs in p.FILTER_FIELD_COLUMNS.values() for c in cs}, _list_cols)
@@ -3779,11 +3848,12 @@ check("no model reads a list column",
 section("the projection cards' SQL, run on an invented book")
 
 # The cards' SQL, rendered the way Metabase fills its template tags and
-# run on DuckDB over migration 0138's tables. The book is small and
-# invented, and each figure below is worked out by hand in its comment,
-# so a wrong join, horizon or weighing changes a number. These are the
-# only checks that run the projection's SQL, so a host without the
-# duckdb module fails here rather than passing without them.
+# run on DuckDB over the yield and income tables and their derived
+# views. The book is small and invented, and each figure below is
+# worked out by hand in its comment, so a wrong join, horizon or
+# weighing changes a number. These are the only checks that run the
+# projection's SQL, so a host without the duckdb module fails here
+# rather than passing without them.
 try:
     import duckdb
 except ImportError:
@@ -3827,35 +3897,20 @@ if duckdb is not None:
           ordered_series(*_latest, legend_last="low") == ["low", "nil-a", "nil-b", "tied-a", "tied-b", "Benchmark"])
 
 _FIELD = {v: k for k, v in p.FIELD_IDS.items()}
+# The day a relative window counts from, fixed so the checks do not move
+# with the calendar.
+_RENDER_TODAY = dt.date(2026, 6, 30)
 
 
 def _render(query, values):
-    """Card `query`'s SQL with its tags filled as Metabase fills them: a
-    variable takes its value, else its default; a field filter given
-    values becomes a predicate on its column, a date one given its first
-    and last day a range; an optional clause whose tag has no value drops
-    out."""
-    sql, tags = query["native"]["query"], query["native"]["template-tags"]
-
-    def value(name):
-        return values.get(name, tags[name].get("default"))
-
-    def fill(name):
-        tag, v = tags[name], value(name)
-        if tag["type"] == "dimension":
-            table, col = _FIELD[tag["dimension"][1]]
-            if tag["widget-type"].startswith("date"):
-                return f'"main"."{table}"."{col}" BETWEEN DATE \'{v[0]}\' AND DATE \'{v[1]}\''
-            return f'"main"."{table}"."{col}" IN (' + ", ".join(f"'{x}'" for x in v) + ")"
-        return str(v) if tag["type"] == "number" else f"'{v}'"
-
-    def clause(m):
-        names = re.findall(r"\{\{(\w+)\}\}", m.group(1))
-        if any(value(n) is None for n in names):
-            return ""
-        return re.sub(r"\{\{(\w+)\}\}", lambda x: fill(x.group(1)), m.group(1))
-    sql = re.sub(r"\[\[(.*?)\]\]", clause, sql, flags=re.S)
-    return re.sub(r"\{\{(\w+)\}\}", lambda x: fill(x.group(1)), sql)
+    """Card `query`'s SQL with its tags filled as Metabase fills them
+    (tile_timings.render). A date field filter takes its (first, last)
+    day as the range `first~last`."""
+    tags = query["native"]["template-tags"]
+    picked = {name: f"{v[0]}~{v[1]}"
+              if tags.get(name, {}).get("widget-type", "").startswith("date") and isinstance(v, (list, tuple))
+              else v for name, v in values.items()}
+    return tt.render(query, picked, _FIELD, _RENDER_TODAY)
 
 
 def _month_start(m):
@@ -3865,8 +3920,9 @@ def _month_start(m):
 
 
 def _book():
-    """A DuckDB holding migrations 0138's and 0146's tables and views, the
-    few gold objects their views read, and the invented book:
+    """A DuckDB holding the tables of migrations 0138, 0146, 0149 and 0169
+    with the derived views and macros they define (_migration_objects),
+    the few gold objects those views read, and the invented book:
 
     - src-1/acct-1 (USD): cash of 12,000 at the USD benchmark less 1.00,
       and a bond of 8,000 paying 400 in months 2, 8, 14, 20, 26 and 32,
@@ -3918,14 +3974,11 @@ def _book():
                "CREATE TABLE web_income (occurred_at TIMESTAMP, silver_source_id TEXT, account_external_id TEXT,"
                " account_label TEXT, tax_wrapper TEXT, income_detailed TEXT, income_label TEXT,"
                " value_usd DOUBLE, value_chf DOUBLE, value_eur DOUBLE, value_gbp DOUBLE);")
-    db.execute(_MIG_TEXT[138])
-    db.execute(_MIG_TEXT[146])
-    # The cash flow projection's table and view (0149, 0169); the pool's
-    # accounts the Cash Flow checks below define for themselves.
+    # The yield, income and cash flow projection tables and their views;
+    # the pool's accounts the Cash Flow checks below define for themselves.
     db.execute("CREATE MACRO cashflow_pool_accounts() AS TABLE"
                " SELECT silver_source_id, account_external_id FROM accounts")
-    db.execute(_MIG_TEXT[149])
-    db.execute(_MIG_TEXT[169])
+    db.execute(_migration_objects(138, 146, 149, 169))
 
     def insert(table, rows):
         for r in rows:
@@ -4005,7 +4058,7 @@ def _book():
          **{f"value_{c.lower()}": v * per_usd.get(c, 1.0) for c in p.REPORTING_CURRENCIES}}
         for src, acct, _key, day, typ, v, _w in
         [*received, ("src-1", "acct-1", None, dt.date(2026, 9, 25), "salary", 1000.0, None)]])
-    # The run-rate of the pool's income lines (gold 0174): 200 a month of
+    # The run-rate of the pool's income lines: 200 a month of
     # earnings into src-1 and 10 of other receipts into src-2. The cash
     # flow projection's other_income, the statement's figure, holds a
     # reimbursement besides, which no income line holds.
@@ -4431,7 +4484,7 @@ if duckdb is not None:
           [round(a, 6) for a, _ in _paid] == [200.0, 200.0, 50.0, 0.0]
           and all(_near(b, 200.0) for _, b in _paid), _paid)
     # An account outside the pool carries its run-rate as outside_income
-    # (gold 0172): the Income cards read it beside the pool's.
+    # (web_cashflow_plan): the Income cards read it beside the pool's.
     _db.execute("BEGIN")
     _db.execute("INSERT INTO report_cashflow_plan (computed_at, currency, month, month_start, part, class,"
                 " silver_source_id, account_external_id, value, quality)"
@@ -4621,11 +4674,11 @@ if duckdb is not None:
     # for a day inside October before the refresh, the refresh from its
     # day on, a day after the history included, and nothing for a day
     # before the first instant. The day reaches it through the calendar
-    # over the history (migration 0166).
+    # over the history (web_history_calendar).
     _db.execute("CREATE TABLE serving_global_history (as_of_day BIGINT)")
     _db.execute("INSERT INTO serving_global_history SELECT epoch(d)::BIGINT"
                 " FROM range(TIMESTAMP '2026-08-01', TIMESTAMP '2026-10-22', INTERVAL 1 DAY) t(d)")
-    _db.execute(_MIG_TEXT[166])
+    _db.execute(_migration_objects(166))
     _db.execute("DELETE FROM report_exposure_issuer_ranks")
     for _at, _who, _v in (("2026-08-31 23:59:59", "Example Alpha", 500.0),
                           ("2026-09-30 23:59:59", "Example Beta", 600.0),
@@ -4662,7 +4715,7 @@ if duckdb is not None:
     # and cash of 400. A month end before, a stock of 50 alone. The card
     # sums the stock to one row with its heaviest slice's labels and its
     # two funds, each a share of the 1,500.
-    _db.execute(_MIG_TEXT[165])
+    _db.execute(_migration_objects(165))
     _sec_now = int(dt.datetime(2026, 10, 21, 23, 59, 59, tzinfo=dt.timezone.utc).timestamp())
     _sec_sep = int(dt.datetime(2026, 9, 30, 23, 59, 59, tzinfo=dt.timezone.utc).timestamp())
     for _at, _src, _w, _cls, _key, _name, _sector, _country, _v, _direct, _funds in (
@@ -4704,7 +4757,7 @@ if duckdb is not None:
 
     # One day's positions: a stock on two accounts and one on one, both
     # sized, a stock nothing sizes, a fund, and two accounts' cash in
-    # francs (migration 0171). The size joins after the ranking, so a
+    # francs. The size joins after the ranking, so a
     # card keeps its rows, order and values; a stock on two lines stays
     # one row, and each account's cash is a row of its own.
     _db.execute("CREATE TABLE web_positions_history (as_of_day DATE, silver_source_id TEXT, tax_wrapper TEXT,"
@@ -4745,7 +4798,7 @@ if duckdb is not None:
 
     section("the Allocation by currency cards' SQL, run on an invented book")
 
-    # One day's lines by currency (migration 0171): positions and cash in
+    # One day's lines by currency: positions and cash in
     # francs and dollars on one source, euros on another. The cards sum
     # every bucket, cash included, largest first; the twin's shares total
     # 100; the Source picker narrows both.
@@ -4806,9 +4859,7 @@ if duckdb is not None:
                 "INSERT INTO accounts (silver_source_id, account_external_id, display_name, account_kind, tax_wrapper)"
                 " VALUES ('src-3', 'acct-3', 'Plan', 'brokerage', 'roth_ira');"
                 + _latest_definition("cashflow_pool_accounts"))
-    _db.execute(_MIG_TEXT[149])
-    _db.execute(_MIG_TEXT[169])
-    _db.execute(_MIG_TEXT[172])
+    _db.execute(_migration_objects(149, 169, 172))
     _db.executemany("INSERT INTO report_yield_parts (computed_at, silver_source_id, account_external_id, "
                     "position_key, holding_currency, rule, month, month_start, month_only, type, basis, fixed, "
                     "principal, spread, roll_constant, roll_forward, roll_principal, fx_USD, fx_CHF) "
@@ -4826,8 +4877,8 @@ if duckdb is not None:
         for _m in range(1, 37):
             # The other income's 50 a month, split by class and account
             # as gold 0169 stores it, and the income lines' run-rate: in
-            # the pool (0174) and a wage on the vehicle's account outside
-            # it (0172). No Cash Flow card reads either.
+            # the pool and a wage on the vehicle's account outside
+            # it. No Cash Flow card reads either.
             _parts = [("other_income", "earnings", "src-1", "acct-1", 30.0),
                       ("other_income", "other_receipts", "src-2", "acct-2", 20.0),
                       ("pool_income", "earnings", "src-1", "acct-1", 30.0),
@@ -5504,6 +5555,289 @@ check("ensure_cards saves each per-source card with the sources' colours",
               for n in _by_source), _nw)
 check("...and any other card's settings as its definition gives them",
       all(_saved[n]["visualization_settings"] == VIZ[n] for n in VIZ if n not in _by_source))
+
+
+# ---- the offline payload dump -----------------------------------------
+
+section("the offline payload dump")
+
+
+class RecordingAPI:
+    """A stand-in for provision.req over an empty collection: answers the
+    sources and withholding probes, hands out ids the way a fresh
+    Metabase does, and keeps every model, card and dashboard layout
+    provisioning sends."""
+
+    def __init__(self, withholding, sources):
+        self.withholding, self.sources = withholding, sources
+        self.phase, self.next_card, self.next_dash = "models", 0, 0
+        self.sent = {"models": {}, "cards": {}, "dashboards": {}}
+        self.ids = {"models": {}, "cards": {}, "dashboards": {}}
+
+    def __call__(self, base, path, method="GET", data=None, session=None, timeout=30):
+        if path == "/api/dataset":
+            if "silver_sources" in data["native"]["query"]:
+                return 202, {"data": {"rows": [[s] for s in self.sources]}}
+            if self.withholding is None:
+                return 500, {}
+            return 202, {"data": {"rows": [[self.withholding]]}}
+        if method == "POST" and path == "/api/card":
+            self.next_card += 1
+            self.sent[self.phase][data["name"]] = data
+            self.ids[self.phase][data["name"]] = self.next_card
+            return 200, {"id": self.next_card}
+        if method == "POST" and path == "/api/dashboard":
+            self.next_dash += 1
+            self.ids["dashboards"][data["name"]] = self.next_dash
+            return 200, {"id": self.next_dash}
+        if method == "PUT" and "dashcards" in (data or {}):
+            self.sent["dashboards"][data["name"]] = data
+        return 200, {"data": []}
+
+
+def _dump_text(dump):
+    return json.dumps(dump, sort_keys=True, indent=1, ensure_ascii=False) + "\n"
+
+
+def _recorded(withholding, sources):
+    """What a provision into an empty collection sends, in the dump's
+    shape, driven through RecordingAPI."""
+    api, real = RecordingAPI(withholding, sources), p.req
+    p.req = api
+    try:
+        with quiet():
+            p.FIELD_IDS = p.offline_field_ids()
+            mids = p.ensure_models("b", "s", 1, 1, {})
+            api.phase = "cards"
+            colors = p.source_colors("b", "s", 1, "")
+            ids, descs = p.ensure_cards("b", "s", 1, 1, {}, mids, colors)
+            rc = p.ensure_dashboards("b", "s", 1, ids, mids,
+                                     p.tile_titles(p.withholding_table("b", "s", 1)), descs)
+    finally:
+        p.req = real
+    fields = {f"{t}.{c}": i for (t, c), i in p.FIELD_IDS.items()}
+    return rc, {**api.sent, "ids": {**api.ids, "fields": fields}}
+
+
+_saved_globals = (p.DEFAULT_CURRENCY, p.DEFAULT_MISSING_BASIS, p.FIELD_IDS)
+_matrix_bad, _unstable, _texts = [], [], {}
+try:
+    for _ccy in ("USD", "CHF"):
+        for _mb in p.MISSING_BASIS_READINGS:
+            for _wh in p.DUMP_WITHHOLDING:
+                for _srcs in ([], ["src-a", "src-b"]):
+                    p.DEFAULT_CURRENCY, p.DEFAULT_MISSING_BASIS = _ccy, _mb
+                    _key = (_ccy, _mb, _wh, len(_srcs))
+                    _first = _dump_text(p.payload_dump(p.DUMP_WITHHOLDING[_wh], _srcs))
+                    _rc, _rec = _recorded(p.DUMP_WITHHOLDING[_wh], _srcs)
+                    if _rc != 0 or _dump_text(_rec) != _first:
+                        _matrix_bad.append(_key)
+                    if _dump_text(p.payload_dump(p.DUMP_WITHHOLDING[_wh], _srcs)) != _first:
+                        _unstable.append(_key)
+                    _texts[_key] = _first
+finally:
+    p.DEFAULT_CURRENCY, p.DEFAULT_MISSING_BASIS, p.FIELD_IDS = _saved_globals
+    all_cards(1, MID)                       # restore the registry
+check("over currency, missing basis, withholding and sources, the dump is what provisioning sends",
+      not _matrix_bad, _matrix_bad)
+check("...and two dumps give the same bytes", not _unstable, _unstable)
+check("each setting reaches the payloads: currency, missing basis, a withholding table, sources",
+      all(_texts[a] != _texts[b] for a, b in (
+          (("USD", "ignore", "yes", 0), ("CHF", "ignore", "yes", 0)),
+          (("USD", "ignore", "yes", 0), ("USD", "zero", "yes", 0)),
+          (("USD", "ignore", "yes", 0), ("USD", "ignore", "no", 0)),
+          (("USD", "ignore", "yes", 0), ("USD", "ignore", "yes", 2)))))
+check("...and a withholding probe that does not answer keeps the cards' names, as one that finds a table",
+      _texts[("USD", "ignore", "unknown", 0)] == _texts[("USD", "ignore", "yes", 0)])
+_one = json.loads(_texts[("USD", "ignore", "yes", 2)])
+check("the dump holds every model, card and dashboard, each with its id",
+      set(_one) == {"models", "cards", "dashboards", "ids"}
+      and len(_one["models"]) == len(p.report_models()) == len(_one["ids"]["models"])
+      and len(_one["cards"]) == len(CARDS) == len(_one["ids"]["cards"])
+      and len(_one["dashboards"]) == len(p.dashboard_defs()) == len(_one["ids"]["dashboards"]))
+check("...and the id of every field a tag names",
+      {t["dimension"][1] for c in _one["cards"].values() if c["dataset_query"]["type"] == "native"
+       for t in c["dataset_query"]["native"]["template-tags"].values() if t.get("dimension")}
+      <= set(_one["ids"]["fields"].values()))
+
+
+def _main_with(argv):
+    """(exit status, stderr) of main() under `argv`, with any API call an
+    error; main()'s globals are restored."""
+    saved = (sys.argv, p.req, p.DEFAULT_CURRENCY, p.DEFAULT_MISSING_BASIS, p.FIELD_IDS)
+
+    def no_network(*_a, **_k):
+        raise AssertionError("the dump called the API")
+    sys.argv, p.req = ["provision.py", *argv], no_network
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            try:
+                rc = p.main()
+            except SystemExit as e:
+                rc = e.code
+    finally:
+        sys.argv, p.req, p.DEFAULT_CURRENCY, p.DEFAULT_MISSING_BASIS, p.FIELD_IDS = saved
+    return rc, err.getvalue()
+
+
+with tempfile.TemporaryDirectory() as _d:
+    _out = os.path.join(_d, "dump.json")
+    _rc, _ = _main_with(["--dump", _out, "--default-currency", "chf", "--missing-basis", "zero",
+                         "--withholding", "no", "--sources", "src-a,src-b"])
+    with open(_out, encoding="utf-8") as _f:
+        _written = _f.read()
+    _saved_globals = (p.DEFAULT_CURRENCY, p.DEFAULT_MISSING_BASIS, p.FIELD_IDS)
+    try:
+        p.DEFAULT_CURRENCY, p.DEFAULT_MISSING_BASIS = "CHF", "zero"
+        _want = _dump_text(p.payload_dump(False, ["src-a", "src-b"]))
+    finally:
+        p.DEFAULT_CURRENCY, p.DEFAULT_MISSING_BASIS, p.FIELD_IDS = _saved_globals
+        all_cards(1, MID)                   # restore the registry
+check("--dump writes the payloads with no API call, its options read as provisioning reads them",
+      _rc == 0 and _written == _want)
+_rc, _err = _main_with([])
+check("without --dump, --base, --email and --gold-path are still required",
+      _rc == 2 and "error: the following arguments are required: --base, --email, --gold-path" in _err, _err)
+
+
+# ---- the tile timings tool --------------------------------------------
+
+section("the tile timings tool")
+
+check("it runs the DuckDB release of the driver web/Dockerfile pins",
+      _driver and tt.duckdb_release().split(".")[:2] == list(_driver.groups()), tt.duckdb_release())
+
+
+class DatabaseAPI:
+    """A stand-in for provision.req that keeps the details of the
+    database ensure_database adds."""
+
+    def __call__(self, base, path, method="GET", data=None, session=None, timeout=30):
+        if method == "POST":
+            self.details = data["details"]
+            return 200, {"id": 1}
+        return 200, {"data": []}
+
+
+_db_api, _real_req = DatabaseAPI(), p.req
+try:
+    p.req = _db_api
+    with quiet():
+        p.ensure_database("b", "s", "gold", "/gold/wealthdb.db")
+finally:
+    p.req = _real_req
+check("...with the memory limit and threads provisioning gives the gold database",
+      (_db_api.details["memory_limit"], _db_api.details["threads"], _db_api.details["read_only"])
+      == (tt.MEMORY_LIMIT, tt.THREADS, True), _db_api.details)
+
+_today = dt.date(2026, 11, 12)                           # a Thursday
+_windows = {"past12months~": ("2025-11-01", "2026-11-30"), "past3months": ("2026-08-01", "2026-10-31"),
+            "past30days~": ("2026-10-13", "2026-11-12"), "past2years": ("2024-01-01", "2025-12-31"),
+            "past1quarters~": ("2026-07-01", "2026-12-31"), "thisday": ("2026-11-12", "2026-11-12"),
+            "thisweek": ("2026-11-08", "2026-11-14"), "next2weeks": ("2026-11-15", "2026-11-28"),
+            "next2weeks~": ("2026-11-08", "2026-11-28"),
+            "2024-03-01~2024-04-30": ("2024-03-01", "2024-04-30"), "~2024-04-30": (None, "2024-04-30"),
+            "2024-03-01~": ("2024-03-01", None), "2025-12-31": ("2025-12-31", "2025-12-31")}
+_got = {v: tuple(d and d.isoformat() for d in tt.date_window(v, _today)) for v in _windows}
+check("a date picker's value reads as Metabase's window", _got == _windows,
+      {k: v for k, v in _got.items() if v != _windows[k]})
+
+_q = {"native": {"query": "SELECT {{currency}}, {{n}} FROM t WHERE {{when}} [[AND {{source}}]] [[AND {{kind}}]]",
+                 "template-tags": {
+                     "currency": {"type": "text", "default": "USD"},
+                     "n": {"type": "number", "default": "0"},
+                     "when": {"type": "dimension", "widget-type": "date/all-options",
+                              "dimension": ["field", 2, None], "default": None},
+                     "source": {"type": "dimension", "widget-type": "string/=",
+                                "dimension": ["field", 1, None], "default": None},
+                     "kind": {"type": "dimension", "widget-type": "string/=",
+                              "dimension": ["field", 3, None], "default": ["a"]}}}}
+_fields = {1: ("t", "src"), 2: ("t", "day"), 3: ("t", "kind")}
+check("a tag with no value drops its clause, and a field filter outside one reads 1 = 1",
+      tt.render(_q, {}, _fields, _today)
+      == """SELECT 'USD', 0 FROM t WHERE 1 = 1  AND "main"."t"."kind" = 'a'""",
+      tt.render(_q, {}, _fields, _today))
+_given = tt.render(_q, {"currency": ["O'C"], "n": [3], "when": "past3months", "source": ["x", "y"]},
+                   _fields, _today)
+check("...and given values, a variable is a literal and a field filter a predicate on its column",
+      _given == ("""SELECT 'O''C', 3 FROM t WHERE ("main"."t"."day" >= DATE '2026-08-01'"""
+                 """ AND "main"."t"."day" < DATE '2026-11-01')"""
+                 """ AND "main"."t"."src" IN ('x', 'y') AND "main"."t"."kind" = 'a'"""), _given)
+
+_tq = tt.queries(_one)
+_tiles = [(d, names) for d, db in sorted(_one["dashboards"].items())
+          for names in [dc["card_id"] for dc in db["dashcards"] if dc.get("card_id")]]
+check("one query per tile of every dashboard, in layout order, then one per model",
+      [(d, _one["ids"]["cards"][c]) for d, c, kind, _q2, _v in _tq if kind != "model"] == _tiles
+      and [c for d, c, kind, _q2, _v in _tq if kind == "model"] == sorted(_one["models"]))
+check("...an MBQL tile among them, and every native tile renders with no tag left",
+      any(k == "mbql" for _d, _c, k, _q2, _v in _tq)
+      and not [c for _d, c, k, q2, v in _tq if k != "mbql"
+               and re.search(r"\{\{|\[\[", tt.render(q2, v, {i: tuple(f.split(".", 1)) for f, i in
+                                                             _one["ids"]["fields"].items()}, _today))])
+_spend = [v for d, c, k, _q2, v in _tq if d == "Spending" and k == "native" and "time_range" in v]
+check("a tile takes its dashboard's picker defaults, the time window included",
+      _spend and all(v["time_range"] == "past12months~" for v in _spend), _spend[:1])
+check("...and with --wide no time window",
+      all(v.get("time_range", None) is None for d, c, k, _q2, v in tt.queries(_one, wide=True)
+          if d == "Spending" and k == "native"))
+
+if duckdb is not None:
+    with tempfile.TemporaryDirectory() as _d:
+        _db = os.path.join(_d, "gold.db")
+        _con = duckdb.connect(_db)
+        _con.execute("CREATE TABLE t AS SELECT range AS v FROM range(3)")
+        _con.close()
+        _rel = duckdb.__version__
+        # Side by side: each query is a process of its own.
+        with concurrent.futures.ThreadPoolExecutor(4) as _pool:
+            _ok, _err, _other, _slow = _pool.map(lambda a: tt.run_query(sys.executable, _db, *a), [
+                ("SELECT v FROM t", _rel, 60), ("SELECT nope FROM t", _rel, 60),
+                ("SELECT v FROM t", "0.0.1", 60), ("SELECT count(*) FROM range(10000000000)", _rel, 0.2)])
+        check("a query runs in its own process and reports its rows, seconds and peak memory",
+              _ok[0] == "ok" and _ok[1] == 0 and _ok[5] == 3 and _ok[2] >= 0 and _ok[3] > 0 and _ok[4] > 1, _ok)
+        check("...a failing one only the name of its error",
+              _err[0] == "error:BinderException" and _err[1] == 1 and _err[5] is None, _err)
+        check("...one under another DuckDB release does not run", _other[0] == "release:" + _rel, _other)
+        check("...and one past the timeout is killed", _slow[0] == "timeout", _slow)
+
+        # An ok tile, an MBQL one the tool skips and one whose query fails.
+        _mini = {"ids": {"cards": {"Tile": 2, "Mbql": 3, "Bad": 4}, "fields": {"t.v": 1}},
+                 "models": {"m": {"dataset_query": {"type": "native", "native": {
+                     "query": "SELECT v FROM t", "template-tags": {}}}}},
+                 "cards": {"Tile": {"dataset_query": {"type": "native", "native": {
+                     "query": "SELECT v FROM t WHERE TRUE [[AND {{v}}]]", "template-tags": {
+                         "v": {"type": "dimension", "widget-type": "number/=",
+                               "dimension": ["field", 1, None], "default": None}}}}},
+                           "Mbql": {"dataset_query": {"type": "query", "query": {"source-table": 1}}},
+                           "Bad": {"dataset_query": {"type": "native", "native": {
+                               "query": "SELECT nope FROM t", "template-tags": {}}}}},
+                 "dashboards": {"D": {"parameters": [{"id": "p1", "default": [1]}], "dashcards": [
+                     {"card_id": None}, {"card_id": 2, "parameter_mappings": [
+                         {"parameter_id": "p1", "target": ["dimension", ["template-tag", "v"]]}]},
+                     {"card_id": 3, "parameter_mappings": []}, {"card_id": 4, "parameter_mappings": []}]}}}
+        _dump_path, _tsv = os.path.join(_d, "dump.json"), os.path.join(_d, "out.tsv")
+        with open(_dump_path, "w", encoding="utf-8") as _f:
+            json.dump(_mini, _f)
+        _real_release = tt.duckdb_release
+        try:
+            tt.duckdb_release = lambda: _rel
+            with quiet():
+                _rc = tt.main([_dump_path, _db, _tsv, "--python", sys.executable])
+        finally:
+            tt.duckdb_release = _real_release
+        with open(_tsv, encoding="utf-8") as _f:
+            _rows = [line.split("\t") for line in _f.read().splitlines()]
+        check("the tool writes one line per query: status, exit, seconds, memory and rows",
+              _rows[0] == list(tt.COLUMNS)
+              and [r[:5] + r[8:] for r in _rows[1:]] == [["D", "Tile", "native", "ok", "0", "1"],
+                                                       ["D", "Mbql", "mbql", "skipped", "", ""],
+                                                       ["D", "Bad", "native", "error:BinderException", "1", ""],
+                                                       ["", "m", "model", "ok", "0", "3"]], _rows)
+        check("...an MBQL tile a line of its own with empty cells",
+              _rows[2] == ["D", "Mbql", "mbql", "skipped", "", "", "", "", ""], _rows[2])
+        check("...and it exits 1 when a query does not run", _rc == 1, _rc)
 
 
 if FAILS:

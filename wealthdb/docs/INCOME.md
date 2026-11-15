@@ -59,7 +59,7 @@ it.
 | `income_lines_base(f, t)` | what a view charts: the population with its type resolved, less the deltas §2 keeps out of the base |
 
 There is **no income matcher pool**. The internal-transfer matcher
-admits `deposit` on every account (migration 0044), so a funding wire
+admits `deposit` on every account, so a funding wire
 pairs. It writes `internal_transfer` on both legs. Income reads those
 verdicts and pairs nothing (§10, decision 8).
 
@@ -120,7 +120,7 @@ is right either way.
 `interest` is the one kind with a **sign guard**. The guard is not a
 policy about reversals. One canonical kind carries two opposite events,
 interest credited and interest charged. Only the sign tells them apart,
-and spending claims the negative half (migration 0041).
+and spending claims the negative half.
 
 A negative `deposit` is a reversal by construction:
 
@@ -333,8 +333,8 @@ Migration 0111 moves each stored verdict to the first value in its row
 above. A stored verdict of the split value therefore reads
 `INCOME_CHILD_SUPPORT`. A config rule on the payer's narrative moves a
 payer of maintenance to `INCOME_ALIMONY`, and a pin moves one payment.
-`reload -a` respells the payer store it carries across the same way
-(§9).
+`reload -a` migrates the outgoing file before it carries the payer store
+across, so the carried store is respelled too (DESIGN.md §9).
 
 A verdict placed under the wider meaning of a narrowed value keeps it.
 Examples:
@@ -421,7 +421,7 @@ writing both families** in one transaction: one matcher run, both
 overlays deleted and re-asserted, both verdict stores re-keyed, one
 commit. Only the model tier is a separate command.
 
-### The floor above the model (migration 0073)
+### The floor above the model
 
 The two families ask a model **different questions**. Which question it
 is decides whether the model or the floor ranks higher.
@@ -431,7 +431,7 @@ merchant's category. It may never decide that a card purchase was
 really an investment. The nature of the row is the data's, and the
 model adds a finer reading of who was paid. A merchant verdict is
 finer than any kind floor, so spending reads the floor under the store
-(migration 0066).
+(`spend_txn_categories`).
 
 On the inflow side the model is asked **what kind of income** a
 receipt is. That is a claim about the transaction itself, not about who
@@ -701,10 +701,8 @@ Everything in SPENDING.md §8 holds, with the income names:
 
 `reload -a` carries the payer store across beside the merchant store. A
 store that is not carried is lost with no backup, so the rebuild walks
-a list of stores rather than naming one. After carrying a store, the
-rebuild respells any retired value in it to its successor (§2). So a
-carry from a file older than migration 0111 brings no retired spelling
-into the rebuilt file.
+a list of stores rather than naming one. DESIGN.md §9 has how the
+carry works.
 
 `wealthdb status -v` prints an `income:` block with the backlog count.
 The catch-all-kind counter (`excluded_unmapped`) is not repeated per
@@ -750,7 +748,7 @@ which is the default, one number answers for both.
     income side it is asked what kind of income a receipt is, which is
     a claim about the transaction. The data makes that claim itself on
     every admitted kind but `deposit`. So two independent guards apply:
-    the kind floor is read over the payer store (migration 0073, §3),
+    the kind floor is read over the payer store (§3),
     and candidacy is restricted to `deposit` in every backlog mode (§7).
 14. **The projection reads today's holdings.** A past month shows what
     was received, never what the holdings of then were expected to pay.

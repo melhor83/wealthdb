@@ -147,9 +147,19 @@ func runStatusOverview(ctx context.Context, db *sql.DB, cfg *config.Config, verb
 		fmt.Fprintln(stdout, "status: no silver sources configured")
 		return
 	}
+	results := gold.StatusForSources(ctx, db, sourceIDs(cfg), verbose)
 	for i := range cfg.SilverSources {
-		printOneLineStatus(ctx, db, &cfg.SilverSources[i], verbose, stdout)
+		printOneLineStatus(ctx, results[i], &cfg.SilverSources[i], verbose, stdout)
 	}
+}
+
+// sourceIDs are the configured sources' ids, in config order.
+func sourceIDs(cfg *config.Config) []string {
+	ids := make([]string, len(cfg.SilverSources))
+	for i, s := range cfg.SilverSources {
+		ids[i] = s.ID
+	}
+	return ids
 }
 
 func runStatusDetailed(ctx context.Context, db *sql.DB, cfg *config.Config, id string, verbose bool, stdout io.Writer) error {
@@ -225,10 +235,10 @@ func runStatusDetailed(ctx context.Context, db *sql.DB, cfg *config.Config, id s
 }
 
 // printOneLineStatus emits a single-line summary for the overview
-// view. Tolerates per-source errors — prints a "?" / message
-// rather than failing the whole report.
-func printOneLineStatus(ctx context.Context, db *sql.DB, src *config.SilverSource, verbose bool, stdout io.Writer) {
-	st, err := gold.StatusForSource(ctx, db, src.ID, verbose)
+// view. Tolerates a per-source error: the line says ERROR and the
+// message, and the next source still prints.
+func printOneLineStatus(ctx context.Context, r gold.SourceStatusResult, src *config.SilverSource, verbose bool, stdout io.Writer) {
+	st, err := r.Status, r.Err
 	if err != nil {
 		fmt.Fprintf(stdout, "%-20s [%s] ERROR: %s\n", src.ID, src.Kind, err.Error())
 		return
@@ -284,11 +294,7 @@ func probeSilverStatus(ctx context.Context, src *config.SilverSource) (canonical
 	if err != nil {
 		return canonical.Status{}, err
 	}
-	spec, err := src.ToSilverOpenSpec()
-	if err != nil {
-		return canonical.Status{}, err
-	}
-	conn, err := adapter.Open(ctx, spec)
+	conn, err := adapter.Open(ctx, src.ToSilverOpenSpec())
 	if err != nil {
 		return canonical.Status{}, err
 	}

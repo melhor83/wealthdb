@@ -136,9 +136,9 @@ func accountsOnDay(t *testing.T, db *sql.DB, ctx context.Context, day int64) []s
 }
 
 // TestAccountHistoryKeepsBothClocks pins the account-history macros
-// against a fixture that defeats a per-source resolution (gold
-// migration 0051). A card's balances arrive on the statement clock
-// while the same source's deposit accounts are re-dumped constantly.
+// against a fixture that defeats a per-source resolution. A card's balances
+// arrive on the statement clock while the same source's deposit accounts are
+// re-dumped constantly.
 // Resolving the active snapshot per (source, ACCOUNT, day) reports
 // both accounts on every day; one active snapshot per source would
 // report only whichever of them happened to snapshot last.
@@ -147,7 +147,7 @@ func TestAccountHistoryKeepsBothClocks(t *testing.T) {
 	db, ctx := openMigrated(t)
 	seedCardBalanceFixture(t, db, ctx)
 
-	day := func(d int) int64 { return bucketAt(2026, time.January, d) }
+	day := func(d int) int64 { return utcMidnight(2026, time.January, d) }
 
 	// Day 11's newest snapshot is the deposit re-dump; the card's day-10
 	// closing is still its own latest, so it is carried alongside.
@@ -180,7 +180,7 @@ func TestCardBalancesHistoryCarriesEachAccountIndependently(t *testing.T) {
           FROM report_card_balances_history_multi()
          WHERE as_of_day BETWEEN ? AND ?
          ORDER BY as_of_day, account_external_id`,
-		bucketAt(2026, time.January, 10), bucketAt(2026, time.January, 15))
+		utcMidnight(2026, time.January, 10), utcMidnight(2026, time.January, 15))
 	if err != nil {
 		t.Fatalf("report_card_balances_history_multi: %v", err)
 	}
@@ -217,7 +217,7 @@ func TestCardBalancesHistoryCarriesEachAccountIndependently(t *testing.T) {
 		{14, 0},    // paid off, and the zero survives
 		{15, 0},
 	} {
-		day := bucketAt(2026, time.January, w.d)
+		day := utcMidnight(2026, time.January, w.d)
 		r, ok := got[day]
 		if !ok {
 			t.Errorf("no card row on Jan %d", w.d)
@@ -234,7 +234,7 @@ func TestCardBalancesHistoryCarriesEachAccountIndependently(t *testing.T) {
 		}
 	}
 	// Days before the card's first balance have nothing to carry.
-	if _, ok := got[bucketAt(2026, time.January, 9)]; ok {
+	if _, ok := got[utcMidnight(2026, time.January, 9)]; ok {
 		t.Error("a card row exists before the card's first balance")
 	}
 
@@ -270,19 +270,17 @@ func TestCardBalancesHistoryCarriesEachAccountIndependently(t *testing.T) {
 	}
 }
 
-// TestMigration0043DDLIsRerunnable holds the web views to the replay
-// bar and confirms both still answer afterwards.
-func TestMigration0043DDLIsRerunnable(t *testing.T) {
+// TestWebSpendingViewsAnswer: both spending views answer over the
+// fixture.
+func TestWebSpendingViewsAnswer(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)
 	seedSpendingReportFixture(t, db, ctx)
 
-	rerunMigrationDDL(t, db, ctx, "0043_web_spending_views.sql")
-
 	for _, v := range []string{"web_spending", "web_card_balances_history"} {
 		var n int
 		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+v).Scan(&n); err != nil {
-			t.Errorf("%s after re-run: %v", v, err)
+			t.Errorf("%s: %v", v, err)
 		}
 	}
 }
@@ -400,19 +398,16 @@ func TestWebViewsRenderEpochsInUTC(t *testing.T) {
 	}
 }
 
-// TestMigration0049DDLIsRerunnable holds the re-issued serving views to
-// the replay bar and confirms each still answers.
-func TestMigration0049DDLIsRerunnable(t *testing.T) {
+// TestWebViewsAnswer: every serving view answers over the fixture.
+func TestWebViewsAnswer(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)
 	seedWebViewEpochFixture(t, db, ctx)
 
-	rerunMigrationDDL(t, db, ctx, "0049_web_view_utc_timestamps.sql")
-
 	for _, v := range webViews {
 		var n int
 		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+v.view).Scan(&n); err != nil {
-			t.Errorf("%s after re-run: %v", v.view, err)
+			t.Errorf("%s: %v", v.view, err)
 		}
 	}
 }
@@ -459,8 +454,8 @@ func TestWebSpendingLabelsAnUnnamedAccount(t *testing.T) {
 	}
 }
 
-// TestWebSpendingLabelsAnAccountWithSourceAndKind pins what migration
-// 0063 adds. An account's own name is what its institution calls it and
+// TestWebSpendingLabelsAnAccountWithSourceAndKind pins account_label.
+// An account's own name is what its institution calls it and
 // no more: a bar reading `Checking` says neither which bank it belongs
 // to nor whether the money left a deposit account or a card, and the
 // names collide across sources. The label carries all three, name
@@ -471,8 +466,8 @@ func TestWebSpendingLabelsAnAccountWithSourceAndKind(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)
 	seedSpendingFixture(t, db, ctx)
-	// An account with no name of its own is labelled by its id: 0061's
-	// rule, now shared by both views through account_display_name.
+	// An account with no name of its own is labelled by its id
+	// (account_display_name), in both views.
 	if _, err := db.ExecContext(ctx, `
         UPDATE accounts SET display_name = NULL WHERE account_external_id = 'CASH1';
     `); err != nil {
@@ -509,7 +504,7 @@ func TestWebSpendingLabelsAnAccountWithSourceAndKind(t *testing.T) {
 	}
 	// An account whose kind gold never learned still says so, rather
 	// than trailing an empty bracket or collapsing the whole label to
-	// NULL — a NULL label is the "null" bar migration 0061 removed.
+	// NULL — a NULL label would chart as a "null" bar.
 	var unknown string
 	if err := db.QueryRowContext(ctx,
 		`SELECT account_label(NULL, 'ID1', 'test-src', NULL)`).Scan(&unknown); err != nil {

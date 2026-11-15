@@ -35,8 +35,8 @@ func seedIncomeReportFixture(t *testing.T, db *sql.DB, ctx context.Context) {
                                   account_external_id, kind, currency, net_amount)
         VALUES ('inc-src', 'T-WHT', 1000, 'BRK1', 'tax', 'USD', -6);
 
-        -- One spending row with a verdict, so the report_transactions
-        -- re-issue can be checked from both sides at once.
+        -- One spending row with a verdict, so report_transactions can
+        -- be checked from both sides at once.
         INSERT INTO transactions (silver_source_id, transaction_external_id, occurred_at,
                                   account_external_id, kind, currency, net_amount, counterparty)
         VALUES ('inc-src', 'T-BUY', 1000, 'CASH1', 'purchase', 'USD', -25, 'Corner Market');
@@ -423,10 +423,10 @@ func TestIncomeTransactionsCarryThePayer(t *testing.T) {
 	}
 }
 
-// TestIncomeReportColumnsSurviveAReissue is the positional-scan guard:
-// each reader scans `SELECT *`, so a macro re-issue that adds, removes
-// or reorders a column breaks the scan rather than the query.
-func TestIncomeReportColumnsSurviveAReissue(t *testing.T) {
+// TestIncomeReportsKeepTheirColumns is the positional-scan guard: each
+// reader scans `SELECT *`, so a body edit that adds, removes or reorders
+// a column breaks the scan rather than the query.
+func TestIncomeReportsKeepTheirColumns(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)
 	assertMacroProjects(t, db, ctx, "report_income_summary(0, 5000, 'USD', 'total')",
@@ -443,19 +443,13 @@ func TestIncomeReportColumnsSurviveAReissue(t *testing.T) {
 		"currency", "net_amount", "description", "counterparty", "value_outccy")
 }
 
-// TestMigration0071DDLIsRerunnable holds the report migration to the
-// replay bar, and checks the one thing in it that touches an existing
-// surface: report_transactions carries the spending trio it already
-// had, plus the income one.
-func TestMigration0071DDLIsRerunnable(t *testing.T) {
+// TestIncomeReportsAnswerBesideTheSpendingTrio: every income report
+// answers over the fixture, and report_transactions carries the spending
+// trio beside the income one.
+func TestIncomeReportsAnswerBesideTheSpendingTrio(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)
 	seedIncomeReportFixture(t, db, ctx)
-
-	// 0071 puts report_transactions back at its own 27-column shape, and
-	// TransactionsBetween below scans the current one positionally: the
-	// rerun replays forward to it, as Migrate would.
-	rerunMigrationDDL(t, db, ctx, "0071_report_income.sql")
 
 	for _, macro := range []string{
 		"report_income_summary(0, 5000, 'USD', 'total')",
@@ -469,11 +463,9 @@ func TestMigration0071DDLIsRerunnable(t *testing.T) {
 	} {
 		var n int
 		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+macro).Scan(&n); err != nil {
-			t.Errorf("%s after re-run: %v", macro, err)
+			t.Errorf("%s: %v", macro, err)
 		}
 	}
-	// The re-issue carried 0042's whole body forward: the spending
-	// trio is still there, and the income trio is beside it.
 	rows, err := TransactionsBetween(ctx, db, 0, 5000, "USD", SortAscending)
 	if err != nil {
 		t.Fatalf("TransactionsBetween: %v", err)
@@ -488,10 +480,10 @@ func TestMigration0071DDLIsRerunnable(t *testing.T) {
 		}
 	}
 	if !sawIncome {
-		t.Error("no row carries an income verdict; the new join is not wired")
+		t.Error("no row carries an income verdict; the income join is not wired")
 	}
 	if !sawSpend {
-		t.Error("no row carries a spending verdict; the re-issue dropped 0042's join")
+		t.Error("no row carries a spending verdict; the spending join is gone")
 	}
 }
 
@@ -515,11 +507,11 @@ func closeEnough(a, b float64) bool {
 }
 
 // TestTransactionsCarriesBothFamiliesInOrder is the positional-scan
-// guard for report_transactions, which 0071 re-issued with three new
-// columns. The row struct, the scan list and the macro must move
-// together, and a permutation of two same-typed columns is a SILENT
-// shift rather than an error — so the values are read back and matched
-// to the rows that should carry them.
+// guard for report_transactions' income columns (derived/40_flows.sql).
+// The row struct, the scan list and the macro must move together, and
+// a permutation of two same-typed columns is a SILENT shift rather than
+// an error — so the values are read back and matched to the rows that
+// should carry them.
 func TestTransactionsCarriesBothFamiliesInOrder(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)

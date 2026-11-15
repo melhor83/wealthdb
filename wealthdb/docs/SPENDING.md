@@ -18,7 +18,8 @@ Related design in [DESIGN.md](DESIGN.md):
 - §10.10: the report macros;
 - §13.10: the pins ledger.
 
-Each mechanism below names the gold migration that defines it.
+Every macro below lives in `wealthdb/internal/gold/derived/40_flows.sql`.
+A table, a column or a seeded row names the gold migration that adds it.
 
 ---
 
@@ -42,14 +43,14 @@ Plaid's primaries: `TRANSFER_IN`, `TRANSFER_OUT`, `LOAN_PAYMENTS`,
 vendored for the income family (migration 0069). Investment fees stay
 in: they are money leaving, and they have a value of their own (§2).
 
-The population is layered in SQL (migration 0041), each layer narrower
+The population is layered in SQL, each layer narrower
 than the one it reads, so no Go-side predicate restates any of it:
 
 | macro | what it is |
 |---|---|
-| `spend_scoped_accounts()` | which accounts count at all: EVERY account by default (migration 0068), because whether an account can pay a fee is not a property of its kind. A `spend_account_scope` row is the only thing that takes one out |
+| `spend_scoped_accounts()` | which accounts count at all: EVERY account by default, because whether an account can pay a fee is not a property of its kind. A `spend_account_scope` row is the only thing that takes one out |
 | `spend_enrichment_population(f, t)` | what the enrichment pass may write a verdict for |
-| `spend_matcher_pool(f, t)` | what the internal-transfer matcher sees — deliberately BROADER on two axes: the transfer-eligible KINDS, which include the income side the spending base excludes, on EVERY account rather than the scoped ones (migration 0044). ONE pool for both families: income reads its verdicts and pairs nothing ([INCOME.md](INCOME.md) §1). The legs the pass builds from it also carry the reference their source stamped, which is not a column of the macro but a second read over `transactions` (§3, *The reference road*) |
+| `spend_matcher_pool(f, t)` | what the internal-transfer matcher sees — deliberately BROADER on two axes: the transfer-eligible KINDS, which include the income side the spending base excludes, on EVERY account rather than the scoped ones. ONE pool for both families: income reads its verdicts and pairs nothing ([INCOME.md](INCOME.md) §1). The legs the pass builds from it also carry the reference their source stamped, which is not a column of the macro but a second read over `transactions` (§3, *The reference road*) |
 | `spending_lines_own(f, t)` | the population with its category resolved, less own-account moves, capital deployed, debt repayments and crossings to untracked plans (§2) |
 | `spending_lines_base(f, t)` | what a report charts: `spending_lines_own` plus each linked repayment, as a refund in its outflow's category (§3, *Reimbursements*). A bill on a card not itemised (`card_spend`) and a cash gift (`gift`) stay in |
 
@@ -64,9 +65,9 @@ every such movement one-legged, and a one-legged outgoing leg is
 indistinguishable from spending.
 
 The reports over that base — `report_spending_{summary,categories,
-transactions}` (migration 0042) and the multi-currency
+transactions}` and the multi-currency
 `report_spending_transactions_multi`, and the `web_spending` /
-`web_card_balances_history` serving views (0043) —
+`web_card_balances_history` serving views —
 restate none of it. Sign-split magnitudes, period bucketing, shares,
 and why the summary-equals-categories identity cannot catch a wrong
 exclusion: DESIGN.md §10.10.
@@ -190,16 +191,16 @@ payment on a debt (§3).
 
 `investment` encodes one policy: **capital deployed is not spending.**
 It is an `internal_transfer` when the destination is an account the
-product tracks — the matcher sees both legs, or a rule knows the
-account — and an `investment` when it is not. The vendored vocabulary
-is consumption through and through, so without a value of its own an
+product tracks — the matcher sees both legs, or a rule knows the account
+— and an `investment` when it is not. The vendored vocabulary is
+consumption through and through, so without a value of its own an
 outright securities purchase from a cash account, which the bank books
 as a plain withdrawal, has no honest home: `internal_transfer` would be
 false, `other` is excluded from nothing and explains nothing, and every
 vendored category says the money was consumed. It is excluded from
-`spending_lines_base` exactly as `internal_transfer` is (migration
-0045), and it is a delta, so the model may never emit it; the rule
-tier and the pins are what place it.
+`spending_lines_base` exactly as `internal_transfer` is, and it is a
+delta, so the model may never emit it; the rule tier and the pins are
+what place it.
 
 `card_spend` encodes the opposite policy, and is the one delta that
 *is* spending: **an unpaired card bill is spend on an unitemised card,
@@ -212,8 +213,8 @@ bill is the only trace of that spending, and filing it as
 `internal_transfer` deletes real consumption from every total,
 silently, at whatever size the bill was. So the built-in card-payment
 rule (§3) places `card_spend`: a placeholder primary, **included** in
-`spending_lines_base` (migration 0046; the base's exclusion list
-names each excluded value, not "every delta"), shown as its own line
+`spending_lines_base`, whose exclusion list names each excluded
+value, not "every delta". It is shown as its own line
 in every category report so it is
 visible rather than hidden, and replaced by itemised purchases the day
 the card is collected, because the matcher outranks the rule. It is a
@@ -232,7 +233,7 @@ under `GENERAL_SERVICES_OTHER_GENERAL_SERVICES`, which is false —
 nothing was bought and no service rendered. `internal_transfer` would
 be false too, since the money left the household. So `gift` is a
 primary in its own right, **included** in `spending_lines_base` by the
-same construction as `card_spend` (migration 0047) and shown as its
+same construction as `card_spend` and shown as its
 own line in every
 category report. It is a delta, so the model may never emit it; and
 no built-in rule places it either, because nothing in a transfer's
@@ -382,7 +383,7 @@ inside `wealthdb load`; the fifth costs money and runs only when
         (per source; derived, pins re-stamped)     (GLOBAL, paid for)
 ```
 
-The **kind** floor (migration 0066, extended by 0067, 0103 and 0110)
+The **kind** floor (in `spend_txn_categories`)
 comes last. It stands outside both stores and reads no verdict anyone
 wrote. It takes the transaction's own kind, for a row nothing else
 placed:
@@ -402,7 +403,7 @@ kind is not a guess: each adapter derives it from whatever evidence its
 own source gives, which is where source-specific knowledge belongs, so
 the floor reads that verdict rather than re-deriving it from prose.
 
-A fee's floor reads its account as well (0103, 0110). A bank account
+A fee's floor reads its account as well. A bank account
 books fees too — account maintenance, card and payment charges — and so
 does a card: an annual, late or cash-advance fee. On an account that
 holds no investments "investment fee" is simply wrong. So a fee on a card,
@@ -424,8 +425,8 @@ never stored.
 
 **Across scopes**, `spend_txn_categories()` resolves with
 `COALESCE(transaction scope, merchant scope, kind floor)`: a
-per-transaction verdict beats the merchant-wide one. Migration 0042
-defines the macro, and its current body is 0110's. Both
+per-transaction verdict beats the merchant-wide one. The macro lives in
+`derived/40_flows.sql`. Both
 `spending_lines_base` and the transaction reports read that
 macro, so the lattice has exactly one definition. The merchant store is
 reached *through* the enrichment row's signature, which is why the pass
@@ -1904,7 +1905,7 @@ vocabulary of §3. Eight values:
 | `rule` | a built-in or configured rule |
 | `provider` | the source's own filing of the row |
 | `model` | the merchant store's verdict for the line's signature |
-| `kind` | the floor: what the transaction's own kind says a row IS, where nothing else placed it (migrations 0066, 0067, 0103, 0110) |
+| `kind` | the floor: what the transaction's own kind says a row IS, where nothing else placed it |
 | `signature-only` | no verdict: the pass reached the row, recorded its signature and could not place it |
 | `reimbursement` | a repayment linked to the outflow it answers, netted in that outflow's category (§3, *Reimbursements*) |
 
@@ -1915,10 +1916,10 @@ Three are stored nowhere:
 - `model`: the model tier writes to the merchant store, not the overlay;
 - `kind`: the floor reads no verdict at all;
 - `reimbursement`: `spending_lines_base` writes it on a linked
-  repayment's row (migration 0160).
+  repayment's row.
 
 `spend_txn_categories()` derives `model` and `kind` where the two
-scopes meet (migration 0050). That is the one place a store verdict is
+scopes meet. That is the one place a store verdict is
 distinguishable from the backlog. At table level such a line carries
 `signature-only`, the same value an unplaced row carries.
 `signature-only` is the backlog
@@ -1930,12 +1931,11 @@ distinguishable from the backlog. At table level such a line carries
 
 1. On a line whose resolved category is a **delta**, the enrichment
    row's `merchant_label` — the issuer on a card bill, and nothing on
-   every other delta (migrations 0048 and 0052, below).
+   every other delta (below).
 2. Otherwise the **merchant store's name** for the line's signature:
    the prose a model wrote for that merchant.
-3. Otherwise the **line's own `merchant_signature`**, verbatim
-   (migration 0054). A line whose signature is absent, empty or blank
-   shows nothing.
+3. Otherwise the **line's own `merchant_signature`**, verbatim.
+   A line whose signature is absent, empty or blank shows nothing.
 
 Step 3 is there because step 2 can only ever answer for a line the
 model tier saw. The store is written by the model tier alone, and the
@@ -1979,7 +1979,7 @@ groups its lines as one merchant. A display caser could fold two
 distinct signatures, or a signature and a store name, onto one label
 and merge rows the resolution holds apart.
 
-**A delta line carries no store name** (migration 0048), whatever the
+**A delta line carries no store name**, whatever the
 store holds for its signature, and no fallback either, because a delta
 line is not a merchant transaction: a gift names the recipient, an
 own-account move the holder's own bank, cash out of an ATM a bank and
@@ -1993,8 +1993,8 @@ underneath is the lattice of §3, unchanged: the delta placed at
 transaction scope outranks the store's verdict, and the merchant
 column follows whichever value won.
 
-**A card bill is the one exception, and it names its ISSUER**
-(migration 0052). A `card_spend` line is a bill for a card wealthdb
+**A card bill is the one exception, and it names its ISSUER**.
+A `card_spend` line is a bill for a card wealthdb
 does not itemise, so there are no purchases to name — that absence is
 the whole reason the placeholder exists — and the issuer the bill was
 paid to is the only handle there is on which card the money went to.
@@ -2120,7 +2120,7 @@ Limits:
   portfolio fixes this where a portfolio exists.
 - A yearly fee in a short window annualizes as if it recurred.
 
-The Spending dashboard's fee tiles read `web_fees` (migrations 0177 and 0179):
+The Spending dashboard's fee tiles read `web_fees`:
 the same lines, daily values and monthly returns, at day grain. A
 portfolio's value there leaves out its mortgages and cards too. So
 every figure on them is this view's over any window.
@@ -2133,6 +2133,7 @@ every figure on them is this view's over any window.
 | `spend_merchant_categories` | merchant_signature | GLOBAL and paid for; survives `reset`, and `reload -a` carries it across the fresh-file swap because nothing could regenerate it; a row leaves only by `categorizations --forget` |
 | `spend_account_scope` | (silver_source_id, account_external_id) | configuration stamped into gold; re-stamped whole every pass |
 | `spend_reimbursement_pairs` | (silver_source_id, transaction_external_id) of the repayment | derived; rewritten whole by every pass from the ledger's `reimburse` lines (§3, *Reimbursements*) |
+| `transfer_links` | (silver_source_id, transaction_external_id) of the leg | derived; rewritten whole by every pass: the far account, partner leg and evidence of each row whose far columns are set |
 
 `spend_txn_enrichment` also carries the far-account columns of
 migration 0079, which only the cash flow statement reads. They hold the
@@ -2192,7 +2193,7 @@ Each decision points to the section that argues it.
   vocabularies are fenced from each other by predicate, so a spending
   rule cannot place an income value.
 - **A rewards credit is income, not an offset against card spend**
-  (migration 0070). The `reward` kind is outside the spending
+  (`income_txn_categories`). The `reward` kind is outside the spending
   population. A statement credit, an account-opening bonus and a
   referral bonus all arrive under it, and only the first relates to
   spending at all.
@@ -2209,11 +2210,11 @@ Each decision points to the section that argues it.
   vendored value fits, and the model would file it under general
   services. Only a config rule or a pin places it.
 - **No merchant on a delta line, except a card bill's issuer**
-  (migrations 0048 and 0052, §7). A delta line is not a merchant
+  (§7). A delta line is not a merchant
   transaction. A card bill names the issuer from the card rule's table,
   because that is the only handle on which card the money went to.
 - **A line with no store row falls back to its own signature,
-  verbatim** (migration 0054, §7). The signature is already a merchant
+  verbatim** (§7). The signature is already a merchant
   identity, and verbatim is the only rendering stable by construction.
 - **Merchant-keyed categorisation**, stored globally (§6). A merchant is
   the same merchant whichever card met it.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -39,9 +40,9 @@ func TestReopenReadWriteDoesNotStampBinaryVersions(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "gold.db")
 
-	db, err := Open(path, ModeReadWrite)
+	db, err := OpenFresh(path)
 	if err != nil {
-		t.Fatalf("Open (create): %v", err)
+		t.Fatalf("OpenFresh: %v", err)
 	}
 	db.Close()
 
@@ -102,6 +103,13 @@ func TestReopenReadWriteDoesNotStampBinaryVersions(t *testing.T) {
 //
 // Not parallel: it swaps the binary-open recorder.
 func TestOpenStampsAndReopenDoesNot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gold.db")
+	db, err := OpenFresh(path)
+	if err != nil {
+		t.Fatalf("OpenFresh: %v", err)
+	}
+	db.Close()
+
 	calls := 0
 	restore := recordBinaryOpen
 	recordBinaryOpen = func(context.Context, *sql.DB) error {
@@ -110,10 +118,9 @@ func TestOpenStampsAndReopenDoesNot(t *testing.T) {
 	}
 	t.Cleanup(func() { recordBinaryOpen = restore })
 
-	path := filepath.Join(t.TempDir(), "gold.db")
-	db, err := Open(path, ModeReadWrite)
+	db, err = Open(path, ModeReadWrite)
 	if err != nil {
-		t.Fatalf("Open (create): %v", err)
+		t.Fatalf("Open: %v", err)
 	}
 	db.Close()
 	if calls != 1 {
@@ -139,6 +146,52 @@ func TestOpenStampsAndReopenDoesNot(t *testing.T) {
 	if calls != 1 {
 		t.Errorf("ReopenReadWrite recorded; calls = %d, want 1 — a re-open is the same command continuing", calls)
 	}
+}
+
+// Open refuses a database a later build has migrated past this binary's
+// schema, in every mode and with no build stamp: there is no migration
+// path down. A database below the binary's schema still opens read-only.
+func TestOpenRefusesANewerSchema(t *testing.T) {
+	t.Parallel()
+	latest, err := binaryVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stamped := func(change string, args ...any) string {
+		path := filepath.Join(t.TempDir(), "gold.db")
+		db, err := OpenFresh(path)
+		if err != nil {
+			t.Fatalf("OpenFresh: %v", err)
+		}
+		if _, err := db.Exec(change, args...); err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
+		return path
+	}
+
+	newer := stamped(`INSERT INTO schema_meta (gold_schema_version, applied_at) VALUES (?, 0)`, latest+1)
+	for _, mode := range []Mode{ModeReadWrite, ModeReadOnly} {
+		if db, err := Open(newer, mode); !errors.Is(err, ErrStaleBinary) {
+			if db != nil {
+				db.Close()
+			}
+			t.Errorf("Open(%d) of a newer schema: err = %v, want ErrStaleBinary", mode, err)
+		}
+	}
+	if db, err := OpenReadOnlyWith(newer, nil); !errors.Is(err, ErrStaleBinary) {
+		if db != nil {
+			db.Close()
+		}
+		t.Errorf("OpenReadOnlyWith of a newer schema: err = %v, want ErrStaleBinary", err)
+	}
+
+	older := stamped(`DELETE FROM schema_meta WHERE gold_schema_version = ?`, latest)
+	db, err := Open(older, ModeReadOnly)
+	if err != nil {
+		t.Fatalf("Open read-only of an older schema: %v", err)
+	}
+	db.Close()
 }
 
 // v15Header is the storage number a file in StorageVersion's format
@@ -208,12 +261,7 @@ func TestAGoldFileInANewerFormatStillOpens(t *testing.T) {
 // data; the script fails the same way in DuckDB's own client.
 func TestOpenAnswersAFilterOverAMixedDictionary(t *testing.T) {
 	t.Parallel()
-	db, err := Open("", ModeReadWrite)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	ctx := context.Background()
+	db, ctx := openEmpty(t)
 	if _, err := db.ExecContext(ctx, `
         CREATE TABLE mixed_lines AS
         SELECT i AS k, i % 10 AS day,

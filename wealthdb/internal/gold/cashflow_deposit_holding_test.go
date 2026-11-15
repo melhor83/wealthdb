@@ -2,7 +2,7 @@ package gold
 
 import "testing"
 
-// TestTheMemoSeesADepositStatedAsAHolding covers migration 0163: an
+// TestTheMemoSeesADepositStatedAsAHolding covers this case: an
 // account whose source states its balance as a demand-deposit holding,
 // and no cash balance, joins the memo's balance pool and is measured by
 // coverage; an account with a cash balance keeps reading that alone.
@@ -54,15 +54,13 @@ func TestTheMemoSeesADepositStatedAsAHolding(t *testing.T) {
 		}
 		for _, r := range cov {
 			if r.Account == "Savings" {
-				if r.Status != "measured" || show(r.Measured) != "250" {
-					t.Errorf("%s: Savings coverage: status %s, measured %s; want measured 250", when, r.Status, show(r.Measured))
+				if r.Status != "measured" || fmtStrPtr(r.Measured) != "250" {
+					t.Errorf("%s: Savings coverage: status %s, measured %s; want measured 250", when, r.Status, fmtStrPtr(r.Measured))
 				}
 				return
 			}
 		}
 		t.Errorf("%s: no coverage row for the savings account", when)
 	}
-	check("at head")
-	rerunMigrationDDL(t, db, ctx, "0163_memo_deposit_holdings.sql")
-	check("after replaying 0163")
+	check("the memo")
 }
