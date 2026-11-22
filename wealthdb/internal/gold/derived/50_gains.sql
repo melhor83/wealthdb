@@ -304,7 +304,7 @@ CREATE MACRO report_gains_coverage(p_from, p_to, p_ccy) AS TABLE (
         UNION SELECT silver_source_id, account_external_id FROM sells
         UNION SELECT silver_source_id, account_external_id FROM sold),
     m AS (
-        SELECT k.silver_source_id, k.account_external_id, a.display_name, a.nickname, a.tax_wrapper,
+        SELECT k.silver_source_id, k.account_external_id, a.display_name, a.nickname, account_wrapper(a.tax_wrapper) AS tax_wrapper,
                COALESCE(p.n_positions, 0) AS n_positions, p.n_with_basis, p.value_x, p.value_with_basis_x,
                p.coverage, p.stamps, COALESCE(p.open_lots, 0) AS open_lots,
                COALESCE(s.n_sells, 0) AS sells, COALESCE(s.n_undocumented, 0) AS n_undocumented,
@@ -981,7 +981,11 @@ CREATE MACRO report_gains_buckets(p_from, p_to, p_ccy, p_period, p_grain, p_miss
            CASE WHEN p_grain = 'portfolios' THEN m.g_pid END AS portfolio_external_id,
            pb.display_name AS portfolio_display_name,
            NULLIF(m.g_acct, '') AS account_external_id,
-           a.display_name, a.nickname, a.account_kind, a.tax_wrapper, a.account_category, a.relationship_id,
+           a.display_name, a.nickname, a.account_kind,
+           -- A grain with no account has no wrapper, so the default
+           -- reads at the accounts grain alone.
+           CASE WHEN p_grain = 'accounts' THEN account_wrapper(a.tax_wrapper) END AS tax_wrapper,
+           a.account_category, a.relationship_id,
            CAST(m.realized_x::DECIMAL(28,4) AS VARCHAR) AS realized,
            CAST(m.realized_short_x::DECIMAL(28,4) AS VARCHAR) AS realized_short,
            CAST(m.realized_long_x::DECIMAL(28,4) AS VARCHAR) AS realized_long,

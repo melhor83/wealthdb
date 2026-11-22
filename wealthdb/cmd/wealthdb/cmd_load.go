@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -33,8 +34,9 @@ func cmdLoad(ctx context.Context, g globalFlags, subargs []string, _ io.Reader, 
 		fmt.Fprintln(stderr, `usage: wealthdb load <silver_source_id> | -a
 
 Merge new silver snapshots into gold for one silver source, or
-for all configured sources (-a). See docs/DESIGN.md §8 for the
-load semantics.`)
+for all configured sources (-a). A silver older than its adapter
+still loads, and the load prints one line naming the parts it lacks.
+See docs/DESIGN.md §8 for the load semantics.`)
 	}
 	if err := parseFlags(fs, subargs, "load"); err != nil {
 		return err
@@ -44,7 +46,7 @@ load semantics.`)
 		return err
 	}
 
-	cfg, err := config.Load(g.ConfigPath)
+	cfg, err := g.loadConfig()
 	if err != nil {
 		return err
 	}
@@ -327,10 +329,14 @@ type loadInputs struct {
 }
 
 // readLoadInputs reads the loadInputs (loader.ParseTransferLedger,
-// parseEnrichmentLedgers, config.ExposureRows, config.YieldRows).
+// checkTransferSources, parseEnrichmentLedgers, config.ExposureRows,
+// config.YieldRows).
 func readLoadInputs(cfg *config.Config) (loadInputs, error) {
 	transfers, err := loader.ParseTransferLedger(cfg.EquityTransfers)
 	if err != nil {
+		return loadInputs{}, err
+	}
+	if err := checkTransferSources(transfers, cfg.SilverSources); err != nil {
 		return loadInputs{}, err
 	}
 	enrichment, err := parseEnrichmentLedgers(cfg)
@@ -342,6 +348,33 @@ func readLoadInputs(cfg *config.Config) (loadInputs, error) {
 		return loadInputs{}, err
 	}
 	return loadInputs{transfers: transfers, enrichment: enrichment, exposure: exposure, yield: cfg.YieldRows()}, nil
+}
+
+// checkTransferSources refuses an equity-transfer leg whose source is no
+// configured source: a load applies a source's legs only, so the leg
+// would book nothing, and a one-row move would book its sending half
+// alone. Every configured source counts, not only the ones a load
+// covers, so a load of one source still reads a ledger that names the
+// others. The error names the row by its line, account and date, and
+// the column the id came from.
+func checkTransferSources(transfers map[string][]loader.TransferEntry, sources []config.SilverSource) error {
+	known := make(map[string]bool, len(sources))
+	for _, s := range sources {
+		known[s.ID] = true
+	}
+	for _, id := range slices.Sorted(maps.Keys(transfers)) {
+		if known[id] {
+			continue
+		}
+		e := transfers[id][0]
+		source, account := "silver_source_id", "account"
+		if e.PairSource != "" && e.Direction == "in" {
+			source, account = "to_silver_source_id", "to_account"
+		}
+		return fmt.Errorf("equity_transfers: line %d: the row of %s %q on %s: %s %q is no configured source",
+			e.Line, account, e.Account, time.Unix(e.OccurredAt, 0).UTC().Format(time.DateOnly), source, id)
+	}
+	return nil
 }
 
 // parseEnrichmentLedgers reads the ledgers the pass applies. Every
@@ -476,6 +509,11 @@ func printPassSummary(stdout io.Writer, res *spending.Result) {
 		fmt.Fprintf(stdout, "spending: %d transfer override(s) matched no leg — "+
 			"not loaded yet, or the ledger row describes none\n",
 			res.UnmatchedTransferOverrides)
+	}
+	if res.IdleTransferMatches > 0 {
+		fmt.Fprintf(stdout, "spending: %d transfer override `match` line(s) named both legs but paired none — "+
+			"the legs read as one direction, one is zero, or another line took one\n",
+			res.IdleTransferMatches)
 	}
 	if res.ReimbursementPairs > 0 || res.UnmatchedReimbursements > 0 || res.UnlinkedReimbursements > 0 {
 		fmt.Fprintf(stdout, "spending: %d reimbursement pair(s) from the ledger, %d ledger line(s) naming none; "+
@@ -639,8 +677,8 @@ func matchNames(m *config.SpendingTransferMatching) []spending.CounterpartyName 
 }
 
 // buildSourceSpec assembles a loader.SourceSpec for one configured
-// silver source: translates `path` / `subsources` / `relationships` /
-// `schwab` to their silver-package counterparts and folds in every config
+// silver source: carries `path`, `subsources` and the settings its kind
+// parsed (`relationships`, `schwab`) and folds in every config
 // statement scoped to this source — the override families and
 // `transaction_instruments`.
 func buildSourceSpec(
@@ -655,8 +693,7 @@ func buildSourceSpec(
 		TaxableWrapper: s.TaxableWrapper,
 		Path:           openSpec.Path,
 		Subsources:     openSpec.Subsources,
-		Relationships:  openSpec.Relationships,
-		MarkGuard:      openSpec.MarkGuard,
+		Settings:       openSpec.Settings,
 		TransferLedger: transferLedger[s.ID],
 	}
 	if cfgOvr := cfg.AccountOverrides[s.ID]; len(cfgOvr) > 0 {
@@ -682,15 +719,6 @@ func buildSourceSpec(
 			}
 		}
 	}
-	if cfgOvr := cfg.InstrumentOverrides[s.ID]; len(cfgOvr) > 0 {
-		spec.InstrumentOverrides = make(map[string]loader.InstrumentOverride, len(cfgOvr))
-		for instrID, ov := range cfgOvr {
-			spec.InstrumentOverrides[instrID] = loader.InstrumentOverride{
-				AssetClass: ov.AssetClass,
-				Vehicle:    ov.Vehicle,
-			}
-		}
-	}
 	if links := cfg.TransactionInstruments[s.ID]; len(links) > 0 {
 		spec.TransactionInstruments = maps.Clone(links)
 	}
@@ -702,27 +730,27 @@ func buildSourceSpec(
 	return spec
 }
 
-// runClassPass reads OpenFIGI's security types over the classes of the
-// instruments whose adapter takes them (gold.RefineClasses). The
-// instruments instrument_overrides pins keep their pair. It prints
+// runClassPass sets the pairs the config pins with instrument_overrides
+// and reads OpenFIGI's security types over the classes of every other
+// instrument (gold.RefineClasses, silver.RefineClass). It prints
 // nothing: every load writes the adapter's pairs back, so the pass
 // rewrites the same instruments each time.
 func runClassPass(ctx context.Context, db *sql.DB, cfg *config.Config) error {
-	_, err := gold.RefineClasses(ctx, db, silver.ClassRefiners(), pinnedInstruments(cfg))
+	_, err := gold.RefineClasses(ctx, db, silver.RefineClass, instrumentPins(cfg))
 	return err
 }
 
-// pinnedInstruments names, per source, the instruments the config pins
-// with instrument_overrides.
-func pinnedInstruments(cfg *config.Config) map[string]map[string]bool {
-	pinned := map[string]map[string]bool{}
+// instrumentPins is, per source, the pair instrument_overrides pins on
+// each instrument it names.
+func instrumentPins(cfg *config.Config) map[string]map[string]gold.ClassPin {
+	pins := map[string]map[string]gold.ClassPin{}
 	for src, overrides := range cfg.InstrumentOverrides {
-		pinned[src] = map[string]bool{}
-		for iid := range overrides {
-			pinned[src][iid] = true
+		pins[src] = map[string]gold.ClassPin{}
+		for iid, ov := range overrides {
+			pins[src][iid] = gold.ClassPin{AssetClass: canonical.AssetClass(ov.AssetClass), Vehicle: canonical.Vehicle(ov.Vehicle)}
 		}
 	}
-	return pinned
+	return pins
 }
 
 // runExposurePass rebuilds the exposure report's derived tables

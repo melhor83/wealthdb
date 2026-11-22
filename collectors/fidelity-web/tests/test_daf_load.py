@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import load  # noqa: E402
+import silver_daf  # noqa: E402
 
 
 # Synthetic ids — obviously fake, never a real DAF account/pool/grant.
@@ -87,13 +88,13 @@ def test_daf_portfolio_and_account(migrated, tmp_path):
     _load(migrated, _write_daf_dump(tmp_path, "20260101T120000Z"))
     kind = migrated.execute(
         "SELECT kind FROM portfolios WHERE portfolio_external_id = ?",
-        (load.DAF_PORTFOLIO_LABEL,)).fetchone()
+        (silver_daf.DAF_PORTFOLIO_LABEL,)).fetchone()
     assert kind == ("daf",)
     row = migrated.execute(
         "SELECT nickname, management_style, portfolio_external_id "
         "FROM accounts WHERE account_external_id = ?", (DAF_ACCT,)).fetchone()
     assert row == ("Example Giving Account", "automated",
-                   load.DAF_PORTFOLIO_LABEL)
+                   silver_daf.DAF_PORTFOLIO_LABEL)
 
 
 def test_daf_pools_become_positions(migrated, tmp_path):
@@ -309,7 +310,7 @@ def test_daf_historical_from_statements(migrated, tmp_path, monkeypatch):
     }
     monkeypatch.setattr(
         load, "_parse_daf_statement_pdf_worker",
-        lambda path: parsed[Path(path).name])
+        lambda job: parsed[Path(job[0]).name])
 
     load.load_dump(migrated, dump, 7)
 
@@ -324,3 +325,121 @@ def test_daf_historical_from_statements(migrated, tmp_path, monkeypatch):
     # Cross-walked to the live pool's instrument key via the matching
     # positions.description written by the same dump's pool load.
     assert ikey == POOL_ID
+
+
+def test_a_new_daf_parser_re_derives_the_dumps_loaded_before(
+        tmp_path, monkeypatch):
+    """When the DAF statement parser changes, the next load re-derives
+    the statements of every dump loaded before, with no new dump in
+    bronze, and stamps the generation in use."""
+    import sqlite3
+    monkeypatch.setattr(load.os, "cpu_count", lambda: 1)  # parse in-process
+    bronze = tmp_path / "bronze"
+    _write_daf_dump(bronze, "20260101T120000Z")
+    db = tmp_path / "silver.db"
+
+    def run(quantity, cache):
+        monkeypatch.setattr(load, "_parse_daf_statement_pdf_worker", lambda job: {
+            "as_of_date": "2001-03-31", "ending_value": 50000.0,
+            "reconciled": True, "reconcile_error": None,
+            "pools": [{"description": "Example Growth Pool",
+                       "quantity": quantity, "price": 100.0,
+                       "market_value": 50000.0}]})
+        assert load.main(["--silver-db", str(db), "--bronze-dir", str(bronze),
+                          "--parse-cache-dir", str(tmp_path / cache)]) == 0
+        conn = sqlite3.connect(db)
+        try:
+            return conn.execute(
+                "SELECT quantity FROM historical_position_snapshots").fetchall()
+        finally:
+            conn.close()
+
+    assert run(500.0, "pc1") == [(500.0,)]
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE document_derivations SET generation = "
+                 "'an-earlier-parser' WHERE scope = ?",
+                 (load.DAF_GENERATION_SCOPE,))
+    conn.commit()
+    conn.close()
+    assert run(400.0, "pc2") == [(400.0,)]
+    conn = sqlite3.connect(db)
+    try:
+        assert conn.execute(
+            "SELECT generation, row_count FROM document_derivations "
+            "WHERE scope = ?", (load.DAF_GENERATION_SCOPE,)).fetchall() == [
+            (load._DAF_STATEMENT_PARSER_VERSION, 1)]
+    finally:
+        conn.close()
+
+
+def test_a_daf_statement_that_never_parsed_is_read_once_its_parser_moves(
+        tmp_path, monkeypatch):
+    """A DAF statement whose parse fails is recorded with no rows, so a
+    moved parser reads it again, also when no statement of the scope
+    ever parsed."""
+    import sqlite3
+    monkeypatch.setattr(load.os, "cpu_count", lambda: 1)  # parse in-process
+    bronze = tmp_path / "bronze"
+    _write_daf_dump(bronze, "20260101T120000Z")
+    db = tmp_path / "silver.db"
+    argv = ["--silver-db", str(db), "--bronze-dir", str(bronze),
+            "--parse-cache-dir", str(tmp_path / "pc")]
+
+    def records_and_rows():
+        conn = sqlite3.connect(db)
+        try:
+            return conn.execute(
+                "SELECT generation, row_count FROM document_derivations "
+                "WHERE scope = ?", (load.DAF_GENERATION_SCOPE,)).fetchall(), \
+                conn.execute("SELECT quantity FROM "
+                             "historical_position_snapshots").fetchall()
+        finally:
+            conn.close()
+
+    monkeypatch.setattr(load, "_parse_daf_statement_pdf_worker", lambda job: {
+        "_error": "synthetic layout", "path": job[0]})
+    assert load.main(argv) == 0
+    assert records_and_rows() == (
+        [(load._DAF_STATEMENT_PARSER_VERSION, 0)], [])
+
+    monkeypatch.setattr(load, "_parse_daf_statement_pdf_worker", lambda job: {
+        "as_of_date": "2001-03-31", "ending_value": 50000.0,
+        "reconciled": True, "reconcile_error": None,
+        "pools": [{"description": "Example Growth Pool",
+                   "quantity": 500.0, "price": 100.0,
+                   "market_value": 50000.0}]})
+    monkeypatch.setattr(load, "_DAF_STATEMENT_PARSER_VERSION",
+                        "dafstmt.a-later-parser")
+    assert load.main(argv) == 0
+    assert records_and_rows() == (
+        [("dafstmt.a-later-parser", 1)], [(500.0,)])
+
+
+def test_a_statement_that_fails_reconciliation_records_its_generation(
+        tmp_path, monkeypatch, caplog):
+    """A statement that fails the gate keeps the rows an earlier parse
+    wrote, by design, and a re-parse under the same parser reads it the
+    same way: it is recorded with no row, and the next load re-derives
+    nothing."""
+    import sqlite3
+    monkeypatch.setattr(load.os, "cpu_count", lambda: 1)  # parse in-process
+    bronze = tmp_path / "bronze"
+    _write_daf_dump(bronze, "20260101T120000Z")
+    db = tmp_path / "silver.db"
+    monkeypatch.setattr(load, "_parse_daf_statement_pdf_worker", lambda job: {
+        "as_of_date": "2001-03-31", "ending_value": 50000.0,
+        "reconciled": False, "reconcile_error": "pool sum mismatch",
+        "pools": []})
+    argv = ["--silver-db", str(db), "--bronze-dir", str(bronze),
+            "--parse-cache-dir", str(tmp_path / "pc")]
+    assert load.main(argv) == 0
+    conn = sqlite3.connect(db)
+    try:
+        assert conn.execute(
+            "SELECT generation, row_count FROM document_derivations").fetchall(
+            ) == [(load._DAF_STATEMENT_PARSER_VERSION, 0)]
+    finally:
+        conn.close()
+    with caplog.at_level("INFO", logger="fidelity-web.load"):
+        assert load.main(argv) == 0
+    assert "re-deriving" not in caplog.text

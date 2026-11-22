@@ -8,7 +8,7 @@ import (
 )
 
 // TestLoadFlowTransactionsMatchesTransactionsBetween pins the lean returns
-// flow loader (loadFlowTransactions) to the wide TransactionsBetween readout:
+// flow loader (loadFlowTxns) to the wide TransactionsBetween readout:
 // for the seven fields the returns engine consumes, both must yield the
 // identical sequence — same order, same values — in every output currency.
 // The lean loader drops the macro's account/instrument LEFT JOINs and 13 unused
@@ -43,9 +43,9 @@ func TestLoadFlowTransactionsMatchesTransactionsBetween(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: TransactionsBetween: %v", outCcy, err)
 		}
-		lean, err := loadFlowTransactions(ctx, db, outCcy)
+		lean, err := loadFlowTxns(ctx, db, oneCurrency(outCcy))
 		if err != nil {
-			t.Fatalf("%s: loadFlowTransactions: %v", outCcy, err)
+			t.Fatalf("%s: loadFlowTxns: %v", outCcy, err)
 		}
 		if len(lean) != len(wide) {
 			t.Fatalf("%s: row count lean %d, wide %d", outCcy, len(lean), len(wide))
@@ -58,7 +58,7 @@ func TestLoadFlowTransactionsMatchesTransactionsBetween(t *testing.T) {
 			if l.src != w.SilverSourceID || l.acct != w.AccountExternalID ||
 				l.occurredAt != w.OccurredAt || l.kind != w.Kind ||
 				l.ccy != w.Currency || l.txID != w.TransactionExternalID ||
-				!strEq(l.valueOut, w.ValueOutCcy) {
+				!strEq(l.values[0], w.ValueOutCcy) {
 				t.Errorf("%s row %d differs:\n wide %+v\n lean %+v", outCcy, i, w, l)
 			}
 		}

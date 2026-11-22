@@ -1,30 +1,10 @@
 package main
 
 import (
-	"fmt"
-	"io"
 	"strings"
 
-	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/gold"
-	"github.com/smartpointer-com/wealthdb/wealthdb/internal/output"
 )
-
-// writeFormatted dispatches to the right output.Write* function
-// for the chosen format.
-func writeFormatted(w io.Writer, f output.Format, t output.Table) error {
-	switch f {
-	case output.FormatTable:
-		return output.WriteTable(w, t)
-	case output.FormatCSV:
-		return output.WriteCSV(w, t)
-	case output.FormatCSVPlain:
-		return output.WriteCSVPlain(w, t)
-	case output.FormatJSON:
-		return output.WriteJSON(w, t)
-	}
-	return fmt.Errorf("unsupported output format %q", f)
-}
 
 // ---- column registry -----------------------------------------------------
 
@@ -44,29 +24,23 @@ func buildColumnRegistry(outCcy string, kindOf func(string) string, categories t
 	key, name := holdingCols(kindOf, func(r gold.PositionRow) string { return r.SilverSourceID },
 		func(r gold.PositionRow) string { return r.PositionKey }, func(r gold.PositionRow) string { return strOrEmpty(r.Name) })
 	return []columnSpec[gold.PositionRow]{
-		{Name: "silver_source", Align: output.AlignLeft,
-			Extract: func(r gold.PositionRow) string { return r.SilverSourceID }},
-		{Name: "snapshot_date", Align: output.AlignLeft, Date: true,
-			Extract: func(r gold.PositionRow) string { return formatDate(r.SnapshotAt) }},
+		strCol("silver_source", func(r gold.PositionRow) string { return r.SilverSourceID }),
+		asDate(strCol("snapshot_date", func(r gold.PositionRow) string { return formatDate(r.SnapshotAt) })),
 		// The date the mark is from: the snapshot date, unless a read
 		// dated the snapshot after the marks it found unchanged.
-		{Name: "valued_date", Align: output.AlignLeft, Date: true,
-			Extract: func(r gold.PositionRow) string { return formatDate(r.ValuedAt) }},
+		asDate(strCol("valued_date", func(r gold.PositionRow) string { return formatDate(r.ValuedAt) })),
 		accountCol(kindOf, ref),
 		accountIDCol("account_id", kindOf, ref),
 		key,
 		textCol("symbol", func(r gold.PositionRow) *string { return r.Symbol }),
 		name,
 		// asset_class is the 2-D exposure; vehicle the wrapper.
-		{Name: "asset_class", Align: output.AlignLeft,
-			Extract: func(r gold.PositionRow) string { return r.AssetClass }},
-		{Name: "vehicle", Align: output.AlignLeft,
-			Extract: func(r gold.PositionRow) string { return r.Vehicle }},
-		{Name: "currency", Align: output.AlignLeft,
-			Extract: func(r gold.PositionRow) string { return r.Currency }},
+		strCol("asset_class", func(r gold.PositionRow) string { return r.AssetClass }),
+		strCol("vehicle", func(r gold.PositionRow) string { return r.Vehicle }),
+		strCol("currency", func(r gold.PositionRow) string { return r.Currency }),
 		quantityCol("quantity", func(r gold.PositionRow) *string { return r.Quantity }),
-		moneyCol("market_value", "", func(r gold.PositionRow) *string { return r.MarketValue }),
-		outCcyCol("value", outCcy, func(r gold.PositionRow) *string { return r.ValueOutCcy }),
+		moneyCol("market_value", func(r gold.PositionRow) *string { return r.MarketValue }),
+		valueCol(outCcy, func(r gold.PositionRow) *string { return r.ValueOutCcy }),
 		// The cost basis (gold's book_value) the source states, else the
 		// one the lot engine rebuilt, and what follows from it, defined
 		// in docs/GAINS.md. Blank on a cash row and wherever no basis is
@@ -74,36 +48,20 @@ func buildColumnRegistry(outCcy string, kindOf func(string) string, categories t
 		// 0; the unrealized gain is blank too on a line no cost basis
 		// describes, such as a mortgage. basis_stamp says which notion of
 		// basis the figure is.
-		moneyCol("cost_basis", "", func(r gold.PositionRow) *string { return r.BookValue }),
+		moneyCol("cost_basis", func(r gold.PositionRow) *string { return r.BookValue }),
 		outCcyTwin("cost_basis", outCcy, func(r gold.PositionRow) *string { return r.BookValueOutCcy }),
-		moneyCol("unrealized_gain", "", func(r gold.PositionRow) *string { return r.UnrealizedGain }),
+		moneyCol("unrealized_gain", func(r gold.PositionRow) *string { return r.UnrealizedGain }),
 		outCcyTwin("unrealized_gain", outCcy, func(r gold.PositionRow) *string { return r.UnrealizedOutCcy }),
 		ratioOrBlankCol("unrealized_pct", "", func(r gold.PositionRow) *float64 { return r.UnrealizedRatio }),
 		textCol("basis_stamp", func(r gold.PositionRow) *string { return r.BasisStamp }),
 		quantityCol("quantity_without_basis", func(r gold.PositionRow) *string { return r.QuantityWithoutBasis }),
 		asDate(textCol("acquisition_date", func(r gold.PositionRow) *string { return r.AcquisitionDate })),
-		moneyCol("accrued_interest", "", func(r gold.PositionRow) *string { return r.AccruedInterest }),
-		moneyCol("clean_value", "", func(r gold.PositionRow) *string { return r.CleanValue }),
-		{Name: "relationship_id", Align: output.AlignLeft, Privacy: PrivacyAccountID,
-			Extract: func(r gold.PositionRow) string { return strOrEmpty(r.RelationshipID) }},
+		moneyCol("accrued_interest", func(r gold.PositionRow) *string { return r.AccruedInterest }),
+		moneyCol("clean_value", func(r gold.PositionRow) *string { return r.CleanValue }),
+		privateCol("relationship_id", PrivacyAccountID, func(r gold.PositionRow) string { return strOrEmpty(r.RelationshipID) }),
 		nicknameCol("account_nickname", func(r gold.PositionRow) *string { return r.Nickname }),
 		accountCategoryCol(categories, func(r gold.PositionRow) *string { return r.AccountCategory }),
 	}
-}
-
-// formatCents renders a decimal-string-as-pointer with exactly two
-// fractional digits — the canonical convention for money columns.
-// Returns "" for nil so empty cells stay empty (not "0.00"). On parse
-// failure falls back to the raw string rather than erroring.
-func formatCents(p *string) string {
-	if p == nil {
-		return ""
-	}
-	d, err := canonical.NewDecimalFromString(*p)
-	if err != nil {
-		return *p
-	}
-	return d.StringFixed(2)
 }
 
 // defaultColumns is what `wealthdb holdings positions` shows when --columns
@@ -167,38 +125,4 @@ unless a download dated the snapshot after marks it found unchanged.
 
 Default column set:
   ` + strings.Join(defaultColumns, ", ")
-}
-
-// mergeSorted interleaves two already-(silver_source, account,
-// position_key)-sorted row slices in the same order. Used by
-// --with-cash to slot synthetic cash rows alongside their account's
-// real positions without re-sorting the entire combined list.
-func mergeSorted(a, b []gold.PositionRow) []gold.PositionRow {
-	out := make([]gold.PositionRow, 0, len(a)+len(b))
-	i, j := 0, 0
-	for i < len(a) && j < len(b) {
-		if positionLess(a[i], b[j]) {
-			out = append(out, a[i])
-			i++
-		} else {
-			out = append(out, b[j])
-			j++
-		}
-	}
-	out = append(out, a[i:]...)
-	out = append(out, b[j:]...)
-	return out
-}
-
-// positionLess is the (silver_source_id, account_external_id,
-// position_key) ordering shared with the report_positions /
-// report_cash macros' ORDER BY.
-func positionLess(x, y gold.PositionRow) bool {
-	if x.SilverSourceID != y.SilverSourceID {
-		return x.SilverSourceID < y.SilverSourceID
-	}
-	if x.AccountExternalID != y.AccountExternalID {
-		return x.AccountExternalID < y.AccountExternalID
-	}
-	return x.PositionKey < y.PositionKey
 }

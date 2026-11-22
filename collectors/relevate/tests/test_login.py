@@ -26,7 +26,8 @@ def _state(tmp_path: Path) -> Path:
 
 
 def test_check_without_a_state_file_is_missing(tmp_path, capsys):
-    assert login.do_check(tmp_path / "absent.json") == 1
+    # No session is a login needed, the same verdict as a dead one.
+    assert login.do_check(tmp_path / "absent.json") == login.cli.EXIT_NEEDS_PERSON
     assert capsys.readouterr().out.strip() == "MISSING"
 
 
@@ -43,5 +44,5 @@ def test_check_reports_the_probe_verdict(tmp_path, monkeypatch, capsys):
     assert seen == ["synthetic"]
 
     monkeypatch.setattr(login, "step_probe", lambda session: False)
-    assert login.do_check(_state(tmp_path)) == 2
+    assert login.do_check(_state(tmp_path)) == login.cli.EXIT_NEEDS_PERSON == 6
     assert capsys.readouterr().out.strip() == "DEAD"

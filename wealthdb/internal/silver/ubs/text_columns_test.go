@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/spending"
 )
 
@@ -83,13 +84,13 @@ func seedWebTextRows(t *testing.T, r *webReader) {
 		`{"Description1":"","Description2":"UCCDDEXAMPLE1; order","Description3":""}`)
 	// PDF backfill, full: booking type + continuation lines (one blank).
 	seedWebTextRow(t, r, "P1", 200*86400, 150.0, nil, "EXAMPLE GROCER", "E-BANKING PAYMENT ORDER",
-		`{"source":"account_statement_pdf","booking_type":"E-BANKING PAYMENT ORDER","internal_transfer":false,"counter_account":null,"continuation":["EXAMPLE GROCER","  ","EXAMPLE CITY","INVOICE 42"],"running_balance":1000.0,"value_date":"01.02.2025","post_closing":false}`)
+		`{"source":"account_statement_pdf","booking_type":"E-BANKING PAYMENT ORDER","counter_account":null,"continuation":["EXAMPLE GROCER","  ","EXAMPLE CITY","INVOICE 42"],"running_balance":1000.0,"value_date":"01.02.2025","post_closing":false}`)
 	// PDF backfill, kind-only: booking type, no continuation.
 	seedWebTextRow(t, r, "P2", 201*86400, 3.0, nil, nil, "FEES",
-		`{"source":"account_statement_pdf","booking_type":"FEES","internal_transfer":false,"counter_account":null,"continuation":[]}`)
+		`{"source":"account_statement_pdf","booking_type":"FEES","counter_account":null,"continuation":[]}`)
 	// PDF backfill, all empty.
 	seedWebTextRow(t, r, "P3", 202*86400, nil, 40.0, nil, nil,
-		`{"source":"account_statement_pdf","booking_type":null,"internal_transfer":false,"counter_account":null,"continuation":[]}`)
+		`{"source":"account_statement_pdf","booking_type":null,"counter_account":null,"continuation":[]}`)
 }
 
 func emitWebText(t *testing.T) map[string]canonical.TransactionChange {
@@ -133,6 +134,20 @@ func emitPSNText(t *testing.T) map[string]canonical.TransactionChange {
 	}
 	defer stream.Close()
 	return drainTx(t, stream)
+}
+
+// connTransactions is the transaction stream of a connection over the
+// given feeds (either may be nil) and relationships, over every day.
+func connTransactions(t *testing.T, web *webReader, psn *psnReader, rels []RelationshipPair) silver.TransactionStream {
+	t.Helper()
+	conn := &Connection{web: web, psn: psn, relationships: rels}
+	stream, err := conn.Transactions(context.Background(),
+		canonical.Window{Start: 0, End: 1 << 40, HasChanges: true})
+	if err != nil {
+		t.Fatalf("Transactions: %v", err)
+	}
+	t.Cleanup(func() { stream.Close() })
+	return stream
 }
 
 func drainTx(t *testing.T, stream interface {
@@ -336,15 +351,15 @@ func TestTextProjectionLeavesNonTextColumnsUnchanged(t *testing.T) {
 		add("W8", 107, no, wd, "-42", `{"bank_ref":"W8","Description1":"","Description2":"UCCDDEXAMPLE1; order","Description3":""}`)
 		// PDF rail-era payment order: external, stays a withdrawal.
 		add("P1", 200, no, wd, "-150",
-			`{"bank_ref":"P1","source":"account_statement_pdf","booking_type":"E-BANKING PAYMENT ORDER","internal_transfer":false,"counter_account":null,"continuation":["EXAMPLE GROCER","  ","EXAMPLE CITY","INVOICE 42"],"running_balance":1000.0,"value_date":"01.02.2025","post_closing":false}`)
+			`{"bank_ref":"P1","source":"account_statement_pdf","booking_type":"E-BANKING PAYMENT ORDER","counter_account":null,"continuation":["EXAMPLE GROCER","  ","EXAMPLE CITY","INVOICE 42"],"running_balance":1000.0,"value_date":"01.02.2025","post_closing":false}`)
 		add("P2", 201, no, canonical.TxKindFee, "-3",
-			`{"bank_ref":"P2","source":"account_statement_pdf","booking_type":"FEES","internal_transfer":false,"counter_account":null,"continuation":[]}`)
+			`{"bank_ref":"P2","source":"account_statement_pdf","booking_type":"FEES","counter_account":null,"continuation":[]}`)
 		// PDF credit with no counter IBAN and no rail booking: conservative
 		// internal. The verdict rides the payload now, so the row keeps
 		// its deposit kind (the spending population reads the kind) and
 		// carries `returns_flow`.
 		add("P3", 202, no, dp, "40",
-			`{"returns_flow":"internal","bank_ref":"P3","source":"account_statement_pdf","booking_type":null,"internal_transfer":false,"counter_account":null,"continuation":[]}`)
+			`{"returns_flow":"internal","bank_ref":"P3","source":"account_statement_pdf","booking_type":null,"counter_account":null,"continuation":[]}`)
 		checkShapes(t, got, want)
 	})
 	t.Run("psn", func(t *testing.T) {

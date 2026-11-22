@@ -24,8 +24,8 @@ tables. [AGENTS.md](AGENTS.md) holds the allow and forbid surface.
   plus a statement backfill, and `download` as the one verb that signs in
   (§L). [`firstcitizens`](../firstcitizens/) supplies the data path: a
   browser login, then REST through `page.request` (§A).
-- **A card is a liability, not a conduit.** Chase's conduit-returns
-  rationale is about its *cash* accounts and is not an argument about
+- **A card is a liability, not a deposit account.** Chase's returns
+  policy is about its *cash* accounts and is not an argument about
   cards. A card projects as `canonical.AccountKindCard`. Its balance is a
   liability in net worth, and it stays out of returns and allocation
   exactly as chase's cards do.
@@ -351,7 +351,7 @@ collection time and stores both code and label, so a category Amex adds
 later resolves on its own rather than becoming an unmapped code. One
 capture cannot enumerate the full vocabulary — the map only lists the
 categories present in the rows it returns — so the gold-side
-`providermap.go` table is built from the labels silver has accumulated,
+`amexCardCategories` table (`internal/spending/vocab_amex.go`) lists every known label,
 and an unmapped label is counted drift and falls through to the model tier
 (never guessed into a neighbour).
 
@@ -574,17 +574,26 @@ them from all of bronze. The result depends only on what bronze holds,
 never on the order loads happened in. A test widens the window between two
 loads to pin this.
 
-**An unfinished rebuild is retried.** Each ingested run clears the
-statement generation stamp in its own transaction. Only a committed
-rebuild writes the stamp back. A rebuild that fails or is killed leaves the
-stamp stale, so the next load rebuilds even when it ingests no run. A
-parser change reads stale the same way.
+**An unfinished rebuild is retried.** A committed rebuild records each
+statement document under the parser generation in
+`document_derivations`. Each ingested run clears those records in its own
+transaction. A rebuild that fails or is killed leaves them cleared, so the
+next load rebuilds even when it ingests no run. A parser change leaves
+every document without a record under the new generation, the same way.
 
 **Statement parses are deduped on the PERIOD.** Every run re-fetches the
 same statements, so a tree with N runs holds N copies of each. Each copy
 would cost a `pdftotext` subprocess. A re-rendered PDF is a new hash for
 the same statement, so the dedupe key is the logical period, not the
 bytes: the fleet's dedupe-on-logical-identity rule.
+
+**Statement parses are cached by content.** A parse result is stored
+under the document's hash and the parser generation, in the collector's
+parse cache (`~/.cache/wealthdb/amex/parse-cache/`). The rebuild a new run
+owes reads every document it has read before from there, so it runs
+`pdftotext` only on new bytes. A parse that raises is never stored. A new
+parser generation reads none of the old entries, and the rebuild sweeps
+them.
 
 ## 4. The build
 
@@ -737,7 +746,7 @@ from turning into lost history:
 
 - **Every copy of a period is kept, newest first.** A period has one copy
   per run. The newest is parsed, and the walk stops there when it passes
-  the gates, so the ordinary case costs one `pdftotext` per period. A
+  the gates, so the ordinary case costs one parse per period. A
   refused render falls through to the older copies rather than erasing the
   period. A copy whose bytes match one already refused is skipped without
   parsing.
@@ -750,9 +759,10 @@ from turning into lost history:
   lost its documents. The rebuild raises instead of proceeding. One
   unreadable document stays a per-document skip.
 
-A parser change also triggers the rebuild. `parser_generations`
-(migration 0002) stamps the parser generation that produced the statement
-era, and a stale stamp opens the same gate a new bronze run does.
+A parser change also triggers the rebuild. `document_derivations`
+(migration 0003) records each statement document under the parser
+generation that produced the statement era. A document with no record
+under the current generation opens the same gate a new bronze run does.
 
 `statement_balances` is keyed `(account, period_end)`, which the activity
 channel shares. When a statement closes on the same day a run's own
@@ -764,11 +774,13 @@ run holding the copy that survived, not the newest run loaded.
 
 ### 4.4 Gold adapter
 
-`wealthdb/internal/silver/amex/` follows the chase adapter's card half.
-Each card is a `canonical.AccountKindCard`, and the owed balance is
-negated into gold's canonical negative cash at exactly one point. Credit
-limit and available credit never become balance rows. The adapter carries a
-co-located `ReturnsPolicy` and fixture tests. The merchant-category
+`wealthdb/internal/silver/amex/` declares a source of the shared bank
+adapter (`wealthdb/internal/silver/bank`), as chase does. Each card is a
+`canonical.AccountKindCard`, and the bank adapter negates the owed
+balance into gold's canonical negative cash at exactly one point. Credit
+limit and available credit never become balance rows. Its
+`silver.Source` states the bank returns policy, and fixture tests
+cover it. The merchant-category
 translation and the `card_spend` pairing are in
 [`wealthdb/docs/adapters/amex.md`](../../wealthdb/docs/adapters/amex.md).
 

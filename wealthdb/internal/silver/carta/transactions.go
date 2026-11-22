@@ -3,35 +3,22 @@ package carta
 import (
 	"context"
 	"database/sql"
-	"fmt"
-	"time"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver"
 )
 
-// cashFlowQuery selects the dated cash-flow ledger (collector migration 0003).
-// flow_date is source TEXT in mixed shapes ('MM/DD/YYYY' for certs / statements,
-// 'YYYY-MM-DD' for the cancellation), so it is parsed in Go, not via strftime.
+// cashFlowQuery selects the dated cash-flow ledger (collector migration 0003),
+// each row at its day in unix seconds (flow_at, migration 0007). A row whose
+// date names no day has no flow_at and is not read. The order is the date as
+// printed, as text.
 const cashFlowQuery = `
-SELECT cash_flow_external_id, entity_external_id, flow_date, kind,
+SELECT cash_flow_external_id, entity_external_id, flow_at, kind,
        amount, shares, price_per_share, COALESCE(currency, 'USD'),
        COALESCE(description, '')
   FROM cash_flows
- WHERE flow_date IS NOT NULL
+ WHERE flow_at IS NOT NULL
  ORDER BY flow_date, cash_flow_external_id`
-
-// flowDateUnix parses a cash_flows.flow_date to a UTC-midnight unix timestamp,
-// accepting both the ISO 'YYYY-MM-DD' and US 'MM/DD/YYYY' shapes the silver
-// carries. Returns false if neither layout matches.
-func flowDateUnix(s string) (int64, bool) {
-	for _, layout := range []string{"2006-01-02", "01/02/2006"} {
-		if t, err := time.Parse(layout, s); err == nil {
-			return t.UTC().Unix(), true
-		}
-	}
-	return 0, false
-}
 
 // Transactions projects the cash-flow ledger (collector DESIGN.md §5.2) as
 // DOUBLE-ENTRY pairs on the custody account — the account carrying the value
@@ -57,34 +44,29 @@ func flowDateUnix(s string) (int64, bool) {
 // positive magnitudes in silver; ApplyCanonicalSign pins the canonical
 // direction (gross == net; Carta surfaces no separate fee).
 func (c *Connection) Transactions(ctx context.Context, w canonical.Window) (silver.TransactionStream, error) {
-	if !w.HasChanges {
+	if !w.HasChanges || !c.schema.flowAt {
 		return silver.NewTransactionStream(canonical.TransactionBatch{}), nil
 	}
 	acct, err := c.accountKey(ctx)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := c.db.QueryContext(ctx, cashFlowQuery)
-	if err != nil {
-		return nil, fmt.Errorf("Transactions: %w", err)
-	}
-	defer rows.Close()
 
 	var txs []canonical.TransactionChange
-	for rows.Next() {
+	if err := silver.ScanRows(ctx, c.db, "Transactions", cashFlowQuery, func(rows *sql.Rows) error {
 		var (
-			entityID              int64
-			cfID, flowDate, kind  string
-			ccy, desc             string
-			amount, shares, price sql.NullFloat64
+			entityID, occurred int64
+			cfID, kind         string
+			ccy, desc          string
+			amount, shares     sql.NullFloat64
+			price              *canonical.Decimal
 		)
-		if err := rows.Scan(&cfID, &entityID, &flowDate, &kind, &amount,
-			&shares, &price, &ccy, &desc); err != nil {
-			return nil, err
+		if err := rows.Scan(&cfID, &entityID, &occurred, &kind, &amount,
+			&shares, silver.Dec(&price, silver.DecFloat), &ccy, &desc); err != nil {
+			return err
 		}
-		occurred, ok := flowDateUnix(flowDate)
-		if !ok || occurred < w.Start || occurred > w.End {
-			continue
+		if occurred < w.Start || occurred > w.End {
+			return nil
 		}
 		isZero := !amount.Valid || amount.Float64 == 0
 		inst := instrumentID(entityID)
@@ -112,7 +94,7 @@ func (c *Connection) Transactions(ctx context.Context, w canonical.Window) (silv
 			}
 			if withLot {
 				tx.Quantity = silver.DecimalPtrFromNullFloat(shares)
-				tx.Price = silver.DecimalPtrFromNullFloat(price)
+				tx.Price = price
 			}
 			txs = append(txs, tx)
 		}
@@ -153,8 +135,8 @@ func (c *Connection) Transactions(ctx context.Context, w canonical.Window) (silv
 		case "contribution":
 			emit(canonical.TxKindContribution, false)
 		}
-	}
-	if err := rows.Err(); err != nil {
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 	return silver.NewTransactionStream(canonical.TransactionBatch{Transactions: txs}), nil

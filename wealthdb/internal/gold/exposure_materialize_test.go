@@ -39,7 +39,7 @@ func TestMaterializeExposureMatchesTheLiveViews(t *testing.T) {
 	// A benchmark beside them changes none of the rows below.
 	syncTestBenchmark(t, db, ctx)
 	to := exAsOf + 45*86400
-	n, err := MaterializeExposure(ctx, db, to, 42)
+	n, err := MaterializeExposure(ctx, db, MaterializeParams{ToEpoch: to, ComputedAt: 42})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func TestMaterializeExposureMatchesTheLiveViews(t *testing.T) {
 		t.Errorf("no large row materialized (%v)", err)
 	}
 	// A second run rewrites the table, it does not add to it.
-	m, err := MaterializeExposure(ctx, db, to, 43)
+	m, err := MaterializeExposure(ctx, db, MaterializeParams{ToEpoch: to, ComputedAt: 43})
 	if err != nil || m != n {
 		t.Errorf("second run: %d rows, %v; want %d", m, err, n)
 	}
@@ -160,7 +160,7 @@ func checkMaterializedInstant(t *testing.T, ctx context.Context, db *sql.DB, at 
 		}
 		return
 	}
-	if want := parse(t, g.TotalValueOutCcy); math.Abs(total.Float64-want) > 0.01 {
+	if want := num(t, g.TotalValueOutCcy); math.Abs(total.Float64-want) > 0.01 {
 		t.Errorf("%s at %d: materialized %.4f, holdings global %.4f", ccy, at, total.Float64, want)
 	}
 	sizes, err := ExposureSizes(ctx, db, at, ccy)
@@ -174,7 +174,7 @@ func checkMaterializedInstant(t *testing.T, ctx context.Context, db *sql.DB, at 
 			ccy, at, r.AssetClass, r.Size).Scan(&v); err != nil {
 			t.Fatal(err)
 		}
-		if want := parse(t, r.Value); math.Abs(v-want) > 0.01 {
+		if want := num(t, r.Value); math.Abs(v-want) > 0.01 {
 			t.Errorf("%s %s %s at %d: materialized %.4f, sizes view %.4f", ccy, r.AssetClass, r.Size, at, v, want)
 		}
 	}
@@ -189,7 +189,7 @@ func checkMaterializedInstant(t *testing.T, ctx context.Context, db *sql.DB, at 
 			ccy, at, r.Situs).Scan(&v); err != nil {
 			t.Fatal(err)
 		}
-		if want := parse(t, r.Value); math.Abs(v-want) > 0.01 {
+		if want := num(t, r.Value); math.Abs(v-want) > 0.01 {
 			t.Errorf("%s situs %s at %d: materialized %.4f, situs view %.4f", ccy, r.Situs, at, v, want)
 		}
 	}
@@ -206,18 +206,14 @@ func checkMaterializedWrappers(t *testing.T, ctx context.Context, db *sql.DB, at
 		t.Fatal(err)
 	}
 	want := map[string]float64{}
-	unwrapped := false
 	for _, a := range accounts {
-		if a.TotalValueOutCcy == nil {
-			continue
+		if a.TotalValueOutCcy != nil {
+			want[*a.TaxWrapper] += num(t, a.TotalValueOutCcy)
 		}
-		w := "taxable_personal"
-		if a.TaxWrapper != nil {
-			w = *a.TaxWrapper
-		} else {
-			unwrapped = true
-		}
-		want[w] += parse(t, a.TotalValueOutCcy)
+	}
+	var unwrapped bool
+	if err := db.QueryRowContext(ctx, `SELECT bool_or(tax_wrapper IS NULL) FROM accounts`).Scan(&unwrapped); err != nil {
+		t.Fatal(err)
 	}
 	if want["roth_ira"] == 0 || !unwrapped {
 		t.Fatalf("at %d: accounts by wrapper %v; the test needs a wrapped and an unwrapped one", at, want)
@@ -245,11 +241,83 @@ func checkMaterializedWrappers(t *testing.T, ctx context.Context, db *sql.DB, at
 	}
 }
 
+// A month end's rows are the same whichever instants share its
+// statement: one statement per instant writes what one for all writes,
+// and what batches with a short last one write, each value to the bit.
+// An empty list writes nothing.
+func TestExposureMonthEndsIgnoreTheirStatement(t *testing.T) {
+	t.Parallel()
+	db, ctx := openExposureFixture(t)
+	tx, _, err := beginPinned(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback() //nolint:errcheck — the test writes nothing to keep
+	if _, err := tx.ExecContext(ctx, `DELETE FROM report_exposure`); err != nil {
+		t.Fatal(err)
+	}
+	first, _, err := FirstHoldingsAt(ctx, tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instants := PeriodEnds(first, exAsOf+45*86400, 1)
+	if len(instants) < 3 {
+		t.Fatalf("instants %v: the test needs several", instants)
+	}
+	n1, err := materializeMonthEnds(ctx, tx, instants, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n2, err := materializeMonthEnds(ctx, tx, instants, len(instants), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Batches of all but one: the last batch holds one instant.
+	n3, err := materializeMonthEnds(ctx, tx, instants, len(instants)-1, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := materializeMonthEnds(ctx, tx, nil, exposureMonthEndsPerStatement, 4); err != nil || n != 0 {
+		t.Errorf("no instants: %d rows, %v", n, err)
+	}
+	var stored int
+	if err := tx.QueryRowContext(ctx, `SELECT count(DISTINCT as_of) FROM report_exposure`).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	// differ counts the rows one run wrote and the other did not, and the
+	// instants whose row counts the two disagree on.
+	differ := func(a, b int) int {
+		var rows, counts int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM (
+		    (SELECT * EXCLUDE (computed_at) REPLACE (CAST(value AS VARCHAR) AS value) FROM report_exposure WHERE computed_at = ?
+		     EXCEPT ALL
+		     SELECT * EXCLUDE (computed_at) REPLACE (CAST(value AS VARCHAR) AS value) FROM report_exposure WHERE computed_at = ?)
+		    UNION ALL
+		    (SELECT * EXCLUDE (computed_at) REPLACE (CAST(value AS VARCHAR) AS value) FROM report_exposure WHERE computed_at = ?
+		     EXCEPT ALL
+		     SELECT * EXCLUDE (computed_at) REPLACE (CAST(value AS VARCHAR) AS value) FROM report_exposure WHERE computed_at = ?))`,
+			a, b, b, a).Scan(&rows); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM (
+		    SELECT as_of FROM report_exposure WHERE computed_at IN (?, ?)
+		     GROUP BY as_of HAVING count(*) FILTER (WHERE computed_at = ?) <> count(*) FILTER (WHERE computed_at = ?))`,
+			a, b, a, b).Scan(&counts); err != nil {
+			t.Fatal(err)
+		}
+		return rows + counts
+	}
+	if n1 == 0 || n1 != n2 || n1 != n3 || stored != len(instants) || differ(1, 2) != 0 || differ(1, 3) != 0 {
+		t.Errorf("one per statement %d rows, all in one %d, a short last batch %d, %d of %d instants stored, "+
+			"%d and %d rows differ", n1, n2, n3, stored, len(instants), differ(1, 2), differ(1, 3))
+	}
+}
+
 // An empty gold materializes nothing.
 func TestMaterializeExposureOnAnEmptyGold(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)
-	n, err := MaterializeExposure(ctx, db, exAsOf, 1)
+	n, err := MaterializeExposure(ctx, db, MaterializeParams{ToEpoch: exAsOf, ComputedAt: 1})
 	if err != nil || n != 0 {
 		t.Errorf("empty gold: %d rows, %v", n, err)
 	}
@@ -278,9 +346,7 @@ func TestFirstHoldingsAtCountsCash(t *testing.T) {
 func TestWebExposureSizesTheUnknown(t *testing.T) {
 	t.Parallel()
 	db, ctx := openExposureFixture(t)
-	if _, err := MaterializeExposure(ctx, db, exAsOf, 1); err != nil {
-		t.Fatal(err)
-	}
+	materializeExposureAt(t, db, ctx, exAsOf, 1)
 	var n int
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM web_exposure WHERE size = 'unknown'`).Scan(&n); err != nil ||
 		n == 0 {
@@ -323,7 +389,7 @@ func checkMaterializedSecurities(t *testing.T, ctx context.Context, db *sql.DB, 
 		t.Fatal(err)
 	}
 	slices.SortStableFunc(rows, func(a, b ExposureSecurityRow) int {
-		va, vb := math.Round(math.Abs(parse(t, a.Value))*1e4), math.Round(math.Abs(parse(t, b.Value))*1e4)
+		va, vb := math.Round(math.Abs(num(t, a.Value))*1e4), math.Round(math.Abs(num(t, b.Value))*1e4)
 		if va != vb {
 			return cmp.Compare(vb, va)
 		}
@@ -339,7 +405,7 @@ func checkMaterializedSecurities(t *testing.T, ctx context.Context, db *sql.DB, 
 		if s == nil {
 			return "-"
 		}
-		return strconv.FormatFloat(parse(t, s), 'f', prec, 64)
+		return strconv.FormatFloat(num(t, s), 'f', prec, 64)
 	}
 	var want []string
 	for _, r := range rows {
@@ -380,12 +446,43 @@ func checkSecuritySlicesNarrow(t *testing.T, db *sql.DB, at int64, ccy string) {
 func TestWebExposureSecuritiesAnswers(t *testing.T) {
 	t.Parallel()
 	db, ctx := openExposureFixture(t)
-	if _, err := MaterializeExposure(ctx, db, exAsOf, 1); err != nil {
-		t.Fatal(err)
-	}
+	materializeExposureAt(t, db, ctx, exAsOf, 1)
 	var n int
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM web_exposure_securities WHERE tax_wrapper = 'taxable_personal'`).
 		Scan(&n); err != nil || n == 0 {
 		t.Errorf("%d slices, err %v", n, err)
+	}
+}
+
+// exposure_sum gives one sum whatever the order of its terms, where a
+// float sum does not: 1e16 + 1 rounds back to 1e16, so the float sum
+// of 1e16, 1 and -1e16 is 0 in that order and 1 with the 1 last.
+// exposure_sum_if sums the rows its condition holds on, NULL where none
+// does, as a FILTER would. A NaN or an infinity is no value: it drops out
+// of both.
+func TestExposureSumIgnoresRowOrder(t *testing.T) {
+	t.Parallel()
+	db, _ := openMigrated(t)
+	terms := `(VALUES (1, 1e16::DOUBLE), (2, 1::DOUBLE), (3, -1e16::DOUBLE), (4, 'nan'::DOUBLE),
+	    (5, 'inf'::DOUBLE), (6, '-inf'::DOUBLE)) v(o, x)`
+	var inOrder, lastOne float64
+	if err := db.QueryRow(`SELECT SUM(x ORDER BY o), SUM(x ORDER BY o = 2, o) FROM `+terms+` WHERE o < 4`).
+		Scan(&inOrder, &lastOne); err != nil {
+		t.Fatal(err)
+	}
+	if inOrder == lastOne {
+		t.Fatalf("a float sum gives %v in both orders: the terms no longer show the order", inOrder)
+	}
+	for _, order := range []string{"o", "o = 2, o", "o DESC"} {
+		var got, odd, even float64
+		var none *float64
+		if err := db.QueryRow(`SELECT exposure_sum(x), exposure_sum_if(x, o % 2 = 1), exposure_sum_if(x, o % 2 = 0),
+		    exposure_sum_if(x, o > 6) FROM (SELECT o, x FROM `+terms+` ORDER BY `+order+`)`).
+			Scan(&got, &odd, &even, &none); err != nil {
+			t.Fatal(err)
+		}
+		if got != 1 || odd != 0 || even != 1 || none != nil {
+			t.Errorf("ordered by %s: %v, odd %v, even %v, none %v; want 1, 0, 1 and NULL", order, got, odd, even, none)
+		}
 	}
 }

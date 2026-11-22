@@ -22,6 +22,24 @@ from pathlib import Path
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
+# A download's or a session probe's exit status, one meaning each, so a
+# caller can tell a run that needs a person from one that failed. 2 stays
+# argparse's usage error. 5 is left out: fred and curves give it to a
+# download with no usable series. The vocabulary does not cover a full
+# login: the ubs-web, schwab-api and schwab-web logins give 4 to 8 their
+# own sign-in failures.
+EXIT_OK = 0
+EXIT_FAILED = 1
+EXIT_USAGE = 2
+# A probe that could not run, such as a browser that did not start: no
+# verdict on the session either way.
+EXIT_NO_VERDICT = 3
+# A download whose phases ran but came back short: a phase it attempted
+# returned less than it should have.
+EXIT_SHORT = 4
+# A person has to sign in first: there is no session, or it is dead.
+EXIT_NEEDS_PERSON = 6
+
 
 def default_data_root() -> Path:
     """The default wealthdb data root for host-side collectors when no
@@ -82,9 +100,12 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
 def _add_force_arg(parser: argparse.ArgumentParser, *,
                    always_rebuilds: bool = False) -> None:
     """The standard ``--force`` flag for `load` commands: rebuild the
-    silver DB from scratch (delete it first, then re-ingest all bronze).
-    Pair with ``collectorkit.silver.reset(db_path)`` in the loader, called
-    before the DB is opened when ``args.force`` is set.
+    silver DB from all bronze.
+
+    A loader on ``collectorkit.loader`` gets it from the frame, which
+    builds a fresh silver beside the old one and puts it in place once the
+    load returns (``collectorkit.rebuild.rebuild``). Any other loader calls
+    ``collectorkit.silver.reset(db_path)`` before the DB is opened.
 
     ``always_rebuilds=True`` is for a loader that has no incremental path —
     every run already deletes and rebuilds, so ``--force`` cannot change the
@@ -97,8 +118,7 @@ def _add_force_arg(parser: argparse.ArgumentParser, *,
                      "rebuilds the silver DB from bronze (delete + full "
                      "rebuild), so --force is a documented no-op.")
     else:
-        help_text = ("Rebuild the silver DB from scratch: delete it, then "
-                     "re-ingest all bronze.")
+        help_text = "Rebuild the silver DB from all bronze."
     parser.add_argument("--force", action="store_true", help=help_text)
 
 
@@ -251,8 +271,8 @@ def add_standard_args(parser: argparse.ArgumentParser, *, verb: str,
                     it parses cleanly everywhere — with help text saying it
                     cannot narrow; :func:`resolve_standard` emits the runtime
                     warning. Pass the same ``full_history`` to both.
-      ``load``      ``-v/--verbose`` + ``--force`` (delete the silver DB,
-                    then rebuild it from all bronze). ``always_rebuilds=True``
+      ``load``      ``-v/--verbose`` + ``--force`` (rebuild the silver DB
+                    from all bronze). ``always_rebuilds=True``
                     marks a loader with no incremental path, where ``--force``
                     parses but cannot change the outcome.
       ``login``     ``-v/--verbose``.

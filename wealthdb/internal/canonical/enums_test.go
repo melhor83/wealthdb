@@ -2,52 +2,6 @@ package canonical
 
 import "testing"
 
-// TestAssetClassValidCoarse locks in the intermediate 1-D vocabulary
-// (used by adapters to canonicalise a raw silver class) and its
-// distinction from Valid, which checks the exposure set written to
-// gold. The two overlap only on the shared strings.
-func TestAssetClassValidCoarse(t *testing.T) {
-	// Coarse-only labels: valid coarse, NOT valid exposures.
-	for _, a := range []AssetClass{
-		AssetClassEquity, AssetClassETF, AssetClassBondETF, AssetClassFund,
-		AssetClassBond, AssetClassOption, AssetClassFuture, AssetClassFxForward,
-		AssetClassFxOption, AssetClassMoneyMarket, AssetClassOTCDerivative,
-		AssetClassSPV, AssetClassPrivateFund, AssetClassConvertibleNote,
-		AssetClassMortgage,
-	} {
-		if !a.ValidCoarse() {
-			t.Errorf("AssetClass(%q).ValidCoarse() = false, want true", a)
-		}
-		if a.Valid() {
-			t.Errorf("AssetClass(%q).Valid() = true, want false (coarse-only)", a)
-		}
-	}
-	// Exposure-only values: valid exposures, NOT coarse labels.
-	for _, a := range []AssetClass{
-		AssetClassPublicEquity, AssetClassFixedIncome, AssetClassPrivateDebt,
-		AssetClassInfrastructure, AssetClassCash, AssetClassForeignExchange,
-		AssetClassHedgeFund, AssetClassMultiAsset,
-	} {
-		if a.ValidCoarse() {
-			t.Errorf("AssetClass(%q).ValidCoarse() = true, want false (exposure-only)", a)
-		}
-	}
-	// Shared strings: valid in both vocabularies.
-	for _, a := range []AssetClass{
-		AssetClassPrivateEquity, AssetClassRealEstate, AssetClassMetal,
-		AssetClassCrypto, AssetClassOther,
-	} {
-		if !a.ValidCoarse() || !a.Valid() {
-			t.Errorf("AssetClass(%q): want valid in both vocabularies", a)
-		}
-	}
-	for _, a := range []AssetClass{"", "unknown", "EQUITY"} {
-		if a.ValidCoarse() {
-			t.Errorf("AssetClass(%q).ValidCoarse() = true, want false", a)
-		}
-	}
-}
-
 func TestAccountKindValid(t *testing.T) {
 	cases := []struct {
 		v    AccountKind
@@ -67,17 +21,6 @@ func TestAccountKindValid(t *testing.T) {
 	for _, c := range cases {
 		if got := c.v.Valid(); got != c.want {
 			t.Errorf("AccountKind(%q).Valid() = %v, want %v", c.v, got, c.want)
-		}
-	}
-}
-
-// A card, a mortgage and an overlay keep their source's kind; every
-// other kind an override may restate.
-func TestAccountKindFollowsSource(t *testing.T) {
-	for k := range accountKindValues {
-		want := k == AccountKindCard || k == AccountKindMortgage || k == AccountKindOverlay
-		if got := k.FollowsSource(); got != want {
-			t.Errorf("AccountKind(%q).FollowsSource() = %v, want %v", k, got, want)
 		}
 	}
 }

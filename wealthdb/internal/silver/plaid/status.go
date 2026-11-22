@@ -10,18 +10,13 @@ import (
 // spanExtrema is the MIN/MAX of every date the projection touches: the runs
 // (every balance and holding carries a run's start), both ledgers' posting
 // dates, the card statements' issue dates (their closing balances), and the
-// start of every ledger window a run read. It bounds the snapshot range in
-// Status and the re-emit window in ChangeWindow. Gold's deleteWindow over
-// [Start,End] must cover every record it re-applies. A trade books no later
-// than its posting date and no earlier than the oldest window start
-// (investmentDate), so the span covers it too.
+// start of every ledger window a run read. It is the snapshot range Status
+// reports.
 //
-// The window starts belong here and would be easy to omit. Silver deletes a
-// ledger's rows within each window a run read in full. It deletes the stale
-// pending rows wherever they are dated. So a row Plaid stopped listing can be
-// the oldest one. Every row silver ever held was stored by a run whose window
-// reached its date. With every window in the span, a reload never leaves
-// such a row standing in gold.
+// A load re-emits the whole history and deletes the source's rows whole
+// first (silver.FullSpan). Silver deletes a ledger's rows within each window
+// a run read in full, and the stale pending rows wherever they are dated, so
+// a row Plaid stopped listing leaves gold on the next load too.
 const spanExtrema = `
 SELECT MIN(t), MAX(t) FROM (
     SELECT snapshot_at AS t FROM dump_runs
@@ -30,20 +25,23 @@ SELECT MIN(t), MAX(t) FROM (
     UNION ALL SELECT window_start FROM run_products
     UNION ALL SELECT last_statement_issue_date FROM liabilities)`
 
-// ledgerExtrema spans both ledgers. LoadClockStatus reads only the bank and
-// card ledger, and an Item linked for investments alone has none.
+// ledgerExtrema is the transaction range over both ledgers: an Item linked
+// for investments alone has no bank or card ledger.
 const ledgerExtrema = `
 SELECT MIN(t), MAX(t) FROM (
     SELECT posted_at AS t FROM transactions
     UNION ALL SELECT ` + investmentDate + ` FROM investment_transactions)`
 
-// Status and ChangeWindow are the shared load clock: this source has no
-// change feed of its own, so a loaded run is the trigger and a full re-emit
-// is the response. See silver.LoadClockStatus.
+// clock is the shared load clock (silver.LoadClock): this source has no
+// change feed of its own, so a loaded run is the trigger and a full
+// re-emit is the response.
+var clock = silver.LoadClock(kindName, spanExtrema, ledgerExtrema)
+
+// Status and ChangeWindow are the clock's (silver.Clock).
 func (c *Connection) Status(ctx context.Context) (canonical.Status, error) {
-	return silver.LoadClockStatusOver(ctx, c.db, kindName, spanExtrema, ledgerExtrema)
+	return clock.Status(ctx, c.db)
 }
 
 func (c *Connection) ChangeWindow(ctx context.Context, since int64) (canonical.Window, error) {
-	return silver.LoadClockChangeWindow(ctx, c.db, kindName, spanExtrema, since)
+	return clock.ChangeWindow(ctx, c.db, since)
 }

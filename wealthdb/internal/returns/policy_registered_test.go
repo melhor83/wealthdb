@@ -1,11 +1,11 @@
 package returns_test
 
-// This external test package blank-imports the silver adapters so their
-// init()-time returns.RegisterPolicy calls run, then pins the EXACT FlowPolicy
-// each source resolves to (via returns.ReturnsPolicyFor(kind).Flow). It lives
-// in package returns_test (not returns) to avoid an import
-// cycle: silver/<kind> imports internal/returns, so only an external test
-// package may pull the silver adapters in alongside the package under test.
+// This external test package blank-imports silver/all so silver.Register
+// forwards each kind's policy (returns.RegisterPolicy), then pins the EXACT
+// FlowPolicy each source resolves to (via returns.ReturnsPolicyFor(kind).Flow).
+// It lives in package returns_test (not returns) to avoid an import cycle:
+// silver imports internal/returns, so only an external test package may pull
+// the silver adapters in alongside the package under test.
 
 import (
 	"reflect"
@@ -13,249 +13,67 @@ import (
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/returns"
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver"
 
-	// Blank-import every silver adapter that registers a policy, mirroring
-	// cmd/wealthdb/main.go, so registration runs before the assertions.
-	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/amex"
-	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/angellist"
-	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/carta"
-	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/chase"
-	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/cointracking"
-	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/curves"
-	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/equityzen"
-	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/erstebank_at"
-	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/fidelity"
-	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/firstcitizens"
-	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/fred"
-	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/manual"
-	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/plaid"
-	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/raiffeisen_at"
-	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/refdata"
-	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/relevate"
-	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/schwab"
-	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/swissquote"
-	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/synthetic"
-	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/ubs"
-	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/viac"
+	// Every adapter, as cmd/wealthdb/main.go imports them, so registration
+	// runs before the assertions.
+	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/all"
 )
 
+// TestRegisteredFlowPolicies pins the whole ReturnsPolicy every silver kind
+// resolves to. The regime and the one kind table (canonical.CapitalKind)
+// decide which kinds count and net (TestCompletenessCells), so a row states
+// the regime and every knob, and nothing per kind.
 func TestRegisteredFlowPolicies(t *testing.T) {
-	// The NAV-only source: manual emits no transactions at all, so no
-	// COLLECTED kind is countable — nav_only regime, deposits and the
-	// private-market kinds stay outside. The two ledger kinds are the one
-	// exception: value that moved in from another tracked vehicle is booked
-	// through the equity-transfer ledger as a transfer_in / transfer_out on
-	// this source, and only those count — otherwise a claim arriving from
-	// an escrow reads as performance.
-	man, _ := returns.ReturnsPolicyFor("manual")
-	if !man.Flow.Known {
-		t.Error("manual: policy must be Known (registered)")
+	bank := returns.DefaultReturnsPolicy(returns.BankFlowPolicy())
+	with := func(p returns.ReturnsPolicy, set func(*returns.ReturnsPolicy)) returns.ReturnsPolicy {
+		set(&p)
+		return p
 	}
-	if man.Flow.Regime != returns.RegimeNavOnly {
-		t.Errorf("manual: regime %v, want nav_only", man.Flow.Regime)
+	// A private-market ledger: complete on the custody account, the exit
+	// ledger authoritative, and the honesty tag kept on flow-less windows.
+	privateLedger := with(bank, func(p *returns.ReturnsPolicy) {
+		p.CapitalCallRisk, p.ClosureScope = true, returns.ClosureLedgerExact
+	})
+	// The reference sources register no policy and fall to the Known=false
+	// default.
+	unknown := with(bank, func(p *returns.ReturnsPolicy) { p.Flow.Known = false })
+	want := map[string]returns.ReturnsPolicy{
+		// The bank policy: every capital kind counts, every other knob at
+		// its default. The deposit banks' accounts are cash and amex's are
+		// cards, which the engine hides or drops by kind on any source.
+		"amex": bank, "angellist": bank, "chase": bank, "erstebank_at": bank, "fidelity": bank, "firstcitizens": bank,
+		"raiffeisen_at": bank, "relevate": bank, "schwab": bank, "swissquote": bank, "viac": bank,
+		// A crypto tracker's coin transfer legs count as every source's
+		// transfers do: a pair nets as any source's does; an unpaired leg
+		// is a flow.
+		"cointracking": bank,
+		// The generic kinds cannot know which institution a source models;
+		// returns_policy_overrides states a source's own regime.
+		"plaid": bank, "synthetic": bank,
+		"carta": privateLedger, "equityzen": privateLedger,
+		// No collected row counts, only the ledger's legs; a hand-dated
+		// release leg on the day a claim zeroes is a real exit.
+		"manual": with(bank, func(p *returns.ReturnsPolicy) {
+			p.Flow = returns.NewFlowPolicy(returns.RegimeNavOnly)
+			p.ClosureScope = returns.ClosureLedgerExact
+		}),
+		// One onboarding per entity, anchored inception, cash as conduit,
+		// and only the rows the silver marks as owner capital.
+		"ubs": with(bank, func(p *returns.ReturnsPolicy) {
+			p.OnboardScope, p.Inception = returns.OnboardPerEntityOnce, returns.InceptionFirstRealSnapshot
+			p.ConduitKinds, p.ExternalOnly = []canonical.AccountKind{canonical.AccountKindCash}, true
+		}),
+		"curves": unknown, "fred": unknown, "refdata": unknown,
 	}
-	if man.Flow.IsExternal(canonical.TxKindDeposit) || man.Flow.IsExternal(canonical.TxKindContribution) {
-		t.Error("manual: a collected deposit or contribution must not count")
-	}
-	if !man.Flow.IsExternal(canonical.TxKindTransferIn) || !man.Flow.IsExternal(canonical.TxKindTransferOut) {
-		t.Error("manual: the ledger kinds transfer_in / transfer_out must count")
-	}
-	if man.Flow.IsTransferLike(canonical.TxKindTransferIn) {
-		t.Error("manual: a ledger leg has nothing on this source to net against")
-	}
-	if man.ClosureScope != returns.ClosureLedgerExact {
-		t.Error("manual: a hand-dated release leg on the day a claim zeroes is a real exit, not a drain to subsume")
-	}
-
-	// carta / equityzen: complete double-entry ledgers on the custody account.
-	// The deposit/withdrawal boundary legs are external capital; the holding
-	// legs (buy/sell/contribution/distribution) are the internal halves of
-	// those pairs and must not count. CapitalCallRisk keeps the honesty tag on
-	// flow-less windows.
-	for _, k := range []string{"carta", "equityzen"} {
-		rp, _ := returns.ReturnsPolicyFor(k)
-		if !rp.Flow.Known {
-			t.Errorf("%s: policy must be Known (registered)", k)
+	for _, k := range silver.Kinds() {
+		w, ok := want[k]
+		if !ok {
+			t.Errorf("%s: no expected policy; add the kind to the table", k)
+			continue
 		}
-		if rp.Flow.Regime != returns.RegimeFlowComplete {
-			t.Errorf("%s: regime %v, want flow_complete", k, rp.Flow.Regime)
-		}
-		if !rp.Flow.IsExternal(canonical.TxKindDeposit) || !rp.Flow.IsExternal(canonical.TxKindWithdrawal) {
-			t.Errorf("%s: deposit/withdrawal must be external", k)
-		}
-		if rp.Flow.IsExternal(canonical.TxKindBuy) || rp.Flow.IsExternal(canonical.TxKindSell) ||
-			rp.Flow.IsExternal(canonical.TxKindContribution) || rp.Flow.IsExternal(canonical.TxKindDistribution) {
-			t.Errorf("%s: holding legs are INTERNAL (counting both halves cancels every event)", k)
-		}
-		if rp.Flow.IsTransferLike(canonical.TxKindDeposit) || rp.Flow.IsTransferLike(canonical.TxKindWithdrawal) {
-			t.Errorf("%s: deposit/withdrawal must never net", k)
-		}
-		if !rp.CapitalCallRisk {
-			t.Errorf("%s: CapitalCallRisk must be set", k)
-		}
-		if rp.ClosureScope != returns.ClosureLedgerExact {
-			t.Errorf("%s: ClosureScope must be ledger-exact (the exit ledger is authoritative)", k)
-		}
-	}
-
-	// cointracking: crypto_partial, fiat deposit/withdrawal external, crypto
-	// transfer legs excluded.
-	ct, _ := returns.ReturnsPolicyFor("cointracking")
-	if ct.Flow.Regime != returns.RegimeCryptoPartial {
-		t.Errorf("cointracking regime %v, want crypto_partial", ct.Flow.Regime)
-	}
-	if !ct.Flow.IsExternal(canonical.TxKindDeposit) || !ct.Flow.IsExternal(canonical.TxKindWithdrawal) {
-		t.Error("cointracking: fiat deposit/withdrawal must be external")
-	}
-	if ct.Flow.IsExternal(canonical.TxKindTransferIn) || ct.Flow.IsExternal(canonical.TxKindTransferOut) {
-		t.Error("cointracking: crypto transfer legs must be excluded")
-	}
-	if ct.AccountsGrain != returns.AccountsGrainBlanked {
-		t.Error("cointracking: AccountsGrain must be blanked (per-wallet rows are noise, but shown)")
-	}
-
-	// fidelity: bank set — a transfer moves capital in a direction, a
-	// journal in none, and both net at the coarse grains.
-	fid, _ := returns.ReturnsPolicyFor("fidelity")
-	for _, k := range []canonical.TxKind{canonical.TxKindTransferIn, canonical.TxKindTransferOut, canonical.TxKindJournal} {
-		if !fid.Flow.IsExternal(k) || !fid.Flow.IsTransferLike(k) {
-			t.Errorf("fidelity: %s must be external and transfer-like", k)
-		}
-	}
-
-	// angellist: deposit/withdrawal external; contribution/distribution internal.
-	al, _ := returns.ReturnsPolicyFor("angellist")
-	if !al.Flow.IsExternal(canonical.TxKindDeposit) || !al.Flow.IsExternal(canonical.TxKindWithdrawal) {
-		t.Error("angellist: deposit/withdrawal must be external")
-	}
-	if al.Flow.IsExternal(canonical.TxKindContribution) || al.Flow.IsExternal(canonical.TxKindDistribution) {
-		t.Error("angellist: contribution/distribution are INTERNAL (funding<->deals)")
-	}
-	// The equity-transfer ledger's kinds — an exit paid in shares — are
-	// external and transfer-like, so the vehicle's out-leg counts at its own
-	// grain and nets against the receiving source's in-leg at global.
-	if !al.Flow.IsExternal(canonical.TxKindTransferOut) || !al.Flow.IsExternal(canonical.TxKindTransferIn) {
-		t.Error("angellist: the ledger's transfer kinds must be external")
-	}
-	if !al.Flow.IsTransferLike(canonical.TxKindTransferOut) || !al.Flow.IsTransferLike(canonical.TxKindTransferIn) {
-		t.Error("angellist: the ledger's transfer kinds must be transfer-like")
-	}
-
-	// The six flow-complete banks/pension all resolve the shared bank policy.
-	for _, k := range []string{"ubs", "schwab", "swissquote", "fidelity", "relevate", "viac"} {
-		rp, _ := returns.ReturnsPolicyFor(k)
-		if !rp.Flow.Known {
-			t.Errorf("%s: policy must be Known (registered)", k)
-		}
-		if rp.Flow.Regime != returns.RegimeFlowComplete {
-			t.Errorf("%s: regime %v, want flow_complete", k, rp.Flow.Regime)
-		}
-		for _, tk := range returns.BankExternal() {
-			if !rp.Flow.IsExternal(tk) {
-				t.Errorf("%s: %s must be external", k, tk)
-			}
-		}
-		if !rp.Flow.IsTransferLike(canonical.TxKindTransferIn) {
-			t.Errorf("%s: transfer_in must be transfer-like", k)
-		}
-		if rp.Flow.IsTransferLike(canonical.TxKindDeposit) {
-			t.Errorf("%s: deposit must not be transfer-like", k)
-		}
-	}
-
-	// The cash-conduit deposit banks: complete ledgers on the shared bank set,
-	// but the accounts are pure plumbing — no rows of their own anywhere,
-	// values and flows still aggregate.
-	for _, k := range []string{"chase", "erstebank_at", "firstcitizens", "raiffeisen_at"} {
-		rp, _ := returns.ReturnsPolicyFor(k)
-		if !rp.Flow.Known {
-			t.Errorf("%s: policy must be Known (registered)", k)
-		}
-		if rp.Flow.Regime != returns.RegimeFlowComplete {
-			t.Errorf("%s: regime %v, want flow_complete", k, rp.Flow.Regime)
-		}
-		if !rp.Flow.IsExternal(canonical.TxKindDeposit) || !rp.Flow.IsExternal(canonical.TxKindWithdrawal) {
-			t.Errorf("%s: deposit/withdrawal must be external", k)
-		}
-		if rp.AccountsGrain != returns.AccountsGrainHidden {
-			t.Errorf("%s: AccountsGrain must be hidden (cash plumbing)", k)
-		}
-	}
-
-	// amex: the card-only source. No knob here can move a figure — the engine
-	// drops `card` accounts at the loader — so what the policy declares is
-	// what there is to pin: Known, so the kind never reports
-	// unknown_adapter_policy; the shared bank set, on which none of the card
-	// kinds count as owner capital; and AccountsGrainHidden, which states the
-	// same invisibility a second way and holds if a card-only source ever
-	// emits a non-card account.
-	amx, _ := returns.ReturnsPolicyFor("amex")
-	if !amx.Flow.Known {
-		t.Error("amex: policy must be Known (registered)")
-	}
-	if amx.Flow.Regime != returns.RegimeFlowComplete {
-		t.Errorf("amex: regime %v, want flow_complete", amx.Flow.Regime)
-	}
-	for _, tk := range returns.BankExternal() {
-		if !amx.Flow.IsExternal(tk) {
-			t.Errorf("amex: %s must be external", tk)
-		}
-	}
-	for _, tk := range []canonical.TxKind{canonical.TxKindPurchase,
-		canonical.TxKindRefund, canonical.TxKindCardPayment} {
-		if amx.Flow.IsExternal(tk) {
-			t.Errorf("amex: %s must not count as owner capital", tk)
-		}
-	}
-	if amx.AccountsGrain != returns.AccountsGrainHidden {
-		t.Error("amex: AccountsGrain must be hidden (a card emits no return row)")
-	}
-
-	// synthetic: the generic kind cannot know which institution a source
-	// models, so it registers the bank-style default — flow_complete on the
-	// shared bank sets, every other knob untouched — and a deployment states
-	// each source's own regime with returns_policy_overrides.
-	syn, _ := returns.ReturnsPolicyFor("synthetic")
-	if !syn.Flow.Known {
-		t.Error("synthetic: policy must be Known (registered)")
-	}
-	if syn.Flow.Regime != returns.RegimeFlowComplete {
-		t.Errorf("synthetic: regime %v, want flow_complete", syn.Flow.Regime)
-	}
-	for _, tk := range returns.BankExternal() {
-		if !syn.Flow.IsExternal(tk) {
-			t.Errorf("synthetic: %s must be external", tk)
-		}
-	}
-	for _, tk := range returns.BankTransferLike() {
-		if !syn.Flow.IsTransferLike(tk) {
-			t.Errorf("synthetic: %s must be transfer-like", tk)
-		}
-	}
-	if syn.Flow.IsTransferLike(canonical.TxKindDeposit) || syn.Flow.IsTransferLike(canonical.TxKindWithdrawal) {
-		t.Error("synthetic: deposit/withdrawal must never net")
-	}
-	if !reflect.DeepEqual(syn, returns.DefaultReturnsPolicy(returns.BankFlowPolicy())) {
-		t.Error("synthetic: every knob but the flow policy must keep its default")
-	}
-
-	// plaid: one Item may be a bank, a broker or a card issuer, so it
-	// registers the same bank-style default as synthetic; the engine treats
-	// each account by its kind, and returns_policy_overrides states an Item's
-	// own regime.
-	pl, _ := returns.ReturnsPolicyFor("plaid")
-	if !pl.Flow.Known {
-		t.Error("plaid: policy must be Known (registered)")
-	}
-	if !reflect.DeepEqual(pl, returns.DefaultReturnsPolicy(returns.BankFlowPolicy())) {
-		t.Error("plaid: the bank-style default, every other knob untouched")
-	}
-
-	// The reference sources are blank-imported but register NO policy —
-	// they must fall to the Known=false default.
-	for _, k := range []string{"curves", "fred", "refdata"} {
-		if rp, _ := returns.ReturnsPolicyFor(k); rp.Flow.Known {
-			t.Errorf("%s: registers no policy, must fall to Known=false default", k)
+		if got, _ := returns.ReturnsPolicyFor(k); !reflect.DeepEqual(got, w) {
+			t.Errorf("%s: policy %+v, want %+v", k, got, w)
 		}
 	}
 }

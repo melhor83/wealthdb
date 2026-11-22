@@ -94,7 +94,23 @@ $XDG_DATA_HOME/wealthdb/<source>/
 **Docker mounts** (the containerised collectors): the wrapper
 bind-mounts `~/.secrets → /secrets` and `$XDG_DATA_HOME/wealthdb/<source> →
 /data`, so inside the container credentials are at
-`/secrets/<source>.env` and bronze/silver at `/data`.
+`/secrets/<source>.env` and bronze/silver at `/data`. It also mounts the
+browser's startup cache dir at `/cache/startupcache`.
+
+**Caches.** A load keeps its caches in
+`${XDG_CACHE_HOME:-~/.cache}/wealthdb/<source>`, on the host as in the
+container:
+
+- the wrapper mounts that dir at `/cache/collector` and points
+  `WEALTHDB_CACHE_DIR` at it;
+- a load that runs on the host finds the same dir through
+  `collectorkit.extract.cache_root`;
+- `WEALTHDB_CACHE_DIR` names one collector's cache root, never a dir
+  that several collectors share: a load sweeps the entries it does not
+  use.
+
+The dir holds extracted statement text and parsed rows, so it is kept
+mode `0700`. It is derived data: deleting it costs one slower load.
 
 **Session discipline:** `login --check` probes the stored session
 without a new MFA push. Where a session persists, `download --dry-run`
@@ -138,6 +154,7 @@ the wrapper, the env file, and the image name.
 ```
 collectors/<name>/
 ├── <name>                 the wrapper — what wealthdb-collect dispatches to (executable)
+├── collector.py           the declaration: SPEC, a collectorkit.spec.Collector
 ├── login.py               mints/refreshes the session  (may be a no-op or absent)
 ├── download.py            fetches bronze
 ├── load.py                parses bronze → silver
@@ -150,6 +167,32 @@ collectors/<name>/
 ├── DESIGN.md              source-specific reverse-engineering notes (optional)
 └── AGENTS.md              source-specific agent rules (allowed UI surface, etc.)
 ```
+
+### The declaration — `collector.py`
+
+Each collector declares itself once, as `SPEC` in its `collector.py`.
+`SPEC` is a `collectorkit.spec.Collector`. It names:
+
+- the collector's name and env prefix, as its wrapper sets them;
+- what a download signs in with, and whether it may run with no person
+  present;
+- whether a download honours `--lookback` or always fetches the whole
+  history;
+- the debug subdirs and globs that `prune` reclaims from a complete run.
+
+The file imports only the standard library and collectorkit, so a tool
+reads it without the collector's own dependencies. This prints one JSON
+object per collector:
+
+```sh
+python -m collectorkit.spec describe collectors/fred collectors/amex
+```
+
+The collectorkit suite checks each declaration against its wrapper's
+`NAME` and `ENV_PREFIX` and against its download's window. It also
+checks that the default paths in its scripts are the ones `spec.paths()`
+derives from the name. A collector without a `collector.py` fails that
+suite.
 
 ### The wrapper — the `wealthdb-collect` contract
 
@@ -183,21 +226,20 @@ The wrapper therefore:
   source accepts it for uniformity but warns it cannot narrow its fetch,
   rather than silently ignoring or rejecting it.
 
-That precedence is not hand-written; it comes from sourcing the matching
-shared library and setting a small config block.
+That precedence is not hand-written. It lives once, in
+[`shared/wrappers/paths-lib.sh`](../shared/wrappers/paths-lib.sh), which
+both wrapper libraries source. A wrapper sources the matching library
+and sets a small config block.
 
 A **Docker** wrapper sources
 [`shared/wrappers/wrapper-lib.sh`](../shared/wrappers/wrapper-lib.sh)
-and sets `NAME`, `ENV_PREFIX` and `ENV_VARS` (env vars forwarded into
-the container with `-e`). It may opt into these knobs:
+and sets `NAME` and `ENV_VARS` (env vars forwarded into the container
+with `-e`). `ENV_PREFIX` is `NAME` in upper snake case unless the
+wrapper sets it. It may opt into these knobs:
 
 - `HAS_DEBUG`: a `/debug` mount for `--screenshot-dir` and `--trace`.
-- `HAS_APP_MOUNT`: the checkout's source over `/app` on every verb.
-  The image then holds no source, so only an edit to the Dockerfile
-  or `requirements.txt` rebuilds it.
 - `HAS_SAFETY`: refuse to clobber a live container mid-MFA.
-- `HAS_VNC`: VNC port forwarding for `vnc-login`. `VNC_SUBCOMMANDS`
-  replaces the list of verbs that get it.
+- `VNC_SUBCOMMANDS`: the verbs that get a forwarded VNC port.
 - `HAS_ENV_FILE`: source the credentials env file on the host, so the
   `ENV_VARS` it sets are forwarded.
 - `SILVER_SUBCOMMANDS`: the verbs that read `--silver-db`, in place of
@@ -205,21 +247,30 @@ the container with `-e`). It may opt into these knobs:
 
 A wrapper with a config file calls `wrapper_source_cfg` first. The
 wrapper then calls `wrapper_init`, prints its help when
-`wrapper_wants_help`, and ends with `wrapper_main "$@"`. `wrapper_main`
+`wrapper_wants_help`, and ends with `wrapper_main "$@"`. A wrapper whose
+`login` folds into `download` calls `wrapper_login_folds` before that.
+A bare `login` then prints a notice and starts no container. `wrapper_main`
 runs `build`, and runs `prune` on the host through
 `wrapper_host_prune`; fidelity-web and schwab-api route `prune`
-themselves. The library bind-mounts
-`~/.secrets → /secrets` and `<data> → /data` (plus `/silver`, `/debug`,
-`/app` when applicable) and runs as `--user $(id -u):$(id -g)`.
+themselves. The library bind-mounts the dirs listed under Docker mounts
+and Caches, plus the checkout over `/app` (and `/silver` and `/debug`
+when applicable), and runs as `--user $(id -u):$(id -g)`.
 
-A **host-venv** wrapper (for tools that need no browser) sources
-[`shared/wrappers/host-lib.sh`](../shared/wrappers/host-lib.sh) and calls
-`host_resolve_dirs "$@"` (which populates `SECRETS_DIR` / `DATA_DIR` /
-`SILVER_DB` / `FORWARD_ARGS`), `host_source_env_file [FILE]` (which
-sources `<secrets>/<name>.env`, or, given FILE, another source's
-`<secrets>/<FILE>.env`, overridden by `<FILE>_ENV_FILE` in upper snake
-case), and `host_python` (the collector's `.venv`), then execs the
-right `.py` with the resolved paths and `FORWARD_ARGS`.
+A **host-venv** wrapper (for tools that need no browser) sets `NAME`,
+sources [`shared/wrappers/host-lib.sh`](../shared/wrappers/host-lib.sh)
+and calls these:
+
+- `host_begin VERB... -- "$@"` prints the banner as help and rejects an
+  unknown verb. It then sets `VERB` and resolves `SECRETS_DIR`,
+  `DATA_DIR`, `SILVER_DB` and `FORWARD_ARGS`.
+- `host_source_env_file [FILE]` sources `<secrets>/<name>.env`. Given
+  FILE, it sources another source's `<secrets>/<FILE>.env`, overridden
+  by `<FILE>_ENV_FILE` in upper snake case.
+- `host_run SCRIPT [ARGS...]` execs the `.py` on the collector's `.venv`
+  with ARGS, then `FORWARD_ARGS`.
+- `host_login_probe SCRIPT [ARGS...]` is the probe in the `login` of a
+  source with no session. `--check` runs SCRIPT. Otherwise it returns,
+  and the wrapper prints its notice.
 
 ### Collector CLI conventions
 
@@ -234,8 +285,9 @@ are the escape, not opt-ins. The canonical spelling per concept:
 | --- | --- | --- |
 | bronze root (every verb that touches it) | `--bronze-dir` | resolved data dir |
 | documents / heavy detail | fetched by default; opt out with `--no-documents` (and the same `--no-<detail>` pattern for other heavy passes) | **on** |
-| force reload (on `load`) | `--force` — delete the silver DB, then rebuild from all bronze | off |
+| force reload (on `load`) | `--force` — rebuild silver from all bronze; on the load frame the old silver stays in place until the new one is complete; on the load frame and the loaders that call `rebuild.runs_without_bronze`, a warning first names each loaded run whose bronze is gone | off |
 | session probe | `login --check`: exit `0` = credential or session alive, nonzero = not. See [login.py — the session](#loginpy--the-session) for what it reads and for the five collectors that differ. | — |
+| exit status (`download`, `login --check`) | `collectorkit.cli`: `0` done, `1` failed, `2` usage error, `3` no verdict (a probe that could not run), `6` a person has to sign in first. A full `login` may give its own codes. | — |
 | human-MFA wait | `--mfa-timeout SECONDS` | per source; see the list below |
 | MFA-page-appear wait | `--mfa-page-timeout SECONDS` | per source |
 | login-diagnostics dir | `--screenshot-dir` (login); `--debug-dir` on an `explore` harness, and on `prune`, which reclaims that dir | None |
@@ -274,8 +326,7 @@ exception is uniformity: a flag the fleet orchestrator forwards to every
 source must PARSE everywhere, so `--lookback` is accepted by every
 `download` and a collector that cannot narrow its fetch warns rather than
 rejecting. A wrapper declares its silver-consuming verbs with
-`SILVER_SUBCOMMANDS` (default `(load)`), the same convention
-`VNC_SUBCOMMANDS` uses.
+`SILVER_SUBCOMMANDS` (default `(load)`).
 
 **There is exactly one window flag: `--lookback`.** Every `download`
 accepts it, so a fleet orchestrator can hand the same flag to every source. It
@@ -463,19 +514,51 @@ runs, that walk signs in first.
 
 ### load.py — silver
 
-`load.py` opens the DB with
+`load.py` parses each bronze run into source-shaped tables. Silver is the
+**input contract to gold**: its columns follow the source's shape, not
+gold's, and are documented in the collector README.
+
+A loader states what is its own in a
+[`collectorkit.loader`](../shared/collectorkit/collectorkit/loader.py)
+`LoaderSpec`: its flags, its migrations, how one run becomes rows, and
+the passes around the runs. `loader.main` does the rest:
+
+- It opens silver and applies the migrations. A migration is an
+  `NNNN_*.sql` file. Each one ends by inserting its own version into
+  `schema_meta`.
+- It loads each run that silver has not loaded. Each run is one
+  transaction, and its `dump_runs` row is written last. A run that fails
+  leaves no rows behind, and the next load reads it again.
+- A load that finds no new run changes nothing.
+- `--force` builds a fresh silver beside the old one from every run. It
+  puts the new one in place only when the load succeeds
+  ([`collectorkit.rebuild`](../shared/collectorkit/collectorkit/rebuild.py)).
+- `--force` reads only the bronze that exists. The rows of a loaded run
+  whose run dir is gone, a pruned one say, are not in the new silver. So
+  a warning names each such run before the rebuild starts
+  (`rebuild.runs_without_bronze`).
+
+A loader that is not on the frame uses the same parts of
 [`collectorkit.silver`](../shared/collectorkit/collectorkit/silver.py)
-`open_db(--silver-db)`, runs `apply_migrations(conn, migrations/)`, and
-parses each bronze run into source-shaped tables. The load is
-**idempotent** — already-loaded dumps are skipped (`loaded_snapshots`,
-backed by a `dump_runs` table keyed by the run timestamp from
-`bronze.parse_run_ts`). Migrations are `NNNN_*.sql` applied in order,
-each ending by inserting its own version into `schema_meta`
-(`silver_schema_version`). `open_db` leaves transactions to the caller;
-`silver.transaction(conn)` makes a block atomic — one per bronze run, so a
-failed load leaves no half-loaded run behind. Silver is the **input
-contract to gold**: its columns follow the source's shape, not gold's, and
-are documented in the collector README.
+itself: `open_db`, `apply_migrations`, one `transaction` per run, and
+`reset` for `--force`.
+
+An error inside a run ends the load. A load also stops on purpose
+(`rebuild.stop`) for a silver newer than the code, or for an invariant
+the loader checks. Silver stays as it was. A new column that only bronze
+can fill for old rows does not stop a load. It adds an entry to the
+loader's `REBUILD_ADVICE` (`rebuild.rebuild_advice`), which asks for one
+`load --force`. The advice also counts the loaded runs whose bronze is
+gone, whose rows that rebuild drops.
+
+Rows parsed from a document carry their document. Each scope records the
+parser generation that derived each document
+([`collectorkit.derivations`](../shared/collectorkit/collectorkit/derivations.py)).
+So a load parses only new documents, and a parser change re-derives its
+own scope. Each parse is cached by the document's hash and the parser's
+fingerprint
+([`collectorkit.parsecache`](../shared/collectorkit/collectorkit/parsecache.py)),
+so `load --force` reads a parsed document from the cache.
 
 **Cost basis** is stated as printed, in columns rather than only in the
 payload, so a reader needs no JSON. That covers a holding's cost basis,
@@ -491,21 +574,49 @@ Both use schwab-web's column names and values for the figures they share
 ([schwab-web/DESIGN.md §9](schwab-web/DESIGN.md#9-cost-basis-and-tax-lots)).
 A lot that two documents print stays in silver twice, once per document.
 
-Document text comes from
+A loader extracts a document once per engine with
+[`collectorkit.extract`](../shared/collectorkit/collectorkit/extract.py)
+(`pdfium`, `pdfplumber`, `pdftotext_layout`, `pdftotext_bbox`).
+`extract.cached` keys the result on the document and the engine. The
+parser reads the pages and words as a
+[`collectorkit.words`](../shared/collectorkit/collectorkit/words.py)
+`Extracted`, and never imports `extract`. So the two change apart:
+
+- a parser change parses the cached text again and extracts nothing;
+- an engine change moves the extraction key, so each document is
+  extracted and parsed again;
+- the parser's fingerprint covers its own code only (`python=False`),
+  and its generation adds the extraction key.
+
+Some parsers extract for themselves, through the whole-document readers
 [`collectorkit.pdf`](../shared/collectorkit/collectorkit/pdf.py)
-(pypdfium, pdfplumber, OCR) or
+(pypdfium, pdfplumber, OCR) and
 [`collectorkit.pdftotext`](../shared/collectorkit/collectorkit/pdftotext.py)
-(poppler's `pdftotext -layout`, for parsers that read printed columns).
-Readings more than one source shares live beside them:
-[`collectorkit.money`](../shared/collectorkit/collectorkit/money.py) for an
-amount in its display form (`$1,234.56`, `(12.50)`),
-[`collectorkit.statement_period`](../shared/collectorkit/collectorkit/statement_period.py)
-for a period printed as two month-name dates, and
-[`collectorkit.parser_cli`](../shared/collectorkit/collectorkit/parser_cli.py)
-for the command line a statement parser offers on its own
-(`python pdf_parsers.py FILE.pdf [--json-out PATH]`, one JSON array of what
-each file yields). A source that prints money or dates another way keeps
-its own reader beside its parser.
+(poppler's `pdftotext -layout`).
+
+Other pieces that more than one source shares:
+
+- [`collectorkit.money`](../shared/collectorkit/collectorkit/money.py):
+  an amount in its display form (`$1,234.56`, `(12.50)`);
+- [`collectorkit.statement_period`](../shared/collectorkit/collectorkit/statement_period.py):
+  a period printed as two month-name dates;
+- [`collectorkit.statement`](../shared/collectorkit/collectorkit/statement.py):
+  a card statement's summary amounts, its row dates, and the checks
+  that its figures add up;
+- [`collectorkit.channels`](../shared/collectorkit/collectorkit/channels.py):
+  where an export's rows end and a statement's begin, and the one-to-one
+  match of rows two channels both carry;
+- [`collectorkit.k1`](../shared/collectorkit/collectorkit/k1.py): the
+  face page of a Schedule K-1;
+- [`collectorkit.series`](../shared/collectorkit/collectorkit/series.py):
+  the loader of a collector of dated series;
+- [`collectorkit.parser_cli`](../shared/collectorkit/collectorkit/parser_cli.py):
+  the command line a statement parser offers on its own
+  (`python pdf_parsers.py FILE.pdf [--json-out PATH]`, one JSON array of
+  what each file yields).
+
+A source that prints money or dates another way keeps its own reader
+beside its parser.
 
 A parser's fingerprint (`collectorkit.srcfp`) covers every collectorkit
 module it imports and the package `__init__`, so a code change to one of
@@ -531,6 +642,16 @@ python3 -I shared/collectorkit/tools/parse_diff.py \
     pdf_parsers_svbdep:parse_svbdep_statement_pdf
 python3 -I shared/collectorkit/tools/silver_diff.py old/svb.db new/svb.db
 ```
+
+Two more prove that a restructuring kept the code and the calls:
+
+- [`move_check.py`](../shared/collectorkit/tools/move_check.py)
+  `OLD NEW...` checks that a module split moved every function and
+  class unchanged.
+- [`collectorkit.testing`](../shared/collectorkit/collectorkit/testing.py)
+  records the calls a browser walk makes. A trace stored as a fixture
+  pins their order. `COLLECTORKIT_RECORD_TRACES=1` writes the fixtures
+  anew after an intended change to a walk.
 
 ### Debug artefacts, run status, and pruning bronze
 
@@ -594,7 +715,9 @@ uniform convention:
 - **`run.json` `status` lifecycle.** A `download` writes
   `{"status": "in-progress"}` when it creates the run dir, then
   atomically overwrites `run.json` with the terminal manifest carrying
-  `"status": "complete"` (or `"dry-run"`) at the end. So a run dir is a
+  `"status": "complete"` (or `"dry-run"`) at the end.
+  `collectorkit.bronze.open_run` writes both manifests, and a new
+  download uses it. So a run dir is a
   **complete** dump (`status == "complete"`) or a **non-complete** one (an
   `in-progress` marker from a crashed walk, a `dry-run` shell, or no
   `run.json` at all). A manifest with no `status` field is classified by
@@ -637,13 +760,18 @@ uniform convention:
 The safety envelope is **identical everywhere** because it lives in one
 place — [`collectorkit.prune`](../shared/collectorkit/collectorkit/prune.py),
 a reviewed, unit-tested engine. Each collector with run dirs ships a
-**thin `prune.py`** that hands the engine a `PruneConfig`: the
-`debug_subdirs` to reclaim (empty for collectors that write none) and
-an `is_complete(run_dir, meta)`
-predicate (most pass `prune.lenient_classification`; the rest build on
-`prune.status_classification`, which encodes the `status` lifecycle plus
-a per-collector legacy fallback). The engine
-guarantees, for every collector:
+**thin `prune.py`** whose config is `prune.spec_config(SPEC)`. That
+config holds:
+
+- the debug subdirs and globs that `collector.py` names (none for a
+  collector that writes no debug artefact);
+- an `is_complete(run_dir, meta)` predicate. It is the lenient rule
+  (`prune.lenient_classification`) unless the collector passes its own,
+  as `prune.spec_config(SPEC, is_complete)`. Its own predicate builds
+  on `prune.status_classification`, which encodes the `status`
+  lifecycle plus a per-collector legacy fallback.
+
+The engine guarantees, for every collector:
 
 - a **`load` input is never deleted** — inside bronze the only paths
   removed are the configured debug subdirs of *complete* dumps and whole
@@ -680,28 +808,72 @@ of `collectors/`); **the presence of a Dockerfile decides the runtime.**
 
 - A **Docker** collector has a `Dockerfile` + `entrypoint.sh`. The
   Dockerfile `FROM`s a shared base
-  ([`shared/images/`](../shared/images/)): `wealthdb/base-python`
-  (REST/no-browser, ships `collectorkit`), `wealthdb/base-playwright`
-  (Chromium, plus Xvfb/x11vnc and the shared entrypoint bootstrap so a
-  browser can be run headed and driven over VNC), or
-  `wealthdb/base-camoufox` (that, plus a stealth-patched Firefox).
-  `requirements.txt` is copied and `pip install`ed first (a cache
-  layer). A collector with `HAS_APP_MOUNT` copies nothing more. Any
-  other copies its scripts, `migrations` and `entrypoint.sh` **by name**,
-  so stray host artefacts never enter the image. `entrypoint.sh` maps
-  the subcommand to the right script. A collectorkit test
-  (`test_collector_images.py`) checks both rules.
+  ([`shared/images/`](../shared/images/)). Each base ships
+  `collectorkit` and the shared entrypoint engine at
+  `/opt/entrypoint-lib.sh`. `wealthdb/base-python` is for REST and
+  no-browser collectors. `wealthdb/base-playwright` adds Chromium and
+  Xvfb/x11vnc, so a browser can run headed and be driven over VNC.
+  `wealthdb/base-camoufox` adds a stealth-patched Firefox to that.
+  `requirements.txt` is copied and `pip install`ed, and nothing more:
+  the wrapper mounts the checkout over `/app`, so a run uses the
+  checkout's code. A collectorkit test (`test_collector_images.py`)
+  checks the rule. `entrypoint.sh` maps the subcommand to the right
+  script. Each verb is one line,
+  `run plain|xvfb|vnc:LABEL SCRIPT [FIXED...] -- "$@"`, from
+  [`shared/images/entrypoint-lib.sh`](../shared/images/entrypoint-lib.sh).
+  A `login` that folds into `download` calls `login_folds` for its
+  session probe, then prints its notice.
   `make build-<name>` runs `<wrapper> build`, and the bases come from
   `make base-images`. A build is skipped when the image's
   `wealthdb.inputs` label matches a hash of its inputs and its base
-  image's id. The inputs are the collector directory, or the Dockerfile
-  and `requirements.txt` with `HAS_APP_MOUNT`. An extra argument to `build` always builds. A
-  host without `python3` always builds.
+  image's id. The inputs are the Dockerfile and `requirements.txt`. An
+  extra argument to `build` always builds. A host without `python3`
+  always builds.
 - A **host-venv** collector has only `requirements.txt` (no Dockerfile).
   `make build-<name>` creates `.venv` and installs `requirements.txt`
   plus `-e shared/collectorkit`.
 
 `make build-collectors` / `make all` builds everything.
+
+### The Camoufox browser
+
+`wealthdb/base-camoufox` carries one pinned build of the Camoufox
+browser. `CAMOUFOX_BUILD` in
+[`base-camoufox.Dockerfile`](../shared/images/base-camoufox.Dockerfile)
+names it.
+
+- The build takes the browser from a local archive when there is one:
+  `${XDG_CACHE_HOME:-$HOME/.cache}/wealthdb/camoufox/camoufox-cache-<build>-lin.<arch>.tgz`.
+  `<arch>` is `arm64` or `amd64`.
+- Without the archive, the build downloads the browser from the
+  Camoufox releases on GitHub.
+- The build checks the archive against a SHA-256 checksum. The
+  Dockerfile pins one per architecture, next to `CAMOUFOX_BUILD`. The
+  checksum covers what the archive holds: each entry's path, the mode
+  of each file and directory, each file's content and each link's
+  target. Any other checksum stops the build.
+- An architecture with no pinned checksum takes no archive. An archive
+  of it stops the build. `make camoufox-archive` prints the checksum to
+  pin.
+- `make camoufox-archive` writes the archive again. It reads the browser
+  from the image `wealthdb/base-camoufox:keep-<build>`. That is a
+  base-camoufox built with the browser (by `make all`), kept under a
+  tag of its own
+  (`docker tag wealthdb/base-camoufox:latest wealthdb/base-camoufox:keep-<build>`).
+  An image without the browser writes nothing. The target checks the
+  new archive against the pinned checksum.
+  `CAMOUFOX_KEEP=<image>` reads another image.
+- The archive also holds the uBlock Origin add-on. Without the archive,
+  the build downloads it with the browser. The build always downloads
+  the GeoLite2 location database.
+- `make all`, `make build-<name>` and `make update` build the image
+  with the browser.
+- `make test-<name>` and CI build base-camoufox without the browser
+  (`CAMOUFOX_BROWSER=none`). The unit tests run on fixtures and never
+  start a browser. A sign-in in such an image stops at once with a
+  message.
+- A test build never replaces a base-camoufox that carries the browser:
+  it rebuilds that one with the browser.
 
 ### Unit tests
 
@@ -711,6 +883,12 @@ Docker collectors, in the `.venv` for host ones. At minimum they cover
 **bronze → silver**: a *synthetic* bronze dump (no real IDs/balances —
 see root [AGENTS.md](../AGENTS.md) §4) and assertions that `load.py`
 projects the expected silver rows; pure-stdlib `unittest` works too.
+A test that needs a PDF draws its own with
+[`collectorkit.testpdf`](../shared/collectorkit/collectorkit/testpdf.py),
+which only tests import.
+Each loader also runs `collectorkit.incremental.check` over its fixture
+runs: the runs loaded one load at a time must build the silver that one
+`load --force` builds.
 `make test` / `make test-collectors` runs the whole suite, and tests
 must pass before any commit. `make lint` runs ruff over every collector
 with the rules in the root `ruff.toml`; it has to be clean too. The
@@ -733,8 +911,8 @@ through a Go **adapter** under
 the silver DB and emits canonical snapshot/transaction batches, mapping
 into the canonical enums (`account_kind`, `tax_wrapper`,
 `management_style`, `asset_class` and the transaction kind, `TxKind`)
-and the transaction sign convention. The adapter registers itself from
-`init()` via `silver.Register` and is imported in `cmd/wealthdb`;
+and the transaction sign convention. The adapter registers its `silver.Source` from
+`init()` via `silver.Register`, and `internal/silver/all` imports it;
 several adapters also carry a design doc under
 [`../wealthdb/docs/adapters/`](../wealthdb/docs/adapters/). The
 interface, canonical vocabulary, and fixture-test pattern live on the

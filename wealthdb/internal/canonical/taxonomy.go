@@ -14,10 +14,9 @@ import (
 // reach gold's `asset_class` column, and Valid gates them. Vehicle
 // (below) is the wrapper dimension.
 
-// Asset-class (exposure) values written to gold. Some strings are
-// shared with the adapters' intermediate 1-D vocabulary in enums.go
-// (PrivateEquity, RealEstate, Metal, Crypto, Other) and keep the same
-// meaning in both roles; the rest are exposure-only.
+// Asset-class (exposure) values written to gold. Five more are
+// declared in enums.go (PrivateEquity, RealEstate, Metal, Crypto,
+// Other).
 const (
 	AssetClassPublicEquity    AssetClass = "public_equity"
 	AssetClassFixedIncome     AssetClass = "fixed_income"
@@ -27,18 +26,13 @@ const (
 	AssetClassForeignExchange AssetClass = "foreign_exchange"
 	AssetClassHedgeFund       AssetClass = "hedge_fund"
 	AssetClassMultiAsset      AssetClass = "multi_asset"
-	// AssetClassPrivateEquity, AssetClassRealEstate, AssetClassMetal,
-	// AssetClassCrypto and AssetClassOther are declared in enums.go and
-	// reused verbatim here.
 )
 
 // assetClassValues is the exposure dimension of the taxonomy —
-// TAXONOMY.md §2. The adapters' intermediate-only labels (equity,
-// etf, bond_etf, fund, bond, option, future, fx_forward, fx_option,
-// money_market, otc_derivative, spv, private_fund, convertible_note,
-// mortgage) are deliberately absent: they are wrappers or
-// wrapper+exposure blends, not pure exposures, and reach gold as
-// (asset_class, vehicle) pairs.
+// TAXONOMY.md §2. A source's own 1-D labels (equity, etf, fund, bond,
+// money_market, spv, …) are absent on purpose. They are wrappers or
+// blends of wrapper and exposure, not pure exposures. An adapter maps
+// them to (asset_class, vehicle) pairs.
 var assetClassValues = map[AssetClass]struct{}{
 	AssetClassPublicEquity: {}, AssetClassPrivateEquity: {},
 	AssetClassFixedIncome: {}, AssetClassPrivateDebt: {},
@@ -62,8 +56,8 @@ func AssetClasses() []AssetClass {
 
 // Valid reports whether the receiver is a recognised exposure value.
 // The gold writer and config validation call it before an
-// asset_class reaches gold. The adapters' intermediate 1-D labels
-// (enums.go) are not exposures and are not accepted here.
+// asset_class reaches gold. A source's own 1-D labels are not
+// exposures and are not accepted here.
 func (a AssetClass) Valid() bool {
 	_, ok := assetClassValues[a]
 	return ok

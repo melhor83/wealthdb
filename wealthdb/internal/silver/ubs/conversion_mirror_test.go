@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"reflect"
 	"strings"
 	"testing"
 
@@ -77,10 +76,19 @@ func psnRowsWith(t *testing.T, db *sql.DB, hints psnHints) map[string]canonical.
 	return psnRowsIn(t, db, canonical.Window{Start: 0, End: 1 << 40, HasChanges: true}, hints)
 }
 
-// psnRowsIn drains the feed's transaction stream over the window.
+// psnRowsIn drains the feed's transaction stream over the window. Where
+// hints carry no verdict, the table runs over the feed alone.
 func psnRowsIn(t *testing.T, db *sql.DB, w canonical.Window, hints psnHints) map[string]canonical.TransactionChange {
 	t.Helper()
-	stream, err := (&psnReader{db: db}).Transactions(context.Background(), w, hints)
+	r := &psnReader{db: db}
+	if hints.rc == nil {
+		rc, err := reconcile(context.Background(), nil, r, nil)
+		if err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+		hints.rc = rc
+	}
+	stream, err := r.Transactions(context.Background(), w, hints)
 	if err != nil {
 		t.Fatalf("Transactions: %v", err)
 	}
@@ -229,14 +237,14 @@ func TestTheExportsRecordOutranksTheCounterLeg(t *testing.T) {
 
 // TestAStatementCopyFoldsOntoTheCounterLeg: a later annual statement
 // reconstructs the JPY credit; it is a second record of the booking the
-// counter-leg holds, and the era fold drops it as it drops any statement
+// counter-leg holds, and the reconcile table drops it as it drops any statement
 // copy of a feed row.
 func TestAStatementCopyFoldsOntoTheCounterLeg(t *testing.T) {
 	r := newWebTxFixture(t)
 	seedRailEraAnchor(t, r)
 	seedWebAccount(t, r, mirrorJPYIBAN)
 	seedWebTxRaw(t, r, "stmt:0000000000000001", mirrorJPYIBAN, mirrorDay, "JPY", 12000000, "CREDIT",
-		`{"source":"account_statement_pdf","booking_type":"CREDIT","internal_transfer":false,"counter_account":null}`)
+		`{"source":"account_statement_pdf","booking_type":"CREDIT","counter_account":null}`)
 	got := mergedText(t, r, newMirrorSilver(t))
 	if _, ok := got["stmt:0000000000000001@"+mirrorJPYIBAN]; ok {
 		t.Error("the statement copy of the booking was emitted beside the counter-leg")
@@ -247,11 +255,11 @@ func TestAStatementCopyFoldsOntoTheCounterLeg(t *testing.T) {
 }
 
 // TestAMergedPassReadsEachIndexOnce: the merged pass asks for the feed's
-// coverage and its conversion mirrors from the web cut, the era fold,
+// coverage and its conversion mirrors from the reconcile table,
 // the offset veto and the PSN stream, and for the valor index from the
 // cash and portfolio passes. Each is read once and kept. Once the pass
-// has run, closed silvers fail every read, so each still answering, with
-// what the pass used, shows that nothing reads it again.
+// has run, closed silvers fail every read, so each still answering shows
+// that the pass kept it and nothing reads it again.
 func TestAMergedPassReadsEachIndexOnce(t *testing.T) {
 	ctx := context.Background()
 	r := newWebTxFixture(t)
@@ -263,27 +271,25 @@ func TestAMergedPassReadsEachIndexOnce(t *testing.T) {
 		t.Fatalf("merged Transactions: %v", err)
 	}
 	drainTx(t, stream)
-	coverage, mirrors, valors := conn.psn.coverage, conn.psn.mirrors, conn.web.valors
-	if coverage == nil || mirrors == nil || valors == nil {
-		t.Fatalf("the pass kept coverage=%v mirrors=%v valors=%v", coverage, mirrors, valors)
-	}
-	if len(coverage) == 0 || len(mirrors.byID) == 0 {
-		t.Fatal("the fixture yields no coverage or no mirror; the test is vacuous")
-	}
-
 	if err := psnDB.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := conn.psn.cashCoverage(ctx); err != nil || !reflect.DeepEqual(got, coverage) {
-		t.Errorf("cashCoverage read again: %v, %v", got, err)
+	coverage, err := conn.psn.cashCoverage(ctx)
+	if err != nil {
+		t.Errorf("cashCoverage read again: %v", err)
 	}
-	if got, err := conn.psn.conversionMirrors(ctx); err != nil || got != mirrors {
-		t.Errorf("conversionMirrors read again: %v, %v", got, err)
+	mirrors, err := conn.psn.conversionMirrors(ctx)
+	if err != nil {
+		t.Errorf("conversionMirrors read again: %v", err)
 	}
-	if got, err := conn.web.valorIndex(ctx, conn.psn); err != nil || !reflect.DeepEqual(got, valors) {
-		t.Errorf("valorIndex read again: %v, %v", got, err)
+	valors, err := conn.web.valorIndex(ctx, conn.psn)
+	if err != nil {
+		t.Errorf("valorIndex read again: %v", err)
+	}
+	if len(coverage) == 0 || mirrors == nil || len(mirrors.byID) == 0 || valors == nil {
+		t.Fatal("the fixture yields no coverage or no mirror; the test is vacuous")
 	}
 }

@@ -165,14 +165,14 @@ type SpendingAccounts struct {
 // explicit value.
 type SpendingTransferMatching struct {
 	// WindowDays is the max day distance between the two legs of a
-	// pair. Defaults to the same 5 days the returns matcher uses: the
-	// two share one matching core, and a spending pass that banded
-	// differently would call the same movement internal in one report
-	// and external in the other.
+	// pair (default DefaultSpendMatchWindowDays). Every family reads the
+	// pairs this matcher stores, so one window serves them all.
 	WindowDays *int `json:"window_days,omitempty"`
 	// TolerancePct is the relative amount tolerance in percent of the
 	// larger leg (an absolute floor of 0.01 always applies, so 0 means
-	// exact-to-a-cent). Covers a transfer fee deducted in transit.
+	// exact-to-a-cent). Covers a transfer fee deducted in transit. Two
+	// legs of a coin pair by the coin rule instead, whatever the window
+	// and the tolerance (docs/SPENDING.md §3).
 	TolerancePct *float64 `json:"tolerance_pct,omitempty"`
 	// Names say which narratives name which account as the other side of a
 	// movement (docs/SPENDING.md §3). A pair one of whose legs names the
@@ -194,11 +194,11 @@ type SpendingMatchName struct {
 // Pattern is Match compiled; nil until Validate has run.
 func (n SpendingMatchName) Pattern() *regexp.Regexp { return n.re }
 
-// Defaults for the spending matcher's knobs, deliberately equal to
-// DefaultTransferMatchWindowDays / DefaultTransferMatchTolerancePct.
+// Defaults for the spending matcher's knobs: cross-border wires settle
+// within a business week, and 0.5% covers wire fees deducted in transit.
 const (
-	DefaultSpendMatchWindowDays   = DefaultTransferMatchWindowDays
-	DefaultSpendMatchTolerancePct = DefaultTransferMatchTolerancePct
+	DefaultSpendMatchWindowDays   = 5
+	DefaultSpendMatchTolerancePct = 0.5
 )
 
 // SpendingCategorization is the `spending.categorization` block: the
@@ -459,9 +459,8 @@ type IncomeRule struct {
 	Type  string             `json:"type"`
 	Scope *SpendingRuleScope `json:"scope,omitempty"`
 	// Far is SpendingRule.Far for the inbound leg: the declared account
-	// the money came FROM. The income overlay has no far columns, so
-	// the spending pass carries it onto its own overlay for the row
-	// (docs/CASHFLOW.md §4).
+	// the money came FROM. The spending pass links it from its own row,
+	// as it links every far side (docs/CASHFLOW.md §4).
 	Far string `json:"far,omitempty"`
 	// AssetClass is SpendingRule.AssetClass for the return leg, stated
 	// only where the rule places `capital_return`.

@@ -2,6 +2,8 @@ package canonical
 
 import (
 	"encoding/json"
+	"math"
+	"slices"
 	"time"
 )
 
@@ -146,6 +148,21 @@ type CashBalanceChange struct {
 	Payload           json.RawMessage
 }
 
+// CoverageChange is one insert into gold's `snapshot_coverage` table: the
+// source reports the account whole at SnapshotAt. The batch's positions
+// and cash balances of the account stamped at that instant are all the
+// account held then, and an account with none held nothing. Gold ends a
+// key at the first such instant after its last observation that omits
+// it, or sooner where an inferred ending comes first (DESIGN.md §10.7).
+// A source states it only for an account it read in full at that
+// instant; a run that skipped the account, or read only its holdings or
+// only its cash, states nothing for it.
+type CoverageChange struct {
+	SilverSourceID    string
+	SnapshotAt        int64
+	AccountExternalID string
+}
+
 // FxRateChange is one insert into gold's `fx_rates` table.
 type FxRateChange struct {
 	SilverSourceID string
@@ -266,8 +283,72 @@ type TransactionChange struct {
 	// head that column "Check or Slip #", where a slip number rides in
 	// on an inflow. Gold migration 0075.
 	CheckNumber *string
-	Payload     json.RawMessage
+	// Action is what the row does to the lots of its instrument where
+	// its kind and the sign of its quantity do not say it: the deposit
+	// of a coin from its airdrop, a corporate action's rule, an option
+	// leg booked on its stock. Only the source's own words
+	// tell such rows apart, so the adapter states the verdict here and
+	// the lot engine reads it (gold's transactions.action). Empty on
+	// every other row.
+	Action  TxAction `json:",omitempty"`
+	Payload json.RawMessage
 }
+
+// TxAction is what a transaction does to the lots of its instrument,
+// as the lot engine reads it (docs/LOTS.md §3). The empty action leaves
+// the reading to the row's kind and the sign of its quantity.
+type TxAction string
+
+const (
+	// TxActionIgnore moves no lot.
+	TxActionIgnore TxAction = "ignore"
+	// TxActionIn and TxActionOut are the legs of a move: paired, the
+	// lots move with it; alone, a receipt of unknown cost or a
+	// departure with no proceeds.
+	TxActionIn  TxAction = "in"
+	TxActionOut TxAction = "out"
+	// TxActionIncome is a receipt in kind, at its market value.
+	TxActionIncome TxAction = "income"
+	// TxActionAcquired is a purchase at market value: the coin a dust
+	// sweep converts the dust into.
+	TxActionAcquired TxAction = "acquired"
+	// TxActionConverted is a sale at market value: the dust a sweep
+	// converts.
+	TxActionConverted TxAction = "converted"
+	// TxActionSpend is a spend at market value.
+	TxActionSpend TxAction = "spend"
+	// TxActionFee is a fee paid in kind, at market value.
+	TxActionFee TxAction = "fee"
+	// TxActionLost and TxActionGift relieve lots with no proceeds: lost
+	// or stolen, or given away.
+	TxActionLost TxAction = "lost"
+	TxActionGift TxAction = "gift"
+	// TxActionThirdCurrencyFee is a trade, read by its kind, whose fee
+	// is in neither of its currencies, so its amounts do not hold it:
+	// the engine values the fee and adds it to the cost of a buy or
+	// takes it off the proceeds of a sale.
+	TxActionThirdCurrencyFee TxAction = "third_currency_fee"
+	// The rules of a corporate action: a reorganisation pairs the day's
+	// legs, a return of capital lowers the cost, cash in lieu sells the
+	// fraction, an expiry disposes at zero, and a cash-only action
+	// moves no lot.
+	TxActionReorganisation  TxAction = "reorganisation"
+	TxActionReturnOfCapital TxAction = "return_of_capital"
+	TxActionCashInLieu      TxAction = "cash_in_lieu"
+	TxActionExpiry          TxAction = "expiry"
+	TxActionCashOnly        TxAction = "cash_only"
+)
+
+// TxActions are the actions an adapter may state, the empty action aside.
+var TxActions = []TxAction{
+	TxActionIgnore, TxActionIn, TxActionOut, TxActionIncome, TxActionAcquired,
+	TxActionConverted, TxActionSpend, TxActionFee, TxActionLost, TxActionGift,
+	TxActionThirdCurrencyFee, TxActionReorganisation, TxActionReturnOfCapital,
+	TxActionCashInLieu, TxActionExpiry, TxActionCashOnly,
+}
+
+// Valid reports whether a is the empty action or one of TxActions.
+func (a TxAction) Valid() bool { return a == "" || slices.Contains(TxActions, a) }
 
 // Status is the return value of silver.Connection.Status(). See
 // docs/DESIGN.md §6.2 for semantics. All timestamps are Unix
@@ -324,6 +405,19 @@ type Window struct {
 	// does not name has no changes; where it is nil, every kind spans
 	// Start..End. SpanOf reads it.
 	Spans map[string]Span
+	// Full says the window is the source's whole history: the adapter
+	// re-emits everything it holds, and the load deletes the source's
+	// rows whole rather than over a span. Start and End are then the
+	// integer limits (FullWindow), so a reader that binds them reads
+	// every row. A window that is not full encodes without it.
+	Full bool `json:",omitempty"`
+}
+
+// FullWindow is the window with changes of a source that re-emits its
+// whole history, advancing to newChangeNumber.
+func FullWindow(newChangeNumber int64) Window {
+	return Window{Start: math.MinInt64, End: math.MaxInt64, NewChangeNumber: newChangeNumber,
+		HasChanges: true, Full: true}
 }
 
 // Span is an inclusive range of instants, Unix seconds UTC.
@@ -364,13 +458,14 @@ func (w Window) Changes(kind string) bool {
 // SnapshotBatch is one batch yielded by a SnapshotStream.Next call.
 // Adapters multiplex change records of different types into one
 // batch. The loader writes each batch's facts (positions,
-// position_lots, cash_balances, fx_rates and the reference records)
-// as it arrives and folds the dimensions (portfolios, accounts,
-// instruments) to upsert once the stream drains (docs/DESIGN.md §8.4);
+// position_lots, cash_balances, fx_rates, the coverage and the
+// reference records) as it arrives and folds the dimensions
+// (portfolios, accounts, instruments) to upsert once the stream drains
+// (docs/DESIGN.md §8.4);
 // gold declares no foreign keys, so the order within the load's
 // transaction does not matter.
 //
-// The reference records (refdata.go) are dated by AsOf, which plays
+// The reference records (refdata.go) are dated by as_of, which plays
 // SnapshotAt's part: the load's windowed delete clears them by it.
 type SnapshotBatch struct {
 	Portfolios   []PortfolioChange
@@ -380,31 +475,52 @@ type SnapshotBatch struct {
 	PositionLots []PositionLotChange
 	CashBalances []CashBalanceChange
 	FxRates      []FxRateChange
+	// Covers are the accounts the batch reports whole, each at an
+	// instant (CoverageChange).
+	Covers []CoverageChange
 
-	FundCompositions   []FundCompositionChange
-	FundLines          []FundLineChange
-	FundAttributes     []FundAttributesChange
-	FundCounterparties []FundCounterpartyChange
-	Securities         []SecurityChange
-	SecurityFacts      []SecurityFactChange
+	FundCompositions []FundCompositionChange
+	FundLines        []FundLineChange
+	// Reference holds the rows of the tables RefTables declares, at most
+	// one entry per table as AppendRef builds them.
+	Reference []RefRows
 
-	FundRisk            []FundRiskChange
-	FundReturns         []FundReturnChange
-	FundCharacteristics []FundCharacteristicChange
-	SecurityPeriodFacts []SecurityPeriodFactChange
-	RateObservations    []RateObservationChange
-
-	DividendEvents  []DividendEventChange
-	StatedPeriods   []StatedPeriodChange
-	ExposureReports []ExposureReportChange
+	RateObservations []RateObservationChange
+	StatedPeriods    []StatedPeriodChange
+	ExposureReports  []ExposureReportChange
+	CapitalAccounts  []CapitalAccountChange
 }
 
 // ReferenceRows is the number of reference records in b.
 func (b *SnapshotBatch) ReferenceRows() int {
-	return len(b.FundCompositions) + len(b.FundLines) + len(b.FundAttributes) +
-		len(b.FundCounterparties) + len(b.Securities) + len(b.SecurityFacts) +
-		len(b.FundRisk) + len(b.FundReturns) + len(b.FundCharacteristics) + len(b.SecurityPeriodFacts) +
-		len(b.RateObservations) + len(b.DividendEvents) + len(b.StatedPeriods) + len(b.ExposureReports)
+	n := len(b.FundCompositions) + len(b.FundLines) +
+		len(b.RateObservations) + len(b.StatedPeriods) + len(b.ExposureReports) + len(b.CapitalAccounts)
+	for _, r := range b.Reference {
+		n += len(r.Rows)
+	}
+	return n
+}
+
+// AppendRef adds row, a value per column of t, to b's rows of t.
+func (b *SnapshotBatch) AppendRef(t *RefTable, row []any) {
+	for i := range b.Reference {
+		if b.Reference[i].Table == t {
+			b.Reference[i].Rows = append(b.Reference[i].Rows, row)
+			return
+		}
+	}
+	b.Reference = append(b.Reference, RefRows{Table: t, Rows: [][]any{row}})
+}
+
+// RefRowsOf is every row of t in b, in the order the batch holds them.
+func (b *SnapshotBatch) RefRowsOf(t *RefTable) [][]any {
+	var out [][]any
+	for _, r := range b.Reference {
+		if r.Table == t {
+			out = append(out, r.Rows...)
+		}
+	}
+	return out
 }
 
 // SetSource sets SilverSourceID on every record of b. Adapters leave
@@ -418,20 +534,14 @@ func (b *SnapshotBatch) SetSource(id string) {
 	setSource(b.PositionLots, id, func(r *PositionLotChange) *string { return &r.SilverSourceID })
 	setSource(b.CashBalances, id, func(r *CashBalanceChange) *string { return &r.SilverSourceID })
 	setSource(b.FxRates, id, func(r *FxRateChange) *string { return &r.SilverSourceID })
+	setSource(b.Covers, id, func(r *CoverageChange) *string { return &r.SilverSourceID })
 	setSource(b.FundCompositions, id, func(r *FundCompositionChange) *string { return &r.SilverSourceID })
 	setSource(b.FundLines, id, func(r *FundLineChange) *string { return &r.SilverSourceID })
-	setSource(b.FundAttributes, id, func(r *FundAttributesChange) *string { return &r.SilverSourceID })
-	setSource(b.FundCounterparties, id, func(r *FundCounterpartyChange) *string { return &r.SilverSourceID })
-	setSource(b.Securities, id, func(r *SecurityChange) *string { return &r.SilverSourceID })
-	setSource(b.SecurityFacts, id, func(r *SecurityFactChange) *string { return &r.SilverSourceID })
-	setSource(b.FundRisk, id, func(r *FundRiskChange) *string { return &r.SilverSourceID })
-	setSource(b.FundReturns, id, func(r *FundReturnChange) *string { return &r.SilverSourceID })
-	setSource(b.FundCharacteristics, id, func(r *FundCharacteristicChange) *string { return &r.SilverSourceID })
-	setSource(b.SecurityPeriodFacts, id, func(r *SecurityPeriodFactChange) *string { return &r.SilverSourceID })
+	setSource(b.Reference, id, func(r *RefRows) *string { return &r.SilverSourceID })
 	setSource(b.RateObservations, id, func(r *RateObservationChange) *string { return &r.SilverSourceID })
-	setSource(b.DividendEvents, id, func(r *DividendEventChange) *string { return &r.SilverSourceID })
 	setSource(b.StatedPeriods, id, func(r *StatedPeriodChange) *string { return &r.SilverSourceID })
 	setSource(b.ExposureReports, id, func(r *ExposureReportChange) *string { return &r.SilverSourceID })
+	setSource(b.CapitalAccounts, id, func(r *CapitalAccountChange) *string { return &r.SilverSourceID })
 }
 
 // TransactionBatch is one batch yielded by a TransactionStream.Next call.

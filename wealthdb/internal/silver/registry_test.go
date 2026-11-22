@@ -11,29 +11,28 @@ import (
 func resetForTesting() {
 	registryMu.Lock()
 	defer registryMu.Unlock()
-	registry = map[string]Adapter{}
+	registry = map[string]Source{}
 }
 
-// stubAdapter is a no-op Adapter used for registry exercises.
-type stubAdapter struct{ kind string }
-
-func (s *stubAdapter) Kind() string { return s.kind }
-func (s *stubAdapter) Open(context.Context, OpenSpec) (Connection, error) {
-	return nil, errors.New("not implemented")
+// stub is a no-op Source used for registry exercises.
+func stub(kind string) Source {
+	return Source{Kind: kind, Open: func(context.Context, OpenSpec) (Connection, error) {
+		return nil, errors.New("not implemented")
+	}}
 }
 
 func TestRegisterAndGet(t *testing.T) {
 	resetForTesting()
 
-	Register(&stubAdapter{kind: "alpha"})
-	Register(&stubAdapter{kind: "bravo"})
+	Register(stub("alpha"))
+	Register(stub("bravo"))
 
 	got, err := Get("alpha")
 	if err != nil {
 		t.Fatalf("Get(alpha): %v", err)
 	}
-	if got.Kind() != "alpha" {
-		t.Errorf("Kind() = %q, want %q", got.Kind(), "alpha")
+	if got.Kind != "alpha" {
+		t.Errorf("Kind = %q, want %q", got.Kind, "alpha")
 	}
 
 	if kinds := Kinds(); len(kinds) != 2 || kinds[0] != "alpha" || kinds[1] != "bravo" {
@@ -43,8 +42,8 @@ func TestRegisterAndGet(t *testing.T) {
 
 func TestGetMissingMentionsKnown(t *testing.T) {
 	resetForTesting()
-	Register(&stubAdapter{kind: "alpha"})
-	Register(&stubAdapter{kind: "bravo"})
+	Register(stub("alpha"))
+	Register(stub("bravo"))
 
 	_, err := Get("nope")
 	if err == nil {
@@ -57,7 +56,7 @@ func TestGetMissingMentionsKnown(t *testing.T) {
 
 func TestRegisterDuplicatePanics(t *testing.T) {
 	resetForTesting()
-	Register(&stubAdapter{kind: "alpha"})
+	Register(stub("alpha"))
 
 	defer func() {
 		r := recover()
@@ -65,5 +64,18 @@ func TestRegisterDuplicatePanics(t *testing.T) {
 			t.Fatal("expected panic on duplicate Register")
 		}
 	}()
-	Register(&stubAdapter{kind: "alpha"})
+	Register(stub("alpha"))
+}
+
+// TestTraitsOf pins the lookup by kind: an unregistered kind has no
+// traits.
+func TestTraitsOf(t *testing.T) {
+	resetForTesting()
+	typed := stub("typed")
+	typed.Labels = LabelTraits{TypedHoldings: true}
+	Register(typed)
+	Register(stub("plain"))
+	if !TraitsOf("typed").TypedHoldings || TraitsOf("plain") != (LabelTraits{}) || TraitsOf("nope") != (LabelTraits{}) {
+		t.Errorf("TraitsOf: typed %+v, plain %+v, nope %+v", TraitsOf("typed"), TraitsOf("plain"), TraitsOf("nope"))
+	}
 }

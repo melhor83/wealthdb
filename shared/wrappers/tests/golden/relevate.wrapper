@@ -36,7 +36,9 @@ Mounted into the container:
   <TMP>/w-relevate/home/.secrets  ->  /secrets
   <TMP>/w-relevate/xdgdata/wealthdb/relevate     ->  /data
   <TMP>/w-relevate/xdgcache/wealthdb/startupcache  ->  /cache/startupcache
+  <TMP>/w-relevate/xdgcache/wealthdb/relevate  ->  /cache/collector
   <TMP>/w-relevate/xdgcache/wealthdb/debug/relevate    ->  /debug
+  <TMP>/w-relevate/tree/collectors/relevate  ->  /app
 
 Override mounts via env (or in <TMP>/w-relevate/xdgconfig/relevate.cfg):
   RELEVATE_SECRETS_DIR=/path/to/secrets
@@ -95,7 +97,9 @@ Mounted into the container:
   <TMP>/w-relevate/home/.secrets  ->  /secrets
   <TMP>/w-relevate/xdgdata/wealthdb/relevate     ->  /data
   <TMP>/w-relevate/xdgcache/wealthdb/startupcache  ->  /cache/startupcache
+  <TMP>/w-relevate/xdgcache/wealthdb/relevate  ->  /cache/collector
   <TMP>/w-relevate/xdgcache/wealthdb/debug/relevate    ->  /debug
+  <TMP>/w-relevate/tree/collectors/relevate  ->  /app
 
 Override mounts via env (or in <TMP>/w-relevate/xdgconfig/relevate.cfg):
   RELEVATE_SECRETS_DIR=/path/to/secrets
@@ -120,7 +124,8 @@ Credentials:
 --- calls
 python3
   -
-  <TMP>/w-relevate/tree/collectors/relevate
+  <TMP>/w-relevate/tree/collectors/relevate/Dockerfile
+  <TMP>/w-relevate/tree/collectors/relevate/requirements.txt
   --
   missing
 docker
@@ -175,7 +180,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-relevate/xdgcache/wealthdb/relevate:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-relevate/xdgcache/wealthdb/debug/relevate:/debug
+  -v
+  <TMP>/w-relevate/tree/collectors/relevate:/app
   wealthdb/relevate:latest
   login
   [env] RELEVATE_LOGIN=invented-RELEVATE_LOGIN
@@ -218,7 +229,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-relevate/xdgcache/wealthdb/relevate:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-relevate/xdgcache/wealthdb/debug/relevate:/debug
+  -v
+  <TMP>/w-relevate/tree/collectors/relevate:/app
   wealthdb/relevate:latest
   download
   [env] RELEVATE_LOGIN=invented-RELEVATE_LOGIN
@@ -261,7 +278,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-relevate/xdgcache/wealthdb/relevate:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-relevate/xdgcache/wealthdb/debug/relevate:/debug
+  -v
+  <TMP>/w-relevate/tree/collectors/relevate:/app
   wealthdb/relevate:latest
   load
   [env] RELEVATE_LOGIN=invented-RELEVATE_LOGIN
@@ -315,7 +338,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-relevate/xdgcache/wealthdb/relevate:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-relevate/xdgcache/wealthdb/debug/relevate:/debug
+  -v
+  <TMP>/w-relevate/tree/collectors/relevate:/app
   wealthdb/relevate:latest
   sh
   [env] RELEVATE_LOGIN=invented-RELEVATE_LOGIN
@@ -358,7 +387,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-relevate/xdgcache/wealthdb/relevate:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-relevate/xdgcache/wealthdb/debug/relevate:/debug
+  -v
+  <TMP>/w-relevate/tree/collectors/relevate:/app
   wealthdb/relevate:latest
   bash
   [env] RELEVATE_LOGIN=invented-RELEVATE_LOGIN
@@ -401,7 +436,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-relevate/xdgcache/wealthdb/relevate:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-relevate/xdgcache/wealthdb/debug/relevate:/debug
+  -v
+  <TMP>/w-relevate/tree/collectors/relevate:/app
   wealthdb/relevate:latest
   login
   --check
@@ -445,7 +486,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-relevate/xdgcache/wealthdb/relevate:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-relevate/xdgcache/wealthdb/debug/relevate:/debug
+  -v
+  <TMP>/w-relevate/tree/collectors/relevate:/app
   wealthdb/relevate:latest
   download
   --dry-run
@@ -491,9 +538,15 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-relevate/xdgcache/wealthdb/relevate:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-relevate/silver:/silver
   -v
   <TMP>/w-relevate/xdgcache/wealthdb/debug/relevate:/debug
+  -v
+  <TMP>/w-relevate/tree/collectors/relevate:/app
   wealthdb/relevate:latest
   load
   --silver-db
@@ -538,9 +591,15 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-relevate/xdgcache/wealthdb/relevate:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-relevate/silver:/silver
   -v
   <TMP>/w-relevate/xdgcache/wealthdb/debug/relevate:/debug
+  -v
+  <TMP>/w-relevate/tree/collectors/relevate:/app
   wealthdb/relevate:latest
   load
   --silver-db
@@ -585,7 +644,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-relevate/xdgcache/wealthdb/relevate:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-relevate/xdgcache/wealthdb/debug/relevate:/debug
+  -v
+  <TMP>/w-relevate/tree/collectors/relevate:/app
   wealthdb/relevate:latest
   load
   [env] RELEVATE_LOGIN=invented-RELEVATE_LOGIN
@@ -628,7 +693,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-relevate/xdgcache/wealthdb/relevate:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-relevate/xdgcache/wealthdb/debug/relevate:/debug
+  -v
+  <TMP>/w-relevate/tree/collectors/relevate:/app
   wealthdb/relevate:latest
   load
   [env] RELEVATE_LOGIN=invented-RELEVATE_LOGIN
@@ -671,7 +742,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-relevate/xdgcache/wealthdb/relevate:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-relevate/xdgcache/wealthdb/debug/relevate:/debug
+  -v
+  <TMP>/w-relevate/tree/collectors/relevate:/app
   wealthdb/relevate:latest
   download
   [env] RELEVATE_LOGIN=<unset>
@@ -714,7 +791,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-relevate/xdgcache/wealthdb/relevate:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-relevate/xdgcache/wealthdb/debug/relevate:/debug
+  -v
+  <TMP>/w-relevate/tree/collectors/relevate:/app
   wealthdb/relevate:latest
   download
   [env] RELEVATE_LOGIN=<unset>
@@ -757,7 +840,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-relevate/xdgcache/wealthdb/relevate:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-relevate/xdgcache/wealthdb/debug/relevate:/debug
+  -v
+  <TMP>/w-relevate/tree/collectors/relevate:/app
   wealthdb/relevate:latest
   bogus-verb
   [env] RELEVATE_LOGIN=invented-RELEVATE_LOGIN

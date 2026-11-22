@@ -6,15 +6,16 @@ import (
 	"fmt"
 	"slices"
 	"strings"
-	"time"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
 )
 
 // The reference tables: the silver shape of the refdata collector
 // (collectors/refdata/migrations), which the synthetic kind repeats so a
-// generator can write the same records. NewReferenceStream reads them
-// into canonical reference records (canonical/refdata.go).
+// generator can write the same records. ReferenceSchema.Stream reads them
+// into canonical reference records (canonical/refdata.go): compositions
+// and lines into records of their own, every other table by its entry of
+// canonical.RefTables.
 //
 //	compositions     one row per fund, day and basis
 //	lines            one row per composition line
@@ -26,6 +27,7 @@ import (
 //	characteristics  one row per fund, day, provider, field and label
 //	period_facts     one row per security, field, period and provider
 //	dividend_events  one row per fund or security, provider and distribution
+//	fund_returns     one row per fund, day and month
 //
 // Every row carries as_of, the UTC midnight of the day it describes (for
 // a period fact, its period's last day; for a distribution, the day its
@@ -33,8 +35,9 @@ import (
 // fund_risk, characteristics, period_facts and the lines columns from
 // coupon_kind on come with the refdata silver's schema v2
 // (0002_yield_facts.sql), dividend_events with v3
-// (0003_dividend_calendar.sql). A file at an older version holds none of
-// them, and its records read with those fields absent.
+// (0003_dividend_calendar.sql), fund_returns with v4. A file at an older
+// version holds none of them, and its records read with those fields
+// absent (ReferenceSchema).
 
 // ReferenceTables are the tables every reference silver holds: the first
 // six of the list above.
@@ -53,51 +56,66 @@ const ReferenceReturnsTable = "fund_returns"
 // ReferenceTableKinds names the kind of record each reference table's
 // rows are (canonical.Window.Spans). A fund's tables, lines among them,
 // are its fund-days; each security table is a kind of its own.
-var ReferenceTableKinds = map[string]string{
-	"compositions": canonical.RefFundDays, "lines": canonical.RefFundDays,
-	"attributes": canonical.RefFundDays, "counterparties": canonical.RefFundDays,
-	"fund_risk": canonical.RefFundDays, "characteristics": canonical.RefFundDays,
-	ReferenceReturnsTable: canonical.RefFundDays,
-	"securities":          canonical.RefSecurities, "security_facts": canonical.RefSecurityFacts,
-	"period_facts": canonical.RefPeriodFacts, ReferenceCalendarTable: canonical.RefDividendEvents,
+var ReferenceTableKinds = referenceTableKinds()
+
+func referenceTableKinds() map[string]string {
+	kinds := map[string]string{"compositions": canonical.RefFundDays, "lines": canonical.RefFundDays}
+	for _, t := range canonical.RefTables {
+		kinds[t.Silver] = t.Kind
+	}
+	return kinds
 }
 
-// ReferenceSchema says which of the later schema versions' tables a
-// reference silver holds: v2's (ReferenceYieldTables), v3's
-// (ReferenceCalendarTable) and v4's (ReferenceReturnsTable). A file last
-// migrated before a version lacks its tables and reads as stating none
-// of their records.
-type ReferenceSchema struct{ Yield, Calendar, Returns bool }
-
-// ProbeReferenceSchema reads which of the later versions' tables db
-// holds.
-func ProbeReferenceSchema(ctx context.Context, db *sql.DB) (ReferenceSchema, error) {
-	var s ReferenceSchema
-	var err error
-	if s.Yield, err = HasTables(ctx, db, ReferenceYieldTables...); err != nil {
-		return s, err
-	}
-	if s.Calendar, err = HasTables(ctx, db, ReferenceCalendarTable); err != nil {
-		return s, err
-	}
-	s.Returns, err = HasTables(ctx, db, ReferenceReturnsTable)
-	return s, err
+// ReferenceSchema is which parts of the later schema versions a
+// reference silver holds: each table of canonical.RefTables past v1, and
+// the lines columns of v2 (ReferenceLineYieldColumns). A file last
+// migrated before a version lacks its parts and reads as stating none of
+// their records. ProbeReferenceSchema reads it.
+type ReferenceSchema struct {
+	// tables are the later versions' tables, by silver name, each with
+	// whether the file holds it.
+	tables    map[string]bool
+	lineYield bool
 }
 
-// ReferenceRunTables are the reference tables whose rows carry run_at,
-// in the order of the list above: every one but lines, whose rows belong
-// to their composition's fund-day and run, and only the later versions'
-// tables the file holds (s).
+// ProbeReferenceSchema reads which parts of the later versions db holds,
+// and notes the parts a file older than them lacks (ProbeOptional), in
+// the order of their versions. silver is the file's base name, for the
+// note.
+func ProbeReferenceSchema(ctx context.Context, db *sql.DB, silver string) (ReferenceSchema, SchemaNote, error) {
+	s := ReferenceSchema{tables: map[string]bool{}}
+	parts := []Optional{{Table: "lines", Columns: ReferenceLineYieldColumns, Version: 2, Has: &s.lineYield}}
+	held := map[string]*bool{}
+	for _, t := range canonical.RefTables {
+		if t.Version > 1 {
+			held[t.Silver] = new(bool)
+			parts = append(parts, Optional{Table: t.Silver, Version: t.Version, Has: held[t.Silver]})
+		}
+	}
+	slices.SortStableFunc(parts, func(a, b Optional) int { return a.Version - b.Version })
+	note, err := ProbeOptional(ctx, db, silver, parts...)
+	for name, h := range held {
+		s.tables[name] = *h
+	}
+	return s, note, err
+}
+
+// holds says the file holds t: a table of v1, or a later one it holds.
+func (schema ReferenceSchema) holds(t *canonical.RefTable) bool {
+	return t.Version <= 1 || schema.tables[t.Silver]
+}
+
+// ReferenceRunTables are the reference tables whose rows carry run_at:
+// every one but lines, whose rows belong to their composition's fund-day
+// and run, and only the later versions' tables the file holds (s). The
+// first six of the list above come first, then canonical.RefTables'
+// later tables in its order.
 func ReferenceRunTables(s ReferenceSchema) []string {
 	tables := slices.Clone(ReferenceTables)
-	if s.Yield {
-		tables = append(tables, ReferenceYieldTables...)
-	}
-	if s.Calendar {
-		tables = append(tables, ReferenceCalendarTable)
-	}
-	if s.Returns {
-		tables = append(tables, ReferenceReturnsTable)
+	for _, t := range canonical.RefTables {
+		if t.Version > 1 && s.holds(t) {
+			tables = append(tables, t.Silver)
+		}
 	}
 	return slices.DeleteFunc(tables, func(t string) bool { return t == "lines" })
 }
@@ -109,15 +127,13 @@ var ReferenceLineYieldColumns = []string{"coupon_kind", "is_default", "in_arrear
 	"real_duration", "real_yield", "accrual_date"}
 
 // ReferenceRecordBudget bounds the records of one batch of fund-days:
-// its compositions, lines, attributes, counterparties, risk rows and
-// characteristics. A batch holds whole fund-days, so a fund-day with
-// more records than this rides alone. It is a variable so a test can
-// lower it.
+// its compositions, lines and the rows of every fund table. A batch
+// holds whole fund-days, so a fund-day with more records than this rides
+// alone. It is a variable so a test can lower it.
 var ReferenceRecordBudget = 20000
 
 // ReferenceTailBudget bounds the security records of one batch: a page
-// of identities, of facts, of period facts or of dividend events. It is a
-// variable so a test can lower it.
+// of one security table. It is a variable so a test can lower it.
 var ReferenceTailBudget = 5000
 
 // fundDay is one fund on one day: the unit a batch holds whole.
@@ -127,52 +143,57 @@ type fundDay struct {
 }
 
 // referenceStream emits the reference rows of a window: the fund-days in
-// order, each with its compositions, lines, attributes, counterparties,
-// risk rows and characteristics, then the security identities, the
-// security facts, the period facts and the dividend events, a page at a
+// order, each with its compositions, lines and the rows of every fund
+// table, then each security table (canonical.RefTables) a page at a
 // time. It reads as it goes, so a window of years holds one batch in
 // memory at a time.
 type referenceStream struct {
 	db *sql.DB
 	w  canonical.Window
-	// yield says the file holds the v2 tables. lineYieldSelect is the
-	// select list of the v2 lines columns, a NULL for each where the
-	// file has none.
-	yield           bool
+	// lineYieldSelect is the select list of the v2 lines columns, a NULL
+	// for each where the file has none.
 	lineYieldSelect string
-	// returns says the file holds the v4 table.
-	returns bool
-	days    []fundDay
-	next    int
-	// The cursors of the three security tables and the distributions.
-	secs, facts, periods, events keyset
+	// fundTables are the fund tables the file holds, each with the query
+	// of one fund-day's rows.
+	fundTables []refQuery
+	days       []fundDay
+	next       int
+	// pages are the security tables, each with its query and cursor, in
+	// the order the stream reads them.
+	pages []refPage
 }
 
-// NewReferenceStream streams the reference rows whose as_of lies in w,
-// each kind of record over its own span of w (canonical.Window.SpanOf),
-// and the distributions of each ref and provider whole (readEvents).
+// refQuery is a reference table and the query that reads its rows.
+type refQuery struct {
+	t *canonical.RefTable
+	q string
+}
+
+// refPage is a security table read a page at a time.
+type refPage struct {
+	refQuery
+	k keyset
+}
+
+// Stream streams the reference rows of a file of schema s whose as_of
+// lies in w, each kind of record over its own span of w
+// (canonical.Window.SpanOf), and the rows of a table read whole by a group
+// (canonical.RefTable's WholeBy) for each group a row of the span names.
 // Nothing is read for a window without changes, nor for a kind without.
-func NewReferenceStream(ctx context.Context, db *sql.DB, w canonical.Window) (SnapshotStream, error) {
+func (schema ReferenceSchema) Stream(ctx context.Context, db *sql.DB, w canonical.Window) (SnapshotStream, error) {
 	if !w.HasChanges {
 		return NewSnapshotStream(nil), nil
 	}
-	schema, err := ProbeReferenceSchema(ctx, db)
-	if err != nil {
-		return nil, err
-	}
-	hasLineYield, err := HasColumns(ctx, db, "lines", ReferenceLineYieldColumns...)
-	if err != nil {
-		return nil, err
-	}
-	s := &referenceStream{db: db, w: w, yield: schema.Yield, returns: schema.Returns,
-		lineYieldSelect: strings.Repeat(", NULL", len(ReferenceLineYieldColumns)),
-		secs:            keyset{after: []any{"", int64(-1), ""}, done: !w.Changes(canonical.RefSecurities)},
-		facts:           keyset{after: []any{"", "", int64(-1), ""}, done: !w.Changes(canonical.RefSecurityFacts)},
-		periods: keyset{after: []any{"", "", int64(-1), "", ""},
-			done: !schema.Yield || !w.Changes(canonical.RefPeriodFacts)},
-		events: keyset{after: []any{"", "", ""}, done: !schema.Calendar || !w.Changes(canonical.RefDividendEvents)}}
-	if hasLineYield {
-		s.lineYieldSelect = ", " + strings.Join(ReferenceLineYieldColumns, ", ")
+	s := &referenceStream{db: db, w: w, lineYieldSelect: ", " + ColumnOr(schema.lineYield, ReferenceLineYieldColumns...)}
+	for _, t := range canonical.RefTables {
+		if !schema.holds(t) {
+			continue
+		}
+		if t.Kind == canonical.RefFundDays {
+			s.fundTables = append(s.fundTables, refQuery{t, fundDayQuery(t)})
+			continue
+		}
+		s.pages = append(s.pages, refPage{refQuery{t, pageQuery(t)}, keyset{after: firstKey(t), done: !w.Changes(t.Kind)}})
 	}
 	days, ok := w.SpanOf(canonical.RefFundDays)
 	if !ok {
@@ -186,30 +207,75 @@ func NewReferenceStream(ctx context.Context, db *sql.DB, w canonical.Window) (Sn
 			parts = append(parts, "SELECT fund_ref, as_of FROM "+t+" WHERE as_of BETWEEN ?1 AND ?2")
 		}
 	}
-	rows, err := db.QueryContext(ctx, strings.Join(parts, "\nUNION ")+`
-ORDER BY 2, 1`, days.Start, days.End)
-	if err != nil {
-		return nil, fmt.Errorf("reference fund-days: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
+	var err error
+	s.days, err = Query(ctx, db, "reference fund-days", strings.Join(parts, "\nUNION ")+`
+ORDER BY 2, 1`, func(rows *sql.Rows) (fundDay, error) {
 		var d fundDay
 		if err := rows.Scan(&d.ref, &d.asOf); err != nil {
-			return nil, fmt.Errorf("reference fund-days scan: %w", err)
+			return d, fmt.Errorf("reference fund-days scan: %w", err)
 		}
-		s.days = append(s.days, d)
+		return d, nil
+	}, days.Start, days.End)
+	if err != nil {
+		return nil, err
 	}
-	return s, rows.Err()
+	return s, nil
+}
+
+// columnList is t's silver columns, comma-separated.
+func columnList(t *canonical.RefTable) string {
+	names := make([]string, len(t.Cols))
+	for i, c := range t.Cols {
+		names[i] = c.Name
+	}
+	return strings.Join(names, ", ")
+}
+
+// fundDayQuery reads one fund-day's rows of a fund table, ordered by its
+// key.
+func fundDayQuery(t *canonical.RefTable) string {
+	q := "SELECT " + columnList(t) + "\n  FROM " + t.Silver + " WHERE fund_ref = ? AND as_of = ?"
+	if len(t.Key) > 0 {
+		q += " ORDER BY " + strings.Join(t.Key, ", ")
+	}
+	return q
+}
+
+// pageQuery reads a page of a security table past its cursor (readPage).
+// A table read whole by a group takes every row of each group a row of
+// the span names.
+func pageQuery(t *canonical.RefTable) string {
+	key := strings.Join(t.Key, ", ")
+	where := "as_of BETWEEN ? AND ?"
+	from := t.Silver
+	if len(t.WholeBy) > 0 {
+		from += " d"
+		same := make([]string, len(t.WholeBy))
+		for i, c := range t.WholeBy {
+			same[i] = "c." + c + " = d." + c
+		}
+		where = "EXISTS (SELECT 1 FROM " + t.Silver + " c\n                WHERE " + strings.Join(same, " AND ") +
+			" AND c.as_of BETWEEN ? AND ?)"
+	}
+	return "SELECT " + columnList(t) + "\n  FROM " + from + "\n WHERE " + where +
+		" AND (" + key + ") > (" + strings.TrimSuffix(strings.Repeat("?, ", len(t.Key)), ", ") + ")" +
+		"\n ORDER BY " + key + " LIMIT ?"
+}
+
+// firstKey is the cursor before a security table's first row: -1 for an
+// integer key column, "" for a text one.
+func firstKey(t *canonical.RefTable) []any {
+	after := make([]any, len(t.Key))
+	for i, k := range t.Key {
+		after[i] = ""
+		if t.Cols[t.Col(k)].Kind == canonical.RefIntReq {
+			after[i] = int64(-1)
+		}
+	}
+	return after
 }
 
 func (s *referenceStream) Close() error { return nil }
-
-// span is the span the window's records of kind change over; a kind
-// without changes has its keyset done before any read.
-func (s *referenceStream) span(kind string) canonical.Span {
-	span, _ := s.w.SpanOf(kind)
-	return span
-}
 
 func (s *referenceStream) Next(ctx context.Context) (canonical.SnapshotBatch, bool, error) {
 	var b canonical.SnapshotBatch
@@ -222,32 +288,39 @@ func (s *referenceStream) Next(ctx context.Context) (canonical.SnapshotBatch, bo
 		}
 		return b, true, nil
 	}
-	var err error
-	switch {
-	case !s.secs.done:
-		b.Securities, err = s.readSecurities(ctx)
-	case !s.facts.done:
-		b.SecurityFacts, err = s.readFacts(ctx)
-	case !s.periods.done:
-		b.SecurityPeriodFacts, err = s.readPeriodFacts(ctx)
-	case !s.events.done:
-		b.DividendEvents, err = s.readEvents(ctx)
+	// One page a batch, of the first table not yet read through.
+	read, more := false, false
+	for i := range s.pages {
+		p := &s.pages[i]
+		if p.k.done {
+			continue
+		}
+		if !read {
+			read = true
+			span, _ := s.w.SpanOf(p.t.Kind)
+			rows, err := readPage(ctx, s.db, span, ReferenceTailBudget, "reference "+p.t.What, p.q, &p.k,
+				func(rows *sql.Rows) ([]any, []any, error) { return scanRef(rows, p.t, true) })
+			if err != nil {
+				return b, false, err
+			}
+			for _, r := range rows {
+				b.AppendRef(p.t, r)
+			}
+		}
+		more = more || !p.k.done
 	}
-	return b, !s.secs.done || !s.facts.done || !s.periods.done || !s.events.done, err
+	return b, more, nil
 }
 
 func (s *referenceStream) readFundDay(ctx context.Context, d fundDay, b *canonical.SnapshotBatch) error {
-	readers := []func(context.Context, fundDay, *canonical.SnapshotBatch) error{
-		s.readCompositions, s.readLines, s.readAttributes, s.readCounterparties,
+	if err := s.readCompositions(ctx, d, b); err != nil {
+		return err
 	}
-	if s.yield {
-		readers = append(readers, s.readFundRisk, s.readCharacteristics)
+	if err := s.readLines(ctx, d, b); err != nil {
+		return err
 	}
-	if s.returns {
-		readers = append(readers, s.readFundReturns)
-	}
-	for _, read := range readers {
-		if err := read(ctx, d, b); err != nil {
+	for _, f := range s.fundTables {
+		if err := s.readFundRows(ctx, f, d, b); err != nil {
 			return err
 		}
 	}
@@ -255,15 +328,10 @@ func (s *referenceStream) readFundDay(ctx context.Context, d fundDay, b *canonic
 }
 
 func (s *referenceStream) readCompositions(ctx context.Context, d fundDay, b *canonical.SnapshotBatch) error {
-	rows, err := s.db.QueryContext(ctx, `
+	return ScanRows(ctx, s.db, "reference compositions", `
 SELECT basis, provider, source_kind, fund_name, currency, net_assets, line_count,
        weight_sum, units_outstanding, run_at, payload
-  FROM compositions WHERE fund_ref = ? AND as_of = ? ORDER BY basis`, d.ref, d.asOf)
-	if err != nil {
-		return fmt.Errorf("reference compositions: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
+  FROM compositions WHERE fund_ref = ? AND as_of = ? ORDER BY basis`, func(rows *sql.Rows) error {
 		var (
 			basis, provider, kind               string
 			name, ccy, net, sum, units, payload sql.NullString
@@ -280,21 +348,16 @@ SELECT basis, provider, source_kind, fund_name, currency, net_assets, line_count
 			WeightSum: DecimalPtrOrNil(sum), UnitsOutstanding: DecimalPtrOrNil(units),
 			FetchedAt: runAt, Payload: JSONOrNil(payload),
 		})
-	}
-	return rows.Err()
+		return nil
+	}, d.ref, d.asOf)
 }
 
 func (s *referenceStream) readLines(ctx context.Context, d fundDay, b *canonical.SnapshotBatch) error {
-	rows, err := s.db.QueryContext(ctx, `
+	return ScanRows(ctx, s.db, "reference lines", `
 SELECT basis, line_no, isin, cusip, figi, ticker, exchange, name, asset_type,
        weight, quantity, market_value, currency, country, risk_country, sector, industry,
        maturity, coupon, long_currency, long_amount, short_currency, short_amount, payload`+s.lineYieldSelect+`
-  FROM lines WHERE fund_ref = ? AND as_of = ? ORDER BY basis, line_no`, d.ref, d.asOf)
-	if err != nil {
-		return fmt.Errorf("reference lines: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
+  FROM lines WHERE fund_ref = ? AND as_of = ? ORDER BY basis, line_no`, func(rows *sql.Rows) error {
 		var (
 			basis                                            string
 			lineNo                                           int64
@@ -334,304 +397,166 @@ SELECT basis, line_no, isin, cusip, figi, ticker, exchange, name, asset_type,
 			AccrualDate: ISODate(accrual.String),
 			Payload:     JSONOrNil(payload),
 		})
-	}
-	return rows.Err()
+		return nil
+	}, d.ref, d.asOf)
 }
 
-func (s *referenceStream) readAttributes(ctx context.Context, d fundDay, b *canonical.SnapshotBatch) error {
-	rows, err := s.db.QueryContext(ctx, `
-SELECT domicile, legal_form, ucits, replication, distribution, ter, hedged_currency,
-       lending, index_name, depositary, payload
-  FROM attributes WHERE fund_ref = ? AND as_of = ?`, d.ref, d.asOf)
-	if err != nil {
-		return fmt.Errorf("reference attributes: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var (
-			dom, form, repl, dist, ter, hedged, idx, depo sql.NullString
-			payload                                       sql.NullString
-			ucits, lending                                sql.NullBool
-		)
-		if err := rows.Scan(&dom, &form, &ucits, &repl, &dist, &ter, &hedged, &lending, &idx, &depo, &payload); err != nil {
-			return fmt.Errorf("reference attributes scan: %w", err)
-		}
-		b.FundAttributes = append(b.FundAttributes, canonical.FundAttributesChange{
-			FundRef: d.ref, AsOf: d.asOf,
-			Domicile: NullStringPtr(dom), LegalForm: NullStringPtr(form), UCITS: boolPtr(ucits),
-			Replication: NullStringPtr(repl), Distribution: NullStringPtr(dist), TER: DecimalPtrOrNil(ter),
-			HedgedCurrency: NullStringPtr(hedged), Lending: boolPtr(lending),
-			IndexName: NullStringPtr(idx), Depositary: NullStringPtr(depo),
-			Payload: JSONOrNil(payload),
-		})
-	}
-	return rows.Err()
-}
-
-func (s *referenceStream) readCounterparties(ctx context.Context, d fundDay, b *canonical.SnapshotBatch) error {
-	rows, err := s.db.QueryContext(ctx, `
-SELECT role, name, lei, share, payload
-  FROM counterparties WHERE fund_ref = ? AND as_of = ? ORDER BY role, name`, d.ref, d.asOf)
-	if err != nil {
-		return fmt.Errorf("reference counterparties: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var (
-			role, name          string
-			lei, share, payload sql.NullString
-		)
-		if err := rows.Scan(&role, &name, &lei, &share, &payload); err != nil {
-			return fmt.Errorf("reference counterparties scan: %w", err)
-		}
-		b.FundCounterparties = append(b.FundCounterparties, canonical.FundCounterpartyChange{
-			FundRef: d.ref, AsOf: d.asOf, Role: role, Name: name,
-			LEI: NullStringPtr(lei), Share: DecimalPtrOrNil(share),
-			Payload: JSONOrNil(payload),
-		})
-	}
-	return rows.Err()
-}
-
-func (s *referenceStream) readFundRisk(ctx context.Context, d fundDay, b *canonical.SnapshotBatch) error {
-	rows, err := s.db.QueryContext(ctx, `
-SELECT currency, tenor, dv01, dv100, credit_ig_dv01, credit_hy_dv01, payload
-  FROM fund_risk WHERE fund_ref = ? AND as_of = ? ORDER BY currency, tenor`, d.ref, d.asOf)
-	if err != nil {
-		return fmt.Errorf("reference fund risk: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var (
-			ccy, tenor                   string
-			dv01, dv100, ig, hy, payload sql.NullString
-		)
-		if err := rows.Scan(&ccy, &tenor, &dv01, &dv100, &ig, &hy, &payload); err != nil {
-			return fmt.Errorf("reference fund risk scan: %w", err)
-		}
-		b.FundRisk = append(b.FundRisk, canonical.FundRiskChange{
-			FundRef: d.ref, AsOf: d.asOf, Currency: ccy, Tenor: tenor,
-			DV01: DecimalPtrOrNil(dv01), DV100: DecimalPtrOrNil(dv100),
-			CreditIGDV01: DecimalPtrOrNil(ig), CreditHYDV01: DecimalPtrOrNil(hy),
-			Payload: JSONOrNil(payload),
-		})
-	}
-	return rows.Err()
-}
-
-// readFundReturns reads a fund-day's monthly returns. A return that is no
-// decimal fails the load: the figure is the row's whole point.
-func (s *referenceStream) readFundReturns(ctx context.Context, d fundDay, b *canonical.SnapshotBatch) error {
-	rows, err := s.db.QueryContext(ctx, `
-SELECT month, class_id, total_return, payload
-  FROM fund_returns WHERE fund_ref = ? AND as_of = ? ORDER BY month`, d.ref, d.asOf)
-	if err != nil {
-		return fmt.Errorf("reference fund returns: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var (
-			month, value   string
-			class, payload sql.NullString
-		)
-		if err := rows.Scan(&month, &class, &value, &payload); err != nil {
-			return fmt.Errorf("reference fund returns scan: %w", err)
-		}
-		total, err := canonical.NewDecimalFromString(value)
+// readFundRows reads a fund-day's rows of one fund table.
+func (s *referenceStream) readFundRows(ctx context.Context, f refQuery, d fundDay, b *canonical.SnapshotBatch) error {
+	return ScanRows(ctx, s.db, "reference "+f.t.What, f.q, func(rows *sql.Rows) error {
+		row, _, err := scanRef(rows, f.t, false)
 		if err != nil {
-			return fmt.Errorf("reference fund returns: %s %s: %w", d.ref, month, err)
+			return err
 		}
-		b.FundReturns = append(b.FundReturns, canonical.FundReturnChange{
-			FundRef: d.ref, AsOf: d.asOf, Month: month, ClassID: NullStringPtr(class), TotalReturn: total,
-			Payload: JSONOrNil(payload),
-		})
-	}
-	return rows.Err()
+		b.AppendRef(f.t, row)
+		return nil
+	}, d.ref, d.asOf)
 }
 
-// readCharacteristics reads a fund-day's characteristics. A value that is
-// no decimal fails the load: the figure is the row's whole point.
-func (s *referenceStream) readCharacteristics(ctx context.Context, d fundDay, b *canonical.SnapshotBatch) error {
-	rows, err := s.db.QueryContext(ctx, `
-SELECT provider, field, label, value, payload
-  FROM characteristics WHERE fund_ref = ? AND as_of = ? ORDER BY provider, field, label`, d.ref, d.asOf)
-	if err != nil {
-		return fmt.Errorf("reference characteristics: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var (
-			provider, field, label, value string
-			payload                       sql.NullString
-		)
-		if err := rows.Scan(&provider, &field, &label, &value, &payload); err != nil {
-			return fmt.Errorf("reference characteristics scan: %w", err)
+// scanRef reads one row of t into a value per column (canonical.RefRows),
+// and, where key is set, its cursor: the key columns as silver holds
+// them. A value that fails to read, as its column's kind says, fails the
+// row with an error that names it (canonical.RefTable's Record).
+func scanRef(rows *sql.Rows, t *canonical.RefTable, key bool) ([]any, []any, error) {
+	dest := make([]any, len(t.Cols))
+	for i, c := range t.Cols {
+		switch c.Kind {
+		case canonical.RefTextReq, canonical.RefDecimalReq, canonical.RefDateReq:
+			dest[i] = new(string)
+		case canonical.RefIntReq:
+			dest[i] = new(int64)
+		case canonical.RefInt:
+			dest[i] = new(sql.NullInt64)
+		case canonical.RefBool:
+			dest[i] = new(sql.NullBool)
+		default:
+			dest[i] = new(sql.NullString)
 		}
-		v, err := canonical.NewDecimalFromString(value)
+	}
+	if err := rows.Scan(dest...); err != nil {
+		return nil, nil, fmt.Errorf("reference %s scan: %w", t.What, err)
+	}
+	// raw is a column's value as silver holds it.
+	raw := func(name string) any {
+		switch v := dest[t.Col(name)].(type) {
+		case *string:
+			return *v
+		case *int64:
+			return *v
+		}
+		return nil
+	}
+	record := func() string {
+		args := make([]any, len(t.RecordBy))
+		for i, c := range t.RecordBy {
+			args[i] = raw(c)
+		}
+		return fmt.Sprintf(t.Record, args...)
+	}
+	row := make([]any, len(t.Cols))
+	for i, c := range t.Cols {
+		v, err := refValue(c, dest[i])
 		if err != nil {
-			return fmt.Errorf("reference characteristic (%s, %d, %s, %s, %q): value %q: %w",
-				d.ref, d.asOf, provider, field, label, value, err)
+			return nil, nil, fmt.Errorf("reference %s: %w", record(), err)
 		}
-		b.FundCharacteristics = append(b.FundCharacteristics, canonical.FundCharacteristicChange{
-			FundRef: d.ref, AsOf: d.asOf, Provider: provider, Field: field, Label: label,
-			Value: v, Payload: JSONOrNil(payload),
-		})
+		row[i] = v
 	}
-	return rows.Err()
+	var cursor []any
+	if key {
+		cursor = make([]any, len(t.Key))
+		for i, k := range t.Key {
+			cursor[i] = raw(k)
+		}
+	}
+	return row, cursor, nil
 }
 
-// readSecurities reads the next page of the window's security
-// identities. The keys are gold's own, so they pass through as written.
-func (s *referenceStream) readSecurities(ctx context.Context) ([]canonical.SecurityChange, error) {
-	return readPage(ctx, s.db, s.span(canonical.RefSecurities), ReferenceTailBudget, "reference securities", `
-SELECT security_key, as_of, provider, isin, cusip, figi, lei, ticker, exchange, name,
-       security_type, listing_currency, payload
-  FROM securities
- WHERE as_of BETWEEN ? AND ? AND (security_key, as_of, provider) > (?, ?, ?)
- ORDER BY security_key, as_of, provider LIMIT ?`, &s.secs,
-		func(rows *sql.Rows) (canonical.SecurityChange, []any, error) {
-			var (
-				key, provider                                       string
-				asOf                                                int64
-				isin, cusip, figi, lei, ticker, exch, name, typ, lc sql.NullString
-				payload                                             sql.NullString
-			)
-			if err := rows.Scan(&key, &asOf, &provider, &isin, &cusip, &figi, &lei, &ticker, &exch, &name,
-				&typ, &lc, &payload); err != nil {
-				return canonical.SecurityChange{}, nil, fmt.Errorf("reference securities scan: %w", err)
-			}
-			return canonical.SecurityChange{
-				SecurityKey: key, AsOf: asOf, Provider: provider,
-				ISIN: NullStringPtr(isin), CUSIP: NullStringPtr(cusip), FIGI: NullStringPtr(figi),
-				LEI: NullStringPtr(lei), Ticker: NullStringPtr(ticker), Exchange: NullStringPtr(exch),
-				Name: NullStringPtr(name), SecurityType: NullStringPtr(typ), ListingCurrency: NullStringPtr(lc),
-				Payload: JSONOrNil(payload),
-			}, []any{key, asOf, provider}, nil
-		})
-}
+// errNoDate is a column's text that is no date.
+type errNoDate struct{ column, text string }
 
-// readFacts reads the next page of the window's security facts.
-func (s *referenceStream) readFacts(ctx context.Context) ([]canonical.SecurityFactChange, error) {
-	return readPage(ctx, s.db, s.span(canonical.RefSecurityFacts), ReferenceTailBudget, "reference security facts", `
-SELECT security_key, field, as_of, provider, value, scheme, payload
-  FROM security_facts
- WHERE as_of BETWEEN ? AND ? AND (security_key, field, as_of, provider) > (?, ?, ?, ?)
- ORDER BY security_key, field, as_of, provider LIMIT ?`, &s.facts,
-		func(rows *sql.Rows) (canonical.SecurityFactChange, []any, error) {
-			var (
-				key, field, provider, value string
-				asOf                        int64
-				scheme, payload             sql.NullString
-			)
-			if err := rows.Scan(&key, &field, &asOf, &provider, &value, &scheme, &payload); err != nil {
-				return canonical.SecurityFactChange{}, nil, fmt.Errorf("reference security facts scan: %w", err)
-			}
-			return canonical.SecurityFactChange{
-				SecurityKey: key, Field: field, AsOf: asOf, Provider: provider, Value: value,
-				Scheme: NullStringPtr(scheme), Payload: JSONOrNil(payload),
-			}, []any{key, field, asOf, provider}, nil
-		})
-}
+func (e errNoDate) Error() string { return fmt.Sprintf("%s %q is no date", e.column, e.text) }
 
-// readPeriodFacts reads the next page of the window's period facts. A
-// value that is no decimal, or a period start that is no date, fails the
-// load: gold holds neither without one.
-func (s *referenceStream) readPeriodFacts(ctx context.Context) ([]canonical.SecurityPeriodFactChange, error) {
-	return readPage(ctx, s.db, s.span(canonical.RefPeriodFacts), ReferenceTailBudget, "reference period facts", `
-SELECT security_key, field, as_of, period_start, provider, value, scheme, unit,
-       fiscal_year, fiscal_period, form, filed, payload
-  FROM period_facts
- WHERE as_of BETWEEN ? AND ? AND (security_key, field, as_of, period_start, provider) > (?, ?, ?, ?, ?)
- ORDER BY security_key, field, as_of, period_start, provider LIMIT ?`, &s.periods,
-		func(rows *sql.Rows) (canonical.SecurityPeriodFactChange, []any, error) {
-			var (
-				key, field, start, provider, value         string
-				asOf                                       int64
-				scheme, unit, period, form, filed, payload sql.NullString
-				year                                       sql.NullInt64
-			)
-			if err := rows.Scan(&key, &field, &asOf, &start, &provider, &value, &scheme, &unit,
-				&year, &period, &form, &filed, &payload); err != nil {
-				return canonical.SecurityPeriodFactChange{}, nil, fmt.Errorf("reference period facts scan: %w", err)
-			}
-			v, err := canonical.NewDecimalFromString(value)
+// refValue reads a scanned column into its value, as its kind says: nil
+// for NULL, or for what the kind reads as none. The error of a value that
+// fails to read names the column and its text.
+func refValue(c canonical.RefColumn, scanned any) (any, error) {
+	switch v := scanned.(type) {
+	case *string:
+		switch c.Kind {
+		case canonical.RefDecimalReq:
+			d, err := canonical.NewDecimalFromString(*v)
 			if err != nil {
-				return canonical.SecurityPeriodFactChange{}, nil, fmt.Errorf(
-					"reference period fact (%s, %s, %d, %s, %s): value %q: %w",
-					key, field, asOf, start, provider, value, err)
+				return nil, decimalErr(c, *v, err)
 			}
-			first := ISODate(start)
-			if first == nil {
-				return canonical.SecurityPeriodFactChange{}, nil, fmt.Errorf(
-					"reference period fact (%s, %s, %d, %s, %s): period_start %q is no date",
-					key, field, asOf, start, provider, start)
+			return d, nil
+		case canonical.RefDateReq:
+			d := ISODate(*v)
+			if d == nil {
+				return nil, errNoDate{c.Name, *v}
 			}
-			return canonical.SecurityPeriodFactChange{
-				SecurityKey: key, Field: field, AsOf: asOf, PeriodStart: *first, Provider: provider,
-				Value: v, Scheme: NullStringPtr(scheme), Unit: NullStringPtr(unit),
-				FiscalYear: NullInt64Ptr(year), FiscalPeriod: NullStringPtr(period), Form: NullStringPtr(form),
-				Filed: ISODate(filed.String), Payload: JSONOrNil(payload),
-			}, []any{key, field, asOf, start, provider}, nil
-		})
+			return *d, nil
+		}
+		return *v, nil
+	case *int64:
+		return *v, nil
+	case *sql.NullInt64:
+		if !v.Valid {
+			return nil, nil
+		}
+		return v.Int64, nil
+	case *sql.NullBool:
+		if !v.Valid {
+			return nil, nil
+		}
+		return v.Bool, nil
+	}
+	ns := *scanned.(*sql.NullString)
+	switch c.Kind {
+	case canonical.RefDecimal:
+		if d := DecimalPtrOrNil(ns); d != nil {
+			return *d, nil
+		}
+	case canonical.RefDecimalStrict:
+		if strings.TrimSpace(ns.String) == "" {
+			return nil, nil
+		}
+		d, err := canonical.NewDecimalFromString(ns.String)
+		if err != nil {
+			return nil, decimalErr(c, ns.String, err)
+		}
+		return d, nil
+	case canonical.RefDate:
+		if d := ISODate(ns.String); d != nil {
+			return *d, nil
+		}
+	case canonical.RefDateStrict:
+		if strings.TrimSpace(ns.String) == "" {
+			return nil, nil
+		}
+		d := ISODate(ns.String)
+		if d == nil {
+			return nil, errNoDate{c.Name, ns.String}
+		}
+		return *d, nil
+	case canonical.RefJSON:
+		if p := JSONOrNil(ns); p != nil {
+			return []byte(p), nil
+		}
+	default:
+		if ns.Valid {
+			return ns.String, nil
+		}
+	}
+	return nil, nil
 }
 
-// readEvents reads the next page of the window's distributions: every
-// row of each ref and provider that a row of the span names, whatever
-// its own as_of. A provider that states a ref's whole history drops from
-// silver the rows it no longer states, which leaves nothing in the span
-// to say so; gold replaces each ref's and provider's rows with the ones
-// read here (gold.Writer). A day or an amount that is empty reads as
-// none. One that is no date or no decimal fails the load: gold would
-// hold the distribution without it.
-func (s *referenceStream) readEvents(ctx context.Context) ([]canonical.DividendEventChange, error) {
-	return readPage(ctx, s.db, s.span(canonical.RefDividendEvents), ReferenceTailBudget, "reference dividend events", `
-SELECT ref, provider, event_id, as_of, kind, ex_date, record_date, pay_date, declared_date, amount, currency, status
-  FROM dividend_events d
- WHERE EXISTS (SELECT 1 FROM dividend_events c
-                WHERE c.ref = d.ref AND c.provider = d.provider AND c.as_of BETWEEN ? AND ?)
-   AND (ref, provider, event_id) > (?, ?, ?)
- ORDER BY ref, provider, event_id LIMIT ?`, &s.events,
-		func(rows *sql.Rows) (canonical.DividendEventChange, []any, error) {
-			var (
-				ref, provider, id, kind               string
-				asOf                                  int64
-				ex, record, pay, declared, amount, cc sql.NullString
-				status                                sql.NullString
-			)
-			if err := rows.Scan(&ref, &provider, &id, &asOf, &kind, &ex, &record, &pay, &declared, &amount, &cc,
-				&status); err != nil {
-				return canonical.DividendEventChange{}, nil, fmt.Errorf("reference dividend events scan: %w", err)
-			}
-			e := canonical.DividendEventChange{Ref: ref, Provider: provider, EventID: id, AsOf: asOf,
-				Kind: canonical.DividendEventKind(kind), Currency: NullStringPtr(cc)}
-			if status.Valid {
-				st := canonical.DividendEventStatus(status.String)
-				e.Status = &st
-			}
-			for _, d := range []struct {
-				column string
-				value  sql.NullString
-				into   **time.Time
-			}{{"ex_date", ex, &e.ExDay}, {"record_date", record, &e.RecordDay}, {"pay_date", pay, &e.PayDay},
-				{"declared_date", declared, &e.DeclaredDay}} {
-				if strings.TrimSpace(d.value.String) == "" {
-					continue
-				}
-				if *d.into = ISODate(d.value.String); *d.into == nil {
-					return canonical.DividendEventChange{}, nil, fmt.Errorf(
-						"reference dividend event (%s, %s, %s): %s %q is no date", ref, provider, id, d.column, d.value.String)
-				}
-			}
-			if strings.TrimSpace(amount.String) != "" {
-				v, err := canonical.NewDecimalFromString(amount.String)
-				if err != nil {
-					return canonical.DividendEventChange{}, nil, fmt.Errorf(
-						"reference dividend event (%s, %s, %s): amount %q: %w", ref, provider, id, amount.String, err)
-				}
-				e.Amount = &v
-			}
-			return e, []any{ref, provider, id}, nil
-		})
+// decimalErr is the error of a column's text that is no decimal: the
+// parse's own where the column is Bare, else naming the column and text.
+func decimalErr(c canonical.RefColumn, text string, err error) error {
+	if c.Bare {
+		return err
+	}
+	return fmt.Errorf("%s %q: %w", c.Name, text, err)
 }
 
 func boolPtr(n sql.NullBool) *bool {

@@ -122,14 +122,15 @@ policy about reversals. One canonical kind carries two opposite events,
 interest credited and interest charged. Only the sign tells them apart,
 and spending claims the negative half.
 
-A negative `deposit` is a reversal by construction:
+A negative `deposit` is the source's own reversal:
 
-- the canonical sign of `deposit` is positive, and
-  `ApplyCanonicalSign` forces it (`canonical/sign.go`);
-- only an adapter that keeps a source sign on purpose can produce a
-  negative one. An adapter does this when the source marks a reversal.
-  The Fidelity adapter keeps every sign, because its sources sign each
-  row from the account's side.
+- the canonical sign of `deposit` is positive;
+- an adapter that reads a magnitude and a side forces that sign
+  (`ApplyCanonicalSign`, `canonical/sign.go`);
+- an adapter of a signed source keeps the source's sign. The Fidelity,
+  viac and swissquote adapters do this, because their sources sign
+  each row from the account's side. So a negative `deposit` comes only
+  from a source that marks a reversal.
 
 ---
 
@@ -137,7 +138,7 @@ A negative `deposit` is a reversal by construction:
 
 Income uses the same provenance, the same three classes and the same
 predicates as SPENDING.md §2, in one table and one dimension.
-`spend_categories` carries a `family` column (migration 0069). A row is
+`spend_categories` carries a `family` column. A row is
 `spending`, `income`, or `both`.
 
 **Vendored, verbatim:** Plaid's `INCOME` primary, version 2, and its
@@ -389,9 +390,7 @@ The tiers, where income differs:
   to say something the data does not.
 - **Config rules.** `income.rules[]` takes the shape of
   `spending.rules`, scope and `far` included, with the value field
-  named `type`. The far account an income rule names is written onto
-  the spending overlay, the one overlay with far columns. So the inbound
-  leg of a move to a declared account places like its outbound leg
+  named `type`. A `far` places the inbound leg as the outbound one
   ([CASHFLOW.md](CASHFLOW.md) §4).
 - **Provider tier.** A bank's booking type can say "salary",
   "dividend", "interest". The provider maps have an income side, keyed
@@ -440,9 +439,9 @@ be wrong. So income reads the floor over the store, and the model
 decides only the kind with no floor: `deposit`.
 
 The shape this protects against is one payer with two kinds. A
-signature is shared by every row that folds to it. Take an employer
-whose shares the household also holds. Without the re-order, the salary
-deposit's `INCOME_SALARY` verdict would re-type that employer's
+signature is shared by every row that folds to it. Take a payer that
+sends both a salary and a dividend. Without the re-order, the salary
+deposit's `INCOME_SALARY` verdict would re-type that payer's
 dividends. With it, the dividend keeps `INCOME_DIVIDENDS` with
 provenance `kind`, and the deposit keeps the store's verdict with
 provenance `model`.
@@ -1045,7 +1044,8 @@ shift is given, `shift=-50bp` follows.
 
 `withheld` is what the `yield.withholding` table withholds at each
 holding's situs and account wrapper ([YIELD.md](YIELD.md) §8). A
-country's `default` row stands for any other wrapper. It reads the same
+country's `default` row stands for any other wrapper, and for an
+account with no stated wrapper, as YIELD.md §8 says. It reads the same
 for received and expected income. It is a model, not the tax rows a
 source booked, and it is blank where the table names no rate. The
 booked tax is `income summary -C +withheld` (§5).

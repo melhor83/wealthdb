@@ -87,16 +87,12 @@ func TestExposureClassesAndSectors(t *testing.T) {
 	}
 }
 
-// Each view's default column set resolves against its registry, and the
-// usage lists every view.
-func TestExposureViewsResolveTheirDefaults(t *testing.T) {
+// The usage's hand-written view list names every view.
+func TestExposureUsageListsEveryView(t *testing.T) {
 	t.Parallel()
-	usage := exposureUsage()
-	for _, view := range exposureViews {
-		if _, err := exposureReport(request{view: view, currency: "USD"}).pick("default"); err != nil {
-			t.Errorf("%s defaults: %v", view, err)
-		}
-		if !strings.Contains(usage, "\n  "+view+" ") {
+	views, _, _ := strings.Cut(exposureUsage(), "Available columns (per view):")
+	for _, view := range exposureFamily.names() {
+		if !strings.Contains(views, "\n  "+view+" ") {
 			t.Errorf("usage does not list the %s view", view)
 		}
 	}
@@ -110,7 +106,7 @@ func TestExposureUsageNamesTheFlagsViews(t *testing.T) {
 	flat := strings.Join(strings.Fields(usage), " ")
 	for _, want := range []string{
 		"--period P " + strings.Join(seriesPeriods, " | ") + ":",
-		"a period column first; on " + andList(exposureSeriesViews),
+		"a period column first; on " + andList(exposureFamily.seriesViews()),
 		"--country C risk (default) | domicile:",
 		"counts in, on countries and securities",
 	} {
@@ -176,7 +172,7 @@ func TestExposurePrivacyHidesAmounts(t *testing.T) {
 		"funds":      {"symbol:IDXF", "57.14"},
 		"coverage":   {"looked_through", "undeclared", "brk"},
 	}
-	for _, v := range exposureViews {
+	for _, v := range exposureFamily.names() {
 		out, errb, code := runExposure(t, cfg, v, "-d", "2026-06-30", "-p", "-f", "csv", "-C", "all")
 		if code != 0 {
 			t.Fatalf("%s: exit %d: %s", v, code, errb)
@@ -423,7 +419,7 @@ func TestExposureBucketAndIssuerViews(t *testing.T) {
 		"credit": "bucket,share_pct,class_share_pct\ncash,20.00,100.00\n(none),80.00,\n",
 		"cycles": "cycle,share_pct,class_share_pct\nsensitive,80.00,100.00\n(none),20.00,\n",
 	} {
-		col := exposureBucketViews[view].column
+		col, _, _ := strings.Cut(want, ",")
 		out, errb, code := runExposure(t, cfg, view, "-d", "2026-06-30", "-f", "csv", "-p", "-C", col+",share,class_share")
 		if code != 0 || out != want {
 			t.Errorf("%s -C %s,share,class_share: %d %s\n%s", view, col, code, errb, out)

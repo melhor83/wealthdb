@@ -1,10 +1,13 @@
 package ubs
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
+	"slices"
 	"strings"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
@@ -34,7 +37,7 @@ import (
 //
 // Window semantics: the loader's window-DELETE deletes positions
 // and cash_balances rows WHERE snapshot_at BETWEEN w.Start AND
-// w.End, so any historical timestamp we emit must be inside the
+// w.End, so any historical timestamp emitted must be inside the
 // window or the next load will collide on the gold PK. The
 // webReader's ChangeWindow extends Start back to MIN(historical
 // times) when there's a new dump_run, so this loop's WHERE clause
@@ -85,7 +88,7 @@ func (r *webReader) snapshotsHistorical(
 // `historical_position_snapshots` (rows where instrument_isin IS
 // NOT NULL). UBS PDFs don't surface the safekeeping account
 // reliably, so silver leaves account_external_id empty on these
-// rows. We attach them to the per-portfolio overlay account
+// rows. They attach to the per-portfolio overlay account
 // pattern PSN already uses for forward contracts (account_kind=
 // 'overlay', '<portfolio>:overlay'), preserving the invariant
 // that every position is owned by some account row.
@@ -95,7 +98,7 @@ func (r *webReader) snapshotsHistorical(
 // balances` rows on the same (account, currency, period_end) and
 // would collide on the gold cash_balances PK. The monthly cash-
 // balances table is the richer source (opening + closing per
-// month vs quarter-end only), so we use it exclusively for cash.
+// month vs quarter-end only), so it alone supplies the cash.
 // safekeepingByPortfolio maps a portfolio_external_id to the PSN
 // safekeeping account that holds its securities, where exactly one
 // of them can be (see psnReader.safekeepingByPortfolio). When a
@@ -112,182 +115,282 @@ func (r *webReader) appendHistoricalSecurities(
 	safekeepingByPortfolio map[string]string,
 	portfolioCutoff map[string]int64,
 ) error {
-	// A year-end Statement of Assets can print a per-instrument gold-bar
-	// detail line for a precious-metals overlay portfolio that the
-	// quarterly statements omit. The adapter also synthesises a single
-	// overview precious-metals position (PM-<portfolio>) for such a
-	// portfolio from the sibling reporting-currency statement, so
-	// emitting the detail line too would double-count the metal at
-	// every year-end (the two reach gold under distinct position
-	// keys). Suppress the detail line whenever its overview sibling
-	// exists for the same (as_of_date, portfolio): the overview row
-	// is continuous across all quarters and reported in clean USD.
-	pmOverview, err := r.preciousMetalsOverviewKeys(ctx, w)
+	holdings, err := r.statementHoldings(ctx, w)
 	if err != nil {
 		return err
 	}
+	suppress := suppressMetalDetail(holdings)
+	// One PortfolioChange and one AccountChange per (snapshot,
+	// portfolio), not one per holding.
+	emitted := map[snapshotKey]bool{}
+	for _, h := range holdings {
+		// Drop rows whose portfolio has crossed over to PSN
+		// coverage; without this the quarter-end PDF row collides
+		// with PSN's daily snapshot for the same safekeeping+ISIN
+		// on the gold PositionChange PK. Portfolios with no PSN
+		// counterpart (cutoff==0) pass through.
+		if cut := portfolioCutoff[h.portID]; cut > 0 && h.asOf >= cut {
+			continue
+		}
+		if suppress(h) {
+			continue
+		}
+		batch := getBatch(h.asOf)
 
+		accountID, mapped := statementSecuritiesAccount(safekeepingByPortfolio, h.portID)
+		if portKey := (snapshotKey{h.asOf, h.portID}); !emitted[portKey] {
+			emitted[portKey] = true
+			statementDimensions(batch, h, accountID, mapped)
+		}
+		inst := statementInstrument(h)
+		batch.Instruments = append(batch.Instruments, inst)
+		batch.Positions = append(batch.Positions, statementPosition(h, accountID, inst))
+	}
+	return nil
+}
+
+// statementHolding is one security row of a statement of assets.
+type statementHolding struct {
+	asOf                                     int64
+	portID, isin, ccy, mvCcy                 string
+	descr                                    sql.NullString
+	units, mv, costPrice, costBasis, accrued sql.NullFloat64
+	payload                                  string
+}
+
+// statementHoldings reads the statements' security rows in the window.
+func (r *webReader) statementHoldings(ctx context.Context, w canonical.Window) ([]statementHolding, error) {
 	// The cost value is a column of ubs-web migration 0013; an older
 	// silver states none.
-	hasCostBasis, err := silver.HasColumn(ctx, r.db, "historical_position_snapshots", "cost_basis")
+	s, err := r.schema(ctx)
 	if err != nil {
-		return fmt.Errorf("appendHistoricalSecurities: %w", err)
+		return nil, fmt.Errorf("statementHoldings: %w", err)
 	}
-	costBasisCol := `NULL`
-	if hasCostBasis {
-		costBasisCol = `cost_basis`
-	}
+	costBasisCol := silver.ColumnOr(s.historicalCost, "cost_basis")
 	q := `
 SELECT as_of_date, portfolio_external_id, instrument_isin, currency_iso,
        units, market_value, market_value_currency,
        cost_price, ` + costBasisCol + `, accrued_interest, description, payload
   FROM historical_position_snapshots
  WHERE instrument_isin IS NOT NULL
-   AND as_of_date BETWEEN ? AND ?`
-	rows, err := r.db.QueryContext(ctx, q, w.Start, w.End)
-	if err != nil {
-		return fmt.Errorf("appendHistoricalSecurities: %w", err)
-	}
-	defer rows.Close()
-
-	// One PortfolioChange and one AccountChange per (snapshot,
-	// portfolio), not one per holding.
-	emitted := map[snapshotKey]bool{}
-
-	for rows.Next() {
-		var (
-			asOf                                     int64
-			portID, isin, ccy, mvCcy                 string
-			descr                                    sql.NullString
-			units, mv, costPrice, costBasis, accrued sql.NullFloat64
-			payload                                  string
-		)
-		if err := rows.Scan(&asOf, &portID, &isin, &ccy, &units, &mv, &mvCcy,
-			&costPrice, &costBasis, &accrued, &descr, &payload); err != nil {
+   AND as_of_date BETWEEN ? AND ?
+ ORDER BY as_of_date, portfolio_external_id, instrument_isin, account_external_id`
+	var out []statementHolding
+	err = silver.ScanRows(ctx, r.db, "statementHoldings", q, func(rows *sql.Rows) error {
+		var h statementHolding
+		if err := rows.Scan(&h.asOf, &h.portID, &h.isin, &h.ccy, &h.units, &h.mv, &h.mvCcy,
+			&h.costPrice, &h.costBasis, &h.accrued, &h.descr, &h.payload); err != nil {
 			return err
 		}
-		// Drop rows whose portfolio has crossed over to PSN
-		// coverage; without this the quarter-end PDF row collides
-		// with PSN's daily snapshot for the same safekeeping+ISIN
-		// on the gold PositionChange PK. Portfolios with no PSN
-		// counterpart (cutoff==0) pass through.
-		if cut := portfolioCutoff[portID]; cut > 0 && asOf >= cut {
-			continue
-		}
-		// Drop the year-end precious-metals detail line when its
-		// synthetic overview sibling is present for the same
-		// (as_of, portfolio) — see the function's opening comment.
-		if looksLikeISIN(isin) && pmOverview[snapshotKey{asOf, portID}] &&
-			isPreciousMetalsLine(descr.String, payload) {
-			continue
-		}
-		batch := getBatch(asOf)
-
-		accountID, mapped := statementSecuritiesAccount(safekeepingByPortfolio, portID)
-		if portKey := (snapshotKey{asOf, portID}); !emitted[portKey] {
-			emitted[portKey] = true
-			batch.Portfolios = append(batch.Portfolios, canonical.PortfolioChange{
-				PortfolioExternalID: portID,
-				BaseCurrency:        silver.StrPtrIfNonEmpty(mvCcy),
-				FirstSeenAt:         asOf,
-				LastSeenAt:          asOf,
-			})
-			pid := portID
-			ac := canonical.AccountChange{
-				AccountExternalID:   accountID,
-				PortfolioExternalID: &pid,
-				FirstSeenAt:         asOf,
-				LastSeenAt:          asOf,
-			}
-			if mapped {
-				// Real safekeeping account. Leave DisplayName nil so
-				// the PSN-era AccountChange (which carries the proper
-				// mandate name) wins via gold's latest-last_seen_at
-				// upsert guard; our contribution just extends
-				// first_seen_at back to the PDF era.
-				ac.AccountKind = canonical.AccountKindSafekeeping
-			} else {
-				ac.AccountKind = canonical.AccountKindOverlay
-				ac.DisplayName = silver.StrPtrIfNonEmpty("Portfolio overlay (historical)")
-				// The synthetic overlay only. A real safekeeping
-				// account's wrapper is the AcctTpCd tables' answer,
-				// and stamping one here would let the PDF era supply
-				// a wrapper for a product code PSN deliberately left
-				// unmapped — gold's merge backfills from older
-				// observations and absence never wins, so the
-				// caution those tables exist for would be undone from
-				// behind.
-				ac.TaxWrapper = relationshipTaxWrapper()
-			}
-			batch.Accounts = append(batch.Accounts, ac)
-		}
-
-		// Some historical rows carry a synthetic, non-ISIN-shaped
-		// instrument key — e.g. the overview-derived precious-metals
-		// position for a portfolio UBS issues no per-instrument
-		// Statement-of-Assets page for ("PM-<portfolio>"). It still
-		// needs a stable instrument/position identity, but must not
-		// claim a canonical ISIN, so leave InstrumentChange.ISIN nil
-		// for those.
-		isinCopy := isin
-		var isinPtr *string
-		if looksLikeISIN(isin) {
-			isinPtr = &isinCopy
-		}
-		// Historical PDF securities carry no CFI/UAC, so the pair
-		// comes from the description-template classifier — UBS
-		// generates PDF descriptions from a fixed per-instrument-type
-		// vocabulary ("Reg.shs …", "… Sicav …", "Sponsored American
-		// Deposit Receipt …"), so the templates are a reliable signal.
-		// Unmatched descriptions keep (other, other). Instruments that
-		// later reappear in PSN converge on PSN's CFI-derived pair via
-		// gold's latest-last_seen_at per-column upsert.
-		acHist, vehHist, _ := taxonomyPairForWebDescription(descr.String)
-		batch.Instruments = append(batch.Instruments, canonical.InstrumentChange{
-			InstrumentExternalID: isin,
-			AssetClass:           acHist,
-			Vehicle:              vehHist,
-			ISIN:                 isinPtr,
-			Name:                 silver.StrPtrIfNonEmpty(descr.String),
-			Currency:             silver.StrPtrIfNonEmpty(ccy),
-			FirstSeenAt:          asOf,
-			LastSeenAt:           asOf,
-		})
-
-		positionCcy := mvCcy
-		if positionCcy == "" {
-			positionCcy = ccy
-		}
-		bookValue, basis, posPayload := statementBookValue(costBasis, costPrice, ccy, mvCcy, payload)
-		pos := canonical.PositionChange{
-			SnapshotAt:           asOf,
-			AccountExternalID:    accountID,
-			PositionKey:          isin,
-			InstrumentExternalID: &isinCopy,
-			AssetClass:           acHist,
-			Vehicle:              vehHist,
-			Currency:             positionCcy,
-			Quantity:             silver.DecimalPtrFromNullFloat(units),
-			MarketValue:          silver.DecimalPtrFromNullFloat(mv),
-			Payload:              posPayload,
-		}
-		// The statement prints a holding's accrued interest on line 2,
-		// apart from its market value and in the same currency. Gold's
-		// market value includes it (docs/DESIGN.md §7.1); the printed
-		// value stays in the payload. A row that names no market-value
-		// currency names none for the accrued figure either.
-		if a := silver.DecimalPtrFromNullFloat(accrued); a != nil && mvCcy != "" {
-			pos.AccruedInterest = a
-			if !a.IsZero() && pos.MarketValue != nil {
-				pos.Payload = silver.PayloadWith(string(pos.Payload), map[string]any{
-					"printed_market_value": pos.MarketValue.String()})
-				pos.MarketValue = silver.WithAccrued(pos.MarketValue, a)
-			}
-		}
-		pos.SetBookValue(bookValue, basis)
-		batch.Positions = append(batch.Positions, pos)
+		out = append(out, h)
+		return nil
+	}, w.Start, w.End)
+	if err != nil {
+		return nil, err
 	}
-	return rows.Err()
+	metals, err := r.preciousMetalsTotals(ctx, w)
+	if err != nil {
+		return nil, err
+	}
+	// Both shapes in one order: date, portfolio, instrument.
+	out = append(out, metals...)
+	slices.SortStableFunc(out, func(a, b statementHolding) int {
+		return cmp.Or(cmp.Compare(a.asOf, b.asOf), cmp.Compare(a.portID, b.portID),
+			cmp.Compare(a.isin, b.isin))
+	})
+	return out, nil
+}
+
+// preciousMetalsCurrency is the copy of a relationship overview the
+// precious-metals position is read from. The overview prints the same
+// total once per valuation currency (USD / CHF / EUR); taking the
+// reporting currency's copy keeps the position one row with one value,
+// which gold converts at query time. A total printed only in another
+// currency's copy gives no position.
+const preciousMetalsCurrency = "USD"
+
+// preciousMetalsKeyPrefix opens the instrument key of a portfolio's
+// overview precious-metals position, "PM-<portfolio>".
+const preciousMetalsKeyPrefix = "PM-"
+
+// preciousMetalsTotals returns the overview's precious-metals totals in
+// the window, each as the holding it becomes: one per (as_of_date,
+// portfolio), read off the preciousMetalsCurrency copy, the last of
+// them the document walk wrote where several print it. UBS issues no
+// Detailed-positions page for such a portfolio (precious-metals
+// custody), so the overview's total is all a statement prints of it. Its
+// instrument key is deliberately not ISIN-shaped ("PM-<portfolio>"), so
+// statementInstrument leaves the canonical ISIN null.
+//
+// An older silver holds these as rows of historical_position_snapshots
+// under that key (ubs-web migration 0018 moves them), which
+// statementHoldings reads with the securities.
+func (r *webReader) preciousMetalsTotals(ctx context.Context, w canonical.Window) ([]statementHolding, error) {
+	ok, err := r.hasTable(ctx, overviewTotalsTable)
+	if err != nil || !ok {
+		return nil, err
+	}
+	const q = `
+SELECT as_of_date, portfolio_external_id, currency_iso, market_value, payload
+  FROM statement_overview_totals t
+ WHERE asset_class = 'precious_metals' AND currency_iso = ?
+   AND as_of_date BETWEEN ? AND ?
+   AND rowid = (SELECT MAX(rowid) FROM statement_overview_totals u
+                 WHERE u.asset_class = t.asset_class
+                   AND u.currency_iso = t.currency_iso
+                   AND u.as_of_date = t.as_of_date
+                   AND u.portfolio_external_id = t.portfolio_external_id)`
+	var out []statementHolding
+	err = silver.ScanRows(ctx, r.db, "preciousMetalsTotals", q, func(rows *sql.Rows) error {
+		var h statementHolding
+		if err := rows.Scan(&h.asOf, &h.portID, &h.ccy, &h.mv, &h.payload); err != nil {
+			return err
+		}
+		h.isin = preciousMetalsKeyPrefix + h.portID
+		h.mvCcy = h.ccy
+		h.descr = sql.NullString{String: "Precious metals & commodities", Valid: true}
+		out = append(out, h)
+		return nil
+	}, preciousMetalsCurrency, w.Start, w.End)
+	return out, err
+}
+
+// suppressMetalDetail reports which holdings are a year-end gold-bar
+// detail line to drop.
+//
+// A year-end Statement of Assets can print a per-instrument gold-bar
+// detail line for a precious-metals overlay portfolio that the
+// quarterly statements omit. The adapter also emits a single overview
+// precious-metals position (PM-<portfolio>) for such a portfolio
+// (preciousMetalsTotals), so emitting the detail line too would
+// double-count the metal at every year-end (the two reach gold under
+// distinct position keys). The detail line is suppressed whenever its
+// overview sibling is among the holdings for the same (as_of_date,
+// portfolio): the overview row is continuous across all quarters and
+// reported in clean USD.
+func suppressMetalDetail(holdings []statementHolding) func(statementHolding) bool {
+	pmOverview := map[snapshotKey]bool{}
+	for _, h := range holdings {
+		if strings.HasPrefix(h.isin, preciousMetalsKeyPrefix) {
+			pmOverview[snapshotKey{h.asOf, h.portID}] = true
+		}
+	}
+	return func(h statementHolding) bool {
+		return looksLikeISIN(h.isin) && pmOverview[snapshotKey{h.asOf, h.portID}] &&
+			isPreciousMetalsLine(h.descr.String, h.payload)
+	}
+}
+
+// statementDimensions emits the portfolio and the account of a
+// holding's (snapshot, portfolio).
+func statementDimensions(batch *canonical.SnapshotBatch, h statementHolding, accountID string, mapped bool) {
+	batch.Portfolios = append(batch.Portfolios, canonical.PortfolioChange{
+		PortfolioExternalID: h.portID,
+		BaseCurrency:        silver.StrPtrIfNonEmpty(h.mvCcy),
+		FirstSeenAt:         h.asOf,
+		LastSeenAt:          h.asOf,
+	})
+	pid := h.portID
+	ac := canonical.AccountChange{
+		AccountExternalID:   accountID,
+		PortfolioExternalID: &pid,
+		FirstSeenAt:         h.asOf,
+		LastSeenAt:          h.asOf,
+	}
+	if mapped {
+		// Real safekeeping account. Leave DisplayName nil so
+		// the PSN-era AccountChange (which carries the proper
+		// mandate name) wins via gold's latest-last_seen_at
+		// upsert guard; this row only extends
+		// first_seen_at back to the PDF era.
+		ac.AccountKind = canonical.AccountKindSafekeeping
+	} else {
+		ac.AccountKind = canonical.AccountKindOverlay
+		ac.DisplayName = silver.StrPtrIfNonEmpty("Portfolio overlay (historical)")
+		// The synthetic overlay only. A real safekeeping
+		// account's wrapper is the AcctTpCd tables' answer,
+		// and stamping one here would let the PDF era supply
+		// a wrapper for a product code PSN deliberately left
+		// unmapped — gold's merge backfills from older
+		// observations and absence never wins, so the
+		// caution those tables exist for would be undone from
+		// behind.
+		ac.TaxWrapper = relationshipTaxWrapper()
+	}
+	batch.Accounts = append(batch.Accounts, ac)
+}
+
+// statementInstrument is the instrument a holding names.
+func statementInstrument(h statementHolding) canonical.InstrumentChange {
+	// Some historical rows carry a synthetic, non-ISIN-shaped
+	// instrument key — e.g. the overview-derived precious-metals
+	// position for a portfolio UBS issues no per-instrument
+	// Statement-of-Assets page for ("PM-<portfolio>"). It still
+	// needs a stable instrument/position identity, but must not
+	// claim a canonical ISIN, so leave InstrumentChange.ISIN nil
+	// for those.
+	isinCopy := h.isin
+	var isinPtr *string
+	if looksLikeISIN(h.isin) {
+		isinPtr = &isinCopy
+	}
+	// Historical PDF securities carry no CFI/UAC, so the pair
+	// comes from the description-template classifier — UBS
+	// generates PDF descriptions from a fixed per-instrument-type
+	// vocabulary ("Reg.shs …", "… Sicav …", "Sponsored American
+	// Deposit Receipt …"), so the templates are a reliable signal.
+	// Unmatched descriptions keep (other, other). Instruments that
+	// later reappear in PSN converge on PSN's CFI-derived pair via
+	// gold's latest-last_seen_at per-column upsert.
+	acHist, vehHist, _ := taxonomyPairForWebDescription(h.descr.String)
+	return canonical.InstrumentChange{
+		InstrumentExternalID: h.isin,
+		AssetClass:           acHist,
+		Vehicle:              vehHist,
+		ISIN:                 isinPtr,
+		Name:                 silver.StrPtrIfNonEmpty(h.descr.String),
+		Currency:             silver.StrPtrIfNonEmpty(h.ccy),
+		FirstSeenAt:          h.asOf,
+		LastSeenAt:           h.asOf,
+	}
+}
+
+// statementPosition is a holding's position on the account, in the
+// instrument's class.
+func statementPosition(h statementHolding, accountID string, inst canonical.InstrumentChange) canonical.PositionChange {
+	positionCcy := h.mvCcy
+	if positionCcy == "" {
+		positionCcy = h.ccy
+	}
+	isin := h.isin
+	bookValue, basis, posPayload := statementBookValue(h.costBasis, h.costPrice, h.ccy, h.mvCcy, h.payload)
+	pos := canonical.PositionChange{
+		SnapshotAt:           h.asOf,
+		AccountExternalID:    accountID,
+		PositionKey:          h.isin,
+		InstrumentExternalID: &isin,
+		AssetClass:           inst.AssetClass,
+		Vehicle:              inst.Vehicle,
+		Currency:             positionCcy,
+		Quantity:             silver.DecimalPtrFromNullFloat(h.units),
+		MarketValue:          silver.DecimalPtrFromNullFloat(h.mv),
+		Payload:              posPayload,
+	}
+	// The statement prints a holding's accrued interest on line 2,
+	// apart from its market value and in the same currency. Gold's
+	// market value includes it (docs/DESIGN.md §7.1); the printed
+	// value stays in the payload. A row that names no market-value
+	// currency names none for the accrued figure either.
+	if a := silver.DecimalPtrFromNullFloat(h.accrued); a != nil && h.mvCcy != "" {
+		pos.AccruedInterest = a
+		if !a.IsZero() && pos.MarketValue != nil {
+			pos.Payload = silver.PayloadWith(string(pos.Payload), map[string]any{
+				"printed_market_value": pos.MarketValue.String()})
+			pos.MarketValue = silver.WithAccrued(pos.MarketValue, a)
+		}
+	}
+	pos.SetBookValue(bookValue, basis)
+	return pos
 }
 
 // statementSecuritiesAccount names the account a statement's securities
@@ -307,35 +410,6 @@ func statementSecuritiesAccount(safekeepingByPortfolio map[string]string, portfo
 type snapshotKey struct {
 	at int64
 	id string
-}
-
-// preciousMetalsOverviewKeys returns the (as_of_date, portfolio)
-// pairs in the window that carry a synthetic overview precious-metals
-// row (instrument_isin like 'PM-%'). Used to suppress the duplicate
-// year-end gold-bar detail line for those portfolios.
-func (r *webReader) preciousMetalsOverviewKeys(
-	ctx context.Context, w canonical.Window,
-) (map[snapshotKey]bool, error) {
-	const q = `
-SELECT DISTINCT as_of_date, portfolio_external_id
-  FROM historical_position_snapshots
- WHERE instrument_isin LIKE 'PM-%'
-   AND as_of_date BETWEEN ? AND ?`
-	rows, err := r.db.QueryContext(ctx, q, w.Start, w.End)
-	if err != nil {
-		return nil, fmt.Errorf("preciousMetalsOverviewKeys: %w", err)
-	}
-	defer rows.Close()
-	set := map[snapshotKey]bool{}
-	for rows.Next() {
-		var asOf int64
-		var port string
-		if err := rows.Scan(&asOf, &port); err != nil {
-			return nil, err
-		}
-		set[snapshotKey{asOf, port}] = true
-	}
-	return set, rows.Err()
 }
 
 // isPreciousMetalsLine reports whether a historical_position_snapshots
@@ -380,17 +454,12 @@ SELECT period_end, period_start, account_external_id, currency_iso,
   FROM historical_cash_balances
  WHERE period_end BETWEEN ? AND ?
     OR period_start BETWEEN ? AND ?`
-	rows, err := r.db.QueryContext(ctx, q, w.Start, w.End, w.Start, w.End)
-	if err != nil {
-		return fmt.Errorf("appendHistoricalCashBalances: %w", err)
-	}
-	defer rows.Close()
 
 	// One AccountChange per (snapshot, account), however many
 	// balances the snapshot carries.
 	accountEmitted := map[snapshotKey]bool{}
 
-	for rows.Next() {
+	return silver.ScanRows(ctx, r.db, "appendHistoricalCashBalances", q, func(rows *sql.Rows) error {
 		var (
 			periodEnd, periodStart int64
 			acctID, ccy            string
@@ -416,7 +485,7 @@ SELECT period_end, period_start, account_external_id, currency_iso,
 			{periodEnd, close, canonical.BalanceKindClosing},
 		} {
 			if !b.balance.Valid || b.at < w.Start || b.at > w.End || (cut > 0 && b.at >= cut) {
-				continue
+				return nil
 			}
 			batch := getBatch(b.at)
 			if key := (snapshotKey{b.at, acctID}); !accountEmitted[key] {
@@ -439,8 +508,8 @@ SELECT period_end, period_start, account_external_id, currency_iso,
 				Payload:           json.RawMessage(payload),
 			})
 		}
-	}
-	return rows.Err()
+		return nil
+	}, w.Start, w.End, w.Start, w.End)
 }
 
 // appendHistoricalMortgages attaches each PDF-derived mortgage
@@ -448,7 +517,9 @@ SELECT period_end, period_start, account_external_id, currency_iso,
 // portfolio snapshot at that same as_of_date, emitting the same
 // triple as the live path — Account + Instrument + Position keyed
 // by the UBS-internal mortgage account number, AccountKind /
-// AssetClass = mortgage, MarketValue already negative from silver.
+// AssetClass = mortgage. Silver holds the principal as the notice
+// prints it, a positive amount (an older silver: negated); the
+// position is the liability, so its MarketValue is negative.
 //
 // It takes `byTime` directly (not byTime.At) and PEEKS rather than
 // creates: a mortgage row is only emitted when a real portfolio
@@ -479,12 +550,7 @@ SELECT as_of_date, account_external_id, currency_iso,
        outstanding_balance, product_name, collateral_description, payload
   FROM historical_mortgages
  WHERE as_of_date BETWEEN ? AND ?`
-	rows, err := r.db.QueryContext(ctx, q, w.Start, w.End)
-	if err != nil {
-		return fmt.Errorf("appendHistoricalMortgages: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
+	return silver.ScanRows(ctx, r.db, "appendHistoricalMortgages", q, func(rows *sql.Rows) error {
 		var (
 			asOf                     int64
 			extID, currency, payload string
@@ -501,7 +567,7 @@ SELECT as_of_date, account_external_id, currency_iso,
 		// future-dated next-quarter Maturity Notice).
 		batch, ok := byTime[asOf]
 		if !ok || (len(batch.Positions) == 0 && len(batch.CashBalances) == 0) {
-			continue
+			return nil
 		}
 
 		display := sql.NullString{
@@ -539,11 +605,20 @@ SELECT as_of_date, account_external_id, currency_iso,
 			AssetClass:           canonical.AssetClassRealEstate,
 			Vehicle:              canonical.VehicleMortgage,
 			Currency:             currency,
-			MarketValue:          silver.DecimalPtrFromNullFloat(outstanding),
+			MarketValue:          silver.DecimalPtrFromNullFloat(liability(outstanding)),
 			Payload:              json.RawMessage(payload),
 		})
+		return nil
+	}, w.Start, w.End)
+}
+
+// liability is a principal as a liability's value: negative, whichever
+// sign silver stores it with.
+func liability(principal sql.NullFloat64) sql.NullFloat64 {
+	if principal.Valid {
+		principal.Float64 = -math.Abs(principal.Float64)
 	}
-	return rows.Err()
+	return principal
 }
 
 // historicalRange returns the span of dates the historical tables cover, or
@@ -566,6 +641,14 @@ func (r *webReader) historicalRange(ctx context.Context) (int64, int64, error) {
 	}
 	if ok {
 		queries = append(queries, `SELECT MIN(as_of_date), MAX(as_of_date) FROM historical_mortgages`)
+	}
+	// The precious-metals positions (preciousMetalsTotals), which an older
+	// silver holds in historical_position_snapshots.
+	if ok, err := r.hasTable(ctx, overviewTotalsTable); err != nil {
+		return -1, -1, err
+	} else if ok {
+		queries = append(queries, `SELECT MIN(as_of_date), MAX(as_of_date) FROM statement_overview_totals
+ WHERE asset_class = 'precious_metals' AND currency_iso = '`+preciousMetalsCurrency+`'`)
 	}
 	return silver.Extrema(ctx, r.db, "historicalRange", queries)
 }

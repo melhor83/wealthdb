@@ -65,12 +65,6 @@ INSERT INTO cash_flows(cash_flow_external_id, entity_external_id, snapshot_at, k
 	}
 }
 
-func TestKindIsCarta(t *testing.T) {
-	if got := (&Adapter{}).Kind(); got != "carta" {
-		t.Errorf("Kind() = %q, want carta", got)
-	}
-}
-
 func TestStatusTransactionExtrema(t *testing.T) {
 	path, db := newFixtureSilver(t)
 	seed(t, db)
@@ -88,6 +82,34 @@ func TestStatusTransactionExtrema(t *testing.T) {
 	}
 	if s.LatestChangeNumber != 1700000000 {
 		t.Errorf("LatestChangeNumber = %d, want 1700000000", s.LatestChangeNumber)
+	}
+}
+
+// A silver older than migration 0007 states its cash flows without their
+// days: it yields no transactions and no transaction range, and the load
+// names the column.
+func TestASilverWithoutFlowAtStatesNoLedger(t *testing.T) {
+	path, db := newFixtureSilver(t)
+	seed(t, db)
+	silvertest.Exec(t, db, `DROP TRIGGER cash_flows_flow_at;
+        ALTER TABLE cash_flows DROP COLUMN flow_at;
+        INSERT INTO schema_meta (silver_schema_version, applied_at) VALUES (6, 0)`)
+	conn := openAdapter(t, path)
+
+	s, err := conn.Status(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.OldestTransactionAt != -1 || s.LatestTransactionAt != -1 {
+		t.Errorf("tx extrema = [%d,%d], want none", s.OldestTransactionAt, s.LatestTransactionAt)
+	}
+	if txs := silvertest.Transactions(t, conn, silvertest.WindowSince0(t, conn)); len(txs) != 0 {
+		t.Errorf("transactions = %d, want none", len(txs))
+	}
+	notes := conn.(silver.SchemaAdviser).SchemaAdvice()
+	if len(notes) != 1 || notes[0].Version != 6 || len(notes[0].Missing) != 1 ||
+		notes[0].Missing[0] != "cash_flows.flow_at" {
+		t.Errorf("advice = %+v, want one note at version 6 naming cash_flows.flow_at", notes)
 	}
 }
 
@@ -372,8 +394,8 @@ INSERT INTO fund_metrics(snapshot_at, entity_external_id, currency, net_asset_va
 		{"entity:100", canonical.AssetClassPrivateEquity, canonical.VehicleStock, canonical.AssetClassPrivateEquity},
 		{"entity:400", canonical.AssetClassPrivateEquity, canonical.VehicleOption, canonical.AssetClassPrivateEquity},
 		{"entity:500", canonical.AssetClassPrivateEquity, canonical.VehicleStock, canonical.AssetClassPrivateEquity},
-		{"entity:300", canonical.AssetClassPrivateDebt, canonical.VehicleConvertibleNote, canonical.AssetClassConvertibleNote},
-		{"entity:200", canonical.AssetClassPrivateEquity, canonical.VehicleFund, canonical.AssetClassPrivateFund},
+		{"entity:300", canonical.AssetClassPrivateDebt, canonical.VehicleConvertibleNote, "convertible_note"},
+		{"entity:200", canonical.AssetClassPrivateEquity, canonical.VehicleFund, "private_fund"},
 	}
 	for _, tc := range cases {
 		if !canonical.ValidTaxonomyPair(tc.exposure, tc.vehicle) {
@@ -591,8 +613,8 @@ INSERT INTO securities(snapshot_at, entity_external_id, security_type, security_
 		t.Errorf("Status latest snapshot = %d %v, want the dump that dropped the company", s.LatestSnapshotAt, err)
 	}
 	w, _ := conn.ChangeWindow(context.Background(), -1)
-	if w.End != 1800000000 {
-		t.Errorf("window end = %d, want the dump that dropped the company", w.End)
+	if !w.Full {
+		t.Errorf("window = %+v, want the whole history", w)
 	}
 	batches := silvertest.Snapshots(t, conn, w)
 	if len(batches) != 2 {

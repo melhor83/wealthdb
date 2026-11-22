@@ -1,9 +1,9 @@
 # Amex adapter
 
 Adapter that projects the `amex` silver SQLite database into the
-canonical gold schema. Implements the `silver.Adapter` /
-`silver.Connection` interface defined in
-[../DESIGN.md](../DESIGN.md) §6.
+canonical gold schema. It is a source of the shared bank adapter
+(`internal/silver/bank`), which implements the `silver.Connection`
+interface defined in [../DESIGN.md](../DESIGN.md) §6.
 
 The source is an American Express card relationship, scoped to **credit
 and charge cards**. A card carries no instrument, so the adapter emits
@@ -76,9 +76,9 @@ Both defaults are overridable through config `account_overrides`.
 A card's outstanding balance is a **liability carried as negative
 cash** (the margin-debit precedent, migration 0037). Silver holds every
 figure the provider's way — the balance is the POSITIVE amount owed —
-and `signedBalance` negates it. That is the **only** place the flip
-happens, and every account this source emits is a card, so it is
-unconditional.
+and the shared bank adapter (`internal/silver/bank`) negates it. That is
+the **only** place the flip happens, and every account this source emits
+is a card, so it is unconditional.
 
 A credit limit and available credit are not balances of anything owned
 and never become rows.
@@ -109,8 +109,7 @@ and says why
 The whole card ledger. Silver already holds the fleet's card convention
 — spend negative, anything reducing the balance owed positive — the
 collector having negated Amex's own spend-positive figures at load.
-Kinds are still routed through `ApplyCanonicalSign`, because each has a
-fixed canonical direction.
+Each row keeps that sign, whatever its kind.
 
 **Kind mapping.** Two vocabularies share silver's `kind` column, one per
 era.
@@ -169,8 +168,8 @@ series at any grain**.
 [../RETURNS-NOTES.md](../RETURNS-NOTES.md#credit-cards-are-returns-invisible)
 says why, and why the cash leg that pays the card is a real outflow.
 
-The source still registers a `ReturnsPolicy`
-(`returns.CardIssuerPolicy`). A source without one falls to a
+The source still registers a `ReturnsPolicy` (the bank policy). A
+source without one falls to a
 conservative default and is reported as `unknown_adapter_policy`.
 
 ## 7. Spending — where this source earns its keep
@@ -180,7 +179,7 @@ building it:
 
 1. **The modern era files its rows under the provider's own spend
    category**, which the provider tier translates without the model
-   (`internal/spending/providermap.go`, `amexCardCategories`). Two
+   (`internal/spending/vocab_amex.go`, `amexCardCategories`). Two
    rows it will not place, and neither is a gap: the monthly bill,
    which Amex leaves uncategorised — the tell §5's kind rule turns on —
    and Amex's own residual bucket, listed as `untranslatable`:

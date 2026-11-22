@@ -1,10 +1,10 @@
-# The base image (mcr.microsoft.com/playwright/python:v1.65.1-noble)
+# The base image (mcr.microsoft.com/playwright/python:v1.65.2-noble)
 # ships only the *browser binaries* under /ms-playwright (with the
 # PLAYWRIGHT_BROWSERS_PATH env var pointing at them). The Python
 # `playwright` package itself must be installed here, and the version
 # MUST match the base-image tag so the package finds compatible
 # browser binaries. `make update` moves the tag and this pin together.
-playwright==1.65.1
+playwright==1.65.2
 
 # Pillow renders the Access-App QR PNG to the terminal as Unicode
 # half-blocks. The Playwright base image happens to ship a recent
@@ -12,10 +12,8 @@ playwright==1.65.1
 # it.
 Pillow>=10.0,<12
 
-# pdfplumber sits on top of pdfminer.six and exposes a clean table-
-# extraction API. Used by load.py to reconstruct historical position
-# snapshots from UBS's semi-annual "Statement of assets" PDFs and
-# month-end "Account Statement" PDFs in the documents archive.
+# pdfplumber (on pdfminer.six) extracts the documents archive's text
+# and word positions; see pdf_parsers.py.
 #
 # pdfplumber, not pypdfium2: see pdf_parsers.py's module docstring.
 pdfplumber>=0.11,<1

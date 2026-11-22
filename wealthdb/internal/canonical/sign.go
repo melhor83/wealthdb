@@ -1,6 +1,11 @@
 package canonical
 
-import "slices"
+import (
+	"fmt"
+	"slices"
+	"strings"
+	"sync"
+)
 
 // Canonical sign convention enforcement for transaction amounts.
 // See TransactionChange.NetAmount in types.go for the contract.
@@ -44,36 +49,68 @@ func canonicalSign(k TxKind) int {
 	return 0
 }
 
-// cashSignedKinds names, per silver kind, the kinds with no canonical
-// sign whose rows that move no quantity state the cash they moved, signed
-// as every amount is: positive into the account. Such a row is a cash leg
-// of a corporate action: cash in lieu of a fraction, a return of capital,
-// the cash for an unissued right. A row of the same kind that moves shares
-// is not one: its amount may value the shares rather than pay for them,
-// so the pin reaches only the rows that move none. The sources pinned here
-// are the ones whose adapters pass the statement's or the API's signed
-// cash amount through for these rows: the fidelity kind (which the svb
-// families load as) and schwab. A source not listed keeps its unsigned
-// kinds unsigned (docs/CASHFLOW.md §4). The list stays ordered by silver
-// kind and kind, the order the cash flow pass stamps.
-var cashSignedKinds = []SignedKindPin{
-	{"fidelity", TxKindCorporateAction},
-	{"schwab", TxKindCorporateAction},
+// cashSigned holds the sign pins: per silver kind, the kinds with no
+// canonical sign whose rows that move no quantity state the cash they
+// moved, signed as every amount is: positive into the account. Such a
+// row is a cash leg of a corporate action: cash in lieu of a fraction, a
+// return of capital, the cash for an unissued right. A row of the same
+// kind that moves shares is not one: its amount may value the shares
+// rather than pay for them, so the pin reaches only the rows that move
+// none. A source pins the kinds whose signed cash amount its adapter
+// passes through as the statement or the API states it
+// (RegisterCashSigned, from silver.Register). A source that pins none
+// keeps its unsigned kinds unsigned (docs/CASHFLOW.md §4).
+var cashSigned pinSet
+
+// pinSet is a set of sign pins, safe for concurrent use.
+type pinSet struct {
+	mu   sync.RWMutex
+	pins []SignedKindPin
 }
 
-// cashflowUnsignedKinds are the six kinds cash flow excludes for want of
-// a sign: canonicalSign's zero-signed set less interest, staking and
-// capital_gain, which cash flow reads by their sign or nets inside their
-// own class. A sign pin names one of them.
-var cashflowUnsignedKinds = []TxKind{
-	TxKindFx, TxKindFxForward, TxKindFxSwap, TxKindCorporateAction, TxKindJournal, TxKindOther,
+// add pins kinds of silverKind. A kind cash flow does not exclude for
+// want of a sign (TxKindRow.Unsigned) panics: a pin on it would move its
+// rows ahead of every verdict. So does a pin made twice. Both are
+// build-time mistakes in a source's registration.
+func (s *pinSet) add(silverKind string, kinds ...TxKind) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, k := range kinds {
+		p := SignedKindPin{silverKind, k}
+		if !slices.Contains(cashflowUnsignedKinds, k) {
+			panic(fmt.Sprintf("canonical: %s pins %s, which is none of the kinds cash flow excludes", silverKind, k))
+		}
+		if slices.Contains(s.pins, p) {
+			panic(fmt.Sprintf("canonical: %s pins %s twice", silverKind, k))
+		}
+		s.pins = append(s.pins, p)
+	}
 }
 
-// CashflowUnsignedKinds returns the six. A copy. A test accessor: the
-// sign pins and cashflow_txn_nodes' exclusion are both held to it.
-func CashflowUnsignedKinds() []TxKind {
-	return slices.Clone(cashflowUnsignedKinds)
+// list is the pins ordered by silver kind and kind.
+func (s *pinSet) list() []SignedKindPin {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := slices.Clone(s.pins)
+	slices.SortFunc(out, func(a, b SignedKindPin) int {
+		if c := strings.Compare(a.SilverKind, b.SilverKind); c != 0 {
+			return c
+		}
+		return strings.Compare(string(a.Kind), string(b.Kind))
+	})
+	return out
 }
+
+// RegisterCashSigned pins kinds of a silver kind as signed cash (pinSet.add).
+func RegisterCashSigned(silverKind string, kinds ...TxKind) {
+	cashSigned.add(silverKind, kinds...)
+}
+
+// cashflowUnsignedKinds are the kinds cash flow excludes for want of a
+// sign (TxKindRow.Unsigned): canonicalSign's zero-signed set less
+// interest, staking and capital_gain, which cash flow reads by their
+// sign or nets inside their own class. A sign pin names one of them.
+var cashflowUnsignedKinds = kindsWhere(func(r TxKindRow) bool { return r.Unsigned })
 
 // SignedKindPin is one sign pin: a silver kind and a kind.
 type SignedKindPin struct {
@@ -81,9 +118,10 @@ type SignedKindPin struct {
 	Kind       TxKind
 }
 
-// CashSignedKinds lists the pins, in their order.
+// CashSignedKinds lists the registered pins, ordered by silver kind and
+// kind, the order the cash flow pass stamps.
 func CashSignedKinds() []SignedKindPin {
-	return slices.Clone(cashSignedKinds)
+	return cashSigned.list()
 }
 
 // ApplyCanonicalSign returns `amount` with its sign normalised
@@ -94,10 +132,14 @@ func CashSignedKinds() []SignedKindPin {
 //   - Kind has no fixed canonical sign (canonicalSign returns 0):
 //     amount returned unchanged so the source-supplied sign wins.
 //   - Kind has a fixed canonical sign: the absolute value of
-//     `amount` is taken and given the canonical sign. This
-//     handles both "raw was positive" sources (UBS MT940 with
-//     debit flag) and "raw was already signed" sources (Schwab
-//     API) uniformly.
+//     `amount` is taken and given the canonical sign.
+//
+// NetAmount is the cash the account gained, as the source states it.
+// A source that states a signed amount passes it through, and an
+// adapter that reads the kind off that sign has nothing to repair.
+// This helper is for a source that states a magnitude and a side
+// (a debit/credit mark, a section, a side word) that the kind
+// carries: there the kind is the stated direction.
 //
 // Reversal handling: this helper unconditionally forces the
 // canonical sign, which is wrong for explicit reversal rows
@@ -107,9 +149,6 @@ func CashSignedKinds() []SignedKindPin {
 // the correction). Adapters that recognise a reversal marker in
 // their silver should bypass this helper for those rows and
 // assign the source-signed amount directly.
-//
-// Adapters should call this in their transaction builder before
-// assigning to GrossAmount and NetAmount.
 func ApplyCanonicalSign(kind TxKind, amount *Decimal) *Decimal {
 	if amount == nil {
 		return nil

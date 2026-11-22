@@ -1,5 +1,5 @@
 # camoufox + playwright pins live in shared/images/base-camoufox.Dockerfile
-# (camoufox[geoip]>=0.4.11,<0.5 + playwright==1.49.0 + the CAMOUFOX_BUILD
+# (camoufox[geoip], the matching Playwright pin and the CAMOUFOX_BUILD
 # browser pin). Bump them there, together: the browser build's juggler
 # patches target a specific Playwright, and camoufox-py's own fetch is
 # unpinned across Firefox majors (see fetch-camoufox.py), which is why the
@@ -8,11 +8,11 @@
 
 # pypdfium2 ships Python bindings to Google's PDFium (the
 # renderer Chrome uses). Pure-C++ under the hood, an order of
-# magnitude faster than a pure-Python extractor — pdf_parsers.py
-# does text-only extraction across hundreds of monthly statement
-# PDFs. Apache/BSD-licensed, wheel-distributed. Capped below 5:
-# load.py puts the pypdfium2 version in its parser fingerprint, so a
-# bump re-parses every schwab-web statement.
+# magnitude faster than a pure-Python extractor, across hundreds of
+# statement PDFs (extraction.py, through collectorkit.extract).
+# Apache/BSD-licensed, wheel-distributed. Capped below 5: the
+# pypdfium2 version is part of each PDF kind's extraction key, so a
+# bump re-derives every statement, letter and realized-lot report.
 pypdfium2>=4.30,<5
 
 # pytest is bundled in the image: `make test-schwab-web` runs the suite there, on

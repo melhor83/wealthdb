@@ -6,10 +6,13 @@ optional and fully dockerized (no host Java or Metabase). It only reads
 the data, and it is reachable only over an SSH tunnel plus Metabase's
 own login.
 
-It comes with ten dashboards: Wealth Overview, Allocation, Returns,
-Gains, Spending, Income, Cash Flow, Exposure, Yield and Data Freshness.
-Each but Gains has a privacy twin that shows shares (%) instead of
-amounts.
+It comes with eleven dashboards: Wealth Overview, Allocation, Returns,
+Gains, Spending, Income, Cash Flow, Exposure, Yield, Data Freshness and
+Private Markets.
+Each but Gains has a privacy twin. It shows shares (%) instead of
+amounts, or hides the money where the figures are ratios already
+(Returns, the Private Markets table). Allocation and Private Markets
+read their figures as of a picked day.
 
 Part of the **wealthdb** suite — see [the architecture
 overview](../DESIGN.md). Run it via the main wrapper:
@@ -88,10 +91,18 @@ wealthdb load -a && wealthdb web refresh
 web/
 ├── web            # host lifecycle script (start/stop/status/refresh/logs/build)
 ├── provision.py   # idempotent Metabase setup: admin, gold DB, models, cards, dashboards (stdlib)
+├── metabase.py    # the Metabase API client provisioning and the checks share
+├── sqlkit.py      # the vocabulary of the card SQL: currencies, tags, viz, the card maker
+├── models.py      # the report models
+├── pickers.py     # every dashboard picker
+├── layout.py      # a dashboard's declaration and its grid
+├── colors.py      # each source's colour
+├── retired.py     # the retired model, card and dashboard names
+├── dashboards/    # one file per dashboard's cards; __init__.py declares the dashboards
 ├── tile_timings.py  # times each tile's query on the DuckDB the driver bundles
 ├── Dockerfile     # Metabase (from JAR, glibc base) + pinned DuckDB driver → /plugins
 ├── test_web.sh    # unit tests: lifecycle script, then provision.py (make test-web)
-├── test_provision.py  # unit tests for provision.py's definitions (no Metabase)
+├── test_provision.py  # unit tests: provisioning definitions, client, tile timings (no Metabase)
 ├── requirements-test.txt  # their duckdb module, in the web/.venv make test-web builds
 ├── README.md      # this file
 ├── DESIGN.md      # rationale: snapshot, glibc base, version pin, provisioning
@@ -106,6 +117,7 @@ On the host:
 $XDG_DATA_HOME/wealthdb/web/
 ├── metabase/                  # Metabase's H2 metadata DB (dashboards, users)
 ├── snapshot/wealthdb.db       # read-only gold snapshot Metabase serves
+├── snapshot/wealthdb-<n>.db   # the same file, under the name Metabase reads it by
 ├── spill/                     # DuckDB spill space for capped queries
 ├── source-colors.json         # each source's chart colour, kept across refreshes
 └── admin-password.txt         # generated admin password (chmod 600), unless set via env

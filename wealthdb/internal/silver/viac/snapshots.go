@@ -44,32 +44,20 @@ func (c *Connection) snapshotTimesInWindow(ctx context.Context, w canonical.Wind
 		"dump_runs", "accounts", "positions", "cash_balances")
 }
 
+// appendAccounts emits one AccountChange per account snapshot, the rate
+// its strategy states under the stated-rate keys (strategyRateKeys).
 func (c *Connection) appendAccounts(ctx context.Context, w canonical.Window, byTime map[int64]*canonical.SnapshotBatch) error {
-	// A silver may carry a promoted `management_style` column.
-	// When present, the silver value wins; otherwise the default
-	// is `automated` — every VIAC product is robo-managed.
-	hasMgmt, err := silver.HasColumn(ctx, c.db, "accounts", "management_style")
-	if err != nil {
-		return err
-	}
-	mgmtCol := "NULL"
-	if hasMgmt {
-		mgmtCol = "management_style"
-	}
-	q := fmt.Sprintf(`
+	// A silver management_style, where set, wins; otherwise the
+	// default is `automated`: every VIAC product is robo-managed.
+	const q = `
 SELECT snapshot_at, account_external_id, product_code,
        COALESCE(name, ''), COALESCE(state, ''),
        COALESCE(currency_code, 'CHF'),
-       COALESCE(%s, ''),
+       COALESCE(management_style, ''),
        payload
   FROM accounts
- WHERE snapshot_at BETWEEN ? AND ?`, mgmtCol)
-	rows, err := c.db.QueryContext(ctx, q, w.Start, w.End)
-	if err != nil {
-		return fmt.Errorf("appendAccounts: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
+ WHERE snapshot_at BETWEEN ? AND ?`
+	if err := silver.ScanRows(ctx, c.db, "appendAccounts", q, func(rows *sql.Rows) error {
 		var (
 			snap                                              int64
 			extID, product, name, state, currency, silverMgmt string
@@ -80,7 +68,7 @@ SELECT snapshot_at, account_external_id, product_code,
 		}
 		batch, ok := byTime[snap]
 		if !ok {
-			continue
+			return nil
 		}
 		wrapper := taxWrapperFor(product)
 		style := canonical.ManagementStyleAutomated
@@ -88,6 +76,14 @@ SELECT snapshot_at, account_external_id, product_code,
 			style = canonical.ManagementStyle(silverMgmt)
 		}
 		ccy := currency
+		accountPayload := json.RawMessage(payload)
+		if keys := strategyRateKeys(accountPayload); keys != nil {
+			stamped, err := silver.WithStatedRates(accountPayload, keys)
+			if err != nil {
+				return fmt.Errorf("viac account %s rate: %w", extID, err)
+			}
+			accountPayload = stamped
+		}
 		change := canonical.AccountChange{
 			AccountExternalID: extID,
 			AccountKind:       canonical.AccountKindBrokerage,
@@ -96,7 +92,7 @@ SELECT snapshot_at, account_external_id, product_code,
 			ManagementStyle:   &style,
 			FirstSeenAt:       snap,
 			LastSeenAt:        snap,
-			Payload:           json.RawMessage(payload),
+			Payload:           accountPayload,
 		}
 		if name != "" {
 			change.DisplayName = &name
@@ -108,8 +104,11 @@ SELECT snapshot_at, account_external_id, product_code,
 			change.AccountCategory = &cat
 		}
 		batch.Accounts = append(batch.Accounts, change)
+		return nil
+	}, w.Start, w.End); err != nil {
+		return err
 	}
-	return rows.Err()
+	return nil
 }
 
 // productCategory returns the short human label silver's
@@ -139,13 +138,8 @@ SELECT instrument_external_id, COALESCE(isin, ''),
        COALESCE(asset_class, ''),
        first_seen_at, last_seen_at, payload
   FROM instruments`
-	rows, err := c.db.QueryContext(ctx, q)
-	if err != nil {
-		return fmt.Errorf("appendInstruments: %w", err)
-	}
-	defer rows.Close()
 	var instruments []canonical.InstrumentChange
-	for rows.Next() {
+	if err := silver.ScanRows(ctx, c.db, "appendInstruments", q, func(rows *sql.Rows) error {
 		var (
 			extID, isin, name, currency, rawClass string
 			firstSeen, lastSeen                   int64
@@ -178,8 +172,8 @@ SELECT instrument_external_id, COALESCE(isin, ''),
 			change.Currency = &currency
 		}
 		instruments = append(instruments, change)
-	}
-	if err := rows.Err(); err != nil {
+		return nil
+	}); err != nil {
 		return err
 	}
 	for _, batch := range byTime {
@@ -206,25 +200,20 @@ SELECT snapshot_at, account_external_id, instrument_external_id,
        payload
   FROM positions
  WHERE snapshot_at BETWEEN ? AND ?`
-	rows, err := c.db.QueryContext(ctx, q, w.Start, w.End)
-	if err != nil {
-		return fmt.Errorf("appendPositions: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
+	if err := silver.ScanRows(ctx, c.db, "appendPositions", q, func(rows *sql.Rows) error {
 		var (
 			snap                                     int64
 			acct, isin, rawClass, name               string
-			qtyStr, marketValueStr, acquisitionPxStr sql.NullString
+			qtyStr, marketValueStr, acquisitionPxStr *canonical.Decimal
 			payload                                  string
 		)
 		if err := rows.Scan(&snap, &acct, &isin, &rawClass, &name,
-			&qtyStr, &marketValueStr, &acquisitionPxStr, &payload); err != nil {
+			silver.Dec(&qtyStr, silver.DecText), silver.Dec(&marketValueStr, silver.DecText), silver.Dec(&acquisitionPxStr, silver.DecText), &payload); err != nil {
 			return err
 		}
 		batch, ok := byTime[snap]
 		if !ok {
-			continue
+			return nil
 		}
 		instrumentKey := isin
 		classNew, vehicle := taxonomyFor(rawClass, name)
@@ -236,20 +225,23 @@ SELECT snapshot_at, account_external_id, instrument_external_id,
 			AssetClass:           classNew,
 			Vehicle:              vehicle,
 			Currency:             "CHF",
-			Quantity:             silver.DecimalPtrOrNil(qtyStr),
-			MarketValue:          silver.DecimalPtrOrNil(marketValueStr),
+			Quantity:             qtyStr,
+			MarketValue:          marketValueStr,
 			Payload:              json.RawMessage(payload),
 		}
 		// BookValue (cost basis in CHF) = quantity * acquisition_price.
 		if change.Quantity != nil {
-			if acq := silver.DecimalPtrOrNil(acquisitionPxStr); acq != nil {
+			if acq := acquisitionPxStr; acq != nil {
 				bv := change.Quantity.Mul(*acq)
 				change.SetBookValue(&bv, acquisitionBasis)
 			}
 		}
 		batch.Positions = append(batch.Positions, change)
+		return nil
+	}, w.Start, w.End); err != nil {
+		return err
 	}
-	return rows.Err()
+	return nil
 }
 
 func (c *Connection) appendCashBalances(ctx context.Context, w canonical.Window, byTime map[int64]*canonical.SnapshotBatch) error {
@@ -259,12 +251,7 @@ SELECT snapshot_at, account_external_id, currency,
   FROM cash_balances
  WHERE snapshot_at BETWEEN ? AND ?
    AND balance_kind = 'cash'`
-	rows, err := c.db.QueryContext(ctx, q, w.Start, w.End)
-	if err != nil {
-		return fmt.Errorf("appendCashBalances: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
+	if err := silver.ScanRows(ctx, c.db, "appendCashBalances", q, func(rows *sql.Rows) error {
 		var (
 			snap      int64
 			acct, ccy string
@@ -275,7 +262,7 @@ SELECT snapshot_at, account_external_id, currency,
 		}
 		batch, ok := byTime[snap]
 		if !ok {
-			continue
+			return nil
 		}
 		amt, err := silver.DecimalOrZero(amountStr)
 		if err != nil {
@@ -288,6 +275,9 @@ SELECT snapshot_at, account_external_id, currency,
 			BalanceKind:       canonical.BalanceKindCurrent,
 			Amount:            amt,
 		})
+		return nil
+	}, w.Start, w.End); err != nil {
+		return err
 	}
-	return rows.Err()
+	return nil
 }

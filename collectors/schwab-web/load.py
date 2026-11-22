@@ -29,8 +29,9 @@ Idempotency:
     filename, the `logical_doc_key`) parsed under the current parser
     generation, so re-downloads of the same logical document are
     skipped, whatever rows its parse yielded. Tx-history exports are
-    skipped once they have transaction rows. Use --reparse to force re-ingestion of a logical
-    document (deletes by logical_doc_key, then re-inserts).
+    skipped once they have transaction rows. Use --reparse to force
+    re-ingestion of a logical document (deletes by logical_doc_key, then
+    re-inserts).
   * The statement snapshot tables are keyed by account and the
     period end a statement prints; the first statement to write a
     key owns it (see _write_statement_snapshots).
@@ -44,7 +45,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import contextlib
 import hashlib
 import json
 import logging
@@ -53,30 +53,78 @@ import re
 import sqlite3
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor
-from concurrent.futures.process import BrokenProcessPool
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from collectorkit import bronze, cli, silver, srcfp
+from collectorkit import (
+    bronze, cli, derivations, extract, parsecache, rebuild, silver, srcfp,
+)
 from collectorkit.parse import iso_date_to_epoch
 
+import extraction
+import form_1099b
+import letters
+import more_detail
 import pdf_parsers as pp
+import realized_reports
+import stmt_parse
 import tax_form_parsers as tf
 from numparse import parse_amount
 
-# `parser_generations` (migration 0005) records which generation of the
-# document parsers produced the rows in hand. A stale one implies
-# `--reparse` for the whole invocation — the single lever the run gate, the
-# per-document gates and the per-document deletes all already read — plus a
-# purge of the statement snapshot tables, which have no delete path of their
-# own, and of the parse markers, which vouch for the old generation.
+# Each document kind is a scope (PASSES). Its generation is the kind's code
+# and the keys of the extractions it reads: an engine upgrade moves it as a
+# parser edit does. A pass records each document it parses, the copy it
+# read, under its generation in `document_derivations`
+# (collectorkit.derivations, migration 0015), beside the document's parse
+# marker. A parse that fails is recorded with no rows and gets no marker.
+# A kind holding a record under another generation has moved: the load
+# purges that kind's markers (and, for statements, the snapshot tables)
+# and re-derives that kind's documents from every run; the rest of the
+# walk is not repeated. A load that fails nowhere then drops the kind's
+# records under another generation (_drop_older_records): the copies the
+# re-derive did not read again. The kind then reads as current.
 #
-# One fingerprint over both parsers rather than one each: they are edited
-# together as often as not, a false purge costs a re-parse of an archive the
-# run is walking anyway, and a missed one costs a duplicated row.
-DOCUMENT_GENERATION_SCOPE = "documents"
-DOCUMENT_GENERATION = srcfp.parser_fingerprint([pp, tf], ("pypdfium2",))
+# The walk is how a run's manifest and its exports become rows. It is not
+# a set of documents, so its stamp is the `documents` scope of
+# `parser_generations` (migration 0005). A migration that changes the walk
+# clears the stamp, and an empty silver has none. A stale walk implies
+# `--reparse` for the whole invocation — the single lever the run gate,
+# the per-document gates and the per-document deletes all already read —
+# plus a purge of the statement snapshot tables, which have no delete path
+# of their own, and of the parse markers, which vouch for an older reading.
+WALK_SCOPE = "documents"
+WALK_GENERATION = "1"
+
+
+def _generation(fingerprint: str, *extractors) -> str:
+    """A kind's generation: its code's fingerprint and the extraction
+    keys of what it reads."""
+    parts = [fingerprint, *(extract.extraction_key(e) for e in extractors)]
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:32]
+
+
+GENERATIONS = {
+    "statement": _generation(
+        srcfp.parser_fingerprint([stmt_parse], python=False),
+        extraction.TEXT),
+    "third_party_distribution": _generation(
+        srcfp.parser_fingerprint([letters], python=False), extraction.TEXT),
+    "form_1099b": _generation(
+        srcfp.parser_fingerprint([form_1099b], python=False)),
+    "realized_report": _generation(
+        srcfp.parser_fingerprint([realized_reports], python=False),
+        extraction.TEXT, extraction.WORDS),
+}
+
+# What a `load --force` fills that an incremental load leaves empty in
+# rows loaded before: (level, what) pairs, extended by hand in the change
+# that leaves such rows (collectorkit.rebuild.rebuild_advice).
+REBUILD_ADVICE = (
+    (1, "the More dialog's detail on its tx-history rows"),
+)
+REBUILD_COMMAND = "schwab-web load --force"
 
 # Written exclusively by the statement passes, and keyed on parser output
 # (`as_of_date` / `period_end`, `instrument_key`), so a moved capture
@@ -144,7 +192,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help=("Re-parse every document (one copy per logical "
               "document), even one already parsed under the current "
               "parser generation. Its rows are replaced once the new "
-              "parse succeeds. A changed parser implies it."),
+              "parse succeeds. A changed parser re-parses its own "
+              "kind's documents by itself."),
     )
     p.add_argument(
         "--workers", type=int, default=None,
@@ -160,24 +209,26 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 # ============================================================
-# Parallel-parse worker
+# Parsing: one pool and one parse cache per load
 # ============================================================
 #
-# Module-level so ProcessPoolExecutor can pickle it. Imports
-# pdf_parsers afresh in each worker (Python's fork semantics
-# share heap state, but spawn on macOS does not — write code
-# that works under both).
+# A document is parsed by a module-level function of one argument, so a
+# process pool pickles it under spawn as well as under fork. The statement
+# pass parses its PDFs through the pool; the other passes parse each
+# document in turn. Every parse reads and fills the parse cache, keyed on
+# the document's content and file name and on its kind's generation.
 
-def _parse_pdf_worker(args: tuple[str, int]) -> dict:
-    """Worker target: parse one PDF, return the parsed dict
-    (or `{"_error": "<repr>"}` on failure so the parent can log
-    and continue rather than crashing the whole pool).
-    """
-    pdf_path, year_hint = args
+def _parse_worker(job: tuple) -> object:
+    """Parse one document: `job` is (pass, path, the parse's arguments,
+    the extraction cache). A failure comes back as {"_error": repr,
+    "_message": text} so the parent can log it and go on rather than
+    the pool crashing."""
+    kind, path, args, extract_dir = job
+    extraction.CACHE_DIR = extract_dir
     try:
-        return pp.parse_statement_pdf(pdf_path, statement_year=year_hint)
+        return PASSES[kind].parse(path, *args)
     except Exception as e:
-        return {"_error": repr(e)}
+        return {"_error": repr(e), "_message": str(e)}
 
 
 def _resolve_worker_count(workers: int | None) -> int:
@@ -189,84 +240,14 @@ def _resolve_worker_count(workers: int | None) -> int:
     return os.cpu_count() or 1
 
 
-def _parse_chunksize(n_tasks: int) -> int:
-    """Group a few PDFs per pool hand-off on large runs so per-task IPC
-    doesn't dominate the tens-of-ms PDFium extraction; a chunksize of 1
-    keeps latency low on the small batches later bronze runs produce."""
-    return max(1, min(8, n_tasks // 20))
-
-
-class _ParsePoolManager:
-    """A process pool shared across an invocation's bronze runs that heals
-    after a worker crash.
-
-    The executor is created lazily on first use and reused for every run
-    (one pool per invocation instead of one per run). If a parse batch
-    trips BrokenProcessPool — a worker died, which under heavy host
-    contention can happen — the poisoned executor is discarded and re-
-    raised so the caller can retry that batch serially; the next batch
-    spins up a fresh executor. A transient worker death therefore
-    degrades to a slower run instead of failing the whole load."""
-
-    def __init__(self, worker_count: int):
-        self._worker_count = worker_count
-        self._pool: ProcessPoolExecutor | None = None
-
-    def map(self, fn, tasks: list, chunksize: int) -> list:
-        if self._pool is None:
-            self._pool = ProcessPoolExecutor(max_workers=self._worker_count)
-        try:
-            return list(self._pool.map(fn, tasks, chunksize=chunksize))
-        except BrokenProcessPool:
-            self.shutdown()  # drop the poisoned executor; next map recreates
-            raise
-
-    def shutdown(self) -> None:
-        if self._pool is not None:
-            self._pool.shutdown(wait=False, cancel_futures=True)
-            self._pool = None
-
-    def __enter__(self) -> _ParsePoolManager:
-        return self
-
-    def __exit__(self, *exc) -> bool:
-        self.shutdown()
-        return False
-
-
-def _parse_statements(parse_jobs: list[dict],
-                      pool: _ParsePoolManager | None,
-                      workers: int | None) -> list[dict]:
-    """Parse every collected statement PDF, returning results aligned
-    positionally with `parse_jobs`.
-
-    workers == 1 keeps the parse in-process (the path unit tests take so
-    a monkeypatched parser is honoured — pool workers run in subprocesses
-    that don't inherit the patch). Otherwise the work fans across a
-    process pool: a caller-supplied `pool` is reused across bronze runs
-    (one pool per invocation instead of one per run), and when none is
-    supplied a run-local pool is created so direct callers still get
-    parallelism. map preserves input order, so the serial insert phase —
-    and the resulting silver — is identical regardless of worker count.
-
-    If the shared pool loses a worker mid-batch, this run's PDFs are
-    re-parsed serially in-process so the run still completes; the manager
-    rebuilds the pool for later runs."""
-    tasks = [(j["pdf_path"], j["year_hint"]) for j in parse_jobs]
-    if workers != 1 and pool is not None:
-        try:
-            return pool.map(_parse_pdf_worker, tasks, _parse_chunksize(len(tasks)))
-        except BrokenProcessPool:
-            log.warning("parse pool lost a worker; parsing this run's %d "
-                        "PDF(s) serially", len(tasks))
-            return [_parse_pdf_worker(t) for t in tasks]
-    worker_count = 1 if workers == 1 else min(
-        _resolve_worker_count(workers), len(parse_jobs))
-    if worker_count == 1:
-        return [_parse_pdf_worker(t) for t in tasks]
-    with ProcessPoolExecutor(max_workers=worker_count) as local_pool:
-        return list(local_pool.map(_parse_pdf_worker, tasks,
-                                   chunksize=_parse_chunksize(len(tasks))))
+def _parse_pool(cache: parsecache.ParseCache | None,
+                workers: int | None) -> parsecache.ParsePool:
+    """The parse pool of a load: in-process with --workers 1 (the path
+    unit tests take so a monkeypatched parser is honoured — pool workers
+    run in subprocesses that do not inherit the patch), else one worker
+    per CPU or as asked."""
+    return parsecache.ParsePool(
+        cache, 1 if workers == 1 else _resolve_worker_count(workers))
 
 
 # ============================================================
@@ -616,20 +597,34 @@ def _account_nickname(label: str | None) -> str | None:
 def load_run(conn: sqlite3.Connection, run_dir: Path,
              reparse: bool = False,
              workers: int | None = None,
-             pool: _ParsePoolManager | None = None,
-             seen_logical_docs: set[tuple] | None = None) -> dict:
+             pool: parsecache.ParsePool | None = None,
+             seen_logical_docs: set[tuple] | None = None, *,
+             reparse_kinds: frozenset[str] | None = None,
+             derive_only: frozenset[str] | None = None) -> dict:
     """Load one bronze-run dir. Returns a stats dict for logging.
+
+    A run is read in three steps: its documents are indexed (the dump_runs
+    row, the accounts, the documents table), the four document passes run
+    in PASSES order, and the tx-history exports are loaded.
+
+    `reparse` re-walks the run as `--reparse` does: every pass parses its
+    documents whatever their parse markers say, and replaces their rows.
+    `reparse_kinds` names the passes that do so (default: all of them
+    under `reparse`, none otherwise). `derive_only` re-derives a run
+    already loaded: only the passes it names run, and the run is not
+    indexed again.
 
     `pool` and `seen_logical_docs`, when supplied by run_load, are shared
     across all of an invocation's bronze runs so each logical document
-    is parsed once. Left at their defaults (a run-local pool and a fresh
-    set) a direct call keeps a per-run scope.
+    is parsed once. Left at their defaults (a run-local, memory-cached
+    pool and a fresh set) a direct call keeps a per-run scope.
 
     A logical doc is added to `seen_logical_docs` when a pass takes it
-    up, before this run's inserts commit. run_load owns the rollback: it
-    snapshots the set before the run and restores it if the run fails, so
-    a rolled-back run never leaves a doc seen (which would wrongly skip it
-    on every later run)."""
+    up, before this run's inserts commit. A pass takes it out again when
+    the parse fails, so a later copy is parsed in its place. run_load owns
+    the rollback: it snapshots the set before the run and restores it if
+    the run fails, so a rolled-back run never leaves a doc seen (which
+    would wrongly skip it on every later run)."""
     snapshot_at = parse_snapshot_at(run_dir.name)
     stats = {
         "snapshot_at": snapshot_at,
@@ -676,13 +671,9 @@ def load_run(conn: sqlite3.Connection, run_dir: Path,
     # run-local default keeps a per-run scope for direct callers.
     if seen_logical_docs is None:
         seen_logical_docs = set()
+    if reparse_kinds is None:
+        reparse_kinds = frozenset(PASSES) if reparse else frozenset()
 
-    # Parse jobs accumulated during the manifest walk. Each entry
-    # captures everything the serial-insert phase needs (suffix,
-    # sha256, logical_doc_key, doc_date). The actual PDF parse happens
-    # in a worker pool once the walk completes — see the
-    # parallel-parse block below.
-    parse_jobs: list[dict] = []
     manifest_path = run_dir / "run.json"
     if not manifest_path.is_file():
         log.warning("no run.json in %s; skipping", run_dir)
@@ -705,9 +696,52 @@ def load_run(conn: sqlite3.Connection, run_dir: Path,
         )
         return stats
 
-    _insert_dump_run(conn, snapshot_at, run_dir)
+    own_pool = pool is None
+    if own_pool:
+        pool = _parse_pool(None, workers)
+    run = _Run(dir=run_dir, snapshot_at=snapshot_at, manifest=manifest,
+               stats=stats, seen=seen_logical_docs, pool=pool,
+               reparse_kinds=reparse_kinds,
+               extract_dir=extraction.CACHE_DIR)
+    try:
+        if derive_only is None:
+            _insert_dump_run(conn, snapshot_at, run_dir)
+            _index_documents(conn, run)
+        for kind, spec in PASSES.items():
+            if derive_only is None or kind in derive_only:
+                run_pass(conn, run, spec)
+        if derive_only is None:
+            _load_tx_history(conn, run, reparse)
+    finally:
+        if own_pool:
+            pool.close()
+    return stats
 
-    for acct in manifest.get("statements", []):
+
+@dataclass
+class _Run:
+    """One bronze run as its passes see it."""
+    dir: Path
+    snapshot_at: int
+    manifest: dict
+    stats: dict
+    seen: set[tuple]
+    pool: parsecache.ParsePool
+    # The passes that parse their documents again whatever their markers.
+    reparse_kinds: frozenset[str]
+    extract_dir: Path | None
+    # The statement pass's harvest: the first registration label and every
+    # full account number its statements print, by account.
+    registration: dict[str, str] = field(default_factory=dict)
+    numbers: dict[str, set[str]] = field(default_factory=dict)
+
+
+def _index_documents(conn: sqlite3.Connection, run: _Run) -> None:
+    """Record the run's accounts and every document of its statements
+    area in the documents table. The passes then parse the documents of
+    their kind."""
+    stats = run.stats
+    for acct in run.manifest.get("statements", []):
         suffix = acct.get("suffix")
         if not suffix:
             continue
@@ -717,7 +751,7 @@ def load_run(conn: sqlite3.Connection, run_dir: Path,
             "label": acct.get("label"),
             "nickname": nickname,
         }
-        if _upsert_account(conn, snapshot_at, suffix, acct_payload):
+        if _upsert_account(conn, run.snapshot_at, suffix, acct_payload):
             stats["accounts_inserted"] += 1
         else:
             stats["accounts_deduped"] += 1
@@ -748,7 +782,7 @@ def load_run(conn: sqlite3.Connection, run_dir: Path,
                     filename, claimed_fmt, fmt,
                 )
             _record_document(conn, stats, (
-                sha256, snapshot_at, suffix, doc_date, doc_kind, fmt,
+                sha256, run.snapshot_at, suffix, doc_date, doc_kind, fmt,
                 filename, size, canonical_json({
                     "raw_type": doc.get("type") or "Unknown",
                     "raw_doc_name": doc.get("document"),
@@ -756,186 +790,289 @@ def load_run(conn: sqlite3.Connection, run_dir: Path,
                 }),
             ))
 
-            # This walk parses only the Statement PDFs (positions,
-            # cash, transactions). The distribution letters, 1099
-            # Composite forms and realized-lot reports recorded here
-            # are parsed in their own passes below; everything else
-            # stays an opaque-blob document.
-            if doc_kind != "statement" or fmt != "pdf":
-                continue
-            pdf_path = _bronze_file(run_dir, suffix, filename, stats)
-            if pdf_path is None:
-                continue
 
-            # One gate per logical statement (account + doc_date +
-            # filename), never the sha256: Schwab regenerates PDFs per
-            # download (new sha256 each time — INTEROP.md §3). A copy
-            # already parsed in this invocation is skipped; one parsed
-            # under the current parser generation carries a parse marker
-            # and is skipped unless `--reparse`.
-            ldk = _logical_doc_key(suffix, doc_date, filename)
-            seen_key = (ldk, "statement")
-            if seen_key in seen_logical_docs:
-                stats["statements_logical_deduped"] += 1
-                continue
-            if not reparse and _is_parsed(conn, ldk, "statement"):
-                continue
-            seen_logical_docs.add(seen_key)
+# ============================================================
+# The document passes
+# ============================================================
 
-            year_hint = datetime.fromtimestamp(doc_date, tz=timezone.utc).year
-            parse_jobs.append({
-                "suffix": suffix,
-                "sha256": sha256,
-                "ldk": ldk,
-                "pdf_path": str(pdf_path),
-                "doc_date": doc_date,
-                "year_hint": year_hint,
-            })
+@dataclass(frozen=True)
+class Doc:
+    """One logical document a pass parses: its account, its key, its
+    parse-marker kind, the copy's file and manifest sha256, its date, and
+    what its parse takes besides the path. `twin` is another copy of the
+    same logical document, in another format, that is read when this
+    one does not parse."""
+    suffix: str
+    ldk: str
+    kind: str
+    path: Path
+    sha256: str
+    doc_date: int
+    args: tuple = ()
+    twin: Doc | None = None
 
-    # Parse every collected statement PDF, then insert serially. PDF
-    # text extraction (pypdfium2 → PDFium C++) is the expensive step per
-    # job; SQLite's single-writer model makes inserts serial anyway, so
-    # the gain comes from sharding the parse work across cores (see
-    # _parse_statements for the pool / serial dispatch).
-    if parse_jobs:
-        log.info("parsing %d statement PDF(s)", len(parse_jobs))
+
+@dataclass(frozen=True)
+class PassSpec:
+    """One kind of document and how a run's copies of it become rows.
+
+    `select(run, gate)` yields the run's documents of the kind, in
+    manifest order, that are due; it asks `gate(ldk, kind)` whether a
+    logical document is. `parse(path, *doc.args)` reads one copy (in a
+    pool worker, so it is module-level). `write(conn, run, doc, parsed)`
+    replaces the document's rows with the parse's and returns how many it
+    wrote. A failed parse is logged with `error_log` and counted in
+    `error_stat`; the log names the path and the error's `error_field`
+    (`_error`, its repr, or `_message`, its text).
+
+    A `batch` pass parses every selected document through the pool before
+    it writes any. `finish(conn, run)` is called at the end of every
+    run's pass, whether or not a document was due. `dedup_stat` counts
+    the copies the gate turns away because the invocation took the
+    document up already."""
+    kind: str
+    marker_kinds: tuple[str, ...]
+    select: Callable[[_Run, Callable[[str, str], bool]], Iterator[Doc]]
+    parse: Callable[..., object]
+    write: Callable[[sqlite3.Connection, _Run, Doc, object], int]
+    error_log: str
+    error_stat: str
+    error_field: str = "_message"
+    batch: bool = False
+    dedup_stat: str | None = None
+    finish: Callable[[sqlite3.Connection, _Run], None] | None = None
+
+
+def run_pass(conn: sqlite3.Connection, run: _Run, spec: PassSpec) -> None:
+    """Run one pass over one run: select its documents, parse each logical
+    document once, write its rows, mark it parsed and record its
+    derivation.
+
+    A logical document is due when the invocation has not taken it up and
+    it carries no parse marker of its kind, or when the pass re-parses.
+    It is taken up as it is selected, and given back when its parse
+    fails, so a later copy is parsed in its place. A pass deletes a
+    document's rows only once its parse succeeded."""
+    stats = run.stats
+    reparse = spec.kind in run.reparse_kinds
+
+    def gate(ldk: str, kind: str) -> bool:
+        if (ldk, kind) in run.seen:
+            if spec.dedup_stat:
+                stats[spec.dedup_stat] += 1
+            return False
+        return reparse or not _is_parsed(conn, ldk, kind)
+
+    selected: list[Doc] = []
+    for doc in spec.select(run, gate):
+        run.seen.add((doc.ldk, doc.kind))
+        if spec.batch:
+            selected.append(doc)
+        else:
+            _derive(conn, run, spec, *_resolve(run, spec, doc))
+    if selected:
+        log.info("parsing %d %s document(s)", len(selected), spec.kind)
         t0 = time.monotonic()
-        parsed_results = _parse_statements(parse_jobs, pool, workers)
+        for doc in selected:
+            run.pool.enqueue(*_parse_job(run, spec, doc))
+        run.pool.dispatch()
+        results = [_resolve(run, spec, doc) for doc in selected]
         elapsed = time.monotonic() - t0
         log.info(
-            "parsed %d PDF(s) in %.2fs (%.3fs/PDF wall)",
-            len(parse_jobs), elapsed, elapsed / max(1, len(parse_jobs)),
+            "parsed %d document(s) in %.2fs (%.3fs/document wall)",
+            len(selected), elapsed, elapsed / max(1, len(selected)),
         )
+        for doc, parsed in results:
+            _derive(conn, run, spec, doc, parsed)
+    # Also when no document was due: a finish may read more than this
+    # run's parses (the statement pass's tax-form fallback reads the
+    # documents table).
+    if spec.finish is not None:
+        spec.finish(conn, run)
 
-        # Harvest the account-registration label from one
-        # parsed statement per account. The label is stable
-        # across statements for a given account; the first
-        # non-null value seen is kept. The wealthdb gold
-        # adapter keys off this string (verbatim) for its
-        # `tax_wrapper` enum mapping — see migration 0003
-        # comment + DESIGN.md §8.
-        registration_by_acct: dict[str, str] = {}
-        # Full account numbers from the page-1 headers, ALL
-        # values per account — _apply_account_number writes the
-        # payload key only when every statement agrees (see
-        # INTEROP.md §1 for the api↔web bridge it feeds).
-        numbers_by_acct: dict[str, set[str]] = {}
 
-        for job, parsed in zip(parse_jobs, parsed_results, strict=True):
-            if parsed.get("_error"):
-                log.warning(
-                    "PDF parse failed for %s: %s",
-                    job["pdf_path"], parsed["_error"],
-                )
-                stats["pdf_parse_errors"] += 1
-                continue
+def _parse_job(run: _Run, spec: PassSpec, doc: Doc) -> tuple:
+    """(cache key, namespace, worker, job) of one document's parse. The
+    key is the copy's content, its file name and the parse's arguments:
+    all a parse reads. The namespace is the kind's generation."""
+    key = hashlib.sha256("|".join(
+        [run.pool.sha_for(doc.path), doc.path.name, *map(str, doc.args)]
+    ).encode("utf-8")).hexdigest()
+    return (key, GENERATIONS[spec.kind], _parse_worker,
+            (spec.kind, str(doc.path), doc.args, run.extract_dir))
 
-            reg = parsed.get("account_registration")
-            if reg and job["suffix"] not in registration_by_acct:
-                registration_by_acct[job["suffix"]] = reg
 
-            num = parsed.get("account_number")
-            if num:
-                numbers_by_acct.setdefault(job["suffix"], set()).add(num)
+def _resolve(run: _Run, spec: PassSpec, doc: Doc) -> tuple[Doc, object]:
+    """The copy read and its parse: `doc`, or its twin when `doc` does
+    not parse."""
+    parsed = run.pool.resolve(*_parse_job(run, spec, doc))
+    if parsecache.is_error(parsed) and doc.twin is not None:
+        log.warning(spec.error_log + "; reading %s instead", doc.path,
+                    parsed[spec.error_field], doc.twin.path.name)
+        return _resolve(run, spec, doc.twin)
+    return doc, parsed
 
-            _reparse_delete(conn, job["ldk"], reparse, stats)
-            stats["transactions_inserted"] += _insert_statement_transactions(
-                conn, job["suffix"], parsed.get("transactions", []),
-                job["sha256"], job["ldk"],
-            )
 
-            period_end_ts = (
-                iso_date_to_epoch(parsed.get("period_end"))
-                or job["doc_date"]
-            )
-            period_start_ts = (
-                iso_date_to_epoch(parsed.get("period_start"))
-                or job["doc_date"]
-            )
-            if period_end_ts != job["doc_date"]:
-                log.info("statement %s prints a period end other than its "
-                         "manifest date; its rows take the printed one",
-                         job["ldk"])
+def _derive(conn: sqlite3.Connection, run: _Run, spec: PassSpec, doc: Doc,
+            parsed: object) -> None:
+    """Write one parsed document, mark it and record the copy read under
+    the kind's generation. A failed one is logged, recorded with no rows
+    and given back unmarked: a later copy is parsed in its place, and the
+    kind's next generation reads it again."""
+    if parsecache.is_error(parsed):
+        log.warning(spec.error_log, doc.path, parsed[spec.error_field])
+        run.stats[spec.error_stat] += 1
+        run.seen.discard((doc.ldk, doc.kind))
+        derivations.record_derivation(conn, doc.sha256, spec.kind,
+                                      GENERATIONS[spec.kind], 0)
+        return
+    rows = spec.write(conn, run, doc, parsed)
+    _mark_parsed(conn, doc.ldk, doc.kind, doc.sha256)
+    derivations.record_derivation(conn, doc.sha256, spec.kind,
+                                  GENERATIONS[spec.kind], rows)
 
-            _check_account_value(parsed, job["ldk"])
-            _write_statement_snapshots(conn, job, parsed, period_start_ts,
-                                       period_end_ts, stats)
-            _mark_parsed(conn, job["ldk"], "statement", job["sha256"])
 
-        # Pin the account-registration label onto each
-        # account's accounts-table row. Stable across runs —
-        # the column drifts only if Schwab restyles the
-        # registration line.
-        for suffix, reg in registration_by_acct.items():
-            conn.execute(
-                "UPDATE accounts SET account_registration = ?"
-                " WHERE account_external_id = ?",
-                (reg, suffix),
-            )
-        n_updated = len(registration_by_acct)
+# ---- Statements ------------------------------------------------------
 
-        # Pin the full account number into each account's
-        # payload (consistent-or-absent — see
-        # _apply_account_number). A key set here where none was
-        # stored rests only on this run's parses — bronze may
-        # hold older, disagreeing statements this run never saw
-        # (dump-run / logical-doc gated, or cleared by an earlier
-        # conflict) — so the suffix is queued for re-verification
-        # against the full bronze evidence
-        # (_reconcile_account_numbers in run_load). Accounts
-        # whose statements were all ingested by earlier
-        # invocations reach the same pass via their absent key.
-        for suffix, nums in numbers_by_acct.items():
-            if (len(nums) == 1
-                    and _stored_account_number(conn, suffix) is None):
-                stats["account_numbers_pinned"].add(suffix)
-            if _apply_account_number(conn, suffix, nums):
-                stats["account_number_updated"] += 1
+def _select_statements(run: _Run, gate) -> Iterator[Doc]:
+    """The run's statement PDFs (positions, cash, transactions). One
+    gate per logical statement (account + doc_date + filename), never the
+    sha256: Schwab regenerates PDFs per download (new sha256 each time —
+    INTEROP.md §3). A document the index passed over (no filename or
+    sha256, no date) is passed over here too, and the index warned."""
+    for suffix, doc in _account_documents(run.manifest, "statement"):
+        filename = doc.get("filename")
+        sha256 = doc.get("sha256")
+        if not filename or not sha256:
+            continue
+        doc_date = parse_doc_date(doc.get("date") or "")
+        if doc_date is None or _format_from_filename(filename) != "pdf":
+            continue
+        pdf_path = _bronze_file(run.dir, suffix, filename, run.stats)
+        if pdf_path is None:
+            continue
+        ldk = _logical_doc_key(suffix, doc_date, filename)
+        if gate(ldk, "statement"):
+            year_hint = datetime.fromtimestamp(doc_date, tz=timezone.utc).year
+            yield Doc(suffix, ldk, "statement", pdf_path, sha256, doc_date,
+                      (year_hint,))
 
-        # Tax-form fallback: for any account whose statements
-        # didn't surface a registration (e.g. a brand-new
-        # account that hasn't received a monthly statement
-        # yet, or one whose statement format the parser does not
-        # handle yet), check the documents table for the cleanest
-        # tax-form signal — Schwab's 5498 / 5498-ESA filenames
-        # carry the account type by definition (the forms are
-        # only ever issued for IRA / ESA accounts).
-        null_rows = conn.execute(
-            "SELECT account_external_id FROM accounts"
-            " GROUP BY account_external_id"
-            " HAVING COUNT(account_registration) = 0"
-        ).fetchall()
-        for (suffix,) in null_rows:
-            reg = _registration_from_tax_forms(conn, suffix)
-            if reg is None:
-                continue
-            conn.execute(
-                "UPDATE accounts SET account_registration = ?"
-                " WHERE account_external_id = ?",
-                (reg, suffix),
-            )
-            n_updated += 1
-        stats["account_registration_updated"] = n_updated
 
-    # 3rd-Party-Distribution letters, 1099-Composite tax forms and the
-    # realized-lot reports. All are already in the documents table
-    # (recorded in the statement walk above) but skipped there for row
-    # parsing; these passes add their rows. They iterate the same
-    # manifest["statements"] documents and gate on the logical_doc_key
-    # parse markers, so they're idempotent across runs and sha256
-    # re-downloads.
-    _load_distribution_letters(conn, run_dir, manifest, reparse, stats,
-                               seen_logical_docs)
-    _load_1099b_forms(conn, run_dir, manifest, reparse, stats,
-                      seen_logical_docs)
-    _load_realized_reports(conn, run_dir, manifest, reparse, stats,
-                           seen_logical_docs)
+def _parse_statement(path: str, year_hint: int) -> dict:
+    return pp.parse_statement_pdf(path, statement_year=year_hint)
 
-    # Tx-history exports: per-account CSV/JSON/XML. JSON is the
-    # canonical source for silver rows;
-    # CSV/XML are stored as opaque documents for traceability.
-    transactions_dir = run_dir / "transactions"
-    for acct in manifest.get("transactions", []):
+
+def _write_statement(conn: sqlite3.Connection, run: _Run, doc: Doc,
+                     parsed: dict) -> int:
+    """A parsed statement's transactions and snapshots; returns the
+    transactions, positions and cash balances written. Its registration
+    label and account number are harvested for the run's accounts."""
+    stats = run.stats
+    reg = parsed.get("account_registration")
+    if reg and doc.suffix not in run.registration:
+        run.registration[doc.suffix] = reg
+    num = parsed.get("account_number")
+    if num:
+        run.numbers.setdefault(doc.suffix, set()).add(num)
+
+    _reparse_delete(conn, doc.ldk, "statement" in run.reparse_kinds, stats)
+    inserted = _insert_statement_transactions(
+        conn, doc.suffix, parsed.get("transactions", []),
+        doc.sha256, doc.ldk,
+    )
+    stats["transactions_inserted"] += inserted
+
+    period_end_ts = (
+        iso_date_to_epoch(parsed.get("period_end")) or doc.doc_date
+    )
+    period_start_ts = (
+        iso_date_to_epoch(parsed.get("period_start")) or doc.doc_date
+    )
+    if period_end_ts != doc.doc_date:
+        log.info("statement %s prints a period end other than its "
+                 "manifest date; its rows take the printed one", doc.ldk)
+
+    _check_account_value(parsed, doc.ldk)
+    return inserted + _write_statement_snapshots(
+        conn, {"suffix": doc.suffix, "ldk": doc.ldk, "sha256": doc.sha256},
+        parsed, period_start_ts, period_end_ts, stats)
+
+
+def _harvest_account_facts(conn: sqlite3.Connection, run: _Run) -> None:
+    """Pin what the run's statements say about their accounts: the
+    registration label, the full account number, and a tax-form fallback
+    for an account no statement names the registration of."""
+    stats = run.stats
+    # Harvest the account-registration label from one
+    # parsed statement per account. The label is stable
+    # across statements for a given account; the first
+    # non-null value seen is kept. The wealthdb gold
+    # adapter keys off this string (verbatim) for its
+    # `tax_wrapper` enum mapping — see migration 0003
+    # comment + DESIGN.md §8. Stable across runs — the
+    # column drifts only if Schwab restyles the
+    # registration line.
+    for suffix, reg in run.registration.items():
+        conn.execute(
+            "UPDATE accounts SET account_registration = ?"
+            " WHERE account_external_id = ?",
+            (reg, suffix),
+        )
+    n_updated = len(run.registration)
+
+    # Pin the full account number into each account's
+    # payload (consistent-or-absent — see
+    # _apply_account_number; INTEROP.md §1 for the api↔web
+    # bridge it feeds). A key set here where none was
+    # stored rests only on this run's parses — bronze may
+    # hold older, disagreeing statements this run never saw
+    # (dump-run / logical-doc gated, or cleared by an earlier
+    # conflict) — so the suffix is queued for re-verification
+    # against the full bronze evidence
+    # (_reconcile_account_numbers in run_load). Accounts
+    # whose statements were all ingested by earlier
+    # invocations reach the same pass via their absent key.
+    for suffix, nums in run.numbers.items():
+        if (len(nums) == 1
+                and _stored_account_number(conn, suffix) is None):
+            stats["account_numbers_pinned"].add(suffix)
+        if _apply_account_number(conn, suffix, nums):
+            stats["account_number_updated"] += 1
+
+    # Tax-form fallback: for any account whose statements
+    # didn't surface a registration (e.g. a brand-new
+    # account that hasn't received a monthly statement
+    # yet, or one whose statement format the parser does not
+    # handle yet), check the documents table for the cleanest
+    # tax-form signal — Schwab's 5498 / 5498-ESA filenames
+    # carry the account type by definition (the forms are
+    # only ever issued for IRA / ESA accounts).
+    null_rows = conn.execute(
+        "SELECT account_external_id FROM accounts"
+        " GROUP BY account_external_id"
+        " HAVING COUNT(account_registration) = 0"
+    ).fetchall()
+    for (suffix,) in null_rows:
+        reg = _registration_from_tax_forms(conn, suffix)
+        if reg is None:
+            continue
+        conn.execute(
+            "UPDATE accounts SET account_registration = ?"
+            " WHERE account_external_id = ?",
+            (reg, suffix),
+        )
+        n_updated += 1
+    stats["account_registration_updated"] = n_updated
+
+
+def _load_tx_history(conn: sqlite3.Connection, run: _Run,
+                     reparse: bool) -> None:
+    """The run's tx-history exports: per-account CSV/JSON/XML. JSON is
+    the canonical source for silver rows; CSV/XML are stored as opaque
+    documents for traceability."""
+    stats = run.stats
+    transactions_dir = run.dir / "transactions"
+    for acct in run.manifest.get("transactions", []):
         suffix = acct.get("suffix")
         if not suffix:
             continue
@@ -944,7 +1081,7 @@ def load_run(conn: sqlite3.Connection, run_dir: Path,
             continue
         # Optional per-account More-detail sidecar (written by
         # download.py's default per-row detail pass, unless
-        # --no-more-detail). Its fields are merged into matching
+        # --no-more-detail). Its parsed dialogs go into matching
         # transactions' payload.
         more_details = _load_more_details(acct_dir)
         for export in acct.get("exports", []):
@@ -957,7 +1094,7 @@ def load_run(conn: sqlite3.Connection, run_dir: Path,
                             export)
                 continue
             _record_document(conn, stats, (
-                sha256, snapshot_at, suffix, snapshot_at,
+                sha256, run.snapshot_at, suffix, run.snapshot_at,
                 "tx_history_export", fmt, filename, size,
                 canonical_json({
                     "raw_type": "Transaction History Export",
@@ -984,7 +1121,7 @@ def load_run(conn: sqlite3.Connection, run_dir: Path,
             # export already loaded; INSERT OR IGNORE in
             # _insert_tx_history_transactions is the row-level
             # dedup backstop.
-            tx_ldk = _logical_doc_key(suffix, snapshot_at, filename)
+            tx_ldk = _logical_doc_key(suffix, run.snapshot_at, filename)
             if not _gate_logical_doc(conn, tx_ldk, reparse):
                 continue
             try:
@@ -1001,18 +1138,18 @@ def load_run(conn: sqlite3.Connection, run_dir: Path,
             )
             stats["transactions_inserted"] += n
 
-    return stats
-
 
 def _load_more_details(acct_dir: Path) -> dict:
-    """Return a {row_key: detail_dict} map of "More"-modal scrape
-    results for this tx-history account, or {} when the sidecar
-    is absent.
+    """Return a {row_key: detail_dict} map of the "More" dialogs of
+    this tx-history account that parse to a non-empty dict, or {} when
+    the sidecar is absent.
 
     download.py's per-row detail pass (default; --no-more-detail skips)
     writes `<acct_dir>/more-details.json` as a list of
-    `{"row_key": "...", "fields": {...}}` records. row_key is a
-    deterministic SHA-256 prefix over the row's promoted columns
+    `{"row_key", "row_cells", "fields", "raw_text"}` records. The
+    dialog is parsed here from `raw_text` (more_detail.parse); the
+    record's `fields` stays empty and is not read. row_key is a deterministic SHA-256
+    prefix over the row's promoted columns
     (date|amount|description|symbol|action) that the loader can
     re-derive from the JSON export to merge details in. See
     download._scrape_more_details for the row_key derivation.
@@ -1029,8 +1166,11 @@ def _load_more_details(acct_dir: Path) -> dict:
     out = {}
     for entry in entries:
         key = entry.get("row_key")
-        fields = entry.get("fields")
-        if key and isinstance(fields, dict):
+        raw_text = entry.get("raw_text")
+        if not key or not isinstance(raw_text, str):
+            continue
+        fields = more_detail.parse(raw_text)
+        if fields:
             out[key] = fields
     log.info("loaded %d more-detail record(s) from %s", len(out), path)
     return out
@@ -1075,10 +1215,12 @@ def _insert_tx_history_transactions(conn: sqlite3.Connection,
     delete all rows for a logical export without touching other
     sources.
 
-    If `more_details[row_key]` exists for a row, its key-value
-    pairs are merged into the row's `payload` JSON under a
-    nested `_more` key — silver consumers can pluck e.g.
-    `json_extract(payload, '$._more.Settle Date')`.
+    If `more_details[row_key]` exists for a row, the parsed dialog is
+    stored in the row's `payload` JSON under a nested `_more` key —
+    silver consumers can pluck e.g.
+    `json_extract(payload, '$._more.settle_date')`. A row an earlier
+    export already loaded takes the dialog when it holds none (no
+    `_more`, or an empty one); a row that holds one keeps it.
 
     The ordinal in the activity_id counts only the earlier rows of the
     export that share the row's hashed fields (date, amount,
@@ -1088,6 +1230,7 @@ def _insert_tx_history_transactions(conn: sqlite3.Connection,
     them while two genuine same-day twins stay apart.
     """
     inserted = 0
+    filled = 0
     ordinals: dict[tuple, int] = {}
     for idx, tx in enumerate(transactions):
         date_str = tx.get("Date") or ""
@@ -1114,28 +1257,144 @@ def _insert_tx_history_transactions(conn: sqlite3.Connection,
         )
         # Merge any matching More-modal detail into payload.
         payload_dict = dict(tx)
-        row_key = _tx_history_row_key(tx)
-        if row_key in more_details:
-            payload_dict["_more"] = more_details[row_key]
-        inserted += _insert_transaction(conn, (
+        detail = more_details.get(_tx_history_row_key(tx))
+        if detail:
+            payload_dict["_more"] = detail
+        n = _insert_transaction(conn, (
             activity_id, timestamp, account_external_id,
             tx.get("Action") or "Unknown", tx.get("Symbol") or None,
             "tx_history_json", source_sha256, logical_doc_key,
-            canonical_json(payload_dict),
-        ))
+        ), payload_dict)
+        inserted += n
+        if not n and detail:
+            filled += _fill_more_detail(conn, activity_id, detail)
+    if filled:
+        log.info("filled More detail on %d earlier row(s)", filled)
     return inserted
 
 
-def _insert_transaction(conn: sqlite3.Connection, row: tuple) -> int:
+def _fill_more_detail(conn: sqlite3.Connection, activity_id: str,
+                      detail: dict) -> int:
+    """Store `detail` as `_more` on the stored tx-history row
+    `activity_id` when that row holds no detail (no `_more`, or an
+    empty one). Returns 1 when the row was filled, else 0."""
+    row = conn.execute(
+        "SELECT payload FROM transactions"
+        " WHERE activity_id = ? AND source = 'tx_history_json'",
+        (activity_id,),
+    ).fetchone()
+    if row is None:
+        return 0
+    payload = json.loads(row[0])
+    if payload.get("_more"):
+        return 0
+    payload["_more"] = detail
+    conn.execute("UPDATE transactions SET payload = ?"
+                 " WHERE activity_id = ? AND source = 'tx_history_json'",
+                 (canonical_json(payload), activity_id))
+    return 1
+
+
+def _insert_transaction(conn: sqlite3.Connection, row: tuple,
+                        payload: dict) -> int:
     """INSERT OR IGNORE one `transactions` row: (activity_id, timestamp,
     account_external_id, kind, instrument_key, source, source_sha256,
-    logical_doc_key, payload). Returns 1 when it was inserted, else 0."""
+    logical_doc_key), its payload and the payload's columns
+    (_transaction_columns). Returns 1 when it was inserted, else 0."""
     return conn.execute(
         "INSERT OR IGNORE INTO transactions"
         " (activity_id, timestamp, account_external_id, kind,"
         "  instrument_key, source, source_sha256, logical_doc_key,"
-        "  payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", row,
+        "  payload, amount, quantity, price, description, action)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (*row, canonical_json(payload), *_transaction_columns(payload)),
     ).rowcount
+
+
+# Whitespace as Go's strings.TrimSpace reads it: the gold adapter read
+# these figures and words out of the payload, and the columns hold what it
+# read.
+_GO_SPACE = ("\t\n\v\f\r \x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004"
+             "\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f"
+             "\u205f\u3000")
+_NUMBER_KEYS = ("amount", "quantity", "price", "market_value", "cash_amount")
+_STRING_KEYS = ("Amount", "Quantity", "Price")
+_DECIMAL_RE = re.compile(r"(?=.*[0-9])[0-9]*\.?[0-9]*")
+
+
+def _is_number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _number_text(v) -> str | None:
+    """A JSON number as the payload's JSON prints it."""
+    return json.dumps(v) if _is_number(v) else None
+
+
+def _figure_text(v) -> str | None:
+    """A tx-history export's figure ("$1,000.00", "-$5.00", "($1.00)")
+    as decimal text: the "$", the thousands commas and the spaces taken
+    off, parentheses or a leading minus made one minus; None for a figure
+    that is then no decimal."""
+    if not isinstance(v, str):
+        return None
+    s = v.strip(_GO_SPACE)
+    negative = len(s) >= 2 and s[0] == "(" and s[-1] == ")"
+    if negative:
+        s = s[1:-1]
+    s = s.replace("$", "").replace(",", "").replace(" ", "")
+    if s.startswith("-"):
+        negative = not negative
+        s = s[1:]
+    if not _DECIMAL_RE.fullmatch(s):
+        return None
+    return f"-{s}" if negative else s
+
+
+def _word(payload: dict, key: str) -> str | None:
+    v = payload.get(key)
+    return (v.strip(_GO_SPACE) or None) if isinstance(v, str) else None
+
+
+def _transaction_columns(payload: dict) -> tuple:
+    """(amount, quantity, price, description, action) of a transactions
+    row, from its payload in any of the three dialects: the statement's
+    numbers (`amount`), the tx-history export's strings (`Amount`), a
+    distribution letter's `market_value` or `cash_amount` where it states
+    no amount. Figures are decimal text, words as printed, trimmed. The
+    action is the movement the row states (see below).
+
+    A payload whose figure keys hold another JSON type has no figures,
+    and one whose description keys do, no description: migration 0014
+    backfills the same values from the stored payload."""
+    typed = (all(payload.get(k) is None or _is_number(payload[k])
+                  for k in _NUMBER_KEYS)
+             and all(payload.get(k) is None or isinstance(payload[k], str)
+                     for k in _STRING_KEYS))
+    amount = quantity = price = None
+    if typed:
+        amount = next((t for t in (
+            _number_text(payload.get("amount")),
+            _figure_text(payload.get("Amount")),
+            _number_text(payload.get("market_value")),
+            _number_text(payload.get("cash_amount"))) if t is not None), None)
+        quantity = (_number_text(payload.get("quantity"))
+                    or _figure_text(payload.get("Quantity")))
+        price = (_number_text(payload.get("price"))
+                 or _figure_text(payload.get("Price")))
+    description = None
+    if all(payload.get(k) is None or isinstance(payload[k], str)
+           for k in ("description", "Description")):
+        description = _word(payload, "description") or _word(payload,
+                                                              "Description")
+    # The movement the row states: the export's `Action`, a statement
+    # row's `action`, else its `category`. "Unknown" is the statement
+    # parser's word for a row whose category did not read: no movement.
+    action = next((w for w in (_word(payload, "Action"),
+                               _word(payload, "action"),
+                               _word(payload, "category"))
+                   if w and w.encode("utf-8").lower() != b"unknown"), None)
+    return amount, quantity, price, description, action
 
 
 def _insert_statement_transactions(conn: sqlite3.Connection,
@@ -1178,8 +1437,7 @@ def _insert_statement_transactions(conn: sqlite3.Connection,
             activity_id, timestamp, account_external_id,
             tx.get("category") or "Unknown", tx.get("symbol"),
             "statement_pdf", source_sha256, logical_doc_key,
-            canonical_json(tx),
-        ))
+        ), tx)
     return inserted
 
 
@@ -1211,8 +1469,8 @@ def _insert_parsed_transactions(conn: sqlite3.Connection,
             _synthesize_activity_id(account_external_id, row, idx),
             timestamp, account_external_id, row.get("kind") or "Unknown",
             row.get("instrument_key"), source, source_sha256,
-            logical_doc_key, canonical_json(row),
-        ))
+            logical_doc_key,
+        ), row)
     return inserted
 
 
@@ -1266,21 +1524,12 @@ def _mark_parsed(conn: sqlite3.Connection, ldk: str, document_kind: str,
     )
 
 
-def _load_distribution_letters(conn: sqlite3.Connection, run_dir: Path,
-                               manifest: dict, reparse: bool, stats: dict,
-                               seen_logical_docs: set[tuple]) -> None:
-    """Parse 3rd-Party-Distribution letters (doc_kind='letter', the
-    "3rd-Party-Distribution_*.PDF" filename) into transfer rows with
-    source='third_party_distribution'.
-
-    These letters are already recorded in the documents table by the
-    statement walk; this pass only adds the transaction rows. Each
-    letter is one logical document (no format twins), so the
-    logical_doc_key uses the filename directly. A letter is parsed once
-    per invocation (`seen_logical_docs`), and once per parser
-    generation: its parse marker skips it on later loads unless
-    `--reparse`, also when it yields no rows."""
-    for suffix, doc in _account_documents(manifest, "letter"):
+def _select_distribution_letters(run: _Run, gate) -> Iterator[Doc]:
+    """3rd-Party-Distribution letters (doc_kind='letter', the
+    "3rd-Party-Distribution_*.PDF" filename). Each letter is one logical
+    document (no format twins), so the logical_doc_key uses the filename
+    directly."""
+    for suffix, doc in _account_documents(run.manifest, "letter"):
         filename = doc.get("filename") or ""
         if (not filename.startswith("3rd-Party-Distribution")
                 or _format_from_filename(filename) != "pdf"):
@@ -1288,56 +1537,52 @@ def _load_distribution_letters(conn: sqlite3.Connection, run_dir: Path,
         doc_date = _document_date(doc)
         if doc_date is None:
             continue
-        path = _bronze_file(run_dir, suffix, filename, stats)
+        path = _bronze_file(run.dir, suffix, filename, run.stats)
         if path is None:
             continue
         ldk = _logical_doc_key(suffix, doc_date, filename)
-        seen_key = (ldk, "third_party_distribution")
-        if seen_key in seen_logical_docs or (
-                not reparse and _is_parsed(conn, ldk,
-                                           "third_party_distribution")):
-            continue
-        seen_logical_docs.add(seen_key)
-        try:
-            rows = pp.parse_distribution_pdf(path)
-        except Exception as e:
-            log.warning("distribution parse failed for %s: %s", path, e)
-            stats["distribution_parse_errors"] += 1
-            continue
-        # Delete only after a successful parse, so a failure can't
-        # drop the prior rows with no replacement.
-        _reparse_delete(conn, ldk, reparse, stats)
-        sha256 = doc.get("sha256") or ""
-        n = _insert_parsed_transactions(
-            conn, suffix, rows, "third_party_distribution", sha256, ldk,
-        )
-        stats["transactions_inserted"] += n
-        stats["distribution_transactions_inserted"] += n
-        _mark_parsed(conn, ldk, "third_party_distribution", sha256)
+        if gate(ldk, "third_party_distribution"):
+            yield Doc(suffix, ldk, "third_party_distribution", path,
+                      doc.get("sha256") or "", doc_date)
 
 
-def _load_1099b_forms(conn: sqlite3.Connection, run_dir: Path,
-                      manifest: dict, reparse: bool, stats: dict,
-                      seen_logical_docs: set[tuple]) -> None:
-    """Parse 1099 Composite tax forms (doc_kind='tax_form', document
-    name containing "1099 Composite") into sale rows with
-    source='form_1099b'.
+def _parse_distribution_letter(path: str) -> list[dict]:
+    return pp.parse_distribution_pdf(path)
+
+
+def _write_distribution_letter(conn: sqlite3.Connection, run: _Run,
+                               doc: Doc, rows: list[dict]) -> int:
+    """A letter's transfer rows, source='third_party_distribution';
+    returns how many were written."""
+    stats = run.stats
+    _reparse_delete(conn, doc.ldk,
+                    "third_party_distribution" in run.reparse_kinds, stats)
+    n = _insert_parsed_transactions(
+        conn, doc.suffix, rows, "third_party_distribution", doc.sha256,
+        doc.ldk,
+    )
+    stats["transactions_inserted"] += n
+    stats["distribution_transactions_inserted"] += n
+    return n
+
+
+def _select_1099b_forms(run: _Run, gate) -> Iterator[Doc]:
+    """1099 Composite tax forms (doc_kind='tax_form', document name
+    containing "1099 Composite"), one per logical form.
 
     Schwab ships each logical form as a PDF plus, where it offers them,
     machine-readable XML and CSV twins. The twins share a base filename;
     the PDF is named apart. All three share the manifest row (date and
-    document name). The XML is preferred, the CSV is the fallback, and the
-    logical_doc_key is keyed on the **base filename (without extension)**
-    so the XML and CSV twins dedup to one set of rows. A PDF without an XML or
-    CSV on its manifest row is logged as a coverage gap (no
-    machine-readable lot detail to parse).
-
-    A form is parsed once per invocation (`seen_logical_docs`), and once
-    per parser generation: its parse marker skips it on later loads
-    unless `--reparse`, also when it holds no 1099-B lots."""
+    document name). The XML is preferred, and the CSV is read when the XML
+    is not on disk or does not parse. The logical_doc_key is keyed on the
+    **base filename (without extension)** so the XML and CSV twins dedup
+    to one set of rows. A PDF without an XML or CSV on its manifest row
+    is logged as a coverage gap (no machine-readable lot detail to
+    parse)."""
+    stats = run.stats
     twins: dict[tuple[str, str], dict[str, dict]] = {}
     pdfs: list[tuple[str, dict]] = []
-    for suffix, doc in _account_documents(manifest, "tax_form"):
+    for suffix, doc in _account_documents(run.manifest, "tax_form"):
         if "1099 Composite" not in (doc.get("document") or ""):
             continue
         filename = doc.get("filename") or ""
@@ -1358,41 +1603,48 @@ def _load_1099b_forms(conn: sqlite3.Connection, run_dir: Path,
             stats["form_1099b_pdf_only"] += 1
 
     for (suffix, base), by_fmt in twins.items():
-        fmt = "xml" if "xml" in by_fmt else "csv"
-        doc = by_fmt[fmt]
-        doc_date = _document_date(doc)
+        fmts = [f for f in ("xml", "csv") if f in by_fmt]
+        doc_date = _document_date(by_fmt[fmts[0]])
         if doc_date is None:
             continue
         # Format-independent key: the XML and CSV twins share `base`,
         # so whichever is parsed first wins and the other is skipped.
         ldk = _logical_doc_key(suffix, doc_date, base)
-        seen_key = (ldk, "form_1099b")
-        if seen_key in seen_logical_docs or (
-                not reparse and _is_parsed(conn, ldk, "form_1099b")):
+        if not gate(ldk, "form_1099b"):
             continue
-        path = _bronze_file(run_dir, suffix, doc["filename"], stats)
-        if path is None:
-            continue
-        seen_logical_docs.add(seen_key)
-        try:
-            parsed = tf.parse_1099b(path, fmt)
-        except Exception as e:
-            log.warning("1099-B parse failed for %s: %s", path, e)
-            stats["form_1099b_parse_errors"] += 1
-            continue
-        sha256 = doc.get("sha256") or ""
-        # Delete only after a successful parse, so a failure can't
-        # drop the prior rows with no replacement.
-        _reparse_delete(conn, ldk, reparse, stats)
-        lots = parsed.get("lots", [])
-        n = _insert_parsed_transactions(
-            conn, suffix, lots, "form_1099b", sha256, ldk)
-        stats["transactions_inserted"] += n
-        stats["form_1099b_transactions_inserted"] += n
-        stats["closed_lots_inserted"] += _replace_closed_lots(
-            conn, ldk, "form_1099b", suffix,
-            [(_closed_lot_from_1099b(lot), lot) for lot in lots], sha256)
-        _mark_parsed(conn, ldk, "form_1099b", sha256)
+        # The XML, with the CSV as its twin; the CSV alone when the XML
+        # is not on disk.
+        form = None
+        for fmt in reversed(fmts):
+            doc = by_fmt[fmt]
+            path = _bronze_file(run.dir, suffix, doc["filename"], stats)
+            if path is not None:
+                form = Doc(suffix, ldk, "form_1099b", path,
+                           doc.get("sha256") or "", doc_date, (fmt,), form)
+        if form is not None:
+            yield form
+
+
+def _parse_1099b_form(path: str, fmt: str) -> dict:
+    return tf.parse_1099b(path, fmt)
+
+
+def _write_1099b_form(conn: sqlite3.Connection, run: _Run, doc: Doc,
+                      parsed: dict) -> int:
+    """A form's sale rows (source='form_1099b') and its closed lots;
+    returns how many of both were written."""
+    stats = run.stats
+    _reparse_delete(conn, doc.ldk, "form_1099b" in run.reparse_kinds, stats)
+    lots = parsed.get("lots", [])
+    n = _insert_parsed_transactions(
+        conn, doc.suffix, lots, "form_1099b", doc.sha256, doc.ldk)
+    stats["transactions_inserted"] += n
+    stats["form_1099b_transactions_inserted"] += n
+    written = _replace_closed_lots(
+        conn, doc.ldk, "form_1099b", doc.suffix,
+        [(_closed_lot_from_1099b(lot), lot) for lot in lots], doc.sha256)
+    stats["closed_lots_inserted"] += written
+    return n + written
 
 
 # Realized-lot reports by filename prefix: the Year-End Summary (alone,
@@ -1458,18 +1710,10 @@ def _replace_closed_lots(conn: sqlite3.Connection, ldk: str, kind: str,
     return len(lots)
 
 
-def _load_realized_reports(conn: sqlite3.Connection, run_dir: Path,
-                           manifest: dict, reparse: bool, stats: dict,
-                           seen_logical_docs: set[tuple]) -> None:
-    """Parse the realized-lot reports (Year-End Summary, Gain/Loss
-    Report; see _REALIZED_REPORT_KINDS) into `closed_lots`, and a Gain/Loss
-    Report's cost-basis methods into `cost_basis_methods`.
-
-    A report is parsed once per invocation (`seen_logical_docs`), and
-    once per parser generation: its parse marker skips it on later loads
-    unless `--reparse`, also when it holds no realized lots. Each parse
-    replaces the report's rows."""
-    for suffix, doc in _account_documents(manifest, "tax_form"):
+def _select_realized_reports(run: _Run, gate) -> Iterator[Doc]:
+    """The realized-lot reports (Year-End Summary, Gain/Loss Report; see
+    _REALIZED_REPORT_KINDS), each its own logical document."""
+    for suffix, doc in _account_documents(run.manifest, "tax_form"):
         filename = doc.get("filename") or ""
         kind = next((k for prefix, k in _REALIZED_REPORT_KINDS
                      if filename.startswith(prefix)), None)
@@ -1479,40 +1723,76 @@ def _load_realized_reports(conn: sqlite3.Connection, run_dir: Path,
         if doc_date is None:
             continue
         ldk = _logical_doc_key(suffix, doc_date, filename)
-        seen_key = (ldk, kind)
-        if seen_key in seen_logical_docs or (
-                not reparse and _is_parsed(conn, ldk, kind)):
+        if not gate(ldk, kind):
             continue
-        path = _bronze_file(run_dir, suffix, filename, stats)
+        path = _bronze_file(run.dir, suffix, filename, run.stats)
         if path is None:
             continue
-        seen_logical_docs.add(seen_key)
-        try:
-            parsed = tf.parse_realized_report_pdf(path, kind)
-        except Exception as e:
-            log.warning("realized-lot report parse failed for %s: %s",
-                        path, e)
-            stats["realized_report_parse_errors"] += 1
-            continue
-        sha256 = doc.get("sha256") or ""
-        if parsed["incomplete"]:
-            log.warning("%s: %d realized lot(s) whose amounts could not "
-                        "be read were left out", ldk, parsed["incomplete"])
-            stats["realized_lots_unreadable"] += parsed["incomplete"]
-        stats["closed_lots_inserted"] += _replace_closed_lots(
-            conn, ldk, kind, suffix,
-            [(lot, lot) for lot in parsed["lots"]], sha256)
-        conn.execute("DELETE FROM cost_basis_methods WHERE logical_doc_key = ?",
-                     (ldk,))
-        for m in parsed.get("methods", []):
-            conn.execute(
-                "INSERT INTO cost_basis_methods (logical_doc_key,"
-                " asset_class, account_external_id, as_of_date, tax_year,"
-                " method, source_sha256) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (ldk, m["asset_class"], suffix, doc_date,
-                 parsed["tax_year"], m["method"], sha256),
-            )
-        _mark_parsed(conn, ldk, kind, sha256)
+        yield Doc(suffix, ldk, kind, path, doc.get("sha256") or "",
+                  doc_date, (kind,))
+
+
+def _parse_realized_report(path: str, kind: str) -> dict:
+    return tf.parse_realized_report_pdf(path, kind)
+
+
+def _write_realized_report(conn: sqlite3.Connection, run: _Run, doc: Doc,
+                           parsed: dict) -> int:
+    """A report's rows in `closed_lots`, and a Gain/Loss Report's
+    cost-basis methods in `cost_basis_methods`; returns how many of both
+    were written. Each parse replaces the report's rows."""
+    stats = run.stats
+    if parsed["incomplete"]:
+        log.warning("%s: %d realized lot(s) whose amounts could not "
+                    "be read were left out", doc.ldk, parsed["incomplete"])
+        stats["realized_lots_unreadable"] += parsed["incomplete"]
+    written = _replace_closed_lots(
+        conn, doc.ldk, doc.kind, doc.suffix,
+        [(lot, lot) for lot in parsed["lots"]], doc.sha256)
+    stats["closed_lots_inserted"] += written
+    conn.execute("DELETE FROM cost_basis_methods WHERE logical_doc_key = ?",
+                 (doc.ldk,))
+    return written + silver.upsert_rows(
+        conn, "cost_basis_methods",
+        ("logical_doc_key", "asset_class", "account_external_id",
+         "as_of_date", "tax_year", "method", "source_sha256"),
+        [(doc.ldk, m["asset_class"], doc.suffix, doc.doc_date,
+          parsed["tax_year"], m["method"], doc.sha256)
+         for m in parsed.get("methods", [])],
+        replace=False)
+
+
+# The four passes, in the order a run's documents are parsed. A pass's
+# key is its generation scope (GENERATIONS), the scope of its records.
+PASSES = {
+    "statement": PassSpec(
+        kind="statement", marker_kinds=("statement",),
+        select=_select_statements, parse=_parse_statement,
+        write=_write_statement, error_log="PDF parse failed for %s: %s",
+        error_stat="pdf_parse_errors", error_field="_error", batch=True,
+        dedup_stat="statements_logical_deduped",
+        finish=_harvest_account_facts),
+    "third_party_distribution": PassSpec(
+        kind="third_party_distribution",
+        marker_kinds=("third_party_distribution",),
+        select=_select_distribution_letters,
+        parse=_parse_distribution_letter, write=_write_distribution_letter,
+        error_log="distribution parse failed for %s: %s",
+        error_stat="distribution_parse_errors"),
+    "form_1099b": PassSpec(
+        kind="form_1099b", marker_kinds=("form_1099b",),
+        select=_select_1099b_forms, parse=_parse_1099b_form,
+        write=_write_1099b_form, error_log="1099-B parse failed for %s: %s",
+        error_stat="form_1099b_parse_errors"),
+    "realized_report": PassSpec(
+        kind="realized_report",
+        marker_kinds=tuple(dict.fromkeys(
+            k for _, k in _REALIZED_REPORT_KINDS)),
+        select=_select_realized_reports, parse=_parse_realized_report,
+        write=_write_realized_report,
+        error_log="realized-lot report parse failed for %s: %s",
+        error_stat="realized_report_parse_errors"),
+}
 
 
 def _registration_from_tax_forms(conn: sqlite3.Connection,
@@ -1854,9 +2134,10 @@ def _snapshot_owner(conn: sqlite3.Connection, account_external_id: str,
 
 def _write_statement_snapshots(conn: sqlite3.Connection, job: dict,
                                parsed: dict, period_start: int,
-                               period_end: int, stats: dict) -> None:
+                               period_end: int, stats: dict) -> int:
     """Write a parsed statement's positions, lots and cash, keyed by
-    account and the period end it prints.
+    account and the period end it prints. Returns the position and cash
+    rows written.
 
     The rows of one account and period end belong to the first statement
     that writes them. A later statement with the same account and period
@@ -1879,33 +2160,62 @@ def _write_statement_snapshots(conn: sqlite3.Connection, job: dict,
                         "but other positions or cash; the rows of %s are "
                         "kept", ldk, owner, owner)
             stats["statements_conflicting"] += 1
-        return
-    stats["positions_inserted"] += _insert_position_snapshots(
+        return 0
+    held = _insert_position_snapshots(
         conn, suffix, period_end, positions, job["sha256"], ldk)
-    stats["cash_balances_inserted"] += _insert_cash_balance(
+    stats["positions_inserted"] += held
+    cash_rows = _insert_cash_balance(
         conn, suffix, period_end, period_start, cash, job["sha256"], ldk)
+    stats["cash_balances_inserted"] += cash_rows
+    return held + cash_rows
 
 
 # ============================================================
 # Top-level
 # ============================================================
 
-def _purge_stale_snapshots(conn: sqlite3.Connection) -> None:
-    """Drop the statement-derived snapshot tables, which have no delete path
-    of their own, so the re-walk refills them rather than adding to them;
-    and the parse markers, so a document whose re-parse does not commit is
-    parsed by the next load rather than skipped.
+def _purge_stale_snapshots(conn: sqlite3.Connection,
+                           kinds: tuple[str, ...] | None = None) -> None:
+    """Drop the parse markers, so a document whose re-parse does not
+    commit is parsed by the next load rather than skipped: all of them, or
+    those of `kinds`. With the statements' markers go the
+    statement-derived snapshot tables, which have no delete path of their
+    own, so the re-walk refills them rather than adding to them.
 
-    Called whenever the generation has moved — never on a bare `--reparse`,
+    Called whenever a generation has moved — never on a bare `--reparse`,
     which re-walks under keys that have not changed and so has nothing to
-    collapse. A stale generation also forces `reparse` on, which is what
-    guarantees the walk that refills these tables actually happens.
+    collapse. A stale generation also forces the re-parse of what it
+    covers, which is what guarantees the walk that refills these tables
+    actually happens.
     """
-    conn.execute("DELETE FROM parsed_documents")
+    if kinds is None:
+        conn.execute("DELETE FROM parsed_documents")
+    else:
+        conn.execute(
+            "DELETE FROM parsed_documents WHERE document_kind IN"
+            f" ({', '.join('?' for _ in kinds)})", kinds)
+        if "statement" not in kinds:
+            return
     dropped = sum(conn.execute(f"DELETE FROM {t}").rowcount
                   for t in _SNAPSHOT_TABLES)
     log.info("the document parsers have changed since these rows were "
              "written; dropped %d snapshot row(s) for re-derivation", dropped)
+
+
+def _drop_older_records(conn: sqlite3.Connection) -> None:
+    """Drop each kind's records under another generation, once a load has
+    failed nowhere. A moved kind has then re-derived every document it
+    could read and recorded the copy it read, a failed parse included.
+    The records left under another generation are the copies it did not
+    read again: gone from bronze, or another copy of a document it read.
+    The kind then reads as current. A kind that has not moved holds no
+    such record.
+
+    After a failure this is not called, so the older records stay and the
+    next load re-derives again."""
+    conn.executemany(
+        "DELETE FROM document_derivations WHERE scope = ?"
+        " AND generation != ?", GENERATIONS.items())
 
 
 def run_load(args: argparse.Namespace) -> int:
@@ -1913,11 +2223,15 @@ def run_load(args: argparse.Namespace) -> int:
     args.silver_db.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(args.silver_db))
     silver.own_only(args.silver_db)
+    cache = parsecache.ParseCache(parsecache.default_dir("schwab-web"))
+    extraction.CACHE_DIR = extract.default_dir("schwab-web")
     try:
         conn.execute("PRAGMA foreign_keys = ON")
         silver.apply_migrations(conn, migrations_dir)
+        rebuild.rebuild_advice(conn, REBUILD_ADVICE, REBUILD_COMMAND,
+                               bronze_dir=args.bronze_dir)
 
-        # A moved parser owes the archive a re-read, and `--reparse` is the
+        # A moved walk owes the archive a re-read, and `--reparse` is the
         # lever that already delivers one: it opens the run gate, the
         # per-document gates and the per-document deletes together.
         #
@@ -1925,17 +2239,31 @@ def run_load(args: argparse.Namespace) -> int:
         # the GENERATION, never the flag: it is the only delete path the
         # snapshot tables have, so gating it on `reparse` would let
         # `load --reparse` over a moved parser re-walk the archive, insert
-        # the re-keyed rows beside the old ones, and then stamp the
-        # generation current — which puts that miss permanently out of
+        # the re-keyed rows beside the old ones, and then settle the
+        # generation as current — which puts that miss permanently out of
         # reach of a later load.
-        stale = silver.stale_generation(conn, DOCUMENT_GENERATION_SCOPE,
-                                        DOCUMENT_GENERATION)
-        reparse = args.reparse or stale
-        if stale:
+        #
+        # A moved document kind owes only its own documents a re-read: its
+        # pass runs again over every run, and nothing else does.
+        walk_stale = silver.stale_generation(conn, WALK_SCOPE, WALK_GENERATION)
+        stale = frozenset(
+            kind for kind in PASSES
+            if derivations.generation_moved(conn, kind, GENERATIONS[kind]))
+        rewalk = args.reparse or walk_stale
+        if walk_stale:
             log.info("the document parsers have changed since silver was "
                      "written; re-parsing the archive")
             _purge_stale_snapshots(conn)
-            conn.commit()
+        elif stale:
+            for kind in PASSES:
+                if kind in stale:
+                    log.info("%s: the parser has changed since silver was "
+                             "written; re-deriving its documents from every "
+                             "run", kind)
+                    _purge_stale_snapshots(conn, PASSES[kind].marker_kinds)
+        conn.commit()
+        reparse_kinds = frozenset(PASSES) if rewalk else stale
+        rederive = frozenset() if rewalk else stale
 
         runs = discover_bronze_runs(args.bronze_dir)
         log.info("found %d bronze run(s) under %s", len(runs), args.bronze_dir)
@@ -1943,35 +2271,34 @@ def run_load(args: argparse.Namespace) -> int:
         # One parse pool and one parse-dedup set for the whole invocation.
         # A per-run pool would pay a spawn/teardown cycle for every bronze
         # run; a per-run dedup set would re-parse, under `--reparse`, every
-        # logical document once per bronze run that carries it. The pool is
-        # skipped when nothing needs loading or when serial parsing is
-        # forced.
+        # logical document once per bronze run that carries it. The pool
+        # spawns its workers only when a pass has two documents or more to
+        # parse, and not at all with --workers 1.
         seen_logical_docs: set[tuple] = set()
         # Suffixes whose account_number_full was pinned by this
         # invocation's in-run harvest, accumulated only from runs
         # that committed (a rolled-back run's stats are discarded
         # with it). Fed to the reconcile pass below.
         pinned_accounts: set[str] = set()
-        # Any run or the reconcile pass rolled back: the generation is
-        # then left unstamped, so the next load re-walks in full rather
-        # than skipping a run whose rows a purge removed.
+        # Any run or the reconcile pass rolled back: the walk is then left
+        # unstamped and a moved kind's older records stay, so the next load
+        # re-walks or re-derives rather than skipping a run whose rows a
+        # purge removed, and the load exits 1. The other runs still load.
         failed = False
-        pending = [
-            r for r in runs
-            if reparse or not already_loaded(conn, parse_snapshot_at(r.name))
-        ]
-        pool_ctx: contextlib.AbstractContextManager = (
-            _ParsePoolManager(_resolve_worker_count(args.workers))
-            if pending and args.workers != 1
-            else contextlib.nullcontext(None)
-        )
-        with pool_ctx as pool:
+        with _parse_pool(cache, args.workers) as pool:
             for run_dir in runs:
                 snapshot_at = parse_snapshot_at(run_dir.name)
-                if already_loaded(conn, snapshot_at) and not reparse:
-                    log.info("skipping %s (already loaded)", run_dir.name)
-                    continue
-                log.info("loading %s (snapshot_at=%d)", run_dir.name, snapshot_at)
+                derive_only = None
+                if already_loaded(conn, snapshot_at) and not rewalk:
+                    if not rederive:
+                        log.info("skipping %s (already loaded)", run_dir.name)
+                        continue
+                    derive_only = rederive
+                    log.info("re-deriving %s (snapshot_at=%d)",
+                             run_dir.name, snapshot_at)
+                else:
+                    log.info("loading %s (snapshot_at=%d)", run_dir.name,
+                             snapshot_at)
                 # load_run marks its docs seen during the walk, before the
                 # commit below. Snapshot the set so a rolled-back run's
                 # marks are undone — otherwise a doc first seen in a run
@@ -1980,14 +2307,15 @@ def run_load(args: argparse.Namespace) -> int:
                 seen_before = set(seen_logical_docs)
                 try:
                     stats = load_run(
-                        conn, run_dir, reparse=reparse,
+                        conn, run_dir, reparse=rewalk,
                         workers=args.workers, pool=pool,
                         seen_logical_docs=seen_logical_docs,
+                        reparse_kinds=reparse_kinds, derive_only=derive_only,
                     )
                     conn.commit()
                     pinned_accounts |= stats["account_numbers_pinned"]
                     log.info(
-                        "loaded %s: accts +%d/-%d, docs +%d/-%d, "
+                        "%s %s: accts +%d/-%d, docs +%d/-%d, "
                         "tx +%d (reparsed %d), positions +%d, cash +%d, "
                         "logical-dup %d, copies %d, conflicts %d, "
                         "registrations %d, "
@@ -1995,6 +2323,7 @@ def run_load(args: argparse.Namespace) -> int:
                         "1099-B +%d (pdf-only %d, errors %d), "
                         "closed lots +%d (unreadable %d, report errors %d), "
                         "distributions +%d (errors %d)",
+                        "loaded" if derive_only is None else "re-derived",
                         run_dir.name,
                         stats["accounts_inserted"], stats["accounts_deduped"],
                         stats["documents_new"], stats["documents_dup"],
@@ -2043,19 +2372,27 @@ def run_load(args: argparse.Namespace) -> int:
             failed = True
             log.exception("account-number reconcile failed; rolled back")
 
-        if failed:
-            log.warning("parser generation left unstamped after a failure; "
-                        "the next load re-walks the archive")
+        if failed and (walk_stale or stale):
+            log.warning("parser generations left as they were after a "
+                        "failure; the next load re-reads what they cover")
+        elif failed:
+            log.warning("a load step failed and was rolled back; "
+                        "the next load runs it again")
         else:
-            silver.stamp_generation(conn, DOCUMENT_GENERATION_SCOPE,
-                                    DOCUMENT_GENERATION)
+            silver.stamp_generation(conn, WALK_SCOPE, WALK_GENERATION)
+            _drop_older_records(conn)
             conn.commit()
+        cache.sweep(GENERATIONS.values())
+        extract.sweep(extraction.CACHE_DIR,
+                      {extract.extraction_key(e)
+                       for e in extraction.EXTRACTORS})
 
         _log_registration_histogram(conn)
         _log_account_number_coverage(conn)
     finally:
+        extraction.CACHE_DIR = None
         conn.close()
-    return 0
+    return 1 if failed else 0
 
 
 def _log_registration_histogram(conn: sqlite3.Connection) -> None:
@@ -2111,6 +2448,7 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     cli.configure_logging(args.verbose)
     if args.force:
+        rebuild.runs_without_bronze(args.silver_db, args.bronze_dir)
         silver.reset(args.silver_db)
     return run_load(args)
 

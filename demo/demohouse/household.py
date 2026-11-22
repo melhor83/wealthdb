@@ -466,21 +466,23 @@ class Simulation:
                       "rate": max(offered, D(td["floor"])).quantize(CENT)}
 
     def _cash_terms(self, acct, ccy, day):
-        """The rate a balance's snapshot states, in UBS's shape (wealthdb
-        reads CdtIntrstRate1 up to CdtLmtAmt1, then CdtIntrstRate2; the day
-        the rates hold from; a term's end, 9999-12-31 for none; the day
-        count): the savings account's tiers and the term deposit's term.
-        Any other balance states none."""
+        """The rate a balance's snapshot states, under the stated-rate keys
+        (wealthdb's canonical/statedrate.go): the savings account's credit
+        tiers, the first up to its limit, and the term deposit's rate with
+        its term's end, each with the day it holds from and its day count
+        as wealthdb names it. Any other balance states none."""
         si = self.spec["savings_interest"]
         if acct.id == si["account"] and ccy == acct.currency:
             ((first, limit), (above, _)), since = self._savings_tiers(day)
-            return {"CdtIntrstRate1": text(first, 2), "CdtLmtAmt1": text(limit, 2), "CdtIntrstRate2": text(above, 2),
-                    "CdtIntrstVldFrmDt": since.isoformat(), "EndOfDurtn": "9999-12-31",
-                    "CalIntrstBasisDesc": si["day_count"]}
+            return {"interest_tiers": [{"rate": text(first, 2), "up_to": text(limit, 2)},
+                                       {"rate": text(above, 2), "up_to": None}],
+                    "interest_side": "credit", "interest_valid_from": since.isoformat(),
+                    "interest_day_count": si["day_count"].upper()}
         td = self.spec["term_deposit"]
         if acct.id == td["account"] and self._term:
-            return {"CdtIntrstRate1": text(self._term["rate"], 2), "CdtIntrstVldFrmDt": self._term["start"].isoformat(),
-                    "EndOfDurtn": self._term["end"].isoformat(), "CalIntrstBasisDesc": td["day_count"]}
+            return {"interest_rate": text(self._term["rate"], 2), "interest_side": "credit",
+                    "interest_valid_from": self._term["start"].isoformat(),
+                    "interest_term_end": self._term["end"].isoformat(), "interest_day_count": td["day_count"].upper()}
         return None
 
     def _in_force(self, kind, day, mine):
@@ -1019,6 +1021,9 @@ class Simulation:
             if day == dates.parse(mark["date"]):
                 fund["nav"] = fund["called"] * D(mark["multiple"]) - fund["distributed"]
                 self._mark_fund(day, f, marked=day)
+                # The manager's quarterly capital account, at its mark.
+                self.book.capital_account(f["account"], f["instrument"], day, commitment=D(f["commitment"]),
+                                          called=fund["called"], distributed=fund["distributed"], nav=fund["nav"])
         s = self.spec["private"]["spv"]
         if day == dates.parse(s["date"]):
             amount = D(s["amount"])
@@ -1026,8 +1031,14 @@ class Simulation:
             self._txn(s["account"], day, "contribution", -amount, instrument=s["instrument"],
                       desc=f"SPV SUBSCRIPTION {self._instrument_name(s['instrument'], day)}")
             self.book.set_mark(s["account"], s["instrument"], amount, day, book=amount)
+            # An SPV calls its whole commitment at the subscription.
+            self.book.capital_account(s["account"], s["instrument"], day, commitment=amount, called=amount,
+                                      distributed=ZERO, nav=amount)
         if day == dates.parse(s["markup"]["date"]):
-            self.book.set_mark(s["account"], s["instrument"], D(s["amount"]) * D(s["markup"]["multiple"]), day)
+            value = D(s["amount"]) * D(s["markup"]["multiple"])
+            self.book.set_mark(s["account"], s["instrument"], value, day)
+            self.book.capital_account(s["account"], s["instrument"], day, commitment=D(s["amount"]),
+                                      called=D(s["amount"]), distributed=ZERO, nav=value)
         ex = s["exit"]
         if day == dates.parse(ex["date"]):
             self._spv_exit(day, s, ex)
@@ -1049,11 +1060,14 @@ class Simulation:
         """The SPV pays out in listed shares that land in the brokerage:
         one equity-transfer ledger row out of the venture account, one into
         the brokerage, same day, same value. The SPV holding leaves the
-        venture account's snapshot that day."""
+        venture account's snapshot that day, and its last capital account
+        states the exit's value as distributed."""
         shares = D(ex["shares"])
         value = cents(shares * self.market.price(ex["listed"]))
         spv = self.book.account(s["account"])
         basis = spv.holdings.pop(s["instrument"]).book
+        self.book.capital_account(s["account"], s["instrument"], day, commitment=D(s["amount"]),
+                                  called=D(s["amount"]), distributed=value, nav=ZERO)
         self.book.add_units(ex["to"], ex["listed"], shares, basis, day)
         name = self.inputs.instruments[ex["listed"]]["name"]
         for source, aid, direction, instrument, qty in (

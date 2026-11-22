@@ -3,13 +3,16 @@ package main
 import (
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/config"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/errs"
 )
 
@@ -22,6 +25,32 @@ type globalFlags struct {
 	// now is the clock the reports and web-materialize read today from
 	// (clock); nil is the wall clock.
 	now func() time.Time
+	// notices shows a loaded config's notices (loadConfig); nil shows
+	// none.
+	notices func(*config.Config)
+}
+
+// loadConfig loads the config at ConfigPath and shows its notices
+// (config.Config.Notices).
+func (g globalFlags) loadConfig() (*config.Config, error) {
+	cfg, err := config.Load(g.ConfigPath)
+	if err == nil && g.notices != nil {
+		g.notices(cfg)
+	}
+	return cfg, err
+}
+
+// noticesOnce writes a config's notices to w, the first time a command
+// loads it: a command that loads the config twice shows them once.
+func noticesOnce(w io.Writer) func(*config.Config) {
+	var once sync.Once
+	return func(cfg *config.Config) {
+		once.Do(func() {
+			for _, n := range cfg.Notices() {
+				fmt.Fprintln(w, n)
+			}
+		})
+	}
 }
 
 // clock is today as the reports read it: a window's default end, an
@@ -140,14 +169,6 @@ func takesValue(fs *flag.FlagSet, name string) bool {
 	}
 	b, ok := f.Value.(interface{ IsBoolFlag() bool })
 	return !ok || !b.IsBoolFlag()
-}
-
-// registerAsOf declares -d / --as-of, the day an as-of report is taken
-// at.
-func registerAsOf(fs *flag.FlagSet) *string {
-	asOf := fs.String("d", "", "as-of date (YYYY-MM-DD; default today UTC)")
-	fs.StringVar(asOf, "as-of", "", "as-of date (YYYY-MM-DD; default today UTC)")
-	return asOf
 }
 
 // checkChoice refuses a flag value outside its vocabulary, naming the

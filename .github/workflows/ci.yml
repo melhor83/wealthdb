@@ -7,6 +7,9 @@
 #     each for cmd/wealthdb and every other package;
 #   - demo: the demo household through the engine;
 #   - collectors: the shared base images and every collector's suite;
+#     base-camoufox is built without its browser, as every
+#     test-<collector> builds it on an empty runner, and the unit tests
+#     never start one;
 #   - rest: every other suite of `make test`;
 #   - check: passes only when every job above has.
 # .github/ci-suites.sh splits the Makefile's suite list between the

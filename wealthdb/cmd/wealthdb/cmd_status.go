@@ -6,13 +6,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"time"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/config"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/errs"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/gold"
-	"github.com/smartpointer-com/wealthdb/wealthdb/internal/output"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver"
 )
 
@@ -38,7 +36,8 @@ watermark, silver-side change number, and a * if a
 With <id>: a detailed per-source block — counts per gold table,
 silver Status() extrema, when the source's holdings and its ledger
 were last observed, the stored watermark, and the most recent
-load_audit rows. A source is observed when a run reads it, whether
+load_audit rows (window=[all] for a load that re-read the whole
+history). A source is observed when a run reads it, whether
 or not anything changed: a portal that marks quarterly is observed
 through its latest download, its snapshot range through the
 quarter's end.
@@ -84,7 +83,7 @@ and -p reach the two money columns; marked_pct does not move.`)
 		return errs.Newf(errs.ExitUsage, "status: at most one silver_source_id allowed")
 	}
 
-	cfg, err := config.Load(g.ConfigPath)
+	cfg, err := g.loadConfig()
 	if err != nil {
 		return err
 	}
@@ -119,7 +118,7 @@ func runStatusMarks(ctx context.Context, g globalFlags, fs *flag.FlagSet, rf *re
 	}
 	req := request{view: "marks", currency: outCcy, from: fromEpoch, to: toEpoch}
 	open := func() (*sql.DB, error) { return openGoldForRead(g, cfg) }
-	return writeReport(ctx, marksReport(req), rf.output(fmtChoice, "status", marksFamily, req, cfg, g.clock()), open, stdout)
+	return writeReport(ctx, marksReport(req), rf.output(fmtChoice, marksFamily, req, cfg, g.clock()), open, stdout)
 }
 
 // marksReport is `status --marks`, the runner the CLI and the MCP server
@@ -134,8 +133,7 @@ func marksReport(req request) *report {
 func buildMarkColumnRegistry(outCcy string) []columnSpec[gold.MarkRow] {
 	return []columnSpec[gold.MarkRow]{
 		asDate(strCol("month_end", func(r gold.MarkRow) string { return formatDate(r.MonthEnd) })),
-		{Name: "marked_pct", Align: output.AlignRight,
-			Extract: func(r gold.MarkRow) string { return formatPercent(r.MarkedPct) }},
+		percentCol("marked_pct", "", func(r gold.MarkRow) string { return formatPercent(r.MarkedPct) }),
 		outCcyCol("value_marked", outCcy, func(r gold.MarkRow) *string { return r.ValueMarked }),
 		outCcyCol("value_total", outCcy, func(r gold.MarkRow) *string { return r.ValueTotal }),
 		qualityCol(func(r gold.MarkRow) string { return r.Quality }),
@@ -180,7 +178,7 @@ func runStatusDetailed(ctx context.Context, db *sql.DB, cfg *config.Config, id s
 
 	silverStatus, silverErr := probeSilverStatus(ctx, src)
 	advancedHint := ""
-	if silverErr == nil && silverStatus.LatestChangeNumber > st.HighWatermark {
+	if silverErr == nil && silverAhead(st, silverStatus) {
 		advancedHint = "  (silver has new data — run `wealthdb load " + id + "`)"
 	}
 
@@ -225,9 +223,9 @@ func runStatusDetailed(ctx context.Context, db *sql.DB, cfg *config.Config, id s
 			if r.ChangeNumberBefore.Valid {
 				before = fmt.Sprintf("%d", r.ChangeNumberBefore.Int64)
 			}
-			fmt.Fprintf(stdout, "    %s  %s → %d  window=[%s..%s]  +%d snap +%d tx\n",
+			fmt.Fprintf(stdout, "    %s  %s → %d  window=[%s]  +%d snap +%d tx\n",
 				formatDateTime(r.LoadedAt/1_000_000_000), before, r.ChangeNumberAfter,
-				formatDate(r.WindowStart), formatDate(r.WindowEnd),
+				formatWindow(r.WindowStart, r.WindowEnd),
 				r.SnapshotsLoaded, r.TransactionsLoaded)
 		}
 	}
@@ -250,7 +248,7 @@ func printOneLineStatus(ctx context.Context, r gold.SourceStatusResult, src *con
 
 	advanced := ""
 	silverStatus, silverErr := probeSilverStatus(ctx, src)
-	if silverErr == nil && silverStatus.LatestChangeNumber > st.HighWatermark {
+	if silverErr == nil && silverAhead(st, silverStatus) {
 		advanced = " *"
 	}
 
@@ -283,6 +281,12 @@ func printOneLineStatus(ctx context.Context, r gold.SourceStatusResult, src *con
 	fmt.Fprintf(stdout, "%-20s [%s] %d pos, %d tx, observed=%s, watermark=%s%s%s\n",
 		src.ID, st.Kind, st.PositionsCount, st.TransactionsCount, formatOptionalDate(st.ObservedSnapshotsThrough),
 		formatWatermark(st.HighWatermark), advanced, driftHint)
+}
+
+// silverAhead says the silver holds data a load would bring: its latest
+// change is past the watermark gold loaded through.
+func silverAhead(st *gold.SourceStatus, silver canonical.Status) bool {
+	return silver.LatestChangeNumber > st.HighWatermark
 }
 
 // probeSilverStatus opens the silver via the adapter and calls
@@ -318,12 +322,6 @@ func formatOptionalDate(epoch int64) string {
 		return "(none)"
 	}
 	return formatDate(epoch)
-}
-
-// formatDateTime is the human-readable form for second-grain
-// audit/registration timestamps.
-func formatDateTime(epoch int64) string {
-	return time.Unix(epoch, 0).UTC().Format("2006-01-02 15:04:05Z")
 }
 
 // printStatusVerbose is `status -v`'s extra block: the taxonomy drift

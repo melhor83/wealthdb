@@ -12,12 +12,12 @@ import (
 // pluggable per-source knobs (see docs/RETURNS-NOTES.md, "Pluggable per-source
 // policy").
 //
-// The engine consumes these knobs: OnboardScope (returns_compute.go,
+// The engine consumes these knobs: OnboardScope (returns_flows.go,
 // per-entity-once onboarding), Inception (entityWindow, first-real-snapshot
 // anchor), ConduitKinds via IsConduit (returns.go), ExternalOnly
 // (attachOneFlow in returns.go), AccountsGrain (returns.go, blanking
-// or hiding the per-account display for sweep/conduit sources),
-// CapitalCallRisk (regimeFlags in returns_compute.go, tagging flow-less
+// or hiding the per-account display),
+// CapitalCallRisk (regimeFlags in returns_flags.go, tagging flow-less
 // windows), and ClosureScope (entityFlows, ledger-exact vs subsumed
 // closures). Every knob defaults to the engine's baseline behavior, so
 // DefaultReturnsPolicy() is a strict no-op: a source without a registered
@@ -25,19 +25,19 @@ import (
 // when a source opts into a non-default value. A knob is added together with
 // the engine site that reads it — no forward stubs.
 //
-// A source declares its ReturnsPolicy co-located in its silver package and
-// registers it via RegisterPolicy from that package's init(). The engine
+// A source declares its ReturnsPolicy in the silver.Source of its silver
+// package, and silver.Register forwards it here (RegisterPolicy). The engine
 // resolves it by adapter kind exactly as it resolves adapters (silver.Get), and
 // never enumerates sources itself.
 type ReturnsPolicy struct {
-	// Flow is the flow-classification policy (regime + external / transfer-like
-	// kind sets); ReturnsPolicyFor(kind).Flow exposes exactly this member.
+	// Flow is the flow-classification policy (the source's completeness);
+	// ReturnsPolicyFor(kind).Flow exposes exactly this member.
 	Flow FlowPolicy
 
 	// ---- consumed knobs ----
 
 	// OnboardScope: whether synthetic onboarding fires per constituent account
-	// (default), once per computed entity at inception, or never.
+	// (default) or once per computed entity at inception.
 	OnboardScope OnboardScope
 	// AccountsGrain: how the source's individual accounts surface in returns
 	// output — full rows (default), blanked rows (values shown, TWR/MWR n/a +
@@ -68,8 +68,8 @@ type ReturnsPolicy struct {
 	// ExternalOnly: count only boundary-crossing flows. The engine
 	// (attachOneFlow) then drops every row the silver tagged internal (UBS
 	// marks conduit churn with a `returns_flow: internal` payload key).
-	// False by default (the flow set is governed by Flow.external /
-	// Flow.transferLike).
+	// False by default: the flow set is the source's regime over the
+	// capital kinds (canonical.CapitalKind).
 	ExternalOnly bool
 }
 
@@ -84,12 +84,6 @@ const (
 	// inception. Consumed by the engine (groupOnboardStep) and set
 	// live by UBS.
 	OnboardPerEntityOnce
-	// OnboardNone never injects synthetic onboarding for this source's
-	// constituents — for crypto-sweep sources whose mid-window debuts are funded
-	// by within-entity transfers already excluded from flows, so onboarding would
-	// double-count. Appended last so OnboardPerConstituent(0) and
-	// OnboardPerEntityOnce(1) keep their numeric values.
-	OnboardNone
 )
 
 // AccountsGrainMode selects how a source's individual accounts surface in
@@ -102,15 +96,16 @@ const (
 	AccountsGrainNormal AccountsGrainMode = iota
 	// AccountsGrainBlanked: accounts-grain rows are emitted with start/end
 	// values but TWR/MWR blanked to n/a + accounts_grain_meaningless — the
-	// accounts are return-bearing in aggregate but individually meaningless
-	// (crypto wallets that coins sweep between on arrival).
+	// accounts are return-bearing in aggregate but individually meaningless.
+	// No registered policy sets it; a deployment sets it with
+	// returns_policy_overrides.
 	AccountsGrainBlanked
 	// AccountsGrainHidden: no rows of their own at ANY grain — the accounts
-	// are pure plumbing (deposit-bank cash conduits money passes through).
-	// Values and flows still enter every aggregate they belong to; an entity
-	// consisting only of hidden constituents (such a source's own sources-
-	// grain row, or its no-portfolio bucket) is hidden too. The global grain
-	// is never hidden.
+	// are pure plumbing. No registered policy sets it; a deployment sets it
+	// with returns_policy_overrides. Values and flows still enter every
+	// aggregate they belong to; an entity consisting only of hidden
+	// constituents (such a source's own sources-grain row, or its
+	// no-portfolio bucket) is hidden too. The global grain is never hidden.
 	AccountsGrainHidden
 )
 
@@ -179,12 +174,12 @@ var (
 )
 
 // RegisterPolicy records a source's ReturnsPolicy under its adapter kind. It is
-// called from each silver package's init() (beside silver.Register), so the
+// called by silver.Register, from each silver package's init(), so the
 // per-source policy lives co-located with that source's domain knowledge. Like
 // the adapter registry, a duplicate kind is a build-time bug and panics.
 //
 // internal/returns must NOT import internal/silver/*; the dependency runs the
-// other way (silver/<kind> imports returns and calls this), which is
+// other way (silver imports returns and calls this), which is
 // cycle-free because returns imports only internal/canonical.
 func RegisterPolicy(kind string, p ReturnsPolicy) {
 	policyMu.Lock()

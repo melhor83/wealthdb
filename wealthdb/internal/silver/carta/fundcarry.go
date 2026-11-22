@@ -43,27 +43,21 @@ type fundLedger map[int64]*fundBook
 
 func (c *Connection) loadFundLedger(ctx context.Context) (fundLedger, error) {
 	ledger := fundLedger{}
-	rows, err := c.db.QueryContext(ctx, `
-SELECT entity_external_id, flow_date, kind, amount, COALESCE(currency, 'USD')
+	if !c.schema.flowAt {
+		return ledger, nil
+	}
+	if err := silver.ScanRows(ctx, c.db, "loadFundLedger", `
+SELECT entity_external_id, flow_at, kind, amount, COALESCE(currency, 'USD')
   FROM cash_flows
  WHERE kind IN ('capital_call', 'distribution')
-   AND flow_date IS NOT NULL AND amount IS NOT NULL`)
-	if err != nil {
-		return nil, fmt.Errorf("loadFundLedger: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
+   AND flow_at IS NOT NULL AND amount IS NOT NULL`, func(rows *sql.Rows) error {
 		var (
-			eid             int64
-			date, kind, ccy string
-			amount          float64
+			eid, at   int64
+			kind, ccy string
+			amount    float64
 		)
-		if err := rows.Scan(&eid, &date, &kind, &amount, &ccy); err != nil {
-			return nil, err
-		}
-		at, ok := flowDateUnix(date)
-		if !ok {
-			continue
+		if err := rows.Scan(&eid, &at, &kind, &amount, &ccy); err != nil {
+			return err
 		}
 		if kind == "distribution" {
 			amount = -amount
@@ -74,27 +68,21 @@ SELECT entity_external_id, flow_date, kind, amount, COALESCE(currency, 'USD')
 			ledger[eid] = b
 		}
 		b.flows = append(b.flows, fundFlow{at: at, net: amount})
-	}
-	if err := rows.Err(); err != nil {
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 
-	navs, err := c.db.QueryContext(ctx,
-		`SELECT entity_external_id, MIN(snapshot_at) FROM fund_metrics GROUP BY entity_external_id`)
-	if err != nil {
-		return nil, fmt.Errorf("loadFundLedger: %w", err)
-	}
-	defer navs.Close()
-	for navs.Next() {
+	if err := silver.ScanRows(ctx, c.db, "loadFundLedger", `SELECT entity_external_id, MIN(snapshot_at) FROM fund_metrics GROUP BY entity_external_id`, func(navs *sql.Rows) error {
 		var eid, at int64
 		if err := navs.Scan(&eid, &at); err != nil {
-			return nil, err
+			return err
 		}
 		if b, ok := ledger[eid]; ok {
 			b.firstNAV, b.hasNAV = at, true
 		}
-	}
-	if err := navs.Err(); err != nil {
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 	for _, b := range ledger {
@@ -157,14 +145,14 @@ func (l fundLedger) acquisitionDate(eid int64) *time.Time {
 // on or before t. It runs after appendFundAt, whose NAV positions it never
 // duplicates. Its book value is the capital called, less the basis
 // distributed in kind by t (inKind).
-func appendFundCarryAt(t int64, acct string, ledger fundLedger, inKind *silver.InKind, batch *canonical.SnapshotBatch, active map[int64]string, classesNew map[int64]canonical.AssetClass, vehicles map[int64]canonical.Vehicle) error {
+func appendFundCarryAt(t int64, acct string, ledger fundLedger, inKind *silver.InKind, h *held) error {
 	ids := make([]int64, 0, len(ledger))
 	for eid := range ledger {
 		ids = append(ids, eid)
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	for _, eid := range ids {
-		if _, placed := active[eid]; placed {
+		if _, placed := h.active[eid]; placed {
 			continue
 		}
 		b := ledger[eid]
@@ -202,10 +190,7 @@ func appendFundCarryAt(t int64, acct string, ledger fundLedger, inKind *silver.I
 			Payload:              silver.PayloadWith(string(payload), extra),
 		}
 		pos.SetBookValue(reduced, basis)
-		batch.Positions = append(batch.Positions, pos)
-		active[eid] = b.ccy
-		classesNew[eid] = canonical.AssetClassPrivateEquity
-		vehicles[eid] = canonical.VehicleFund
+		h.place(eid, b.ccy, canonical.AssetClassPrivateEquity, canonical.VehicleFund, pos)
 	}
 	return nil
 }

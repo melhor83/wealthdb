@@ -13,7 +13,7 @@ import (
 // lotsEngineVersion enters every input fingerprint. A change to what the
 // engine, the feed or a registered policy makes of the same input bumps
 // it, so the next pass replays.
-const lotsEngineVersion = 2
+const lotsEngineVersion = 6
 
 // LotsOptions configure a lot pass.
 type LotsOptions struct {
@@ -105,7 +105,9 @@ func RebuildLots(ctx context.Context, db *sql.DB, opt LotsOptions) (*LotsSummary
 // lotFingerprints is one fingerprint per replayed or stated source: its
 // rows in every table the feed reads, the rows that tie sources together
 // (the rates, the portfolios), its policy and methods, and the engine
-// version. A row the engine itself wrote does not count.
+// version. A row the engine itself wrote does not count. The in-kind
+// links count only where a source has any, so a source without one
+// keeps the fingerprint it had without them.
 func lotFingerprints(ctx context.Context, db *sql.DB, f *lotFeed, cfg lots.Config) (map[string]string, error) {
 	out := map[string]string{}
 	ids := f.all()
@@ -115,7 +117,8 @@ func lotFingerprints(ctx context.Context, db *sql.DB, f *lotFeed, cfg lots.Confi
 	rows, err := db.QueryContext(ctx, `
 WITH ids AS (SELECT unnest(?::VARCHAR[]) id),
      t AS (SELECT silver_source_id s, count(*) n, bit_xor(hash(transaction_external_id, occurred_at, account_external_id,
-                  instrument_external_id, instrument_hint, kind, currency, quantity, net_amount, description, payload::VARCHAR)) h
+                  instrument_external_id, instrument_hint, kind, currency, quantity, net_amount, description, action,
+                  payload::VARCHAR, asset_class, vehicle)) h
              FROM transactions WHERE silver_source_id IN (SELECT id FROM ids) GROUP BY 1),
      p AS (SELECT silver_source_id s, count(*) n, bit_xor(hash(snapshot_at, account_external_id, position_key,
                   instrument_external_id, currency, quantity, asset_class, vehicle,
@@ -128,14 +131,18 @@ WITH ids AS (SELECT unnest(?::VARCHAR[]) id),
                   instrument_external_id, instrument_hint, description, quantity, book_value, disposal_date,
                   settlement_date, acquisition_date, tax_year, is_primary)) h
              FROM realized_lots WHERE silver_source_id IN (SELECT id FROM ids) GROUP BY 1),
-     i AS (SELECT silver_source_id s, bit_xor(hash(instrument_external_id, cusip, symbol)) h
+     i AS (SELECT silver_source_id s, bit_xor(hash(instrument_external_id, cusip, symbol, asset_class, vehicle)) h
              FROM instruments WHERE silver_source_id IN (SELECT id FROM ids) GROUP BY 1),
      a AS (SELECT src s, bit_xor(hash(acct, pid)) h FROM portfolio_acct_map() GROUP BY 1),
-     x AS (SELECT count(*) n, bit_xor(hash(from_ccy, to_ccy, day, rate)) h FROM fx_daily)
-SELECT ids.id, concat_ws('/', t.n, t.h, p.n, p.h, l.n, l.h, r.n, r.h, i.h, a.h, x.n, x.h)
+     x AS (SELECT count(*) n, bit_xor(hash(from_ccy, to_ccy, day, rate)) h FROM fx_daily),
+     k AS (SELECT silver_source_id s, bit_xor(hash(transaction_external_id, far_silver_source_id,
+                  far_transaction_external_id)) h
+             FROM transfer_links WHERE measure = ? AND silver_source_id IN (SELECT id FROM ids) GROUP BY 1)
+SELECT ids.id, concat_ws('/', t.n, t.h, p.n, p.h, l.n, l.h, r.n, r.h, i.h, a.h, x.n, x.h, 'k' || k.h)
   FROM ids
   LEFT JOIN t ON t.s = ids.id LEFT JOIN p ON p.s = ids.id LEFT JOIN l ON l.s = ids.id
-  LEFT JOIN r ON r.s = ids.id LEFT JOIN i ON i.s = ids.id LEFT JOIN a ON a.s = ids.id, x`, ids)
+  LEFT JOIN r ON r.s = ids.id LEFT JOIN i ON i.s = ids.id LEFT JOIN a ON a.s = ids.id
+  LEFT JOIN k ON k.s = ids.id, x`, ids, LinkMeasureInKind)
 	if err != nil {
 		return nil, fmt.Errorf("lots: fingerprint: %w", err)
 	}

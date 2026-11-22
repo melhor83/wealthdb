@@ -4,16 +4,13 @@ import (
 	"cmp"
 	"context"
 	"database/sql"
-	"flag"
 	"fmt"
-	"io"
 	"strings"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/config"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/errs"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/gold"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/lots"
-	"github.com/smartpointer-com/wealthdb/wealthdb/internal/output"
 )
 
 // `wealthdb gains <view>` — what was gained or lost, realized and
@@ -30,126 +27,172 @@ import (
 // question it cannot answer. So is --missing-basis on `coverage` and
 // `check`, which count a missing cost rather than read it.
 func init() {
-	register("gains", cmdGains)
+	// The usage lists the family's columns, so it joins the family here.
+	gainsFamily.usage = gainsUsage
+	register("gains", routeReport(gainsFamily))
 }
 
-// gainsViews are the views, coarse to fine.
-var gainsViews = []string{"summary", "sources", "portfolios", "accounts", "positions", "realized", "lots", "coverage", "check"}
+// gainsFamily are the views, coarse to fine: the four aggregate views,
+// then the holdings, the lots, and the diagnostics.
+var gainsFamily = &family{
+	name: "gains",
+	views: []view{
+		gainsBucketView("summary", gold.GainsAll),
+		gainsBucketView("sources", gold.GainsSources),
+		gainsBucketView("portfolios", gold.GainsPortfolios),
+		gainsBucketView("accounts", gold.GainsAccounts),
+		{name: "positions", total: flowTotal, principal: fixedColumn("gain"), header: gainsLineHeader,
+			takes: []string{"missing_basis"},
+			build: func(cfg *config.Config, req request) *report {
+				ccy, missing := req.currency, missingOr(req.missing, cfg)
+				kindOf, loadKinds := sourceKinds()
+				return withLoads(newReport(buildGainsPositionColumnRegistry(ccy, kindOf), defaultGainsPositionColumns,
+					func(ctx context.Context, db *sql.DB) ([]gold.GainsPositionRow, error) {
+						return gold.GainsPositions(ctx, db, req.from, req.to, ccy, missing)
+					}), loadKinds)
+			}},
+		{name: "realized", total: flowTotal, principal: fixedColumn("gain_outccy"), header: gainsLineHeader,
+			takes: []string{"documents", "newest_first", "missing_basis"},
+			build: func(cfg *config.Config, req request) *report {
+				ccy, missing := req.currency, missingOr(req.missing, cfg)
+				kindOf, loadKinds := sourceKinds()
+				order := gold.SortAscending
+				if req.newestFirst {
+					order = gold.SortDescending
+				}
+				return withLoads(newReport(buildRealizedLotColumnRegistry(ccy, kindOf), defaultRealizedLotColumns,
+					func(ctx context.Context, db *sql.DB) ([]gold.RealizedLotRow, error) {
+						return gold.RealizedLotsBetween(ctx, db, req.from, req.to, ccy, req.allDocuments, order, missing)
+					}), loadKinds)
+			}},
+		{name: "lots", total: balanceTotal, principal: fixedColumn("unrealized_gain_outccy"), header: gainsLineHeader,
+			takes: []string{"missing_basis"},
+			build: func(cfg *config.Config, req request) *report {
+				ccy, missing := req.currency, missingOr(req.missing, cfg)
+				kindOf, loadKinds := sourceKinds()
+				return withLoads(newReport(buildOpenLotColumnRegistry(ccy, kindOf), defaultOpenLotColumns,
+					func(ctx context.Context, db *sql.DB) ([]gold.OpenLotRow, error) {
+						return gold.OpenLotsAsOf(ctx, db, req.to, ccy, missing)
+					}), loadKinds)
+			}},
+		{name: "coverage", principal: fixedColumn("value"), header: gainsLineHeader,
+			build: func(_ *config.Config, req request) *report {
+				ccy := req.currency
+				kindOf, loadKinds := sourceKinds()
+				return withLoads(newReport(buildGainsCoverageColumnRegistry(ccy, kindOf), defaultGainsCoverageColumns,
+					func(ctx context.Context, db *sql.DB) ([]gold.GainsCoverageRow, error) {
+						return gold.GainsCoverage(ctx, db, req.from, req.to, ccy)
+					}), loadKinds)
+			}},
+		{name: "check", principal: fixedColumn("cost_delta"), header: gainsLineHeader,
+			build: func(_ *config.Config, req request) *report {
+				ccy := req.currency
+				kindOf, loadKinds := sourceKinds()
+				return withLoads(newReport(buildGainsCheckColumnRegistry(ccy, kindOf), defaultGainsCheckColumns,
+					func(ctx context.Context, db *sql.DB) ([]gold.GainsCheckRow, error) {
+						return gold.GainsCheck(ctx, db, req.from, req.to, ccy)
+					}), loadKinds)
+			}},
+	},
+	options: []option{
+		{name: "period", cli: []string{"period"}, choices: reportPeriodNames, def: [2]string{"monthly", "total"}},
+		{name: "documents", cli: []string{"documents"}, choices: gainsDocuments, def: [2]string{"primary", "primary"}},
+		{name: "missing_basis", cli: []string{"missing-basis"}},
+		{name: "newest_first", cli: []string{"r", "reverse"}, kind: optFlag},
+	},
+	window:   trailingYear,
+	currency: true,
+	narrow:   "from/to or a filter",
+	settle: func(fam *family, in optionSource, req *request, _ *[]string) error {
+		// On another view the two would ask a question it cannot answer.
+		v := fam.view(req.view)
+		if !v.takesOption("documents") && (in.has("documents") || in.has("newest_first")) {
+			if in.cli() {
+				return errs.Newf(errs.ExitUsage, "gains: --documents and -r belong to the realized view")
+			}
+			return fmt.Errorf("gains: documents and newest_first belong to view=realized")
+		}
+		if !v.takesOption("missing_basis") && in.has("missing_basis") {
+			if in.cli() {
+				return errs.Newf(errs.ExitUsage, "gains: --missing-basis does not apply to the %s view", req.view)
+			}
+			return fmt.Errorf("gains: missing_basis does not apply to view=%s", req.view)
+		}
+		var err error
+		if req.period, err = choose(in, "gains", "period"); err != nil {
+			return err
+		}
+		documents, err := choose(in, "gains", "documents")
+		if err != nil {
+			return err
+		}
+		req.allDocuments = documents == "all"
+		req.newestFirst = in.on("newest_first")
+		return nil
+	},
+	after: func(in optionSource, cfg *config.Config, req *request) error {
+		var err error
+		req.missing, err = missingBasisOption(in, cfg, "gains")
+		return err
+	},
+	header: func(req request) []string {
+		if req.missing == lots.MissingZero {
+			return []string{"missing_basis=zero"}
+		}
+		return nil
+	},
+}
+
+// gainsBucketView is an aggregate view at its grain: its figures add up
+// over a window, and its main column is gain. It reads a missing cost
+// basis under a reading.
+func gainsBucketView(name string, grain gold.GainsGrain) view {
+	return view{name: name, total: flowTotal, principal: fixedColumn("gain"), header: periodHeader,
+		takes: []string{"missing_basis"},
+		build: func(cfg *config.Config, req request) *report {
+			ccy, missing := req.currency, missingOr(req.missing, cfg)
+			kindOf, loadKinds := sourceKinds()
+			return withLoads(newReport(buildGainsBucketColumnRegistry(ccy, req.period, grain, kindOf, req.categories),
+				gainsBucketDefaults[grain],
+				func(ctx context.Context, db *sql.DB) ([]gold.GainsBucketRow, error) {
+					return gold.GainsBuckets(ctx, db, req.from, req.to, ccy, reportPeriods[req.period], grain, missing)
+				}), loadKinds)
+		}}
+}
+
+// gainsLineHeader names the options of the views that are no aggregate:
+// realized's documents and order.
+func gainsLineHeader(req request) []string {
+	var h []string
+	if req.allDocuments {
+		h = append(h, "documents=all")
+	}
+	if req.newestFirst {
+		h = append(h, "newest first")
+	}
+	return h
+}
 
 // gainsDocuments are the `--documents` choices of the realized view:
 // each sale once, or every document's copy of it.
 var gainsDocuments = []string{"primary", "all"}
 
-// gainsGrains maps the four aggregate views to their grain.
-var gainsGrains = map[string]gold.GainsGrain{
-	"summary": gold.GainsAll, "sources": gold.GainsSources,
-	"portfolios": gold.GainsPortfolios, "accounts": gold.GainsAccounts,
-}
-
-func cmdGains(ctx context.Context, g globalFlags, subargs []string, _ io.Reader, stdout, stderr io.Writer) error {
-	view, rest, err := routeView("gains", subargs, gainsViews, gainsUsage, stderr)
+// missingBasisOption reads how a missing cost basis counts for cmd. On
+// the CLI it is the reading asked for, else the config's
+// (resolveMissingBasis); on MCP the reading asked for, "" when none,
+// which the view's build takes the config's default for (missingOr).
+func missingBasisOption(in optionSource, cfg *config.Config, cmd string) (lots.MissingBasis, error) {
+	if in.cli() {
+		return resolveMissingBasis(in.str("missing_basis"), cfg, cmd)
+	}
+	if !in.has("missing_basis") {
+		return "", nil
+	}
+	m, err := lots.ParseMissingBasis(in.str("missing_basis"))
 	if err != nil {
-		return err
+		return "", fmt.Errorf("%s: missing_basis: %w", cmd, err)
 	}
-	return runGainsView(ctx, g, view, rest, stdout, stderr)
-}
-
-func runGainsView(ctx context.Context, g globalFlags, view string, args []string, stdout, stderr io.Writer) error {
-	fs := flag.NewFlagSet("wealthdb gains "+view, flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	period := fs.String("period", "monthly", strings.Join(reportPeriodNames, " | "))
-	documents := fs.String("documents", "primary", "primary | all — which copies of a sale the realized view lists")
-	missing := registerMissingBasisFlag(fs)
-	reverse := fs.Bool("r", false, "realized only: newest first")
-	fs.BoolVar(reverse, "reverse", false, "realized only: newest first")
-	rf := registerReportFlags(fs, true)
-	fs.Usage = func() { fmt.Fprintln(stderr, gainsUsage()) }
-	if err := parseFlags(fs, args, "gains"); err != nil {
-		return err
-	}
-	if view != "realized" && isSet(fs, "documents", "r", "reverse") {
-		return errs.Newf(errs.ExitUsage, "gains: --documents and -r belong to the realized view")
-	}
-	if !gainsReadsBasis(view) && isSet(fs, "missing-basis") {
-		return errs.Newf(errs.ExitUsage, "gains: --missing-basis does not apply to the %s view", view)
-	}
-	if err := checkChoice("gains", "period", *period, reportPeriodNames...); err != nil {
-		return err
-	}
-	if err := checkChoice("gains", "documents", *documents, gainsDocuments...); err != nil {
-		return err
-	}
-	fromEpoch, toEpoch, err := parseTrailingYearWindow(fs.Args(), g.clock())
-	if err != nil {
-		fs.Usage()
-		return errs.Newf(errs.ExitUsage, "gains: %s", err.Error())
-	}
-	fmtChoice, cfg, outCcy, err := rf.resolve(g, "gains")
-	if err != nil {
-		return err
-	}
-	missingBasis, err := resolveMissingBasis(*missing, cfg, "gains")
-	if err != nil {
-		return err
-	}
-
-	req := request{view: view, currency: outCcy, from: fromEpoch, to: toEpoch,
-		period: *period, allDocuments: *documents == "all", newestFirst: *reverse, missing: missingBasis,
-		categories: overrideCategories(cfg)}
-	rep := gainsReport(req)
-	open := func() (*sql.DB, error) { return openGoldForRead(g, cfg) }
-	return writeReport(ctx, rep, rf.output(fmtChoice, "gains", gainsFamily, req, cfg, g.clock()), open, stdout)
-}
-
-// gainsReport is one view of the gains family, the runner the CLI and
-// the MCP server share.
-func gainsReport(req request) *report {
-	ccy := req.currency
-	kindOf, loadKinds := sourceKinds()
-	if grain, ok := gainsGrains[req.view]; ok {
-		return withLoads(newReport(buildGainsBucketColumnRegistry(ccy, req.period, grain, kindOf, req.categories),
-			gainsBucketDefaults[grain],
-			func(ctx context.Context, db *sql.DB) ([]gold.GainsBucketRow, error) {
-				return gold.GainsBuckets(ctx, db, req.from, req.to, ccy, reportPeriods[req.period], grain, req.missing)
-			}), loadKinds)
-	}
-	switch req.view {
-	case "positions":
-		return withLoads(newReport(buildGainsPositionColumnRegistry(ccy, kindOf), defaultGainsPositionColumns,
-			func(ctx context.Context, db *sql.DB) ([]gold.GainsPositionRow, error) {
-				return gold.GainsPositions(ctx, db, req.from, req.to, ccy, req.missing)
-			}), loadKinds)
-	case "realized":
-		order := gold.SortAscending
-		if req.newestFirst {
-			order = gold.SortDescending
-		}
-		return withLoads(newReport(buildRealizedLotColumnRegistry(ccy, kindOf), defaultRealizedLotColumns,
-			func(ctx context.Context, db *sql.DB) ([]gold.RealizedLotRow, error) {
-				return gold.RealizedLotsBetween(ctx, db, req.from, req.to, ccy, req.allDocuments, order, req.missing)
-			}), loadKinds)
-	case "lots":
-		return withLoads(newReport(buildOpenLotColumnRegistry(ccy, kindOf), defaultOpenLotColumns,
-			func(ctx context.Context, db *sql.DB) ([]gold.OpenLotRow, error) {
-				return gold.OpenLotsAsOf(ctx, db, req.to, ccy, req.missing)
-			}), loadKinds)
-	case "check":
-		return withLoads(newReport(buildGainsCheckColumnRegistry(ccy, kindOf), defaultGainsCheckColumns,
-			func(ctx context.Context, db *sql.DB) ([]gold.GainsCheckRow, error) {
-				return gold.GainsCheck(ctx, db, req.from, req.to, ccy)
-			}), loadKinds)
-	default: // coverage
-		return withLoads(newReport(buildGainsCoverageColumnRegistry(ccy, kindOf), defaultGainsCoverageColumns,
-			func(ctx context.Context, db *sql.DB) ([]gold.GainsCoverageRow, error) {
-				return gold.GainsCoverage(ctx, db, req.from, req.to, ccy)
-			}), loadKinds)
-	}
-}
-
-// registerMissingBasisFlag declares --missing-basis on a command that
-// reads a cost basis.
-func registerMissingBasisFlag(fs *flag.FlagSet) *string {
-	return fs.String("missing-basis", "", "ignore | zero — how a missing cost basis counts (default: config lots.missing_basis, else ignore)")
+	return m, nil
 }
 
 // resolveMissingBasis settles --missing-basis for cmd: the reading
@@ -172,10 +215,6 @@ func missingOr(m lots.MissingBasis, cfg *config.Config) lots.MissingBasis {
 	return cmp.Or(m, cfg.MissingBasis())
 }
 
-// gainsReadsBasis reports whether a gains view reads a missing cost
-// basis under a reading. coverage and check count one instead.
-func gainsReadsBasis(view string) bool { return view != "coverage" && view != "check" }
-
 // ---- column registries ---------------------------------------------------
 //
 // A money column in the holding's own currency has a twin in the output
@@ -192,8 +231,7 @@ func buildGainsBucketColumnRegistry(outCcy, period string, grain gold.GainsGrain
 	type col = columnSpec[row]
 	var ids []col
 	if grain != gold.GainsAll {
-		ids = append(ids, col{Name: "silver_source", Align: output.AlignLeft,
-			Extract: func(r row) string { return strOrEmpty(r.SilverSourceID) }})
+		ids = append(ids, strCol("silver_source", func(r row) string { return strOrEmpty(r.SilverSourceID) }))
 	}
 	switch grain {
 	case gold.GainsPortfolios:
@@ -216,14 +254,11 @@ func buildGainsBucketColumnRegistry(outCcy, period string, grain gold.GainsGrain
 			textCol("tax_wrapper", func(r row) *string { return r.TaxWrapper }),
 			nicknameCol("account_nickname", func(r row) *string { return r.Nickname }),
 			accountCategoryCol(categories, func(r row) *string { return r.AccountCategory }),
-			col{Name: "relationship_id", Align: output.AlignLeft, Privacy: PrivacyAccountID,
-				Extract: func(r row) string { return strOrEmpty(r.RelationshipID) }})
+			privateCol("relationship_id", PrivacyAccountID, func(r row) string { return strOrEmpty(r.RelationshipID) }))
 	}
 	return append(ids,
-		col{Name: "period", Align: output.AlignLeft, Date: true,
-			Extract: func(r row) string { return periodLabel(r.PeriodStart, period) }},
-		col{Name: "period_start", Align: output.AlignLeft, Date: true,
-			Extract: func(r row) string { return periodStart(r.PeriodStart) }},
+		asDate(strCol("period", func(r row) string { return periodLabel(r.PeriodStart, period) })),
+		asDate(strCol("period_start", func(r row) string { return periodStart(r.PeriodStart) })),
 		outCcyCol("realized", outCcy, func(r row) *string { return r.Realized }),
 		outCcyCol("realized_short", outCcy, func(r row) *string { return r.RealizedShort }),
 		outCcyCol("realized_long", outCcy, func(r row) *string { return r.RealizedLong }),
@@ -239,7 +274,7 @@ func buildGainsBucketColumnRegistry(outCcy, period string, grain gold.GainsGrain
 		countCol("positions", func(r row) int64 { return r.Positions }),
 		countCol("positions_without_basis", func(r row) int64 { return r.PositionsWithoutBasis }),
 		ratioOrBlankCol("basis_coverage", "basis_coverage_pct", func(r row) *float64 { return r.BasisCoverage }),
-		col{Name: "quality", Align: output.AlignLeft, Extract: func(r row) string { return r.Quality }},
+		strCol("quality", func(r row) string { return r.Quality }),
 	)
 }
 
@@ -273,7 +308,7 @@ func buildGainsPositionColumnRegistry(outCcy string, kindOf func(string) string)
 	keyCol, nameCol := holdingCols(kindOf, func(r row) string { return r.SilverSourceID }, key,
 		func(r row) string { return strOrEmpty(r.Name) })
 	return []col{
-		{Name: "silver_source", Align: output.AlignLeft, Extract: func(r row) string { return r.SilverSourceID }},
+		strCol("silver_source", func(r row) string { return r.SilverSourceID }),
 		accountCol(kindOf, ref),
 		accountIDCol("account_id", kindOf, ref),
 		nicknameCol("account_nickname", func(r row) *string { return r.Nickname }),
@@ -285,10 +320,10 @@ func buildGainsPositionColumnRegistry(outCcy string, kindOf func(string) string)
 		textCol("currency", func(r row) *string { return r.Currency }),
 		quantityCol("quantity_start", func(r row) *string { return r.QuantityStart }),
 		quantityCol("quantity_end", func(r row) *string { return r.QuantityEnd }),
-		moneyCol("cost_basis", "", func(r row) *string { return r.BookValue }),
+		moneyCol("cost_basis", func(r row) *string { return r.BookValue }),
 		outCcyTwin("cost_basis", outCcy, func(r row) *string { return r.BookValueOutCcy }),
-		moneyCol("market_value", "", func(r row) *string { return r.MarketValue }),
-		outCcyCol("value", outCcy, func(r row) *string { return r.ValueOutCcy }),
+		moneyCol("market_value", func(r row) *string { return r.MarketValue }),
+		valueCol(outCcy, func(r row) *string { return r.ValueOutCcy }),
 		outCcyCol("unrealized_start", outCcy, func(r row) *string { return r.UnrealizedStart }),
 		outCcyCol("unrealized_end", outCcy, func(r row) *string { return r.UnrealizedEnd }),
 		outCcyCol("unrealized_change", outCcy, func(r row) *string { return r.UnrealizedChange }),
@@ -298,7 +333,7 @@ func buildGainsPositionColumnRegistry(outCcy string, kindOf func(string) string)
 		textCol("basis_stamp", func(r row) *string { return r.BasisStamp }),
 		asDate(textCol("acquisition_date", func(r row) *string { return r.AcquisitionDate })),
 		countCol("lots", func(r row) int64 { return r.OpenLots }),
-		{Name: "quality", Align: output.AlignLeft, Extract: func(r row) string { return r.Quality }},
+		strCol("quality", func(r row) string { return r.Quality }),
 	}
 }
 
@@ -315,8 +350,8 @@ func buildRealizedLotColumnRegistry(outCcy string, kindOf func(string) string) [
 	}
 	holding := func(r row) (string, string) { return r.SilverSourceID, strOrEmpty(r.InstrumentExternalID) }
 	return []col{
-		{Name: "silver_source", Align: output.AlignLeft, Extract: func(r row) string { return r.SilverSourceID }},
-		{Name: "date", Align: output.AlignLeft, Date: true, Extract: func(r row) string { return r.EffectiveDate }},
+		strCol("silver_source", func(r row) string { return r.SilverSourceID }),
+		asDate(strCol("date", func(r row) string { return r.EffectiveDate })),
 		// The date is the tax year's last day when the document states
 		// no disposal or settlement date.
 		yesNoCol("undated", func(r row) *bool { return &r.Undated }),
@@ -329,38 +364,36 @@ func buildRealizedLotColumnRegistry(outCcy string, kindOf func(string) string) [
 		textCol("description", func(r row) *string { return r.Description }),
 		holdingIDCol(textCol("instrument_id", func(r row) *string { return r.InstrumentExternalID }), kindOf, holding),
 		quantityCol("quantity", func(r row) *string { return r.Quantity }),
-		{Name: "acquired", Align: output.AlignLeft,
-			Extract: func(r row) string {
-				if r.AcquiredVarious {
-					return "various"
-				}
-				return strOrEmpty(r.AcquisitionDate)
-			}},
+		strCol("acquired", func(r row) string {
+			if r.AcquiredVarious {
+				return "various"
+			}
+			return strOrEmpty(r.AcquisitionDate)
+		}),
 		textCol("term", func(r row) *string { return r.Term }),
 		yesNoCol("covered", func(r row) *bool { return r.Covered }),
 		textCol("form_8949_box", func(r row) *string { return r.Form8949Box }),
 		intPtrCol("held_days", func(r row) *int64 { return r.HeldDays }),
-		moneyCol("proceeds", "", func(r row) *string { return r.Proceeds }),
-		moneyCol("cost_basis", "", func(r row) *string { return r.BookValue }),
-		moneyCol("gain", "", func(r row) *string { return r.Gain }),
-		moneyCol("wash_disallowed", "", func(r row) *string { return r.WashDisallowed }),
-		moneyCol("accrued_market_discount", "", func(r row) *string { return r.AccruedMarketDiscount }),
-		{Name: "gain_origin", Align: output.AlignLeft, Extract: func(r row) string { return r.GainOrigin }},
+		moneyCol("proceeds", func(r row) *string { return r.Proceeds }),
+		moneyCol("cost_basis", func(r row) *string { return r.BookValue }),
+		moneyCol("gain", func(r row) *string { return r.Gain }),
+		moneyCol("wash_disallowed", func(r row) *string { return r.WashDisallowed }),
+		moneyCol("accrued_market_discount", func(r row) *string { return r.AccruedMarketDiscount }),
+		strCol("gain_origin", func(r row) string { return r.GainOrigin }),
 		// What the lot realized: a sale, or a fee, spend, tender, cash
 		// in lieu or expiry, which a filter can set apart.
-		{Name: "disposal", Align: output.AlignLeft, Extract: func(r row) string { return r.Disposal }},
-		{Name: "currency", Align: output.AlignLeft, Extract: func(r row) string { return r.Currency }},
+		strCol("disposal", func(r row) string { return r.Disposal }),
+		strCol("currency", func(r row) string { return r.Currency }),
 		outCcyTwin("proceeds", outCcy, func(r row) *string { return r.ProceedsOutCcy }),
 		outCcyTwin("cost_basis", outCcy, func(r row) *string { return r.BookValueOutCcy }),
 		outCcyTwin("gain", outCcy, func(r row) *string { return r.GainOutCcy }),
-		{Name: "document", Align: output.AlignLeft, Extract: func(r row) string { return r.DocumentKind }},
-		{Name: "tax_year", Align: output.AlignLeft, Extract: func(r row) string { return fmt.Sprintf("%d", r.TaxYear) }},
+		strCol("document", func(r row) string { return r.DocumentKind }),
+		strCol("tax_year", func(r row) string { return fmt.Sprintf("%d", r.TaxYear) }),
 		yesNoCol("primary", func(r row) *bool { return &r.IsPrimary }),
 		textCol("basis_stamp", func(r row) *string { return r.BasisStamp }),
 		// The lot engine names a lot it realizes by the line that sold it.
 		typedIDCol("lot_id", kindOf, func(r row) (string, string) { return r.SilverSourceID, r.RealizedLotExternalID }),
-		{Name: "source_document", Align: output.AlignLeft, Privacy: PrivacyAccountID,
-			Extract: func(r row) string { return strOrEmpty(r.SourceDocument) }},
+		privateCol("source_document", PrivacyAccountID, func(r row) string { return strOrEmpty(r.SourceDocument) }),
 	}
 }
 
@@ -378,8 +411,8 @@ func buildOpenLotColumnRegistry(outCcy string, kindOf func(string) string) []col
 	key, name := holdingCols(kindOf, func(r row) string { return r.SilverSourceID },
 		func(r row) string { return r.PositionKey }, func(r row) string { return strOrEmpty(r.Name) })
 	return []col{
-		{Name: "silver_source", Align: output.AlignLeft, Extract: func(r row) string { return r.SilverSourceID }},
-		{Name: "snapshot_date", Align: output.AlignLeft, Date: true, Extract: func(r row) string { return formatDate(r.SnapshotAt) }},
+		strCol("silver_source", func(r row) string { return r.SilverSourceID }),
+		asDate(strCol("snapshot_date", func(r row) string { return formatDate(r.SnapshotAt) })),
 		accountCol(kindOf, ref),
 		accountIDCol("account_id", kindOf, ref),
 		nicknameCol("account_nickname", func(r row) *string { return r.Nickname }),
@@ -392,18 +425,17 @@ func buildOpenLotColumnRegistry(outCcy string, kindOf func(string) string) []col
 		textCol("term", func(r row) *string { return r.Term }),
 		yesNoCol("covered", func(r row) *bool { return r.Covered }),
 		quantityCol("quantity", func(r row) *string { return r.Quantity }),
-		moneyCol("cost_basis", "", func(r row) *string { return r.BookValue }),
-		moneyCol("market_value", "", func(r row) *string { return r.MarketValue }),
+		moneyCol("cost_basis", func(r row) *string { return r.BookValue }),
+		moneyCol("market_value", func(r row) *string { return r.MarketValue }),
 		textCol("value_origin", func(r row) *string { return r.ValueOrigin }),
-		moneyCol("unrealized_gain", "", func(r row) *string { return r.UnrealizedGain }),
+		moneyCol("unrealized_gain", func(r row) *string { return r.UnrealizedGain }),
 		ratioOrBlankCol("unrealized_pct", "", func(r row) *float64 { return r.UnrealizedRatio }),
-		{Name: "currency", Align: output.AlignLeft, Extract: func(r row) string { return r.Currency }},
+		strCol("currency", func(r row) string { return r.Currency }),
 		outCcyTwin("cost_basis", outCcy, func(r row) *string { return r.BookValueOutCcy }),
-		outCcyCol("value", outCcy, func(r row) *string { return r.ValueOutCcy }),
+		valueCol(outCcy, func(r row) *string { return r.ValueOutCcy }),
 		outCcyTwin("unrealized_gain", outCcy, func(r row) *string { return r.UnrealizedOutCcy }),
 		textCol("basis_origin", func(r row) *string { return r.BasisOrigin }),
-		{Name: "source_document", Align: output.AlignLeft, Privacy: PrivacyAccountID,
-			Extract: func(r row) string { return strOrEmpty(r.SourceDocument) }},
+		privateCol("source_document", PrivacyAccountID, func(r row) string { return strOrEmpty(r.SourceDocument) }),
 	}
 }
 
@@ -419,7 +451,7 @@ func buildGainsCoverageColumnRegistry(outCcy string, kindOf func(string) string)
 		return accountRef{source: r.SilverSourceID, name: r.DisplayName, nickname: r.Nickname, id: r.AccountExternalID}
 	}
 	return []col{
-		{Name: "silver_source", Align: output.AlignLeft, Extract: func(r row) string { return r.SilverSourceID }},
+		strCol("silver_source", func(r row) string { return r.SilverSourceID }),
 		accountCol(kindOf, ref),
 		accountIDCol("account_id", kindOf, ref),
 		nicknameCol("account_nickname", func(r row) *string { return r.Nickname }),
@@ -432,7 +464,7 @@ func buildGainsCoverageColumnRegistry(outCcy string, kindOf func(string) string)
 		countCol("sells", func(r row) int64 { return r.Sells }),
 		countCol("realized_lots", func(r row) int64 { return r.RealizedLots }),
 		textCol("documents", func(r row) *string { return r.Documents }),
-		{Name: "verdict", Align: output.AlignLeft, Extract: func(r row) string { return r.Verdict }},
+		strCol("verdict", func(r row) string { return r.Verdict }),
 		countCol("sells_rebuilt", func(r row) int64 { return r.SellsRebuilt }),
 		countCol("positions_rebuilt", func(r row) int64 { return r.PositionsRebuilt }),
 		countCol("seed_lots", func(r row) int64 { return r.SeedLots }),
@@ -453,8 +485,8 @@ func buildGainsCheckColumnRegistry(outCcy string, kindOf func(string) string) []
 		return accountRef{source: r.SilverSourceID, name: r.DisplayName, nickname: r.Nickname, id: r.AccountExternalID}
 	}
 	return []col{
-		{Name: "check", Align: output.AlignLeft, Extract: func(r row) string { return r.Check }},
-		{Name: "silver_source", Align: output.AlignLeft, Extract: func(r row) string { return r.SilverSourceID }},
+		strCol("check", func(r row) string { return r.Check }),
+		strCol("silver_source", func(r row) string { return r.SilverSourceID }),
 		accountCol(kindOf, ref),
 		accountIDCol("account_id", kindOf, ref),
 		nicknameCol("account_nickname", func(r row) *string { return r.Nickname }),
@@ -475,9 +507,9 @@ var defaultGainsCheckColumns = []string{
 }
 
 func gainsUsage() string {
-	cols := func(grain gold.GainsGrain) string {
-		return joinColumnNames(buildGainsBucketColumnRegistry("CCY", "monthly", grain, nil, nil))
-	}
+	available, defaults := columnSets(gainsFamily, 13, gainsFamily.names(), request{currency: "CCY", period: "monthly"},
+		map[string]string{"sources": "silver_source, then summary's",
+			"portfolios": "silver_source, portfolio, portfolio_id, then summary's"})
 	return "usage: wealthdb gains <view> [FROM [TO]] [--period P] [--documents D] [-r]\n" +
 		"                         [--missing-basis M] [-f FORMAT] [-C COLS] [-F COND]... [-x CCY] [-p]\n" +
 		`
@@ -557,30 +589,12 @@ Notes
   basis_assumed_zero=N, fx_missing=N. docs/GAINS.md §6 says what each
   means.
 
-Available columns (per view):
-  summary       ` + cols(gold.GainsAll) + `
-  sources       silver_source, then summary's
-  portfolios    silver_source, portfolio, portfolio_id, then summary's
-  accounts      ` + cols(gold.GainsAccounts) + `
-  positions     ` + joinColumnNames(buildGainsPositionColumnRegistry("CCY", nil)) + `
-  realized      ` + joinColumnNames(buildRealizedLotColumnRegistry("CCY", nil)) + `
-  lots          ` + joinColumnNames(buildOpenLotColumnRegistry("CCY", nil)) + `
-  coverage      ` + joinColumnNames(buildGainsCoverageColumnRegistry("CCY", nil)) + `
-  check         ` + joinColumnNames(buildGainsCheckColumnRegistry("CCY", nil)) + `
+Available columns (per view):` + available + `
 
   A money column in the holding's own currency has a twin in the output
   currency, <name>_outccy, which prints as <name>_<CCY> (value is
   market_value's twin). The window's figures exist only in the output
   currency and print as <name>_<CCY>.
 
-Default column sets:
-  summary       ` + strings.Join(gainsBucketDefaults[gold.GainsAll], ", ") + `
-  sources       ` + strings.Join(gainsBucketDefaults[gold.GainsSources], ", ") + `
-  portfolios    ` + strings.Join(gainsBucketDefaults[gold.GainsPortfolios], ", ") + `
-  accounts      ` + strings.Join(gainsBucketDefaults[gold.GainsAccounts], ", ") + `
-  positions     ` + strings.Join(defaultGainsPositionColumns, ", ") + `
-  realized      ` + strings.Join(defaultRealizedLotColumns, ", ") + `
-  lots          ` + strings.Join(defaultOpenLotColumns, ", ") + `
-  coverage      ` + strings.Join(defaultGainsCoverageColumns, ", ") + `
-  check         ` + strings.Join(defaultGainsCheckColumns, ", ")
+Default column sets:` + defaults
 }

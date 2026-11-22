@@ -77,9 +77,9 @@ the template should read this whole file plus the docs it names.
 
 Every build copies the newest validated sibling of its archetype and
 diverges only where a capture proves the new source differs — including
-the site half of its explore harness (entry URL, host gate, detector
-script, login-form fill); the recording half is `collectorkit.explore`,
-shared by every harness. Pick the archetype from the
+the site half of its explore harness (an `explore.Site`: entry URL, host
+gate, detector script, login-form selectors); the recording half is
+`collectorkit.explore`, shared by every harness. Pick the archetype from the
 Auth/Runtime columns of the roster table in
 [collectors/README.md](collectors/README.md), newest sibling first
 (date candidates with `git log --diff-filter=A -- collectors/<name>`):
@@ -163,17 +163,22 @@ and move on.
 
 ## Phases
 
-1. **Scaffold** — adapt the template sibling's harness: an explore.py
-   that gives `collectorkit.explore.Session` the site's host gate,
-   detector script and login-form fill. The session already captures a
+1. **Scaffold** — adapt the template sibling's files. A collector.py
+   declares the collector (`collectorkit.spec.Collector`); the
+   collectorkit suite fails a collector without one. An explore.py
+   declares the site as a `collectorkit.explore.Site` (host gate,
+   detector script, login-form selectors) and runs `explore.main`.
+   The session already captures a
    DOM snapshot per distinct screen AND response bodies (network +
    click logs alone pin no selectors and leave every JSON shape a
    guess), routes every capture through the harness's
    `debugcap.secret_redactor(username, password)` and every DOM through
    `debugcap.scrub_dom`, and cleans the recorded HAR after the context
-   close. A capture written from a `login.py` or a `download.py` is the
-   author's to route through the same two maskers; the collectorkit
-   suite enforces `scrub_dom` on any module that serialises a page. A
+   close. A `login.py` or `download.py` capture goes through
+   `debugcap.landmark_capturer` (sign-in landmarks) or
+   `debugcap.page_capturer` (a walk that holds a session), which mask
+   and scrub; the collectorkit suite enforces `scrub_dom` on any module
+   that serialises a page. A
    Playwright trace cannot be rewritten at all and holds the credential
    verbatim. Dockerfile on the matching
    shared base image (Camoufox for unknown or hostile bot defense — it
@@ -224,15 +229,18 @@ and move on.
    authenticated-surface request mid-challenge — it can invalidate
    the challenge server-side. Give every browser-event dependency a
    poll-based twin and pump the event loop in every wait. Bronze runs
-   follow the fleet layout (run.json status lifecycle, accounts
+   follow the fleet layout (the run.json status lifecycle, written by
+   `bronze.open_run`; accounts
    roster, per-account exports/JSON/statements; diagnostics only
    behind --debug). Wire the standard flags via collectorkit.cli
    (add_standard_args / resolve_standard) — the conventions table in
    collectors/README.md is binding; a standard flag the source cannot
    honour parses cleanly and warns loudly, never silently no-ops.
 4. **load** — bronze → SQLite silver (JSON1 payloads), migrations,
-   idempotent (re-load is a clean no-op; --force = delete + rebuild),
-   unit tests on synthetic fixtures only (synthesize values from
+   through the kit's load frame (collectorkit.loader; collectors/README.md,
+   "load.py — silver"): re-load is a clean no-op, and --force rebuilds
+   from all bronze beside the old silver. Add the standing test
+   collectorkit.incremental.check. Unit tests on synthetic fixtures only (synthesize values from
    scratch — never transform real ones; placeholder patterns per root
    AGENTS.md §4). The ledger source is whatever the capture proves
    richest — the SPA's own JSON usually supersedes CSV/HTML exports;
@@ -246,25 +254,33 @@ and move on.
    silver").
 5. **Statement backfill** (conditional — build only if the measured
    history floors say the transaction export is date-capped while
-   statements reach further back). If built: parse the
-   `pdftotext -layout` text `collectorkit.pdftotext` extracts; gate
-   every import on beginning + Σ == ending reconciliation (skip and log
-   what doesn't reconcile — never import a mis-parse); import only rows
-   strictly older than the export seam (the oldest row the transaction
-   export reaches — the chase collector's DESIGN.md documents the
-   reference implementation); attribute multi-product statements per
+   statements reach further back). If built: parse the text
+   collectorkit.extract extracts (`extract.cached(extract.pdftotext_layout,
+   …)`); the parser imports collectorkit.words, never extract. Gate
+   every import on beginning + Σ == ending reconciliation with
+   collectorkit.statement's checks (skip and log what doesn't
+   reconcile — never import a mis-parse); import only rows strictly
+   older than the export seam (the oldest row the transaction export
+   reaches, collectorkit.channels; the chase collector's DESIGN.md
+   documents the reference implementation); attribute multi-product statements per
    segment by balance chaining, stopping on ambiguity, never guessing.
    Where neither reaches far enough, a document the bank prints on
    request can: raiffeisen_at stitches such listings from `supplied/`
    beside the live history (its DESIGN.md §I).
 6. **Gold adapter** — wealthdb/internal/silver/<name>/ modeled on the
    newest comparable adapter (contract: wealthdb/docs/DESIGN.md §6):
-   the Adapter/Connection interface, a silver_sources whitelist
-   migration, the blank import in wealthdb/cmd/wealthdb/main.go, a
-   co-located ReturnsPolicy (policy.go beside adapter.go, plus the
-   test blank-import lists in internal/returns/policy_registered_test.go
-   and internal/gold/returns_policy_import_test.go — a gold guard test
-   fails when a whitelisted kind registers no policy), fixture tests.
+   the Connection interface, one silver.Source registered from
+   adapter.go's init with its ReturnsPolicy and the kind's other facts
+   (DESIGN.md §6.3), the import in wealthdb/internal/silver/all (a new
+   kind needs no gold migration: a load accepts any registered kind; a
+   gold guard test fails when a registered kind has no policy).
+   A deposit or card source declares a `bank.Source`
+   (wealthdb/internal/silver/bank) instead of an adapter of its own.
+   The change number and window are a `silver.Clock` (`silver.LoadClock`
+   for a silver that records its dumps). Tables and columns a later
+   silver schema adds are `silver.Optional`. Add fixture tests and a
+   canonical golden file (`silvertest.Golden`; `-update-canonical`
+   rewrites it).
    Map accounts and transactions into the canonical
    enums; unrecognised values fall through to `other` with the raw
    value in payload — never fail the load. Validation gate: the user
@@ -582,13 +598,17 @@ as hard rules rather than advice.
   archive floor) — the comparison decides whether a backfill phase
   exists at all, in either direction.
 - **Idempotency and self-healing:** re-load is a clean no-op; derived
-  silver tables are rebuilt from bronze each load rather than patched
-  incrementally (an incremental build can never retire stale rows
-  after an identity shift); destructive loaders validate their input
+  rows carry their document and are re-derived per parser generation
+  (collectorkit.derivations), so a parser change re-derives its own
+  scope and a routine load derives nothing. Runs loaded one at a time
+  must build the silver of one `load --force`
+  (collectorkit.incremental). Destructive loaders validate their input
   before touching existing output, and a windowed replace deletes only
   the span the input covers, not the span that was asked for. Mark
-  each parsed document, not just its rows: a document that yields no
-  rows is otherwise parsed again on every load.
+  each parsed document, not just its rows
+  (`derivations.record_derivation`, with a row count of 0 for one that
+  yields nothing): such a document is otherwise parsed again on every
+  load.
 - **Private-market portals differ from banks:** no transaction feed
   (synthesize a balanced double-entry ledger on the custody account —
   each event nets to zero, and the deposit/withdrawal boundary legs are

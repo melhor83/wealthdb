@@ -1,7 +1,8 @@
-"""Shared test helpers: an invented wanted list and the plan of it, fake
-providers, fake sources and a run's context on them, a run and a silver
-DB as the collector writes them, invented workbooks, PDFs and filing
-archives, and the engine's vocabularies read from its Go source."""
+"""Shared test helpers: an invented wanted list and the plan of it, a
+ledger of earlier runs, fake providers, fake sources and a run's context
+on them, a run and a silver DB as the collector writes them, invented
+workbooks, PDFs and filing archives, and the engine's vocabularies read
+from its Go source."""
 
 import email.message
 import http
@@ -20,11 +21,15 @@ import download
 import fetcher
 import load
 import wanted as wantedmod
-from collectorkit import bronze, silver
+from collectorkit import bronze, silver, testpdf
+from ledger import FIGURES, NAMED, Ledger
 from providers import openfigi
 from providers.base import KIND_DIRS, Context, Parsed, Provider, Unavailable, folder_name, read_meta, write_meta
+from wants import COMPOSITION, IDENTITY
 
 TODAY = date(2026, 7, 15)
+# The day of a run so long past that it never counts as recent.
+LONG_AGO = date(2000, 1, 1)
 ENGINE = Path(__file__).resolve().parents[3] / "wealthdb" / "internal"
 
 
@@ -57,6 +62,87 @@ def held(ref="symbol:FUNDA", symbol="FUNDA", wants=(), facts=None, **kw):
     """A held fund of a version 3 wanted list: fund() with the facts it
     `wants` and gold's days of each (`facts`)."""
     return {**fund(ref, symbol, **kw), "wants": list(wants), "facts": facts or {}}
+
+
+class Fetched(Ledger):
+    """A ledger (ledger.py) a test builds or reads, stated as one map per
+    kind of answer, each with the day of the latest run that fetched it:
+
+    funds      (provider, fund ref, day of the composition)
+    facts      (provider, fund ref, fact)
+    fact_days  (provider, fund ref, fact) -> the days a request fetched it for, by
+               a run of LONG_AGO
+    lookups    (provider, security key)
+    families   (provider, security key), of a security request that asked for figures
+    wants      (provider, security key, fact), of a request that asked for a fact the
+               security wants: a security request, or a bulk answer that names it
+    answered   (provider, security key), of a bulk answer whose `answered` names it
+    bulk       (provider, bulk ref)
+    asked      (provider, security key), of a security request sent, one that failed too"""
+
+    @classmethod
+    def of(cls, *, funds=None, facts=None, fact_days=None, lookups=None, families=None, wants=None, answered=None,
+           bulk=None, asked=None) -> "Fetched":
+        """The maps given, every other one empty."""
+        out = cls()
+        for (p, ref, day), run in (funds or {}).items():
+            out.settle(p, "fund", ref, COMPOSITION, day, run)
+        for (p, ref, fact), run in (facts or {}).items():
+            out.settle(p, "fund", ref, fact, None, run)
+        for (p, ref, fact), days in (fact_days or {}).items():
+            for day in days:
+                out.settle(p, "fund", ref, fact, day, LONG_AGO)
+        for m, fact in ((lookups, IDENTITY), (families, FIGURES), (answered, NAMED)):
+            for (p, key), run in (m or {}).items():
+                out.settle(p, "security", key, fact, None, run)
+        for (p, key, fact), run in (wants or {}).items():
+            out.settle(p, "security", key, fact, None, run)
+        for (p, ref), run in (bulk or {}).items():
+            out.settle(p, "bulk", ref, None, None, run)
+        out.sent.update(asked or {})
+        return out
+
+    def _map(self, kind, keep, with_fact=False) -> dict:
+        return {(p, s, *((f,) if with_fact else ())): last for (p, k, s, f) in self.runs
+                if k == kind and keep(f) and (last := self.last(p, k, s, f)) is not None}
+
+    @property
+    def funds(self) -> dict:
+        return {(p, s, d): run for (p, k, s, f), days in self.runs.items() if (k, f) == ("fund", COMPOSITION)
+                for d, run in days.items()}
+
+    @property
+    def facts(self) -> dict:
+        return self._map("fund", lambda f: f != COMPOSITION, True)
+
+    @property
+    def fact_days(self) -> dict:
+        return {(p, s, f): days for (p, k, s, f) in self.runs if k == "fund" and f != COMPOSITION
+                and (days := self.settled(p, k, s, f))}
+
+    @property
+    def lookups(self) -> dict:
+        return self._map("security", lambda f: f == IDENTITY)
+
+    @property
+    def families(self) -> dict:
+        return self._map("security", lambda f: f == FIGURES)
+
+    @property
+    def wants(self) -> dict:
+        return self._map("security", lambda f: f not in (IDENTITY, FIGURES, NAMED), True)
+
+    @property
+    def answered(self) -> dict:
+        return self._map("security", lambda f: f == NAMED)
+
+    @property
+    def bulk(self) -> dict:
+        return self._map("bulk", lambda f: True)
+
+    @property
+    def asked(self) -> dict:
+        return dict(self.sent)
 
 
 def make_run(data, slug, reqs, ctx=None):
@@ -333,28 +419,8 @@ def broken_archive(primary: bytes, second: bytes) -> bytes:
 def pdf(pages) -> bytes:
     """A PDF whose pages hold the given lines of text, in Helvetica: the
     smallest file a text extractor reads as a report does."""
-    objs = {1: b"<< /Type /Catalog /Pages 2 0 R >>",
-            3: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"}
-    kids = []
-    for i, lines in enumerate(pages):
-        page, content = 4 + 2 * i, 5 + 2 * i
-        text = b"".join(b"(" + ln.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)").encode("cp1252")
-                        + b") Tj T* " for ln in lines)
-        stream = b"BT /F1 9 Tf 12 TL 36 800 Td " + text + b"ET"
-        objs[content] = b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream"
-        objs[page] = (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >>"
-                      b" /Contents %d 0 R >>" % content)
-        kids.append(b"%d 0 R" % page)
-    objs[2] = b"<< /Type /Pages /Kids [" + b" ".join(kids) + b"] /Count %d >>" % len(kids)
-    out, offsets = bytearray(b"%PDF-1.4\n"), {}
-    for n in sorted(objs):
-        offsets[n] = len(out)
-        out += b"%d 0 obj\n" % n + objs[n] + b"\nendobj\n"
-    xref = len(out)
-    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)
-    out += b"".join(b"%010d 00000 n \n" % offsets[n] for n in sorted(objs))
-    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, xref)
-    return bytes(out)
+    return testpdf.pdf([testpdf.lines(page, size=9, leading=12, x=36, y=800)
+                        for page in pages], page=testpdf.A4)
 
 
 def characteristics_by_key(rows, provider: str) -> dict:
@@ -375,6 +441,14 @@ def go_strings(text, var) -> list:
     """The quoted strings of a `var <var> = []string{…}` slice."""
     body = re.search(rf"var {var} = \[\]string\{{(.*?)\}}", text, re.S).group(1)
     return re.findall(r'"([^"]*)"', body)
+
+
+def go_rows(text, var) -> list:
+    """(name, [strings]) of each `{"name", []string{…}, …}` row of a
+    `var <var> = …` block."""
+    block = re.search(rf"var {var} = .*?\n\}}\n", text, re.S).group(0)
+    return [(name, re.findall(r'"([^"]*)"', strings))
+            for name, strings in re.findall(r'\{"(\w+)",\s*\[\]string\{(.*?)\}', block, re.S)]
 
 
 def go_const(text, name) -> str:

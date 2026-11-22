@@ -19,14 +19,13 @@ runtime (§4), and operating notes (§5). The layout follows
   in other countries.
 - **The model is chase, refined by firstcitizens.** Both are US retail
   deposit collectors: browser login, REST or export data, statement PDFs
-  as documents, cash accounts as conduits in gold. This collector starts
+  as documents, cash accounts kept out of returns in gold. This collector starts
   from them and diverges only where the source differs.
-- **Conduit accounts.** Cash passes through these accounts on its way to
-  and from other sources. Their transactions matter for cross-source
-  money-flow tracking. Their own return rows are noise, so the
-  registered ReturnsPolicy (`internal/silver/raiffeisen_at/policy.go`,
-  the shared deposit-bank policy) hides them at every grain. Their
-  balances and flows still enter every aggregate.
+- **Deposit accounts are not investments.** Their transactions matter for
+  cross-source money-flow tracking. Their own return rows are noise.
+  They are `cash` accounts, which the returns engine hides on any source
+  ([docs/adapters/chase.md](../../wealthdb/docs/adapters/chase.md) §7).
+  Their balances and flows still enter every aggregate.
 - **2FA is pushTAN** (§A). The login is confirmed in the Raiffeisen app;
   nothing is typed. The completion signal is a plain REST poll. The
   browser shows a 4-character Vergleichswert, which the run announces in
@@ -651,15 +650,17 @@ plus `load.py`'s supplied pass. `pdftotext` comes from the image's
 - a closing cash balance per day from `daily_balances`, stamped at the
   day's last second;
 - a current balance from the roster at each run that listed the account
-  (`run_accounts`). An account the bank stops listing has no balance
-  after its last listing run, so gold can end it;
+  (`run_accounts`);
+- the coverage of each such run. The run reads the whole roster, so it
+  covers every account the roster held by then. An account the bank
+  stops listing ends at the first run that leaves it out
+  ([wealthdb/docs/DESIGN.md](../../wealthdb/docs/DESIGN.md) §10.7). A
+  listed account with no roster balance is not covered at that run;
 - every transaction, with `amount` already signed: interest and fee
   recognised from the category or description, else deposit or
   withdrawal by sign.
 
-It registers via the blank import in `cmd/wealthdb/main.go` and the
-`silver_sources` migration
-(`internal/gold/migrations/0035_silver_sources_raiffeisen_at.sql`). Its
+It registers via its import in `internal/silver/all`. Its
 return rows are hidden per §1.
 
 ## 5. Operating notes

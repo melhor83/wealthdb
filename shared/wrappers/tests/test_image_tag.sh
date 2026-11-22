@@ -7,10 +7,12 @@
 # .image-tag stops the wrapper. A build whose inputs hash matches the
 # image's wealthdb.inputs label is skipped, for the engine, a collector
 # and the shared bases; an extra argument, a changed input or a rebuilt
-# base image builds. A HAS_APP_MOUNT collector's inputs are its
-# Dockerfile and requirements.txt alone. The wrappers run from a copy of the tree, so the
-# checkout's own .image-tag plays no part. A stubbed docker on PATH
-# records the argv; nothing real is built.
+# base image builds. base-camoufox takes its browser mode and the local
+# archive, and a test build keeps one that carries the browser. A
+# collector's inputs are its Dockerfile and requirements.txt alone. The
+# wrappers run from a copy of the tree, so the checkout's own .image-tag
+# plays no part. A stubbed docker on PATH records the argv; nothing real
+# is built.
 set -uo pipefail
 # The makes this test starts read only what it gives them: an outer
 # make's flags and command-line variables (make test-wrappers X=…) stay
@@ -32,6 +34,7 @@ mkdir -p "$TREE/wealthdb" "$TREE/shared/wrappers"
 cp "$ROOT/wealthdb/wealthdb" "$ROOT/wealthdb/wealthdb-go" "$TREE/wealthdb/"
 cp "$ROOT/shared/wrappers/wrapper-lib.sh" "$ROOT/shared/wrappers/image-tag.sh" \
     "$ROOT/shared/wrappers/envfile-lib.sh" "$ROOT/shared/wrappers/demo-root.sh" \
+    "$ROOT/shared/wrappers/paths-lib.sh" "$ROOT/shared/wrappers/service-lib.sh" \
     "$TREE/shared/wrappers/"
 mkdir -p "$TREE/mcp" "$TREE/web"
 cp "$ROOT/Makefile" "$TREE/"
@@ -244,11 +247,14 @@ else
 fi
 
 # An image whose label matches that hash is not built. The stub returns
-# the label on the inputs inspect and STUB_ID on any other inspect, and
-# prints BUILT and its argv on a build and PULLED and the image on a pull.
+# the label on the inputs inspect, STUB_ENV on the environment inspect
+# (an image that is not there with STUB_NO_IMAGE) and STUB_ID on any
+# other inspect, and prints BUILT and its argv on a build and PULLED and
+# the image on a pull.
 skipdir="$TMP/skipcol"
 mkdir -p "$skipdir"
 printf 'FROM wealthdb/base-python:${WEALTHDB_IMAGE_TAG}\n' > "$skipdir/Dockerfile"
+printf 'requests>=2\n' > "$skipdir/requirements.txt"
 cat > "$TMP/bin/docker" <<'STUB'
 #!/usr/bin/env bash
 if [ "${1:-}" = build ]; then
@@ -264,103 +270,71 @@ fi
 for a in "$@"; do
     case "$a" in
         *wealthdb.inputs*) printf '%s\n' "${STUB_LABEL:-}"; exit 0 ;;
+        *.Config.Env*)
+            [ -n "${STUB_NO_IMAGE:-}" ] && exit 1
+            printf '%s\n' "${STUB_ENV:-}"; exit 0 ;;
     esac
 done
 printf '%s\n' "${STUB_ID:-sha256:from}"
 STUB
 chmod +x "$TMP/bin/docker"
-skiphash="$(hash_of "$skipdir" -- sha256:from)"
-out="$(
-    export PATH="$TMP/bin:$PATH" STUB_LABEL="$skiphash" WEALTHDB_IMAGE_TAG=feature
-    NAME=testcol; ENV_PREFIX=TESTCOL; ENV_VARS=(); HERE="$skipdir"
-    unset TESTCOL_IMAGE
-    # shellcheck disable=SC1091
-    source "$TREE/shared/wrappers/wrapper-lib.sh"
-    wrapper_init
-    wrapper_build build
-)"
+# skip_build LABEL [ARGS...]: `build ARGS` of a collector in skipdir
+# whose image carries LABEL.
+skip_build() {
+    (
+        export PATH="$TMP/bin:$PATH" STUB_LABEL="$1" WEALTHDB_IMAGE_TAG=feature
+        shift
+        NAME=testcol; ENV_PREFIX=TESTCOL; ENV_VARS=(); HERE="$skipdir"
+        unset TESTCOL_IMAGE
+        # shellcheck disable=SC1091
+        source "$TREE/shared/wrappers/wrapper-lib.sh"
+        wrapper_init
+        wrapper_build build "$@"
+    )
+}
+skiphash="$(hash_of "$skipdir/Dockerfile" "$skipdir/requirements.txt" -- sha256:from)"
+out="$(skip_build "$skiphash")"
 if grep -qx 'build: wealthdb/testcol:feature unchanged' <<<"$out" \
     && ! grep -qx BUILT <<<"$out"; then
     ok "a labeled image is not rebuilt"
 else
     bad "a labeled image is not rebuilt ($out)"
 fi
-out="$(
-    export PATH="$TMP/bin:$PATH" STUB_LABEL=other WEALTHDB_IMAGE_TAG=feature
-    NAME=testcol; ENV_PREFIX=TESTCOL; ENV_VARS=(); HERE="$skipdir"
-    unset TESTCOL_IMAGE
-    # shellcheck disable=SC1091
-    source "$TREE/shared/wrappers/wrapper-lib.sh"
-    wrapper_init
-    wrapper_build build
-)"
+out="$(skip_build other)"
 if grep -qx BUILT <<<"$out"; then
     ok "a different label rebuilds the image"
 else
     bad "a different label rebuilds the image ($out)"
 fi
-out="$(
-    export PATH="$TMP/bin:$PATH" STUB_LABEL="$skiphash" WEALTHDB_IMAGE_TAG=feature
-    NAME=testcol; ENV_PREFIX=TESTCOL; ENV_VARS=(); HERE="$skipdir"
-    unset TESTCOL_IMAGE
-    # shellcheck disable=SC1091
-    source "$TREE/shared/wrappers/wrapper-lib.sh"
-    wrapper_init
-    wrapper_build build --no-cache
-)"
+out="$(skip_build "$skiphash" --no-cache)"
 if grep -qx BUILT <<<"$out"; then
     ok "extra build arguments rebuild a labeled image"
 else
     bad "extra build arguments rebuild a labeled image ($out)"
 fi
-
-out="$(
-    export PATH="$TMP/bin:$PATH" STUB_LABEL="$skiphash" STUB_ID=sha256:rebuilt WEALTHDB_IMAGE_TAG=feature
-    NAME=testcol; ENV_PREFIX=TESTCOL; ENV_VARS=(); HERE="$skipdir"
-    unset TESTCOL_IMAGE
-    # shellcheck disable=SC1091
-    source "$TREE/shared/wrappers/wrapper-lib.sh"
-    wrapper_init
-    wrapper_build build
-)"
+out="$(STUB_ID=sha256:rebuilt skip_build "$skiphash")"
 if grep -qx BUILT <<<"$out"; then
     ok "a rebuilt base image rebuilds the collector"
 else
     bad "a rebuilt base image rebuilds the collector ($out)"
 fi
-# A HAS_APP_MOUNT image holds no source: its inputs are the Dockerfile
-# and requirements.txt, so a doc or code edit beside them builds nothing
-# and an edit to requirements.txt builds.
-mountdir="$TMP/mountcol"
-mkdir -p "$mountdir"
-cp "$skipdir/Dockerfile" "$mountdir/"
-printf 'requests>=2\n' > "$mountdir/requirements.txt"
-mount_build() {
-    (
-        export PATH="$TMP/bin:$PATH" STUB_LABEL="$1" WEALTHDB_IMAGE_TAG=feature
-        NAME=testcol; ENV_PREFIX=TESTCOL; ENV_VARS=(); HERE="$mountdir"; HAS_APP_MOUNT=1
-        unset TESTCOL_IMAGE
-        # shellcheck disable=SC1091
-        source "$TREE/shared/wrappers/wrapper-lib.sh"
-        wrapper_init
-        wrapper_build build
-    )
-}
-mounthash="$(hash_of "$mountdir/Dockerfile" "$mountdir/requirements.txt" -- sha256:from)"
-printf 'notes\n' > "$mountdir/README.md"
-printf 'print(1)\n' > "$mountdir/download.py"
-out="$(mount_build "$mounthash")"
+# The image holds no source: its inputs are the Dockerfile and
+# requirements.txt, so a doc or code edit beside them builds nothing and
+# an edit to requirements.txt builds.
+printf 'notes\n' > "$skipdir/README.md"
+printf 'print(1)\n' > "$skipdir/download.py"
+out="$(skip_build "$skiphash")"
 if grep -qx 'build: wealthdb/testcol:feature unchanged' <<<"$out"; then
-    ok "a mounted image ignores an edit to its code or docs"
+    ok "an edit to the code or docs builds nothing"
 else
-    bad "a mounted image ignores an edit to its code or docs"
+    bad "an edit to the code or docs builds nothing ($out)"
 fi
-printf 'requests>=3\n' > "$mountdir/requirements.txt"
-out="$(mount_build "$mounthash")"
+printf 'requests>=3\n' > "$skipdir/requirements.txt"
+out="$(skip_build "$skiphash")"
 if grep -qx BUILT <<<"$out"; then
-    ok "a mounted image rebuilds on a requirements edit"
+    ok "a requirements edit rebuilds the image"
 else
-    bad "a mounted image rebuilds on a requirements edit"
+    bad "a requirements edit rebuilds the image ($out)"
 fi
 
 from="$(. "$TREE/shared/wrappers/image-tag.sh"; WEALTHDB_IMAGE_TAG=feature wealthdb_from_ref "$skipdir/Dockerfile")"
@@ -459,5 +433,68 @@ if grep -q 'build base image wealthdb/base-python:feature (--pull)' <<<"$out" \
 else
     bad "update-bases pulls and builds a labeled base ($out)"
 fi
+
+# base-camoufox takes its browser mode as a build argument, and in
+# bundle mode the local archive's directory as a build context when that
+# directory exists. A none build never replaces a base-camoufox that
+# carries the browser, up to date or stale; a bundle build replaces one
+# without it.
+camo_hash() {
+    (
+        mode="$1"
+        cd "$TREE" || exit 1
+        set --
+        for x in shared/images/*; do
+            case "$x" in *.Dockerfile) ;; *) set -- "$@" "$x" ;; esac
+        done
+        hash_of shared/images/base-camoufox.Dockerfile shared/collectorkit "$@" \
+            shared/.dockerignore -- sha256:from "browser=$mode"
+    )
+}
+camo_bases() {
+    label="$1"
+    shift
+    (cd "$TREE" && run_env STUB_LABEL="$label" WEALTHDB_IMAGE_TAG=feature \
+        make --no-print-directory "$@" 2>&1)
+}
+# update-bases prints each build's argv; base-images keeps it in a log.
+camo_block() { sed -n '/build base image wealthdb\/base-camoufox/,$p' <<<"$1"; }
+out="$(camo_bases none update-bases)"
+has_item "base-camoufox bakes in the browser by default" "CAMOUFOX_BROWSER=bundle" "$(camo_block "$out")"
+lacks_item "no archive directory, no archive context" "--build-context" "$(camo_block "$out")"
+lacks "the other bases take no browser mode" "CAMOUFOX_BROWSER" \
+    "$(sed '/build base image wealthdb\/base-camoufox/,$d' <<<"$out")"
+mkdir -p "$TMP/cache/wealthdb/camoufox"
+out="$(camo_bases none update-bases)"
+has_item "the archive directory is a build context" \
+    "camoufox-archive=$TMP/cache/wealthdb/camoufox" "$(camo_block "$out")"
+out="$(camo_bases none update-bases CAMOUFOX_BROWSER=none)"
+has_item "a none build leaves the browser out" "CAMOUFOX_BROWSER=none" "$(camo_block "$out")"
+lacks_item "a none build takes no archive context" "--build-context" "$(camo_block "$out")"
+out="$(STUB_ENV=WEALTHDB_CAMOUFOX_BROWSER=bundle \
+    camo_bases "$(camo_hash bundle)" base-images CAMOUFOX_BROWSER=none)"
+has "a none build keeps a base-camoufox with the browser" \
+    "build: wealthdb/base-camoufox:feature unchanged" "$out"
+# A stale one is rebuilt with the browser, and so is one from before
+# the browser mode, which has no such variable. Only one built without
+# the browser, or none at all, is built without it.
+kept="build base image wealthdb/base-camoufox:feature (browser: bundle, as the image there carries it)"
+out="$(STUB_ENV=WEALTHDB_CAMOUFOX_BROWSER=bundle camo_bases stale base-images CAMOUFOX_BROWSER=none)"
+has "a none build rebuilds a stale base-camoufox with the browser" "$kept" "$out"
+out="$(STUB_ENV=PATH=/usr/bin camo_bases stale base-images CAMOUFOX_BROWSER=none)"
+has "a none build rebuilds a base-camoufox without the mode variable with the browser" "$kept" "$out"
+out="$(STUB_ENV=WEALTHDB_CAMOUFOX_BROWSER=none camo_bases stale base-images CAMOUFOX_BROWSER=none)"
+has "a none build rebuilds a base-camoufox without the browser as none" \
+    "build base image wealthdb/base-camoufox:feature (browser: none)" "$out"
+out="$(STUB_NO_IMAGE=1 camo_bases stale base-images CAMOUFOX_BROWSER=none)"
+has "a none build with no base-camoufox there builds none" \
+    "build base image wealthdb/base-camoufox:feature (browser: none)" "$out"
+out="$(camo_bases "$(camo_hash none)" base-images)"
+has "a bundle build replaces a base-camoufox without the browser" \
+    "build base image wealthdb/base-camoufox:feature (browser: bundle)" "$out"
+out="$(camo_bases "$(camo_hash bundle)" update-bases CAMOUFOX_BROWSER=none)"
+has "update-bases builds a none base-camoufox over one with the browser" \
+    "build base image wealthdb/base-camoufox:feature (browser: none)" "$out"
+rm -r "$TMP/cache/wealthdb/camoufox"
 
 summary "image tag tests"

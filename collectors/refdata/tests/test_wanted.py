@@ -2,6 +2,7 @@
 
 import json
 import stat
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
@@ -12,6 +13,8 @@ from tests.helpers import fund, wanted_doc
 
 # The wanted list the engine's own tests pin.
 GOLDEN = Path(__file__).resolve().parents[3] / "wealthdb" / "internal" / "gold" / "testdata" / "refdata_wanted.json"
+# The same list as gold builds it, in version 4's shape.
+GOLDEN_V4 = GOLDEN.with_name("refdata_wanted_v4.json")
 
 
 def test_parse_reads_funds_and_securities():
@@ -30,15 +33,15 @@ def test_parse_reads_funds_and_securities():
 
 def test_parse_reads_the_facts_of_version_2():
     doc = wanted_doc([{**fund("symbol:EXBF", "EXBF", compositions=["2026-03-31", "2026-06-30"]),
-                       "wants": ["risk_metrics", "characteristics", "line_durations"],
-                       "facts": {"risk_metrics": ["2026-03-31", "2026-06-30"], "line_durations": ["2026-03-31"]}}],
+                       "wants": ["risk_metrics", "characteristics", "money_market"],
+                       "facts": {"risk_metrics": ["2026-03-31", "2026-06-30"], "money_market": ["2026-03-31"]}}],
                      [{"key": "isin:XX0000000302", "scope": "constituent", "share_pct": 1.5,
                        "missing": ["earnings"], "lookups": {},
                        "periods": {"dividends": "2026-06-30", "financials": "2026-03-31"}}], version=2)
     w = wanted.parse(doc)
     (f,) = w.funds
-    assert f.wants == ("risk_metrics", "characteristics", "line_durations")
-    assert f.facts == {"risk_metrics": (date(2026, 3, 31), date(2026, 6, 30)), "line_durations": (date(2026, 3, 31),)}
+    assert f.wants == ("risk_metrics", "characteristics", "money_market")
+    assert f.facts == {"risk_metrics": (date(2026, 3, 31), date(2026, 6, 30)), "money_market": (date(2026, 3, 31),)}
     (s,) = w.securities
     assert s.missing == ("earnings",)
     assert s.periods == {"dividends": date(2026, 6, 30), "financials": date(2026, 3, 31)}
@@ -74,6 +77,34 @@ def test_parse_reads_the_history_of_version_4():
     assert f.history_from is None
 
 
+def test_parse_reads_a_version_5_list_as_the_fields_before():
+    """A benchmark fund's history_from is the `from` of its
+    monthly_returns; its other wants and their days, a security's lookups,
+    missing families and calendar read as the versions before state
+    them."""
+    doc = wanted_doc(funds=[{"ref": "symbol:QIDX", "roles": ["benchmark"], "wants": [
+        {"fact": "composition", "from": "2026-07-15", "to": None, "have": ["2026-06-30"]},
+        {"fact": "monthly_returns", "from": "2019-01-01", "to": None, "have": ["2026-05-31", "2026-06-30"]},
+        {"fact": "characteristics", "from": "2026-07-15", "to": None, "have": []}]}],
+        securities=[{"key": "isin:XX0000000303", "scope": "direct", "wants": [
+            {"fact": "identity", "by": {"gleif": "2026-07-01"}},
+            {"fact": "earnings", "have": ["2026-03-31"]},
+            {"fact": "dividend_calendar", "have": ["2026-07-01"]}]}], version=5)
+    w = wanted.parse(doc)
+    (f,) = w.funds
+    assert (f.held_from, f.held_to, f.compositions) == (date(2026, 7, 15), None, (date(2026, 6, 30),))
+    assert f.history_from == date(2019, 1, 1) and f.wants == ("monthly_returns", "characteristics")
+    assert f.facts == {"monthly_returns": (date(2026, 5, 31), date(2026, 6, 30))}
+    (s,) = w.securities
+    assert (s.lookups, s.missing, s.periods) == ({"gleif": date(2026, 7, 1)}, ("earnings",),
+                                                 {"earnings": date(2026, 3, 31)})
+    assert (s.wants, s.calendar) == (("dividend_calendar",), date(2026, 7, 1))
+    # A fund that wants no monthly returns has no history_from.
+    (f,) = wanted.parse(wanted_doc(funds=[{"ref": "symbol:QHLD", "wants": [
+        {"fact": "composition", "from": "2026-01-02", "to": None, "have": []}]}], version=5)).funds
+    assert f.history_from is None and f.wants == ()
+
+
 @pytest.mark.parametrize("doc,msg", [
     ({"contract": "other", "version": 1}, "not a refdata-wanted"),
     ({"contract": "refdata-wanted", "version": 9}, "version 9"),
@@ -86,6 +117,14 @@ def test_parse_reads_the_history_of_version_4():
       "securities": [{"key": "isin:XX0000000302", "receipt": "false"}]}, "malformed"),
     ({"contract": "refdata-wanted", "version": 3, "as_of": "2026-07-15",
       "securities": [{"key": "isin:XX0000000302", "calendar": "x"}]}, "malformed"),
+    ({"contract": "refdata-wanted", "version": 5, "as_of": "2026-07-15",
+      "funds": [{"ref": "symbol:EXBF", "wants": [{"from": "2026-01-02"}]}]}, "malformed"),
+    ({"contract": "refdata-wanted", "version": 5, "as_of": "2026-07-15",
+      "funds": [{"ref": "symbol:EXBF", "wants": [{"fact": "risk_metrics", "have": 20260630}]}]}, "malformed"),
+    ({"contract": "refdata-wanted", "version": 5, "as_of": "2026-07-15",
+      "securities": [{"key": "isin:XX0000000302", "wants": [{"have": ["2026-03-31"]}]}]}, "malformed"),
+    ({"contract": "refdata-wanted", "version": 5, "as_of": "2026-07-15",
+      "securities": [{"key": "isin:XX0000000302", "wants": [{"fact": "earnings", "have": 20260331}]}]}, "malformed"),
 ])
 def test_parse_refuses(doc, msg):
     with pytest.raises(wanted.WantedError, match=msg):
@@ -170,27 +209,32 @@ def test_parse_reads_the_engine_golden():
     # The engine's own pinned output reads as the contract this collector
     # knows, field by field.
     raw = json.loads(GOLDEN.read_text(encoding="utf-8"))
+    assert raw["version"] == max(wanted.VERSIONS)
     w = wanted.from_file(GOLDEN)
-    assert w.funds and w.securities
     assert [f.ref for f in w.funds] == [f["ref"] for f in raw["funds"]]
-    assert [f.held_from for f in w.funds] == [date.fromisoformat(f["held_from"]) if f.get("held_from") else None
-                                              for f in raw["funds"]]
-    assert any(f.held_from for f in w.funds)
-    assert [s.share_pct for s in w.securities] == [None if s.get("share_pct") is None else float(s["share_pct"])
-                                                   for s in raw["securities"]]
-    assert [{k: v.isoformat() for k, v in s.lookups.items()} for s in w.securities] == \
-        [s.get("lookups") or {} for s in raw["securities"]]
-    assert any(s.lookups for s in w.securities)
-    assert raw["version"] in wanted.VERSIONS
-    assert [list(f.wants) for f in w.funds] == [f["wants"] for f in raw["funds"]]
-    assert {"risk_metrics", "characteristics", "money_market", "line_durations"} <= {x for f in w.funds for x in f.wants}
-    assert [{k: [d.isoformat() for d in v] for k, v in f.facts.items()} for f in w.funds] == \
-        [f["facts"] for f in raw["funds"]]
+    assert [s.key for s in w.securities] == [s["key"] for s in raw["securities"]]
+    assert any(f.held_from for f in w.funds) and any(s.lookups for s in w.securities)
+    assert {"risk_metrics", "characteristics", "money_market"} <= {x for f in w.funds for x in f.wants}
     assert any(len(v) for f in w.funds for v in f.facts.values())
-    assert [s.missing for s in w.securities] == [tuple(s["missing"]) for s in raw["securities"]]
     assert {"earnings", "dividends", "financials"} <= {x for s in w.securities for x in s.missing}
-    assert [{k: v.isoformat() for k, v in s.periods.items()} for s in w.securities] == \
-        [s["periods"] for s in raw["securities"]]
-    assert any(s.periods for s in w.securities)
-    assert [(s.receipt, list(s.wants), s.calendar and s.calendar.isoformat()) for s in w.securities] == \
-        [(bool(s.get("receipt")), s.get("wants") or [], s.get("calendar")) for s in raw["securities"]]
+    assert any(s.periods for s in w.securities) and any(s.calendar for s in w.securities)
+    assert any(f.history_from for f in w.funds)
+
+
+def test_a_version_5_list_reads_as_the_version_4_list_of_the_same_gold():
+    """Gold pins its build in version 4's shape beside the list it prints.
+    Both read alike, but for what version 5 leaves out: the days of a fact
+    a fund does not want, the periods of a family a security does not
+    lack, and the calendar of a security that does not want it."""
+    def fund(f):
+        return replace(f, facts={k: v for k, v in f.facts.items() if k in f.wants})
+
+    def security(s):
+        return replace(s, periods={k: v for k, v in s.periods.items() if k in s.missing},
+                       calendar=s.calendar if "dividend_calendar" in s.wants else None)
+
+    v4, v5 = wanted.from_file(GOLDEN_V4), wanted.from_file(GOLDEN)
+    assert json.loads(GOLDEN_V4.read_text(encoding="utf-8"))["version"] == 4
+    assert [fund(f) for f in v4.funds] == list(v5.funds)
+    assert [security(s) for s in v4.securities] == list(v5.securities)
+    assert (v4.as_of, v4.max_gap_days) == (v5.as_of, v5.max_gap_days)

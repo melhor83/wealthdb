@@ -72,6 +72,7 @@ var corpusFixtures = []struct {
 	{"yield", setupYieldGold},
 	{"benchmark", setupBenchmarkGold},
 	{"typedlabel", setupTypedLabelGold},
+	{"private", setupPrivateGold},
 }
 
 func TestReportCorpus(t *testing.T) {
@@ -260,10 +261,10 @@ func (c *corpus) help(tools []toolSpec) {
 		}
 	}
 	for _, tool := range tools {
-		if tool.family == nil || tool.family.views == nil {
+		if tool.family == nil || tool.family.names() == nil {
 			continue
 		}
-		for _, v := range tool.family.views {
+		for _, v := range tool.family.names() {
 			c.helpCase("cli/help/view/"+segment(tool.name)+"_"+segment(v), tool.name, v, "-h")
 		}
 	}
@@ -490,15 +491,15 @@ var output4 = []string{"table", "csv", "csv_plain", "json"}
 // each hold two errors: a bad date and a bad format, then a bad option
 // value and a bad column. Which one a family reports first is surface.
 func (c *corpus) twoErrors(tools []toolSpec) {
-	for _, rf := range reportFamilies {
-		i := slices.IndexFunc(tools, func(t toolSpec) bool { return t.name == rf.name })
+	for _, fam := range reportFamilies {
+		i := slices.IndexFunc(tools, func(t toolSpec) bool { return t.name == fam.name })
 		if i < 0 {
-			c.t.Fatalf("corpus: no tool for the report family %s", rf.name)
+			c.t.Fatalf("corpus: no tool for the report family %s", fam.name)
 		}
 		v := c.cliViews(tools[i])[0]
-		base := "cli/" + segment(rf.name) + "/" + segment(v.label) + "/"
+		base := "cli/" + segment(fam.name) + "/" + segment(v.label) + "/"
 		date := []string{"not-a-date"}
-		if rf.fam.window == asOfDate {
+		if fam.window == asOfDate {
 			date = []string{"-d", "not-a-date"}
 		}
 		c.cli(base+"errors_date_format", append(append(slices.Clone(v.args), date...), "-f", "xml")...)

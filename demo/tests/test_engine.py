@@ -499,8 +499,8 @@ class TestRollForward(unittest.TestCase):
 
     def test_the_wanted_list_matches_a_fresh_build(self):
         """It reads the reference records no report compared above reads:
-        the funds' risk rows, characteristics and line durations, and the
-        companies' reported figures. rate_observations has no reader to
+        the funds' risk rows and characteristics, and the companies'
+        reported figures. rate_observations has no reader to
         compare."""
         def wanted(root):
             out = json.loads(engine(root, "refdata-wanted", read_only=True))
@@ -526,7 +526,11 @@ class TestToToday(unittest.TestCase):
     def test_a_holding_held_most_of_the_year_has_its_realized_yield(self):
         """A holding held for more than half the year has a realized
         yield; one thin, near zero on most of its days, has none and was
-        bought within half a year."""
+        bought within half a year. A cash balance has no purchase date,
+        so the test reads the rule itself, on twelve days thirty days
+        apart: a thin balance holds nothing, or under a tenth of those
+        days' mean in size, on half of them or more. The twelve stand in
+        for the year's days, so the bound is half, not more than half."""
         rows = report(self.root, "yield", "positions", "-d", TODAY.isoformat(), "-C", "all")
         bought = {(r["account_id"], r["position_key"]): r["acquisition_date"]
                   for r in report(self.root, "holdings", "positions", "-d", TODAY.isoformat(), "-C", "all")}
@@ -534,7 +538,21 @@ class TestToToday(unittest.TestCase):
         self.assertTrue([r for r in rows if r["realized_yield_pct"]])
         for r in rows:
             self.assertEqual(r["realized_yield_pct"] == "", r in thin, r["position_key"])
+        cash = {(r["account_id"], r["position_key"]) for r in thin if r["position_key"].startswith("cash:")}
+        days = [TODAY - dt.timedelta(days=30 * k) for k in range(12)]
+        sampled = collections.defaultdict(lambda: [Decimal(0)] * len(days))
+        for i, day in enumerate(days):
+            for c in report(self.root, "yield", "cash", "-d", day.isoformat(), "-C", "all"):
+                key = (c["account_id"], "cash:" + c["currency"])
+                if not c["symbol"] and key in cash:
+                    sampled[key][i] += abs(amount(c, "value_USD"))
+        for key in cash:
+            values = sampled[key]
+            mean = sum(values) / len(values)
+            self.assertGreaterEqual(2 * sum(not v or v < mean / 10 for v in values), len(values), (key, values))
         for r in thin:
+            if r["position_key"].startswith("cash:"):
+                continue
             day = bought.get((r["account_id"], r["position_key"]))
             self.assertTrue(day and (TODAY - dates.parse(day)).days < 183, (r["position_key"], day))
 
@@ -605,6 +623,55 @@ class TestToToday(unittest.TestCase):
         (statement,) = report(self.root, "cashflow", "summary", str(last), "--period", "total", "-C", "+fees")
         self.assertGreaterEqual(amount(cat, "net_spend_USD") - amount(statement, "fees_USD"), fee)
 
+    def test_the_private_holdings_read_their_calls_distributions_and_marks(self):
+        """The fund reads its calls, its distribution and its last mark; the
+        SPV its subscription and the shares it paid out in kind, with no
+        NAV left once it exited. The multiples hold in every currency, and
+        the total adds the money up. Each reads its manager's latest capital
+        account: the fund's commitment less what its last mark says was
+        called, the SPV's called whole."""
+        private = spec.load().spec["private"]
+        fund, spv = private["fund"], private["spv"]
+
+        def upto(events, day=TODAY):
+            return sum(Decimal(e["amount"]) for e in events if dates.parse(e["date"]) <= day)
+
+        mark = max((m for m in fund["marks"] if dates.parse(m["date"]) <= TODAY), key=lambda m: m["date"])
+        at = dates.parse(mark["date"])
+        # The mark, rolled forward by the calls and distributions after it.
+        marked = upto(fund["calls"], at) * Decimal(mark["multiple"]) - upto(fund["distributions"], at)
+        nav = (marked + (upto(fund["calls"]) - upto(fund["calls"], at))
+               - (upto(fund["distributions"]) - upto(fund["distributions"], at)))
+        rows = report(self.root, "returns", "private")
+        by = {r["holding"]: r for r in rows}
+        (f,) = [r for name, r in by.items() if "Fund" in name]
+        self.assertEqual((amount(f, "paid_in_USD"), amount(f, "distributed_USD"), amount(f, "nav_USD")),
+                         (upto(fund["calls"]), upto(fund["distributions"]), nav), f)
+        self.assertEqual(f["marked_at"], mark["date"])
+        self.assertEqual((amount(f, "commitment_USD"), amount(f, "unfunded_USD")),
+                         (Decimal(fund["commitment"]), Decimal(fund["commitment"]) - upto(fund["calls"], at)), f)
+        (s,) = [r for name, r in by.items() if "SPV" in name]
+        self.assertEqual(amount(s, "paid_in_USD"), Decimal(spv["amount"]))
+        self.assertEqual((amount(s, "commitment_USD"), amount(s, "unfunded_USD")), (Decimal(spv["amount"]), 0), s)
+        if dates.parse(spv["exit"]["date"]) <= TODAY:
+            self.assertEqual((amount(s, "nav_USD"), s["quality"]), (0, "exited"), s)
+            self.assertTrue(s["marked_at"], s)
+            self.assertGreater(amount(s, "distributed_USD"), 0)
+        self.assertEqual(rows[-1]["holding"], "Total")
+        for ccy in ("USD", "CHF", "EUR", "GBP"):
+            rows = report(self.root, "returns", "private", "-x", ccy, "-C", "all")
+            *held, total = rows
+            for r in rows:
+                paid, back, value = (amount(r, f"{c}_{ccy}") for c in ("paid_in", "distributed", "nav"))
+                self.assertAlmostEqual(float(r["dpi"]), float(back / paid), places=2)
+                self.assertAlmostEqual(float(r["tvpi"]), float((back + value) / paid), places=2)
+                self.assertTrue(r["irr_pct"], r)
+            for c in ("paid_in", "commitment", "unfunded", "distributed", "nav"):
+                self.assertEqual(amount(total, f"{c}_{ccy}"), sum(amount(r, f"{c}_{ccy}") for r in held))
+            (fr,) = [r for r in held if "Fund" in r["holding"]]
+            self.assertEqual(fr["stated_as_of"], mark["date"], fr)
+            self.assertAlmostEqual(float(fr["stated_tvpi"]), float(mark["multiple"]), places=2)
+
     def test_the_fund_and_the_home_lower_the_marked_share(self):
         rows = report(self.root, "status", "--marks")
         shares = [Decimal(r["marked_pct"]) for r in rows]
@@ -652,6 +719,19 @@ class TestReusedGold(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         return pathlib.Path(tmp.name)
 
+    def stand_in(self, parent, build, run):
+        """Until the test ends, the scratch roots live in parent, build
+        stands in for the generator, run for the engine, and fixed stamp
+        inputs for the image and the files. A test may reassign a stamp
+        input's global: the end of the test restores each one."""
+        module = sys.modules[__name__]
+        for target, name, value in ((module, "PARENT", str(parent)), (generate, "build", build),
+                                    (module, "engine", run), (module, "engine_image_id", lambda: "sha256:abc"),
+                                    (module, "inputs_hash", lambda: "spec\ncatalogue\ncode")):
+            patcher = unittest.mock.patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def test_a_matching_stamp_is_reused(self):
         d = self.scratch_dir()
         stamp = gold_stamp(dt.date(2023, 9, 30), "sha256:abc", "hash", SEED)
@@ -682,7 +762,6 @@ class TestReusedGold(unittest.TestCase):
     def test_build_and_load_reuses_only_a_matching_stamp(self):
         parent = self.scratch_dir() / "roots"
         calls = []
-        saved = (PARENT, generate.build, engine, engine_image_id, inputs_hash)
 
         def fake_build(root, *_args, **_kwargs):
             calls.append("build")
@@ -693,42 +772,29 @@ class TestReusedGold(unittest.TestCase):
             calls.append("engine")
             return "load: demo: 1\n"
 
-        try:
-            globals()["PARENT"] = str(parent)
-            generate.build = fake_build
-            globals()["engine"] = fake_engine
-            globals()["engine_image_id"] = lambda: "sha256:abc"
-            globals()["inputs_hash"] = lambda: "spec\ncatalogue\ncode"
-            day = dt.date(2023, 9, 30)
-            build_and_load("short", day)
-            self.assertEqual(build_and_load("short", day)[1], "load: demo: 1\n")
-            self.assertEqual(calls.count("build"), 1)
-            globals()["inputs_hash"] = lambda: "spec\nother\ncode"
-            build_and_load("short", day)
-            self.assertEqual(calls.count("build"), 2)
-            globals()["engine_image_id"] = lambda: ""
-            build_and_load("short", day)
-            self.assertEqual(calls.count("build"), 3)
-            globals()["engine_image_id"] = lambda: "sha256:abc"
-            globals()["inputs_hash"] = lambda: "spec\ncatalogue\ncode"
-            build_and_load("fresh", day)
-            build_and_load("fresh", day)
-            self.assertEqual(calls.count("build"), 4)
-            build_and_load("rolled", day)
-            build_and_load("rolled", day)
-            self.assertEqual(calls.count("build"), 6)
-        finally:
-            globals()["PARENT"] = saved[0]
-            generate.build = saved[1]
-            globals()["engine"] = saved[2]
-            globals()["engine_image_id"] = saved[3]
-            globals()["inputs_hash"] = saved[4]
-
+        self.stand_in(parent, fake_build, fake_engine)
+        day = dt.date(2023, 9, 30)
+        build_and_load("short", day)
+        self.assertEqual(build_and_load("short", day)[1], "load: demo: 1\n")
+        self.assertEqual(calls.count("build"), 1)
+        globals()["inputs_hash"] = lambda: "spec\nother\ncode"
+        build_and_load("short", day)
+        self.assertEqual(calls.count("build"), 2)
+        globals()["engine_image_id"] = lambda: ""
+        build_and_load("short", day)
+        self.assertEqual(calls.count("build"), 3)
+        globals()["engine_image_id"] = lambda: "sha256:abc"
+        globals()["inputs_hash"] = lambda: "spec\ncatalogue\ncode"
+        build_and_load("fresh", day)
+        build_and_load("fresh", day)
+        self.assertEqual(calls.count("build"), 4)
+        build_and_load("rolled", day)
+        build_and_load("rolled", day)
+        self.assertEqual(calls.count("build"), 6)
 
     def test_rolled_and_bare_are_reused_only_under_a_matching_stamp(self):
         parent = self.scratch_dir() / "roots"
         calls = []
-        saved = (PARENT, generate.build, engine, engine_image_id, inputs_hash)
 
         def fake_build(root, *_args, append=False, **_kwargs):
             calls.append("append" if append else "build")
@@ -745,39 +811,29 @@ class TestReusedGold(unittest.TestCase):
             (root / "wealthdb.db").write_bytes(b"")
             return "* waiting\n" if args[0] == "status" else "load: demo: 1\n"
 
-        try:
-            globals()["PARENT"] = str(parent)
-            generate.build = fake_build
-            globals()["engine"] = fake_engine
-            globals()["engine_image_id"] = lambda: "sha256:abc"
-            globals()["inputs_hash"] = lambda: "spec\ncatalogue\ncode"
-            first = roll_forward()
-            self.assertEqual(roll_forward(), first)
-            self.assertEqual(first[1:], ("* waiting\n", "load: demo: 1\n"))
-            self.assertEqual(calls.count("append"), 1)
-            (parent / "rolled" / STAMP).unlink()
-            roll_forward()
-            self.assertEqual(calls.count("append"), 2)
-            bare_gold()
-            bare_gold()
-            self.assertEqual(calls.count("init"), 3)
-            cfg = json.loads((parent / "bare" / "wealthdb.cfg").read_text())
-            self.assertNotIn("yield", cfg)
-            self.assertNotIn("declarations", cfg["exposure"])
-            globals()["inputs_hash"] = lambda: "spec\nother\ncode"
-            roll_forward()
-            bare_gold()
-            self.assertEqual((calls.count("append"), calls.count("init")), (3, 5))
-            globals()["engine_image_id"] = lambda: ""
-            roll_forward()
-            roll_forward()
-            self.assertEqual(calls.count("append"), 5)
-        finally:
-            globals()["PARENT"] = saved[0]
-            generate.build = saved[1]
-            globals()["engine"] = saved[2]
-            globals()["engine_image_id"] = saved[3]
-            globals()["inputs_hash"] = saved[4]
+        self.stand_in(parent, fake_build, fake_engine)
+        first = roll_forward()
+        self.assertEqual(roll_forward(), first)
+        self.assertEqual(first[1:], ("* waiting\n", "load: demo: 1\n"))
+        self.assertEqual(calls.count("append"), 1)
+        (parent / "rolled" / STAMP).unlink()
+        roll_forward()
+        self.assertEqual(calls.count("append"), 2)
+        bare_gold()
+        bare_gold()
+        self.assertEqual(calls.count("init"), 3)
+        cfg = json.loads((parent / "bare" / "wealthdb.cfg").read_text())
+        self.assertNotIn("yield", cfg)
+        self.assertNotIn("declarations", cfg["exposure"])
+        globals()["inputs_hash"] = lambda: "spec\nother\ncode"
+        roll_forward()
+        bare_gold()
+        self.assertEqual((calls.count("append"), calls.count("init")), (3, 5))
+        globals()["engine_image_id"] = lambda: ""
+        roll_forward()
+        roll_forward()
+        self.assertEqual(calls.count("append"), 5)
+
 
 if __name__ == "__main__":
     unittest.main()

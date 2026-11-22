@@ -41,6 +41,14 @@ from pathlib import Path
 
 import download
 import landmarks as schwab
+# The lookback's mapping onto the site's filters; each name is
+# bound here too.
+from landmarks import (  # noqa: F401
+    LAST_10_YEARS_DAYS,
+    _since_to_schwab_preset,
+    _exact_window,
+)
+from landmarks import LOGIN_ID_ENV, PASSWORD_ENV
 from download import maybe_screenshot
 
 from collectorkit import cli, debugcap, envfile, launch
@@ -72,21 +80,6 @@ DEFAULT_ENV_FILE_CANDIDATES = (
     Path.home() / ".secrets" / "schwab-web.env",
 )
 
-# Env var names. The companion ~/.secrets/schwab-web.env file is a
-# bash script that sets `SCHWAB_LOGIN_ID=<login-id>` and
-# `SCHWAB_PASSWORD=<password>`, quoted by bash's rules (single quotes
-# keep every character as written).
-#
-# Note the asymmetry vs. schwab-api (Trader API), which uses
-# SCHWAB_CLIENT_ID / SCHWAB_CLIENT_SECRET for OAuth credentials.
-# These are the web-login credentials and live in a separate
-# namespace so the two sets never collide in a single shell env.
-LOGIN_ID_ENV = "SCHWAB_LOGIN_ID"
-PASSWORD_ENV = "SCHWAB_PASSWORD"
-
-# Credentials whose env-file value wins over a value inherited from
-# the calling environment: the file is authoritative for them.
-_CRED_OVERRIDE_VARS = (LOGIN_ID_ENV, PASSWORD_ENV)
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -209,9 +202,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 # ============================================================
 
 def maybe_source_env_files(args: argparse.Namespace) -> None:
-    envfile.source_first_env_file(
-        args.env_file, DEFAULT_ENV_FILE_CANDIDATES, logger=log,
-        override_vars=_CRED_OVERRIDE_VARS, warn_on_override=True)
+    envfile.load(args.env_file, candidates=DEFAULT_ENV_FILE_CANDIDATES,
+                 logger=log)
 
 
 # ============================================================
@@ -520,28 +512,9 @@ def run_manual(profile_dir: Path,
                                           "manual", log=log)
 
 
-def _live_url(page) -> str:
-    """Read the page's current URL by asking Firefox directly.
-
-    Equivalent to `page.url` EXCEPT under camoufox 135 + playwright
-    1.49: juggler doesn't reliably deliver `frameNavigated` events
-    to the driver, so `page.url` stays stuck on the pre-redirect
-    value after a top-level navigation completes (the Firefox UI
-    URL bar updates, but Playwright's cached accessor doesn't).
-    `location.href` via evaluate forces Firefox to answer from its
-    actual document state, which is what landmark detection needs.
-
-    Returns the cached page.url on evaluation failure — page mid-
-    navigation, page closing, or other races — so a transient
-    error doesn't kill the polling loop.
-    """
-    try:
-        result = page.evaluate("() => location.href")
-        if isinstance(result, str) and result:
-            return result
-    except Exception:
-        pass
-    return page.url
+# The page's URL as the browser shows it. Bound here so a test can
+# replace it for this module alone.
+_live_url = launch.live_url
 
 
 def _visible_page_text(scope, limit: int = 600) -> str:
@@ -1114,52 +1087,6 @@ def _prefill_login_iframe(page, login_id_value: str, password_value: str) -> Non
 # ============================================================
 # Entry point
 # ============================================================
-
-# Schwab's Statements filter tops out at Last10Years. A window reaching
-# further back cannot be honoured, so the walk covers less than was asked
-# for — worth one warning rather than a silent shortfall.
-LAST_10_YEARS_DAYS = 3650
-
-
-def _since_to_schwab_preset(since, until, log=None) -> str:
-    """Map a (since, until) window to the narrowest Statements preset that
-    still covers it.
-
-    A named --lookback window runs on the preset; an exact window
-    (_exact_window) uses the custom date-range mode and falls back to this
-    preset. A window wider than the longest preset is capped, with a
-    warning."""
-    days = (until - since).days
-    if days <= 90:
-        return "Last3Months"
-    if days <= 180:
-        return "Last6Months"
-    # <= keeps the shared 5y preset (exactly 1825 days) on Last5Years.
-    # Safe: Schwab resolves Last5Years to the 5-calendar-year
-    # anniversary date, and any 5-year calendar span contains at least
-    # one leap day, so the preset always covers >= 1826 days — never a
-    # day short of 1825.
-    if days <= 1825:
-        return "Last5Years"
-    if days > LAST_10_YEARS_DAYS and log is not None:
-        log.warning(
-            "requested window reaches back to %s (%d days), but Schwab's "
-            "filter stops at Last10Years — coverage is capped at ~10 years.",
-            since, days)
-    return "Last10Years"
-
-
-def _exact_window(lookback, since, until):
-    """(since, until) when ``--lookback`` names an exact ISO date, else
-    None. resolve_lookback already validated the value, so anything
-    that is not a named preset is an ISO date. Named presets keep the
-    preset ladder on both pages; an exact date drives the shared
-    SpecifyDateRange custom mode on Statements and Tx-history alike,
-    each falling back to the covering preset if the fill fails."""
-    if lookback and lookback not in cli.LOOKBACK_PRESETS:
-        return (since, until)
-    return None
-
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)

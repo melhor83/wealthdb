@@ -123,11 +123,11 @@ def test_username_comes_from_the_env_file(tmp_path, monkeypatch):
     assert explore.load_username(env) == USERNAME
 
 
-def test_an_inherited_username_wins_over_the_file(tmp_path, monkeypatch):
+def test_the_file_username_wins_over_an_inherited_one(tmp_path, monkeypatch):
     monkeypatch.setenv(explore.USER_ENV, "inherited-user")
     env = tmp_path / "erstebank_at.env"
     env.write_text(f"{explore.USER_ENV}='{USERNAME}'\n", encoding="utf-8")
-    assert explore.load_username(env) == "inherited-user"
+    assert explore.load_username(env) == USERNAME
 
 
 def test_a_missing_username_is_loud(tmp_path, monkeypatch, caplog):

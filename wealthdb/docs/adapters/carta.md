@@ -74,6 +74,7 @@ One SQLite DB (`$XDG_DATA_HOME/wealthdb/carta/carta.db`). The relevant tables:
 | cash_balances| —                                                | none; each transaction pair nets to 0, so no cash position is implied |
 | portfolios   | —                                                | not grouped at source (the engine rolls the accounts up under "(no portfolio)") |
 | fx_rates     | —                                                | adapter emits none (holdings are USD) |
+| capital_accounts | `fund_metrics` (partner metrics)             | one per fund and partner-metrics row: commitment, called capital, capital contributed, distributions, NAV — see §5 |
 
 ## 4. Account taxonomy
 
@@ -199,6 +200,13 @@ paid.
 - `commitment` / `called_capital` / `distributions` / `vintage_year` ride
   in the payload.
 
+Each partner-metrics row is also the fund's capital account on its day
+(`capital.go`, gold `capital_accounts`): the commitment, the called
+capital, the capital contributed (paid in), the distributions and the
+NAV, as stated, in the fund's currency. A row only a capital-account
+statement wrote states none of the first three and gives none. Carta
+states no unfunded figure and no multiple.
+
 Before a fund's first NAV — its first statement can follow its first call
 by years — the interest has no valuation of its own. Leaving it out would
 book each call as a loss in the period it was paid and the first NAV as a
@@ -312,7 +320,12 @@ figures in the fund position payload.
 download). `NewChangeNumber` is `MAX(dump_runs.snapshot_at)`, so an idle
 reload is a no-op ([../DESIGN.md](../DESIGN.md) §6.4).
 
-The window spans the **event-dated content**, not the download time:
+The window is the whole history (`Window.Full`): the load deletes the
+source's rows whole before it re-inserts them
+([../DESIGN.md](../DESIGN.md) §8.2).
+
+`Status` reports the **event-dated content** as the snapshot range, not
+the download time:
 
 - MIN/MAX `snapshot_at` across `entities`, `securities` and
   `fund_metrics`. The reconstructed deltas can sit years before the
@@ -323,8 +336,7 @@ The window spans the **event-dated content**, not the download time:
   lie after every mark.
 - each K-1's period end (§5), which can also lie after every mark.
 
-`Status` reports the content span, widened by the fund carry days, the
-removal times and the K-1 period ends, as the snapshot range. `LatestChangeNumber` is the
+The range also takes in the fund carry days. `LatestChangeNumber` is the
 newest dump. The source is observed through the newest dump that is not
 a dry run.
 

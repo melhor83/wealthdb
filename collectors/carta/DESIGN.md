@@ -357,7 +357,8 @@ The carta specifics:
 
 ## 5. Silver schema
 
-SQLite + JSON1, source-shaped, owned by `load.py` (via
+SQLite + JSON1, source-shaped, owned by the loader (`load.py`, with
+`captable.py`, `exercises.py`, `fund_documents.py` and `common.py`; via
 `collectorkit.silver`), in `migrations/`. Timestamps INTEGER
 Unix-seconds-UTC; stable filter columns promoted, rest in `payload`; snapshot
 tables monotemporal on `snapshot_at` — which is the **event date**, not the
@@ -376,7 +377,8 @@ the tables follow the internal responses.
 | `documents` | content_sha256 | PDF archive index (K-1 / 1042-S / statements / notices / financials), content-deduped on SHA-256; the PDF blobs stay under the bronze tree. |
 | `k1_capital_accounts` | content_sha256 | One per K-1 document (§5.3): the federal face page's tax year and, for a fiscal year, its period (migration 0005), the tax capital account (item L), net short- and long-term gain (boxes 8, 9a), and cash and property distributions (box 19 A, C). |
 | `capital_events` | (snapshot_at, entity_external_id, event_kind) | The reconstructed timeline (§5.1): one row per snapshot-defining event — `acquired` / `disposition` / `exercise` / `price_change` / `statement`. |
-| `cash_flows` | cash_flow_external_id | The dated money ledger (migration 0003, §5.2): one positive-magnitude row per cash event — `exercise` / `exit` (cap-table, carrying `shares` + `price_per_share`), `convertible_purchase` (a SAFE / note at its principal), and `capital_call` / `distribution` (fund). `kind` carries direction; the gold adapter projects each as a balanced double-entry pair on the custody account (§6). |
+| `cash_flows` | cash_flow_external_id | The dated money ledger (migration 0003, §5.2): one positive-magnitude row per cash event — `exercise` / `exit` (cap-table, carrying `shares` + `price_per_share`), `convertible_purchase` (a SAFE / note at its principal), and `capital_call` / `distribution` (fund). `kind` carries direction; the gold adapter projects each as a balanced double-entry pair on the custody account (§6). `flow_date` is the date as printed, `flow_at` the same day at UTC midnight in unix seconds (migration 0007), NULL where the text names no day. |
+| `document_derivations` | (content_sha256, scope) | Which documents a parser has read, under which generation, and how many rows each gave (migration 0006). Scope `k1`: each tax document, a 1042-S with no face page included. A document is read once per generation. |
 | `schema_meta`, `dump_runs` | — | collectorkit migration / snapshot bookkeeping. `dump_runs.snapshot_at` is the download time (idempotency only), distinct from the content tables' event-dated `snapshot_at`. |
 
 Identity: `entity_external_id` = Carta's `corporation_id`;
@@ -547,11 +549,9 @@ columns, so the statement lines stay when that run carries no statements
 (`download --no-documents`).
 
 **K-1 tax capital.** Each tax document is searched for the federal Schedule
-K-1 (Form 1065) face page; a 1042-S has none and yields no row. `k1.py`
-reads the page from `pdftotext -bbox` word boxes, because `-layout` folds the
-form's three columns into each other on dense lines. A word belongs to the
-column its left edge falls in, and to the box whose caption is nearest above
-it. An item-L amount belongs to the caption line nearest it vertically.
+K-1 (Form 1065) face page; a 1042-S has none and yields no row. The kit's
+K-1 reader (`collectorkit.k1`, which describes how it places each figure)
+reads the face page from `pdftotext -bbox` word boxes.
 `k1_capital_accounts` keeps one row per K-1 document, keyed on its sha256:
 
 - item L: `beginning_capital`, `contributions`, `net_income`,
@@ -566,7 +566,15 @@ the figure inside the form's own parentheses, so it is positive; every
 other figure carries the sign the form prints. The fund is the index row's
 `fund_id`, which is the fund entity's id. A re-issued K-1 under the same
 document id replaces the row. Two documents that print the same tax year
-both stay; gold reconciles them.
+both stay; gold reconciles them. Each tax document is read once per
+generation (`K1_GENERATION`, recorded in `document_derivations`). The
+generation is the reader's code and the extraction's key, so an edit to
+`collectorkit.k1` or a pdftotext upgrade derives every tax document again.
+A run reads only its own documents. After the runs, the load reads again
+each tax document that an older reader read. It reads the copy that
+`documents` names in bronze. So a reader change reaches every stored run.
+A document whose copy is gone keeps its rows. A later run that holds the
+same bytes reads nothing.
 
 **Tax year and period (migration 0005).** The heading reads "For calendar
 year YYYY, or tax year beginning … ending …". A calendar-year form leaves

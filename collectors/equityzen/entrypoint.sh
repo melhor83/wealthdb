@@ -13,62 +13,19 @@
 
 set -euo pipefail
 
-# Xvfb / x11vnc / camoufox-cache bootstrap (VFB_DISPLAY, start_xvfb,
-# start_x11vnc), shared by the browser collectors and baked into
-# base-playwright at /opt/entrypoint-lib.sh.
+# The verb engine, baked into the base image (shared/images/entrypoint-lib.sh).
 # shellcheck source=/dev/null
 source /opt/entrypoint-lib.sh
 
-case "${1:-help}" in
-    explore)
-        # Discovery harness. Drives Camoufox over VNC, records every
-        # click + every network fetch into /debug/<ts>/ so login.py +
-        # download.py can be written from real traces.
-        shift
-        exec_if_help explore.py "$@"
-        start_xvfb
-        start_x11vnc explore
-        exec python3 /app/explore.py "$@"
-        ;;
-    login)
-        # SPA login form + TOTP, reading the 2FA code from stdin. Runs
-        # headed Camoufox in the Xvfb virtual display (the proven stealth
-        # fingerprint) — no VNC. Xvfb is needed for the headed browser; the
-        # only interaction is the CLI TOTP prompt.
-        shift
-        exec_if_help login.py "$@"
-        start_xvfb
-        exec python3 /app/login.py "$@"
-        ;;
-    download)
-        # Per-surface browse + GraphQL-capture loop. Headed Camoufox in the
-        # Xvfb display (same engine/fingerprint as login), no VNC. Uses the
-        # same persistent profile as login.py so authentication carries over.
-        shift
-        exec_if_help download.py "$@"
-        start_xvfb
-        exec python3 /app/download.py "$@"
-        ;;
-    load)
-        # SQLite silver loader. Ingests bronze (offering/position/
-        # cash-flow JSON, document PDFs) into the source-shaped silver
-        # tables. Pure Python, no browser, no display.
-        shift
-        exec python3 /app/load.py "$@"
-        ;;
-    prune)
-        # Delete non-complete dumps (a crashed download with no terminal
-        # run.json) from the bronze tree, and strip screenshots/ (the
-        # download --debug captures) from complete dumps, whose load
-        # inputs are never touched. Pure file walk — no browser, no
-        # display. --dry-run prints the plan first.
-        shift
-        exec python3 /app/prune.py "$@"
-        ;;
-    sh|bash)
-        shift
-        exec /bin/bash "$@"
-        ;;
+verb="${1:-help}"
+[[ $# -gt 0 ]] && shift
+
+case "$verb" in
+    explore)  run vnc:explore explore.py -- "$@" ;;
+    login)    run xvfb login.py -- "$@" ;;
+    download) run xvfb download.py -- "$@" ;;
+    load)     run plain load.py -- "$@" ;;
+    prune|sh|bash) entrypoint_common "$verb" "$@" ;;
     help|--help|-h)
         cat <<'EOF'
 equityzen container
@@ -96,7 +53,7 @@ Subcommands:
   load        Ingest bronze snapshots into the SQLite silver: offerings,
               positions, cash_flows, tax_documents,
               capital_account_statements, k1_documents. Pass --force to
-              delete the silver DB and rebuild it from all bronze.
+              rebuild it from all bronze.
   prune       Delete non-complete dumps (crashed downloads with no
               terminal run.json) from the bronze tree, and strip
               screenshots/ (the download --debug captures) from complete
@@ -108,8 +65,5 @@ Subcommands:
 Run "<wrapper> <subcommand> --help" for subcommand-specific flags.
 EOF
         ;;
-    *)
-        # Pass-through for ad-hoc commands inside the container.
-        exec "$@"
-        ;;
+    *) exec "$verb" "$@" ;;
 esac

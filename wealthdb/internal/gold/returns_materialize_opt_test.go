@@ -3,6 +3,7 @@ package gold
 import (
 	"database/sql"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -13,27 +14,44 @@ import (
 )
 
 // TestLoadReturnsDatasetsMultiMatchesSingle is the core guarantee for the
-// single-pass multi-currency loader: for every currency, the dataset it
-// produces must be bit-identical to the one loadReturnsDataset(ccy) builds from
-// the per-currency macros — same accounts, value series, snapshot days, flows,
-// derived flags and globalMax. If they ever diverge, the materialized table
-// would silently stop matching the CLI outside USD.
+// single-pass multi-currency load (everyCurrency): for every currency, the
+// dataset it produces must be bit-identical to the one loadReturnsDataset(ccy)
+// builds from the per-currency macros — same accounts, policies, value series,
+// snapshot days, flows, stored links, derived flags and globalMax. If they
+// ever diverge, the materialized table would silently stop matching the CLI
+// outside USD. Both sides load under a policy override and with the stored
+// links read, over a fixture that holds one stored pair.
 func TestLoadReturnsDatasetsMultiMatchesSingle(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)
 	seedMaterializeFixture(t, db, ctx)
+	tMove := dy(2024, time.May, 1)
+	seedAcct(t, db, ctx, "src-a", "A2", canonical.AccountKindBrokerage, nil,
+		[]snap{{dy(2024, time.January, 2), 800}, {dy(2024, time.July, 2), 750}},
+		[]txn{{tMove, canonical.TxKindJournal, -100}})
+	seedAcct(t, db, ctx, "test-src", "B2", canonical.AccountKindBrokerage, nil,
+		[]snap{{dy(2024, time.January, 2), 300}, {dy(2024, time.July, 2), 410}},
+		[]txn{{tMove, canonical.TxKindDeposit, 100}})
+	seedTransferLink(t, db, ctx, "src-a", "A2-tx0", "test-src", "B2-tx0")
 
 	fx, err := loadFxBounds(ctx, db)
 	if err != nil {
 		t.Fatalf("loadFxBounds: %v", err)
 	}
-	multi, err := loadReturnsDatasetsMulti(ctx, db, fx, nil, nil)
+	blanked := returns.AccountsGrainBlanked
+	s := ReturnsSettings{TransferMatching: true,
+		PolicyOverrides: map[string]ReturnsPolicyOverride{"src-a": {AccountsGrain: &blanked}}}
+	multi, err := loadReturnsDatasets(ctx, db, everyCurrency(), fx, s)
 	if err != nil {
-		t.Fatalf("loadReturnsDatasetsMulti: %v", err)
+		t.Fatalf("loadReturnsDatasets: %v", err)
+	}
+	if a := multi["USD"].accts[acctKey("src-a", "A2")]; a == nil || a.rpolicy.AccountsGrain != blanked ||
+		len(a.links) != 1 {
+		t.Fatalf("the fixture's override and stored pair do not reach the multi load: %+v", a)
 	}
 
 	for _, ccy := range materializeCurrencies {
-		single, err := loadReturnsDataset(ctx, db, ccy, fx, nil, nil)
+		single, err := loadReturnsDataset(ctx, db, ccy, fx, s)
 		if err != nil {
 			t.Fatalf("loadReturnsDataset %s: %v", ccy, err)
 		}
@@ -60,11 +78,17 @@ func TestLoadReturnsDatasetsMultiMatchesSingle(t *testing.T) {
 				a.portfolio != b.portfolio || a.kind != b.kind {
 				t.Errorf("%s/%s: metadata differs", ccy, key)
 			}
-			if a.cryptoExcluded != b.cryptoExcluded || a.journalPresent != b.journalPresent ||
-				a.hasClampedFlow != b.hasClampedFlow || a.droppedNonzero != b.droppedNonzero {
+			if a.journalPresent != b.journalPresent || a.hasClampedFlow != b.hasClampedFlow ||
+				a.droppedNonzero != b.droppedNonzero {
 				t.Errorf("%s/%s: flags differ (single %+v multi %+v)", ccy, key,
-					[]bool{a.cryptoExcluded, a.journalPresent, a.hasClampedFlow, a.droppedNonzero},
-					[]bool{b.cryptoExcluded, b.journalPresent, b.hasClampedFlow, b.droppedNonzero})
+					[]bool{a.journalPresent, a.hasClampedFlow, a.droppedNonzero},
+					[]bool{b.journalPresent, b.hasClampedFlow, b.droppedNonzero})
+			}
+			if !reflect.DeepEqual(a.rpolicy, b.rpolicy) {
+				t.Errorf("%s/%s: policies differ (single %+v multi %+v)", ccy, key, a.rpolicy, b.rpolicy)
+			}
+			if !reflect.DeepEqual(a.links, b.links) {
+				t.Errorf("%s/%s: links differ (single %+v multi %+v)", ccy, key, a.links, b.links)
 			}
 			if !slices.Equal(a.series, b.series) {
 				t.Errorf("%s/%s: value series differ:\n single %v\n multi  %v", ccy, key, a.series, b.series)
@@ -92,73 +116,6 @@ func sameFlows(a, b []returns.Flow) bool {
 		}
 	}
 	return true
-}
-
-// TestReturnsInsertSQL checks the batched-INSERT builder emits one placeholder
-// tuple per row with the right column count (a miscount would shift every bind
-// value silently).
-func TestReturnsInsertSQL(t *testing.T) {
-	t.Parallel()
-	for _, n := range []int{1, 3, returnsInsertBatch} {
-		q := returnsInsertSQL(n)
-		if got := strings.Count(q, "?"); got != n*returnsInsertCols {
-			t.Errorf("n=%d: %d placeholders, want %d", n, got, n*returnsInsertCols)
-		}
-		if got := strings.Count(q, "("); got != n+1 { // n value tuples + the column list
-			t.Errorf("n=%d: %d open-parens, want %d", n, got, n+1)
-		}
-		if !strings.HasPrefix(q, "INSERT INTO report_returns") {
-			t.Errorf("n=%d: unexpected prefix %q", n, q[:30])
-		}
-	}
-}
-
-// TestMaterializeReturnsBatchBoundary drives enough rows through the batched
-// insert to cross the returnsInsertBatch boundary (≥1 full batch + a
-// remainder) and checks nothing is lost or duplicated: the reported count
-// equals the table count equals the sum of the per-partition RunReturns row
-// counts, on a single computed_at.
-func TestMaterializeReturnsBatchBoundary(t *testing.T) {
-	t.Parallel()
-	db, ctx := openMigrated(t)
-	seedReturnsSource(t, db, ctx, "src-a", "schwab")
-
-	// A wide monthly window so the accounts/monthly partitions alone yield
-	// hundreds of bucket rows (carried forward between the two sparse snaps),
-	// comfortably past the 128-row batch size.
-	t0, t1 := dy(2016, time.January, 4), dy(2024, time.July, 1)
-	pf := "PF1"
-	seedAcct(t, db, ctx, "src-a", "A1", canonical.AccountKindBrokerage, &pf,
-		[]snap{{t0, 1000}, {t1, 2200}}, []txn{{dy(2020, time.March, 2), canonical.TxKindDeposit, 300}})
-	seedAcct(t, db, ctx, "test-src", "B1", canonical.AccountKindBrokerage, nil,
-		[]snap{{t0, 500}, {t1, 900}}, nil)
-	seedFX(t, db, dy(2016, time.January, 1), "USD", "CHF", "1.10")
-	seedFX(t, db, dy(2016, time.January, 1), "USD", "EUR", "1.05")
-	end := time.Date(2024, time.July, 1, 23, 59, 59, 0, time.UTC).Unix()
-
-	n, err := MaterializeReturns(ctx, db, MaterializeParams{ToEpoch: end, ComputedAt: 1000})
-	if err != nil {
-		t.Fatalf("MaterializeReturns: %v", err)
-	}
-	if n <= returnsInsertBatch {
-		t.Fatalf("fixture only produced %d rows; need > %d to exercise a full batch + remainder",
-			n, returnsInsertBatch)
-	}
-
-	// No row lost or duplicated across batch boundaries: the reported count
-	// equals the actual table count, on a single computed_at. (Row-content
-	// correctness is covered by the verbatim / windowed tests.)
-	var total, stamps int
-	if err := db.QueryRowContext(ctx,
-		`SELECT COUNT(*), COUNT(DISTINCT computed_at) FROM report_returns`).Scan(&total, &stamps); err != nil {
-		t.Fatalf("count: %v", err)
-	}
-	if total != n {
-		t.Errorf("table has %d rows, MaterializeReturns reported %d", total, n)
-	}
-	if stamps != 1 {
-		t.Errorf("expected one computed_at, got %d distinct", stamps)
-	}
 }
 
 // TestMaterializeReturnsWindowedSummaries verifies the per-year windowed
@@ -236,10 +193,11 @@ func TestGroupAccountsMemberOrderDeterministic(t *testing.T) {
 			[]snap{{t0, 1000}, {t1, 1100}}, nil)
 	}
 
-	accts, _, err := loadAccountData(ctx, db, "USD", nil)
+	spines, _, err := loadSpine(ctx, db, oneCurrency("USD"), nil)
 	if err != nil {
-		t.Fatalf("loadAccountData: %v", err)
+		t.Fatalf("loadSpine: %v", err)
 	}
+	accts := spines["USD"]
 
 	for _, level := range []string{"sources", "global"} {
 		groups, order := groupAccounts(level, accts, nil)

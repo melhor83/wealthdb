@@ -16,7 +16,7 @@ Each source's knowledge enters through its `ReturnsPolicy` (see
   global) **are best-effort** — heuristic transfer netting plus synthetic
   onboarding for staggered inception. Returns are **not additive across
   grains**: `global == Σ accounts + hidden plumbing` is a *value* identity
-  (guarded by a reconciliation test; cash-account, AccountsGrainHidden and
+  (guarded by a reconciliation test; cash-account, hidden-mode and
   returns_hide rows are in global but emit no accounts-grain row), never a
   return identity.
 - **Mortgage / net-negative entities** are excluded from return rollups;
@@ -51,11 +51,11 @@ downstream stage follows from that absence:
 
 - `attachOneFlow`'s nil-account gate drops every card flow — purchases,
   refunds, card payments, interest charges, rewards;
-- cross-source transfer-match candidacy requires a flow to have attached,
-  so a card leg can never pair with a real transfer and net it away;
+- a stored transfer pair binds only where both legs attached, so a card
+  leg can never pair with a real transfer and net it away;
 - snapshot-day loading, grouping and the materializer need no change of
   their own: they only ever walk the map, and `loadSnapshotDays` /
-  `matchCrossTransfers` already skip accounts they do not find.
+  `bindStoredLinks` already skip accounts they do not find.
 
 **Deliberately not a `ReturnsPolicy` knob.** Policies are keyed by adapter
 kind and default to a strict no-op, so a card arriving from a source with
@@ -196,12 +196,282 @@ Guards: `TestBridgeReadsTheCommonCases`,
 `TestBridgeGainIsReturnsGainPlusFXOnDebt`,
 `TestMaterializeBridgeIsTheCLIsRows`.
 
+## Private markets
+
+`wealthdb returns private` says what each private holding took, what it
+gave back and what it is marked at. It reads gold alone. `-d DATE` reads
+it as of a day: the legs up to the end of that day, and the NAV from the
+last snapshot on or before it.
+
+**Which holdings it lists.** A private holding is an instrument in one
+account whose asset class is `private_equity` or `private_debt`, in any
+vehicle but a listed fund (`etf`). The rule holds for every source and
+every way the holding was funded:
+
+- a fund called with `contribution` lines, or bought with `buy` lines;
+- an SPV, a private company's stock, a convertible note or a loan;
+- a holding that only a source's positions state, with no cash leg.
+
+An instrument a `contribution` line names is a private holding whatever
+its class, so a fund of another class that calls capital is listed too.
+
+The class is the instrument's row's. Where a source writes no instrument
+row, it is the holding's latest line's, else its latest leg's.
+
+**One holding, one row.** A holding is one instrument in one portfolio,
+or in one account outside any portfolio. The instrument is known by its
+ISIN where gold states one, else by its id. A bank that keeps a fund on a
+custody account and pays its calls from a cash account of the same
+portfolio therefore has one row for it. The row names the account that
+holds the latest line, else the account of the first leg. The same fund
+in two portfolios is two holdings.
+
+A move of the holding between two accounts of its portfolio is no exit.
+A `transfer_out` counts for nothing where a `transfer_in` of the same
+instrument into another account of the portfolio answers it on its day,
+of the same quantity where both rows state one.
+
+A holding with no money in, out or marked is no investment, and the
+view leaves it out: a call refunded whole, a call of no amount, or a
+line with no cost and no value. The test reads the legs and the lines in
+their own currency, so every output currency lists the same holdings.
+
+One row per holding, then the total:
+
+| column | reads |
+|---|---|
+| `asset_class`, `vehicle` | the instrument's class and vehicle |
+| `status` | `held` where nothing came back; `partially_exited` where something came back and the NAV is not 0; `exited` where the NAV is 0 after something came back, or once the holding has left the holdings |
+| `first_call` | the day of the first call; with none, of the first leg, else of the first line |
+| `paid_in` | the `contribution`, `buy` and `fee` lines on the holding, net of refunds |
+| `commitment` | what the holder committed, as the holding's capital account states it (below); blank where none states one |
+| `unfunded` | what the commitment still holds open: the remainder the account states, else the commitment less what it says was called or paid, never below 0. Where it states none of these, the commitment less `paid_in`, read as 0 below 1% of the commitment, and blank with no `paid_in`. 0 once the holding has exited |
+| `distributed` | the `distribution` and `sell` lines, a `private_debt` holding's `interest`, `dividend` and `coupon` lines (the cash a loan or a note returns), and the exits in kind: a `transfer_out` of the holding, or one whose `holding` names it, at the value it states |
+| `nav` | the holding's lines at the latest snapshot. It is 0 once the holding has left the holdings, and blank where it never had a value |
+| `marked_at` | the oldest mark of those lines, `coalesce(valued_at, snapshot_at)`; for a holding that has left, the mark of its last line |
+| `dpi` | `distributed / paid_in` |
+| `tvpi` | `(distributed + nav) / paid_in` |
+| `irr_pct` | the money-weighted return since the first call, a yearly rate |
+| `stated_tvpi`, `stated_dpi` | the capital account's own multiples; where it states none, the ratios of its stated figures over what it says was paid in, else called |
+| `stated_as_of` | the day of the capital account |
+
+**A holding with no call.** A source that states positions only has no
+cash leg for what was paid. Such a holding reads its stated cost: each
+line it holds at the day gives one call, its book value on its
+acquisition date. Its lines in each account count, whenever each
+account's snapshot is. A holding that has left reads the lines of its
+last snapshot. The IRR reads those calls as any other, and the row says
+`paid_in_from_cost`. Where a line states no cost or no acquisition date,
+the holding has no `paid_in`, `dpi`, `tvpi` or `irr_pct`, and it says
+`no_cost`. The rule reads each day for itself: a day before a holding's
+first call reads its stated cost.
+
+An SPV that pays out cash books a `sell`, as AngelList does, so
+`distributed` counts a sale as a distribution. Without it an SPV that
+exited for cash would read a TVPI of 0.
+
+**Exits in kind.** An SPV that pays out in listed shares is a pair of
+equity-transfer ledger rows (DESIGN.md §13.9). Both name the shares, not
+the SPV. The out-row's `holding` column names the SPV, by the id
+`-C +holding_id` prints. The view then counts the exit as the SPV's
+distribution:
+
+- at the value the row states, on the row's day;
+- in `dpi`, `tvpi` and the IRR's flows.
+
+The exit ends the SPV's figures. A later gain on the shares belongs to
+the broker's position.
+
+**Capital accounts.** A capital account is what a source states for a
+holding on one day (gold's `capital_accounts`):
+
+- Carta: a fund's partner metrics, with its commitment, called capital,
+  capital contributed, distributions and NAV;
+- AngelList: a deal's row of the positions table, with its commitment,
+  contributed capital, realized and unrealized value and TVPI, at the
+  data date of the latest dump that listed it. The commitment is the
+  row's stated commitment, else its investment amount. A fund's calls
+  draw on it over time. An SPV pays it at once;
+- UBS: a fund's quarterly report, with its net commitment, capital
+  called and valuation.
+
+The view reads each holding's latest account on or before the day it
+reads. The account names its holding by its instrument, and by its
+account where the source states one. Each account of a source keeps its
+own latest account of an instrument. A UBS report names the fund by its
+ISIN alone, so it takes the one holding of that ISIN in the source; one
+held in two portfolios takes none. A day before a holding's first
+account reads no commitment: AngelList's dump keeps no history, so its
+accounts read from the latest dump's day on.
+
+An account can state a commitment but no remainder, call or payment,
+as an AngelList node can. It gives no unfunded of its own, so the view
+takes the holding's own `paid_in`: the commitment less it. Fees and
+rounding part a stated amount from a computed one, so a remainder below
+1% of the commitment reads 0. So an SPV paid in whole reads 0, not a
+sliver. With no `paid_in` the unfunded is blank.
+
+The subtraction runs in the commitment's currency. Each call converts
+to it at its own day's rate, and the rest converts once at the
+account's day's rate, as a stated remainder does. So a holding paid in
+whole reads 0 in every currency, however far the rate moved. A call
+with no rate leaves it blank, and the holding reads `unpriced`.
+
+An exited holding reads `unfunded` 0: a holding sold or wound up whole
+owes no further calls. Its `commitment` still shows.
+
+The stated figures stand beside the computed ones. A source counts its
+own fees, calls and marks, so they can differ. Neither replaces the
+other. A stock or a note has no commitment, and that is no gap.
+
+**One definition.** The macro `report_private` computes every figure but
+the IRR, from `private_legs`. The IRR is the engine's own solver
+(`solveIRR`, the money-weighted code of every grain): the legs as flows,
+nothing held before the first call, and the NAV received on `end_date`,
+the later of the NAV's snapshot and the last leg. So
+`irr_pct` carries the engine's `mwr_*` tags where it has no answer.
+
+**Historic FX.** Each leg converts at its own day's rate, the NAV at
+its snapshot's, and the commitment and unfunded at the capital
+account's. The computed multiples therefore move with the output
+currency. The stated ones read in the account's own currency.
+
+**The total.** Each holding's money rounds once, to the cent, and the
+total adds the cents, so it is the sum of the rows as they print. `dpi`
+and `tvpi` pool the holdings: they are the ratios of the sums, not an
+average of the rows' ratios, and both mean what a fund's own DPI and
+TVPI mean. The total's `marked_at` is the oldest mark. The total never
+goes blank because one holding lacks a figure:
+
+- its money adds what the holdings state, and `no_mark=N` and
+  `no_cost=N` count the holdings it leaves out;
+- `dpi` pools the holdings with a `paid_in`, and `tvpi` those with a
+  `paid_in` and a `nav`;
+- `irr_pct` pools the legs and NAVs of the holdings that have their own
+  IRR's inputs: a `paid_in`, a `nav` and a rate for every leg.
+
+The total adds the `commitment` and `unfunded` of the holdings that
+state one. Its `stated_tvpi`, `stated_dpi` and `stated_as_of` are blank.
+
+The total is over every holding: a filter keeps or drops it as a row,
+never recomputes it.
+
+The total also counts every exit in kind out of a listed holding's
+portfolio, or its account outside one, that no holding claims: an
+equity-transfer ledger out-row with no `holding`, of an instrument that
+no `buy` or `transfer_in` there names. Shares the portfolio bought or
+took in are a direct holding, and cash is no exit in kind, so neither
+counts. A source's own `transfer_out` that no holding claims is no
+private distribution either: a bank delivers listed shares out of a
+portfolio that also holds a fund. Such an exit is in the total's
+`distributed`, `dpi`, `tvpi` and `irr_pct`, and the total says
+`unattributed_exit=N`. Then the total is more than the sum of the rows.
+
+**No mark, no NAV.** Every row has a mark but one: a holding that never
+had a value. Its `nav`, `tvpi` and `irr_pct` are blank, never zero, and
+it says `no_mark`. A zero that was never anything else is no value
+either: a source may carry a fund at 0 until it values it. So a holding
+whose lines never stated a value but 0 up to the day, and from which
+nothing came back, has no mark. One marked above 0 before and at 0 now
+is written off and keeps its 0.
+
+A holding that had a value and has left reads a NAV of 0, a real one:
+gold holds it no more. Its multiples and IRR are final, and its
+`marked_at` is its last line's mark. A holding that has left is
+`exited`, valued or not, as is a holding still listed at a NAV of 0
+after something came back. A holding written off with nothing back is
+still `held`. A holding that has left with no money in or out is no
+investment and is not listed, whatever its lines were marked at.
+
+The IRR stands wherever the solver finds one. A holding or a total that
+has paid back more than it took and still holds a value has one, and
+`mwr_nonunique` says where its flows change sign more than once.
+
+Quality tags:
+
+- `no_mark`: the holding never had a value other than 0, and nothing
+  came back, so `nav`, `tvpi` and `irr_pct` are blank.
+- `no_cost`: the holding has no call and states no cost, so
+  `paid_in`, `dpi`, `tvpi` and `irr_pct` are blank.
+- `paid_in_from_cost`: `paid_in` is the holding's stated cost on its
+  acquisition date, not a cash leg.
+- `exited`: the status is `exited`, so `nav` is 0. Once the holding has
+  left the holdings, `marked_at` is the mark of its last line.
+- `at_cost`: the source carries the NAV at cost, before any valuation
+  of its own. The NAV holds no gain, so with nothing back `tvpi` reads 1
+  and `irr_pct` 0. AngelList states such a line as
+  `valuation_basis: cost`, Carta's fund carry as `called_capital`.
+  AngelList may carry a deal at cost without stating a basis. So its
+  adapter states `cost` on a mark worth exactly its nonzero book value
+  too. A mark plus what moved in since is a mark.
+- `call_after_mark`: a call came after the mark. The NAV leaves it out
+  until the next mark, so `tvpi` reads low.
+- `distribution_after_mark`: a distribution or an exit came after the
+  mark. A NAV not yet marked down for it reads `tvpi` high.
+- `exit_unvalued=N`: N exits in kind state no value. `distributed` misses
+  them.
+- `unattributed_exit=N`, on the total only: N exits in kind name no
+  holding. The total counts them, and no row does. To give one to its
+  holding, write the holding's id in the ledger row's `holding` column.
+- `unmatched_commitment=N`, on the total only: N capital accounts state
+  a commitment of a private holding that no row takes. The holding is
+  not listed at the day, as before its first call, or the account would
+  name two holdings. The total leaves them out.
+- `unpriced=N`: N legs, lines or commitments have no rate to the output
+  currency. The sums leave them out, and a leg with none leaves
+  `irr_pct` blank. A zero needs no rate.
+
+On the total each tag counts the holdings it holds on. Its
+`exit_unvalued` and `unpriced` also count the unattributed exits that
+state no value or have no rate.
+
+Limits:
+
+- Marks are old by nature, so `marked_at` always shows.
+- A commitment reads only where a source states one. AngelList states
+  one for each deal.
+- A deal a source values at cost without saying so reads `tvpi` 1 with
+  no `at_cost`, and its `stated_tvpi` reads 1 too. AngelList's lines are
+  the exception the `at_cost` tag names.
+- No source states an IRR per holding. AngelList's multiples for the
+  whole account are not shown.
+- The view carries no volatility or other risk figure. Marks are too old
+  and too sparse for one.
+
+`web refresh` writes the view's rows to `report_private_markets`: in
+every reporting currency, at every quarter end since the total's
+`first_call` and at the end of the refresh's day. Each row's figures are
+`-d`'s at its day. The rows name a holding, its account, class and
+vehicle as at the refresh, as the holdings group then. The Private Markets dashboard reads
+them through `web_private`, the IRR with them. The macros take a list of
+instants, so one pass per currency computes every quarter end. The
+returns engine solves each IRR once per distinct set of legs, NAV and
+days, so an exited holding is solved once for all its later quarters.
+The macro `report_private_flows_multi` adds the legs the total counts
+per holding and quarter, in every reporting currency, and
+`serving_private_flows` holds it for the dashboard's cash flows. Guards:
+`TestPrivateMarkets`, `TestPrivateMarketsListing`,
+`TestPrivateMarketsStatus`, `TestPrivateMarketsAsOf`,
+`TestPrivateMarketsHistoricFX`, `TestPrivateMarketsTableIsTheCLIsRows`,
+`TestPrivateMaterialStartsAtTheFirstLine`,
+`TestPrivateMarketsPortfolioHolding`, `TestPrivateMarketsPortfolioMoves`,
+`TestPrivateMarketsNeverValued`, `TestPrivateMarketsDebtIncome`,
+`TestPrivateIRRPastPaybackPooled`, `TestPrivateFlowsAreTheTotalsLegs`,
+`TestPrivateMarketsCapitalAccounts`, `TestPrivateView`,
+`TestPrivateViewAsOf`.
+
 ## The math (`internal/returns`)
 
 - **All returns math is float64.** Money is exact (DECIMAL) up to the
   gold→returns boundary and floated only here; XIRR is inherently
   iterative and Modified-Dietz an approximation. No precision claim beyond
   ~1e-7 on rates.
+- **No figure follows the order of its inputs.** Every sum over flows is
+  exact and rounded once (`returns.Sum`), and MWR reads a day's flows as
+  one cash flow. So a row reads the same whatever order a day's flows
+  arrive in, its `mwr_nonunique` tag included. Guards:
+  `TestSumIsExactInAnyOrder`,
+  `TestReturnsDoNotFollowTheOrderOfADaysFlows`.
 - **Snapshot-aligned headline.** The since-inception cumulative TWR chains
   Modified-Dietz over the entity's **actual valuation (snapshot) days**
   (`canonicalChainBounds`), not a fixed daily/monthly calendar grid
@@ -240,6 +510,19 @@ Guards: `TestBridgeReadsTheCommonCases`,
   valuation days a roll adds nothing, so a grain whose accounts value
   together chains its plain carried values. The accounts grain never rolls.
   Guard: `TestChainRollsAnAccountForward`.
+- **No loss beyond everything while the value stays at zero or above.**
+  The chain compounds the entity's assets summed. A value that never
+  reads below zero cannot lose more than it held. A sub-period below
+  -100% while that value stays at zero or above therefore says the flows
+  and values disagree, as when money paid in has no value yet, or that the
+  sub-period is too coarse for the approximation. Chained, that one factor
+  takes the whole window below -100%. So the window's TWR is n/a, tagged
+  `loss_beyond_total`. Where the entity's value reads below zero on some
+  day of the sub-period, as when an overdraft or a margin loan outweighs
+  the rest, the arithmetic stands. A loan account of the grain is no part
+  of the value the chain compounds, so it does not count. The tag changes
+  no other figure: MWR, the values, the flows and the per-period rows read
+  as before. Guard: `TestLossBeyondTotal`.
 - **MWR reads the values the chain reads.** Its opening and closing values
   hold what the window's edges have rolled in, so a window that ends with
   a deposit not yet shown has an MWR beside its TWR, not behind it.
@@ -249,12 +532,12 @@ Guards: `TestBridgeReadsTheCommonCases`,
   still unshown. Such a row is tagged `rolled_forward`. The per-period
   rows read the carried values too. Guard: `TestMWRReadsTheChainsValues`.
 - **Onboarding books the debut value.** A staggered constituent's real
-  debut-region flows are subsumed first (`flowSubsumed` in `entityFlows`),
-  then synthetic onboarding books the first-snapshot value, less the
-  pre-debut legs netting cancelled. Under per-entity-once it books the
-  group's step (`groupOnboardStep`), which offsets the same legs and is
-  floored at zero. A per-constituent amount reduced by such legs can be
-  negative ("Staggered-inception subsumption").
+  pre-debut flows are dropped first (their fate in the pre-debut region,
+  `fateOf`), then synthetic onboarding books the first-snapshot value,
+  less the pre-debut legs netting cancelled. Under per-entity-once it
+  books the group's step (`groupOnboardStep`), which offsets the same
+  legs and is floored at zero. A per-constituent amount reduced by such
+  legs can be negative ("Staggered-inception subsumption").
 - **XIRR:** Newton-Raphson (analytic derivative) from a 10% guess, with a
   bisection fallback scanning `[−0.9999, 100]` at 0.01 resolution for the
   first sign-change bracket. The rate is floored at −0.9999 (never worse
@@ -314,26 +597,108 @@ macro of its own:
   `journal`), never deposit/withdrawal: a deposit+withdrawal of equal size
   can be a genuine pair of external movements, so netting them would cancel
   real external capital. An internal move booked as deposit/withdrawal
-  surfaces as two external flows, not silently cancelled. Netting is
-  deterministic — `netOwnedTransfers` sorts stably by `(|amount|, day, id)`.
-  ε = max(1.00 outCcy, 0.5% of the larger leg); window ±3 calendar days;
-  FX-normalized via `value_outccy`; named constants.
-- **Cross-source transfer matching** (opt-in, DESIGN.md §5.8) is the one
-  sanctioned crossing of that deposit/withdrawal line: a pair explicitly
-  matched ACROSS sources (opposite sign, same native currency, equal
-  amount within tolerance, day window) nets in entities containing both
-  legs live — tagged `cross_source_netted=N` — because the cross-source
-  evidence is exactly what the within-entity heuristic lacks. Matched
-  legs are withheld from `netOwnedTransfers`' candidate pool, matching
-  operates on native amounts (partitions derive identical pairs whenever
-  their attached-flow universes coincide), and `--netting off` disables
-  cross-source drops along with the heuristic netter. Off ⇒
-  byte-identical.
+  surfaces as two external flows, not silently cancelled. A leg pairs by
+  what it moved:
+  - **In kind.** A leg whose transaction names an instrument moved a
+    holding, unless the instrument is money: class `cash` outside a fund,
+    such as a wallet's balance in a fiat currency. It pairs by holding
+    and quantity, never by value: one coin out, one coin in. The two legs
+    move one holding in opposite directions as one move (`oneMove`). What one move is depends on the
+    holding's asset class and vehicle, each the row's own where it states
+    one, else its instrument's:
+    - **A coin** (asset class `crypto`, vehicle `physical`) pairs by the
+      coin rule, the rule the transfer matcher applies (SPENDING.md §3,
+      "The matcher"). The receipt lies within 2 days of the withdrawal,
+      in either order. It is at most 0.1% more than the coin sent. Or it
+      is short by a fee of at most the larger of 0.1% of the coin sent
+      and 100 USD's worth at the coin's rate that day, and less than a
+      quarter of it. The rate is the latest one at most 7 days old. A
+      coin with no such rate may lose 1%. So a network fee taken in kind
+      still pairs, and its value reads as a loss.
+    - **Everything else:** a security (a share, an option contract, a unit
+      of a fund, a bond) never arrives short. Its legs pair at most 7 days
+      apart (`lots.PairWindow`), on the exact quantity only, up to float
+      noise (1e-9 of the larger). 100 shares out and 99 in do not pair.
+      This includes a share of a fund or trust that holds coins (class
+      `crypto`, vehicle `etf` or `fund`), and a class or vehicle gold does
+      not state.
+
+    The value netter runs first, over every leg, but pairs two legs only
+    where both are cash or both moved one holding as one move (a
+    security on the exact quantity, a coin by the coin rule, its days
+    included).
+    The legs that moved a holding and are left then pair by holding and
+    quantity (`pairInKind`):
+    - **Pairing.** Each leg, in day order, takes the open leg of the
+      smallest shortfall (for a security, the closest quantity), the
+      latest on a tie. One leg pairs with one leg:
+      a move split over two receipts pairs at most one of them. A leg
+      that states no quantity pairs only through a stored pair. Whatever
+      the price did between the two days is return.
+    - **Identity.** Two legs move one holding where any identity of
+      their instruments agrees: the same ISIN, the same CUSIP, or the
+      same instrument id among the sources of one kind
+      (`holdingUnion`). So shares moved between two banks pair by ISIN,
+      and a leg whose instrument states an ISIN still pairs with one
+      whose instrument states only the CUSIP, or only the id, both
+      share.
+    - **Funding a debut.** A leg that funds a debut funds it by quantity
+      where the first valuation holds what the legs moved, as one move
+      would deliver it (`quantitiesAgree`: the coin rule's quantities for
+      a coin, the exact quantity for a security). The first value then
+      stands for them at the debut's prices, by the holding's share of
+      that value (`movedLegs.fundedAt`). So the price move up to the debut
+      is return, and a shortfall, a fee in kind, is a loss. Where a zero
+      first value is no valuation, the debut is the first nonzero one
+      ("Staggered-inception subsumption"), and its valuation is the one
+      read. Each holding's
+      part of the first value is read only where the first valuation
+      holds positions in one currency and no cash. Elsewhere, and where
+      the quantities do not agree, a leg funds its debut by its value. A
+      first value below that value then books the difference as capital
+      that left: nothing says the same holding arrived.
+  - **Cash.** A leg that names no instrument, or names money, pairs by
+    value: ε = max(1.00 outCcy, 0.5% of the larger leg); window ±3
+    calendar days; FX-normalized via `value_outccy`. It is deterministic:
+    `netMatch` sorts stably by `(|amount|, day, id)`.
+- **Stored transfer pairs** (opt-in, DESIGN.md §5.8) are the one
+  sanctioned crossing of that deposit/withdrawal line. A pair the load
+  stored binds in every entity that holds both legs in the window, at any
+  day gap and any value gap: the matcher's pairs and the equity-transfer
+  ledger's `in_kind` pairs alike. Where both legs are live the pair drops.
+  Where a leg falls on or before its account's debut, or in a zero tail,
+  the pair settles as a netted pair: the leg funds the debut, or the
+  closure books it. Such an entity is tagged `cross_source_netted=N`. The
+  stored evidence is exactly what the within-entity heuristic lacks. Their
+  legs are withheld from the netter's candidates, and `--netting off`
+  disables them along with the netter. Off ⇒ byte-identical. Where both
+  legs moved one holding in quantities that are not one move's (a
+  security at all, a coin beyond the coin rule's quantities), the pair
+  binds the quantity both legs hold. The larger leg's rest, at its share
+  of the leg's value, stays a transfer nothing pairs: a flow, counted in
+  `unmatched_transfers`. A coin within the coin rule pairs whole: the
+  shortfall is the network's fee.
+- **Money in transit.** Between a pair's two legs the money is in neither
+  account, and it is still the household's. For a pair the value netter's
+  rule would not pair (a stored pair whose legs are days or a price move
+  apart, or a leg on a debut that is a deposit or withdrawal, or legs paired
+  by holding and quantity alone), the chain carries the money
+  (`movedLegs.rolled`). The carry runs from the day the chain stops
+  counting it in the sending account until the receiving account's value
+  shows it: the valuation a leg funds (below), else the leg's valuation.
+  It runs whether or not either valuation confirms the legs, so every
+  funding leg of a debut is carried when the first value appears. Where the
+  sending account would stop counting the money only on or after the day
+  the receiving one shows it, there is no transit and nothing is carried.
+  Such a pair leaves TWR and MWR as if the money never left: cash legs of
+  one amount into a debut have no net effect. A pair the value netter's
+  rule pairs, and a stored pair whose both legs are live, keep their own
+  reading.
 - **Explicit closure** is detected only when an account's value series ends
   in a ~0 carry tail (`|v| < valueTol`) — mere staleness never triggers it.
   The per-source `ClosureScope` knob decides how the exit is accounted:
   - `ClosureSubsumeDrains` (default): flows dated inside the flat zero-carry
-    tail show no ΔV, so they are subsumed (`subsumesAtClosure`). The
+    tail show no ΔV, so they are subsumed (the zero-tail region). The
     closure flow books them instead, on the zeroing day (below).
     Real drains before the zeroing snapshot stay flows. Safe when the
     ledger may be missing or mis-dated around a closure.
@@ -349,7 +714,7 @@ macro of its own:
   window must hold that day.
 
   - **Inside a longer zero tail** it books what the tail's legs moved out,
-    once netting has run (`exitsAtClosure`). That is the legs' own money
+    once netting has run (the exit fate). That is the legs' own money
     on another day, so it is a real flow, not a synthetic one, and the
     bridge reads it as money that left. An exit leg dated days after the
     zeroing therefore leaves on the day the value shows the money gone. A
@@ -428,7 +793,7 @@ sub-period would carry the whole chain.
   carries the same tag. Where the USD figures cannot be loaded, the
   reporting currency decides alone.
 - The two shares are `residueShare` (1%) and `exitOutflowShare` (90%),
-  beside `residueCurrency`, in `internal/gold/returns_compute.go`.
+  beside `residueCurrency`, in `internal/gold/returns_chain.go`.
 
 A known edge: a withdrawal of 90% and a market fall that leave less
 than 1% read as an exit, within one sub-period or across a run. A small
@@ -450,7 +815,7 @@ never fires and the engine
 books *both* the synthetic onboarding and the real funding — driving the
 chained TWR below −100%.
 
-**Mechanism (`flowSubsumed` + `entityFlows`):**
+**Mechanism (`entityFlows`: each leg's region and fate):**
 
 - A constituent debuting at `d > winFrom` has every own external flow dated
   `≤ d` **dropped** from the aggregate flow series; onboarding books the
@@ -462,12 +827,13 @@ chained TWR below −100%.
   zero-carry tail — land where the series shows no ΔV. Under the default
   `ClosureScope` they are subsumed, and the closure flow books them on
   the zeroing day; `ClosureLedgerExact` keeps them as the real exit legs.
-- **Netting interaction:** transfer/journal netting runs over the full
-  candidate set (pre-debut legs included) **before** subsumption, so
-  genuine internal pairs annihilate and only a constituent's own surviving
-  pre-debut/closure capital is subsumed. A surviving journal-OUT sits on an
-  *alive* account whose value series reflects the drop, so it is real, not
-  an orphaned phantom.
+- **Netting interaction:** stored pairs and transfer/journal netting run
+  over the legs of every account valued by the window's end (pre-debut
+  legs included) **before** subsumption, so genuine internal pairs
+  annihilate and only a constituent's own surviving pre-debut/closure
+  capital is subsumed. A surviving journal-OUT sits on an *alive* account
+  whose value series reflects the drop, so it is real, not an orphaned
+  phantom.
 - **A cancelled pre-debut leg reduces onboarding** by its signed amount,
   where the partner's account is on the spine by then and shows the leg by
   the window's end. The debut value holds that money and the pair's other
@@ -478,6 +844,58 @@ chained TWR below −100%.
   amount may be negative: an account that passed on more than it kept. What
   happens before a first valuation is capital in either direction, never
   performance. Guard: `TestFundedDebutBooksNoNewMoney`.
+- **A debut after the window's end** is no part of the window. The entity
+  holds an account from its first valuation, so a window that ends
+  before it holds none of the account's value:
+  - The account's legs in the window are no flows of the entity. Money
+    paid into it is not in the entity yet.
+  - A leg on a held account that pairs with one of them is a real flow.
+    The money left the value the window measures. Its partner is no flow
+    of the window, so the leg counts in `unmatched_transfers`.
+  - A stored pair with a leg on the account does not bind, so it counts
+    in no `cross_source_netted`.
+  - A window that ends on or after the debut reads the same pair as an
+    inside move that funds the debut.
+
+  Guards: `TestWindowBeforeDebutKeepsThePartnersLeg`,
+  `TestWindowBeforeDebutDropsItsLegs`,
+  `TestWindowBeforeDebutUnbindsAStoredPair`.
+- **A zero first value is no valuation.** It holds none of the money
+  moved in before the account's first nonzero valuation. The test is the
+  net of every leg on or before that valuation, paired or not
+  (`movesInBy`). Where it moves money in, the engine drops the zero head
+  (`readZeroHead`), and the first nonzero valuation is the debut:
+  - Every leg on or before it funds it, as for any debut. A deposit
+    from outside, a transfer in from an untracked account and a move
+    from a tracked account all count.
+  - A round trip before the zero moves nothing in.
+  - Money moved in after the zero funds the debut too.
+  - A net within the value netter's tolerance counts as none, so FX
+    between the legs of a round trip does not read as money in.
+  - The legs are netted in USD, as the post-exit residue is decided
+    ("One decision, in USD"). Every reporting currency then drops the
+    same zero, so the account debuts on the same day in each.
+
+  The household reads, flow for flow, as the same household without the
+  zero, in every window: one that opens before the legs, between them
+  and the zero, at the zero, between the zero and the debut, or on it.
+  Two cases keep the zero:
+  - Where the legs move more out than in, or nothing at all, the zero is
+    the first valuation. Money paid out before it funds the zero, since a
+    zero is what paying out everything leaves. A later value reads as the
+    account's own.
+  - Where no nonzero value follows, every valuation says none of the
+    money is there. The money moved in funds the zero: a pair's money
+    leaves as capital on it, and money from outside never counts.
+
+  Guards: `TestZeroIsNoValuation`, `TestZeroHeadShapes`,
+  `TestMovesInByNetsTheLegs`, `TestReadZeroHeadDropsOnlyAFundedZero`,
+  `TestZeroDebutKeepsItsReading`, `TestZeroDebutFundsItsFirstNonzeroValue`,
+  `TestZeroDebutInsideTheWindowsOpening`, `TestZeroDebutInASinceYearWindow`,
+  `TestZeroHeadDebutBooksWhatItsValueDoesNotHold`,
+  `TestZeroDebutThatStaysZeroPaysOut`,
+  `TestPerEntityOnceZeroDebutCarriesItsFunding`,
+  `TestZeroHeadAgreesAcrossPaths`, `TestZeroHeadDecidesOnceAcrossCurrencies`.
 - **The same holds at a closure.** A leg the closure day first shows,
   cancelled against money that stays inside, leaves the synthetic closure
   flow.
@@ -499,19 +917,19 @@ double-count. Guard: `TestStaggeredJournalFundedNoPhantom`.
 
 *(referenced by DESIGN.md §10.9 and `internal/returns/returnspolicy.go`)*
 
-Source economics differ: NAV-only tiny bases, crypto sweep churn, drained
-closures, conduit cash. A single hardcoded model is wrong for most
-sources. Per-source `if` branches in shared engine code would leak one
-source's behaviour into another, because at the global grain every
-constituent merges into one entity. So the engine reads a declarative
+Source economics differ: NAV-only tiny bases, drained closures, conduit
+cash. A single hardcoded model is wrong for most sources. Per-source
+`if` branches in shared engine code would leak one source's behaviour
+into another, because at the global grain every constituent merges into
+one entity. So the engine reads a declarative
 `ReturnsPolicy` per source instead, and the returns calculation names no
 source.
 
 - **Registry.** `internal/returns/returnspolicy.go` defines
   `ReturnsPolicy` and a registry keyed by adapter kind (`RegisterPolicy`
-  / `ReturnsPolicyFor`). Each source declares its policy in
-  `internal/silver/<source>/policy.go` and registers it from that
-  package's `init()`, as it registers its adapter. Each constituent keeps
+  / `ReturnsPolicyFor`). Each source declares its policy in its
+  `silver.Source`, and `silver.Register` forwards it to the registry
+  from the adapter package's `init()`. Each constituent keeps
   its own source's policy inside a merged entity, so a policy is
   source-scoped even at the global grain. `DefaultReturnsPolicy(flow)`
   sets every knob to the engine's baseline, so a policy that changes no
@@ -521,8 +939,8 @@ source.
 
   | knob | default | effect |
   |---|---|---|
-  | `Flow` | per source | the regime and the kinds that count as external flows and as transfer-like (netting) flows |
-  | `OnboardScope` | per constituent | `OnboardPerEntityOnce` books one step-up per entity (`groupOnboardStep`); `OnboardNone` books no onboarding |
+  | `Flow` | per source | the completeness regime: which collected rows of the capital kinds count (`canonical.CapitalKind` says which kinds those are) |
+  | `OnboardScope` | per constituent | `OnboardPerEntityOnce` books one step-up per entity (`groupOnboardStep`) |
   | `AccountsGrain` | normal | `blanked` shows values with TWR/MWR n/a + `accounts_grain_meaningless`; `hidden` emits no rows, while values and flows still aggregate |
   | `CapitalCallRisk` | off | keeps `nav_only_capital_call_risk` on a window where the source's own accounts observed no external flow |
   | `ClosureScope` | `ClosureSubsumeDrains` | `ClosureLedgerExact` keeps zero-tail flows as real exit legs ("Netting and closure") |
@@ -530,20 +948,23 @@ source.
   | `ConduitKinds` | none | account kinds that feed the value spine but get no per-account onboarding |
   | `ExternalOnly` | off | drops every row the silver tagged `returns_flow: internal` (`attachOneFlow`) |
 
-- **Flow classification.** Banks and pensions are flow-complete
-  (`BankFlowPolicy`). Crypto counts fiat flows only, and its transfer
-  legs are excluded. carta and equityzen count boundary deposit and
-  withdrawal only (`PrivateMarketLedgerPolicy`). The holding legs of
-  their double-entry pairs (buy, sell, contribution, distribution) stay
-  internal, or every event would cancel to a net-0 flow. angellist counts
-  deposit and withdrawal plus the equity-transfer ledger's transfer legs;
-  contribution and distribution stay internal. manual is NAV-only and
-  counts only the equity-transfer ledger's legs.
-- **Shared policies.** `DepositBankPolicy` (checking, savings and
-  money-market conduits) and `CardIssuerPolicy` (card-only sources) are
-  the bank set with `AccountsGrainHidden`. A deposit account is cash
-  plumbing. A card emits nothing anyway ("Credit cards are
-  returns-invisible"); its policy states that rather than fall through to
+- **Flow classification.** One table says which kinds move capital
+  (deposit, withdrawal, transfer in and out, journal) and which of them
+  net (the transfers and journal); it lives beside the kind roles in
+  `internal/canonical` (`CapitalKind`). A source declares only its
+  completeness, the regime:
+  - flow-complete counts every capital kind: banks, pensions, angellist,
+    and carta and equityzen (`PrivateMarketLedgerPolicy`), whose holding
+    legs (buy, sell, contribution, distribution) are no capital kind;
+  - nav-only counts no collected row; manual counts only the
+    equity-transfer ledger's legs.
+
+  A ledger leg counts under every regime, and nets against a partner where
+  a grain holds both.
+- **Deposit banks and card issuers** register the bank policy. Their
+  accounts are cash or cards: a cash account is plumbing and hides on any
+  source, and a card emits nothing ("Credit cards are returns-invisible").
+  The policy states that rather than fall through to
   `unknown_adapter_policy`.
 - **UBS.** UBS is a conduit relationship: external cash lands in a cash
   account and funds securities in another account of the same
@@ -563,17 +984,19 @@ source.
   - `Inception = InceptionFirstRealSnapshot`: the window starts past the
     sparse cash-only pre-history, so a tiny opening base cannot inflate
     the return.
-- **cointracking** sets `OnboardNone`: its wallets debut funded by
-  crypto transfers already excluded from flows, so onboarding would
-  double-count. It also sets `AccountsGrain = blanked`, because coins
-  sweep between wallets.
+- **cointracking** registers the default policy. A coin's transfer legs
+  count as any source's transfers do. A move between two wallets nets
+  where a grain holds both wallets: the netter pairs its legs by coin and
+  quantity, and with `returns_transfer_matching` on, the pair the load
+  stores nets too. A wallet that debuts funded by such a move onboards only
+  what the move did not bring in. A leg nothing pairs is a flow at the
+  day's rate.
 - **Config overrides.** wealthdb.cfg can adjust a source's registered
   policy (`returns_policy_overrides`, DESIGN.md §5.6), keyed by
   silver_source_id. The override applies at the engine's single
   resolution point (`newAccountData`), so the CLI and the materialized
-  `report_returns` agree. `flow_regime` replaces the whole flow
-  classification with the regime's own kind sets
-  (`FlowPolicyForRegime`). `accounts_grain` sets the per-account display
+  `report_returns` agree. `flow_regime` replaces the source's
+  completeness. `accounts_grain` sets the per-account display
   mode. It is the escape hatch for data completeness that differs from
   the registered default. One example: a flow-counting source whose
   silver carries no transactions pins back to `nav_only`. The
@@ -604,14 +1027,15 @@ every approximation is tagged. Computed set:
 `since_data_inception`, `configured_inception`, `partial_window`,
 `staggered_inception`, `accounts_grain_meaningless`, `empty_bucket`,
 `carried_forward`, `boundary_same_snapshot`, `stale_snapshot`,
-`dropped_while_nonzero`, `dietz_degenerate`, `nonpositive_base`,
+`dropped_while_nonzero`, `dietz_degenerate`, `loss_beyond_total`,
+`nonpositive_base`,
 `mwr_no_flows`, `mwr_no_sign_change`, `mwr_nonunique`,
 `mwr_no_converge`, `mwr_incomplete_flows`, `mwr_negative_net_capital`,
 `unmatched_transfers=N`, `cross_source_netted=N`, `rolled_forward`,
 `post_exit_residue`, `journal_present`,
-`nav_only`, `nav_only_capital_call_risk`, `crypto_unclassified_transfers`,
-`unknown_adapter_policy`, `fx_clamped_flow`, `pre_fx_history`,
-`flows_before_inception`, `after_tax`.
+`nav_only`, `nav_only_capital_call_risk`, `unknown_adapter_policy`,
+`fx_clamped_flow`, `pre_fx_history`, `flows_before_inception`,
+`after_tax`.
 
 A benchmark's figures have flags of their own ("Benchmarks" below):
 `benchmark_gap`, `benchmark_partial_period`, `benchmark_start_clipped`,
@@ -620,18 +1044,22 @@ A benchmark's figures have flags of their own ("Benchmarks" below):
 `post_exit_residue` marks a summary row whose chain left out sub-periods on
 the residue of an exit ("Post-exit residue").
 
+`loss_beyond_total` marks a summary row whose TWR is n/a because one of its
+sub-periods lost more than everything while the entity's value stayed at
+zero or above ("The math").
+
 `rolled_forward` marks a summary row whose window starts or ends with money
 moved that a valuation has not shown yet. TWR and MWR read it rolled in;
 `start`, `end`, `net_flow` and `gain` read the carried values.
 
 `configured_inception` marks a window truncated to a configured
 inception override (DESIGN.md §5.4) rather than the data's own start.
-`accounts_grain_meaningless` blanks TWR/MWR on accounts-grain rows of
-sweep sources (a single crypto wallet's return is noise; the coarser
-grains stay valid). Plumbing goes further: every `cash` account, whatever
-its source, `AccountsGrainHidden` sources (deposit banks, card issuers) and
-`returns_hide` ids emit no rows at all, nor does a portfolio or source made
-only of them, while still feeding every aggregate.
+`accounts_grain_meaningless` blanks TWR/MWR on accounts-grain rows of a
+source set to the blanked accounts-grain mode (its accounts' returns are
+noise one by one; the coarser grains stay valid). Plumbing goes further:
+every `cash` account, whatever its source, a source set to the hidden
+accounts-grain mode, and `returns_hide` ids emit no rows at all, nor does a
+portfolio or source made only of them, while still feeding every aggregate.
 `mwr_negative_net_capital` reports XIRR as n/a because the
 window's net invested capital (opening base plus net external flow) is
 zero or below.
@@ -646,12 +1074,13 @@ per-source configuration; with fewer than 3 observed gaps no cadence
 is inferred and the flag stays off.
 
 `unknown_adapter_policy` is unreachable through the real pipeline.
-`silver_sources.silver_kind` has a CHECK constraint that admits only the
-known adapter kinds, and each registers a policy from its `init()`. A
-guard test (`TestEveryCheckKindHasAdapterAndPolicy`) cross-checks the
-CHECK list against the adapter and policy registries. fred is exempt: it
-is a pure FX reference source that never reaches the returns engine. The
-flag stays as defense in depth, unit-tested at policy resolution.
+A load opens a source only through a registered adapter, and each
+adapter that emits accounts registers a policy from its `init()`. A
+guard test (`TestEveryAccountKindHasPolicy`) checks every registered
+kind against the policy registry. The reference sources (curves, fred,
+refdata) are exempt: they emit no accounts and never reach the returns
+engine. The flag stays as defense in depth, unit-tested at policy
+resolution.
 
 `flows_before_inception` marks an entity whose observed external ledger
 flows reach back before its resolved inception (data-derived, policy
@@ -694,10 +1123,10 @@ wealthdb returns global --benchmark "Global 60/40" --period annual
 wealthdb returns global 2024 --benchmark "S&P 500" --period total -x CHF
 ```
 
-**Months.** Each public N-PORT filing states the fund's total return for
-each of the three months it covers, per share class. refdata keeps the
-class the ticker maps to, and gold holds them in `fund_returns`. Where
-two filings state a month, the later one counts.
+**Months.** A fund's monthly total returns come from its public N-PORT
+filings, in gold's `fund_returns` ([adapters/refdata.md
+§2](adapters/refdata.md#2-coverage-matrix) defines the row). Where two
+filings state a month, the later one counts.
 
 - US registered funds only. A configured mix of UCITS funds has no
   returns.
@@ -777,8 +1206,7 @@ Each month end's solve starts from the rate of the one before, over the
 flows netted by day (`returns.FlowSeries`). The last one is solved from
 the engine's usual guess over the flows themselves, as the summary row
 is, so a line ends on its tile's number. A month end's `mwr_nonunique`
-reads the netted flows, so it can differ from the raw flows' on a day
-with flows both ways.
+reads the flows netted by day, as the summary row's does.
 
 `web refresh` writes both tables with `report_returns`, in one
 transaction, from the same datasets. `returns global --benchmark`

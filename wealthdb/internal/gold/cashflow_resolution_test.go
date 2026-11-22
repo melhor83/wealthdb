@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/enrichtest"
 )
 
 // The resolution's pins. Two table-driven walks, each over one of the
@@ -101,7 +102,6 @@ type line struct {
 	spend       string // spend_detailed, "" for none
 	income      string // income_detailed, "" for none
 	farAccount  string // the matcher's partner, "" for none
-	farClass    string // a rule's own word, "" for none
 	spendClass  string // stated_asset_class on the spending overlay, "" for none
 	incomeClass string // stated_asset_class on the income overlay, "" for none
 	want        string // "section.class.group", or "" for not a line
@@ -120,34 +120,23 @@ func seedLines(t *testing.T, db *sql.DB, ctx context.Context, lines []line) map[
             INSERT INTO transactions (silver_source_id, transaction_external_id, occurred_at,
                                       account_external_id, instrument_external_id,
                                       kind, currency, net_amount, description)
-                 VALUES ('cf', ?, 1728000, ?, ?, ?, 'USD', ?, ?)`,
-			l.id, l.account, nullIfEmpty(l.instrument), l.kind, l.amount, l.id); err != nil {
+                 VALUES ('cf', ?, 1728000, ?, NULLIF(?, ''), ?, 'USD', ?, ?)`,
+			l.id, l.account, l.instrument, l.kind, l.amount, l.id); err != nil {
 			t.Fatalf("seed transaction %s: %v", l.id, err)
 		}
-		if l.spend != "" || l.farAccount != "" || l.farClass != "" || l.spendClass != "" {
-			if _, err := db.ExecContext(ctx, `
-                INSERT INTO spend_txn_enrichment (silver_source_id, transaction_external_id,
-                        merchant_signature, signature_version, spend_detailed, provenance,
-                        far_silver_source_id, far_account_external_id, far_class,
-                        stated_asset_class, assigned_at)
-                     VALUES ('cf', ?, 'sig', 1, ?, 'rule', ?, ?, ?, ?, 100)`,
-				l.id, nullIfEmpty(l.spend),
-				nullIfEmpty(map[bool]string{true: "cf", false: ""}[l.farAccount != ""]),
-				nullIfEmpty(l.farAccount), nullIfEmpty(l.farClass), nullIfEmpty(l.spendClass)); err != nil {
-				t.Fatalf("seed spending overlay for %s: %v", l.id, err)
+		if l.spend != "" || l.farAccount != "" || l.spendClass != "" {
+			far := enrichtest.Spend{Source: "cf", Txn: l.id, Signature: "sig", Detailed: l.spend,
+				Provenance: "rule", FarAccount: l.farAccount, Stated: l.spendClass}
+			if l.farAccount != "" {
+				far.FarSource = "cf"
 			}
+			enrichtest.SeedSpend(t, db, far)
 		}
 		if l.income != "" || l.incomeClass != "" {
-			if _, err := db.ExecContext(ctx, `
-                INSERT INTO income_txn_enrichment (silver_source_id, transaction_external_id,
-                        payer_signature, signature_version, income_detailed, provenance,
-                        stated_asset_class, assigned_at)
-                     VALUES ('cf', ?, ?, 1, ?, 'rule', ?, 100)`,
-				// A payer signature of its own: shared with the spending
-				// rows', a repayment would link to one of them (0160).
-				l.id, "payer:"+l.id, nullIfEmpty(l.income), nullIfEmpty(l.incomeClass)); err != nil {
-				t.Fatalf("seed income overlay for %s: %v", l.id, err)
-			}
+			// A payer signature of its own: shared with the spending
+			// rows', a repayment would link to one of them (0160).
+			enrichtest.SeedIncome(t, db, enrichtest.Income{Source: "cf", Txn: l.id, Signature: "payer:" + l.id,
+				Detailed: l.income, Provenance: "rule", Stated: l.incomeClass})
 		}
 	}
 
@@ -179,13 +168,6 @@ func seedLines(t *testing.T, db *sql.DB, ctx context.Context, lines []line) map[
 		t.Fatalf("iterate cashflow_txn_nodes: %v", err)
 	}
 	return out
-}
-
-func nullIfEmpty(s string) any {
-	if s == "" {
-		return nil
-	}
-	return s
 }
 
 // check walks the table, comparing the node each row landed on with the
@@ -459,8 +441,8 @@ func TestTheBoundaryTableInBothDirections(t *testing.T) {
 			spend: "internal_transfer", want: "vehicles.unpaired.unnamed",
 			why: "no far account at all: a finding, visible rather than lost to the residual"},
 		line{id: "W-RULE-MORT", account: "CASH", kind: "withdrawal", amount: -1800,
-			spend: "internal_transfer", farClass: "mortgage", want: "financing.mortgage.mortgage",
-			why: "the mortgage rule's own word, for the lender the product does not track"},
+			spend: "mortgage_transfer", want: "financing.mortgage.mortgage",
+			why: "the mortgage rule's own value, for the lender the product does not track"},
 	)
 	check(t, seedLines(t, db, ctx, lines), lines)
 }
@@ -536,29 +518,30 @@ func TestTheCrossingDeltasAreDirectional(t *testing.T) {
 	check(t, seedLines(t, db, ctx, lines), lines)
 }
 
-// TestVehicleTransferDetailedMatchesTheResolution pins
-// canonical.VehicleTransferDetailed to the resolution's own CASE: for
-// every class that has a crossing delta, a row placed with that delta
-// and no far account lands on that class, read from either family.
-func TestVehicleTransferDetailedMatchesTheResolution(t *testing.T) {
+// TestEveryCrossingLandsOnItsPool pins the crossings' roles
+// (canonical.CategoryRoles) to the resolution: for every value placed as
+// a crossing, a row placed with that value and no far account lands on
+// the pool the value names, read from either family.
+func TestEveryCrossingLandsOnItsPool(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)
 	seedResolutionFixture(t, db, ctx)
 	var lines []line
-	for _, c := range canonical.CashflowClasses() {
-		d, ok := canonical.VehicleTransferDetailed(c)
-		if !ok {
+	for _, c := range canonical.SpendCategories {
+		r := c.Roles()
+		if r.FlowPlace != canonical.PlaceVehicleDelta {
 			continue
 		}
-		want := "vehicles." + string(c) + "." + string(c)
+		d, pool := c.Detailed, string(r.FlowClassOut)
+		want := "vehicles." + pool + "." + pool
 		lines = append(lines,
-			line{id: "VT-OUT-" + string(c), account: "CASH", kind: "withdrawal", amount: -500,
+			line{id: "VT-OUT-" + pool, account: "CASH", kind: "withdrawal", amount: -500,
 				spend: d, want: want, why: d + " on the spending side"},
-			line{id: "VT-IN-" + string(c), account: "CASH", kind: "deposit", amount: 500,
+			line{id: "VT-IN-" + pool, account: "CASH", kind: "deposit", amount: 500,
 				income: d, want: want, why: d + " on the income side"})
 	}
 	if len(lines) == 0 {
-		t.Fatal("no class has a crossing delta; the walk proves nothing")
+		t.Fatal("no value is a crossing; the walk proves nothing")
 	}
 	check(t, seedLines(t, db, ctx, lines), lines)
 }
@@ -566,11 +549,10 @@ func TestVehicleTransferDetailedMatchesTheResolution(t *testing.T) {
 // TestAMortgageServicerNeedsNoFarAccount pins the verdict that reaches
 // `financing · Mortgage` on its own.
 //
-// Both other roads to that node read the far side — a far account of
-// kind `mortgage`, or `far_class`, which only the built-in tier may
-// write — so a servicer gold holds no account for fell through to the
-// untracked residual. `mortgage_transfer` is tested here with NEITHER
-// far signal set, because needing neither is the whole of the point;
+// The other road to that node reads the far side — a far account of
+// kind `mortgage` — so a servicer gold holds no account for would fall
+// through to the untracked residual. `mortgage_transfer` is tested here
+// with no far account, because needing none is the whole of the point;
 // and on both legs, since a drawdown arrives the other way.
 //
 // `debt_repayment` is asserted beside it unchanged: the two values
@@ -711,7 +693,7 @@ func TestNodeLabelsReadAsVocabulary(t *testing.T) {
 		{id: "L-WAGE", account: "CASH", kind: "deposit", amount: 100, income: "INCOME_SALARY"},
 		{id: "L-BUY", account: "BROK", kind: "buy", amount: -100, instrument: "PE"},
 		{id: "L-MORT", account: "CASH", kind: "withdrawal", amount: -100,
-			spend: "internal_transfer", farClass: "mortgage"},
+			spend: "mortgage_transfer"},
 		{id: "L-UNTRACKED", account: "CASH", kind: "withdrawal", amount: -100,
 			spend: "internal_transfer"},
 		{id: "L-DAF", account: "CASH", kind: "withdrawal", amount: -100,
@@ -798,7 +780,12 @@ func TestNoVerdictPromotesAnUnsignedKind(t *testing.T) {
 	db, ctx := openMigrated(t)
 	seedResolutionFixture(t, db, ctx)
 
-	unsigned := canonical.CashflowUnsignedKinds()
+	var unsigned []canonical.TxKind
+	for _, r := range canonical.TxKindRows() {
+		if r.Unsigned {
+			unsigned = append(unsigned, r.Kind)
+		}
+	}
 	var rows []line
 	for _, k := range canonical.TxKinds() {
 		rows = append(rows, line{
@@ -938,13 +925,9 @@ func TestAStatedExposureYieldsToEveryRoadAboveIt(t *testing.T) {
              VALUES ('cf', 'X-FEED', 1728000, 'CASH', 'withdrawal', 'USD', -1000, 'metal')`); err != nil {
 		t.Fatalf("seed feed-stated row: %v", err)
 	}
-	if _, err := db.ExecContext(ctx, `
-        INSERT INTO spend_txn_enrichment (silver_source_id, transaction_external_id,
-                merchant_signature, signature_version, spend_detailed, provenance,
-                stated_asset_class, assigned_at)
-             VALUES ('cf', 'X-FEED', 'sig', 1, 'investment', 'rule', 'real_estate', 100)`); err != nil {
-		t.Fatalf("seed feed-stated overlay: %v", err)
-	}
+	enrichtest.SeedSpend(t, db,
+		enrichtest.Spend{Source: "cf", Txn: "X-FEED", Signature: "sig", Detailed: "investment", Provenance: "rule", Stated: "real_estate"},
+	)
 	lines := []line{
 		// A named instrument whose dimension row is MISSING must still
 		// fall to `other`. gold's instruments.asset_class is NOT NULL,

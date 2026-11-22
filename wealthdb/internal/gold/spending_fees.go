@@ -66,7 +66,7 @@ func feeBuckets(from, to int64, period string) []feeBucket {
 			next = time.Date(t.Year(), time.Month((int(t.Month())-1)/3*3+4), 1, 0, 0, 0, 0, time.UTC)
 		}
 		end := min(EpochDay(next.Unix())-1, to)
-		out = append(out, feeBucket{periodLabel(end+1, period), start, end})
+		out = append(out, feeBucket{PeriodLabel(t, period), start, end})
 		start = end + 1
 	}
 	return out
@@ -79,10 +79,6 @@ type feeEntity struct {
 	unpriced             int
 	spans                []*accountData
 }
-
-// feeGroups are the detailed groups of fee_group, in
-// column order. A test holds the two to one set.
-var feeGroups = []string{"investment", "bank", "atm", "other"}
 
 // feeLine is one spending line of primary BANK_FEES.
 type feeLine struct {
@@ -102,7 +98,7 @@ func loadFeeLines(ctx context.Context, db *sql.DB, fromEpoch, toEpoch int64, out
 		  FROM report_spending_transactions(?, ?, ?) t
 		  LEFT JOIN accounts a ON a.silver_source_id = t.silver_source_id
 		       AND a.account_external_id = t.account_external_id
-		 WHERE t.spend_primary = 'BANK_FEES'`, fromEpoch, toEpoch, outCcy)
+		 WHERE t.spend_primary = ?`, fromEpoch, toEpoch, outCcy, canonical.BankFeesPrimary)
 	if err != nil {
 		return nil, fmt.Errorf("fee lines: %w", err)
 	}
@@ -129,11 +125,7 @@ func loadFeeLines(ctx context.Context, db *sql.DB, fromEpoch, toEpoch int64, out
 // RunFees computes the fee view. p carries the window, the output currency,
 // the config's returns settings and the bucket size in Period.
 func RunFees(ctx context.Context, db *sql.DB, p ReturnParams) ([]FeeRow, error) {
-	fx, err := loadFxBounds(ctx, db)
-	if err != nil {
-		return nil, err
-	}
-	ds, err := loadReturnsDataset(ctx, db, p.OutCcy, fx, p.PolicyOverrides, p.TransferMatching)
+	ds, err := loadRunDataset(ctx, db, p)
 	if err != nil {
 		return nil, err
 	}
@@ -180,7 +172,7 @@ func computeFees(ds *returnsDataset, lines []feeLine, portfolioNames map[string]
 		}
 		rows := make([]FeeRow, 0, len(entities))
 		for _, e := range entities {
-			rows = append(rows, e.row(b, months[acctKey(e.src, e.kind+"\x00"+e.id)]))
+			rows = append(rows, e.row(b, months[feeKey(e.src, e.kind, e.id)]))
 		}
 		slices.SortFunc(rows, func(x, y FeeRow) int {
 			if c := compareCost(y, x); c != 0 {
@@ -218,11 +210,16 @@ func compareCost(x, y FeeRow) int {
 	return 0
 }
 
+// feeKey keys a fee entity by its source, its kind (a grain's entity
+// word) and its id. A line, an entity and a monthly return row must key
+// alike, or the entity gets no monthly rows.
+func feeKey(src, kind, id string) string { return acctKey(src, acctKey(kind, id)) }
+
 func (l feeLine) entityKey() string {
 	if l.portfolio != "" {
-		return acctKey(l.src, "portfolio\x00"+l.portfolio)
+		return feeKey(l.src, grainPortfolios.entity, l.portfolio)
 	}
-	return acctKey(l.src, "account\x00"+l.acct)
+	return feeKey(l.src, grainAccounts.entity, l.acct)
 }
 
 // newEntity is the line's entity, with the accounts whose value it holds: every
@@ -230,9 +227,9 @@ func (l feeLine) entityKey() string {
 // cards are left out, as its return leaves them out; an account that is a card
 // or a mortgage holds its own balance.
 func (l feeLine) newEntity(portfolioNames map[string]string, ds *returnsDataset) *feeEntity {
-	e := &feeEntity{src: l.src, kind: "account", id: l.acct, label: l.label, fees: map[string]float64{}}
+	e := &feeEntity{src: l.src, kind: grainAccounts.entity, id: l.acct, label: l.label, fees: map[string]float64{}}
 	if l.portfolio != "" {
-		e.kind, e.id, e.label = "portfolio", l.portfolio, l.portfolio
+		e.kind, e.id, e.label = grainPortfolios.entity, l.portfolio, l.portfolio
 		if n, ok := portfolioNames[acctKey(l.src, l.portfolio)]; ok {
 			e.label = n
 		}
@@ -257,14 +254,12 @@ func (l feeLine) newEntity(portfolioNames map[string]string, ds *returnsDataset)
 // of accounts inside a portfolio are never read.
 func feeMonths(ds *returnsDataset, p ReturnParams) map[string][]ReturnRow {
 	out := map[string][]ReturnRow{}
-	for _, level := range []struct{ grain, kind string }{{"portfolios", "portfolio"}, {"accounts", "account"}} {
-		w := p
-		w.Level, w.Method, w.Period, w.Annualize = level.grain, "twr", "monthly", "auto"
-		w.Netting, w.Inception = true, "full"
-		w.FromEpoch, w.ToEpoch = 0, ds.globalMax*SecondsPerDay
+	for _, g := range []*grain{grainPortfolios, grainAccounts} {
+		w := p.defaultRun(g.name, "monthly", p.OutCcy, 0, ds.globalMax*SecondsPerDay)
+		w.Method = "twr"
 		for _, r := range computeReturns(ds, w) {
 			if !r.IsSummary {
-				key := acctKey(r.SilverSourceID, level.kind+"\x00"+r.EntityID)
+				key := feeKey(r.SilverSourceID, g.entity, r.EntityID)
 				out[key] = append(out[key], r)
 			}
 		}
@@ -274,7 +269,7 @@ func feeMonths(ds *returnsDataset, p ReturnParams) map[string][]ReturnRow {
 
 // chainMonths compounds the returns of the months that end in the bucket. A
 // month with no return, or one that lost everything, is left out, as the
-// fee tiles' logarithms leave it out. It returns nil with nothing to chain,
+// fee tiles' chain_returns leaves it out. It returns nil with nothing to chain,
 // and the months' quality tags.
 func chainMonths(months []ReturnRow, b feeBucket) (*float64, []string) {
 	growth, chained := 1.0, false
@@ -318,6 +313,16 @@ func (e *feeEntity) meanValue(b feeBucket) (float64, int64) {
 	return sum / float64(days), days
 }
 
+// feeRate is the yearly fee rate, a ratio, of total paid over days on
+// which the entity held mean on average; nil where it held no value. The
+// fee tiles read it as fee_rate_pct.
+func feeRate(total, mean float64, days int64) *float64 {
+	if !(mean > valueTol) {
+		return nil
+	}
+	return f64(total / mean * feeDaysPerYear / float64(days))
+}
+
 func (e *feeEntity) row(b feeBucket, months []ReturnRow) FeeRow {
 	r := FeeRow{Period: b.label, StartDay: b.start, EndDay: b.end,
 		SilverSourceID: e.src, EntityKind: e.kind, EntityID: e.id, EntityLabel: e.label}
@@ -327,15 +332,15 @@ func (e *feeEntity) row(b feeBucket, months []ReturnRow) FeeRow {
 		total += e.fees[g]
 	}
 	r.Fees = decStr(total)
-	r.FeesInvestment, r.FeesBank = decStr(e.fees["investment"]), decStr(e.fees["bank"])
-	r.FeesATM, r.FeesOther = decStr(e.fees["atm"]), decStr(e.fees["other"])
+	r.FeesInvestment = decStr(e.fees[canonical.FeeGroupInvestment])
+	r.FeesBank = decStr(e.fees[canonical.FeeGroupBank])
+	r.FeesATM = decStr(e.fees[canonical.FeeGroupATM])
+	r.FeesOther = decStr(e.fees[canonical.FeeGroupOther])
 	mean, days := e.meanValue(b)
 	if days > 0 {
 		r.MeanValue = decStr(mean)
 	}
-	if mean > valueTol {
-		r.FeeRate = f64(total / mean * feeDaysPerYear / float64(days))
-	} else {
+	if r.FeeRate = feeRate(total, mean, days); r.FeeRate == nil {
 		r.Quality = append(r.Quality, "no_mean_value")
 	}
 	if days > 0 && days < b.end-b.start+1 {
@@ -353,7 +358,8 @@ func (e *feeEntity) row(b feeBucket, months []ReturnRow) FeeRow {
 	return r
 }
 
-// debtKind reports an account kind that is a debt: a mortgage or a card.
+// debtKind reports an account kind that is a debt
+// (canonical.AccountKindRow.Liability).
 func debtKind(kind string) bool {
-	return kind == string(canonical.AccountKindMortgage) || kind == string(canonical.AccountKindCard)
+	return canonical.AccountKind(kind).Liability()
 }

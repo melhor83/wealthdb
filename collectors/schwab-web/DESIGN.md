@@ -122,13 +122,15 @@ those rows.
 | `account_balances` | `historical_cash_balances` | api has live per-dump balances; web parses the monthly statement cash-flow summary (opening/closing) and the rate the cash earns (migration 0011; see §3.1) into `historical_cash_balances` |
 | `positions` | `historical_position_snapshots` | api has live per-dump positions; web parses the monthly/quarterly statement holdings block into `historical_position_snapshots` |
 | `open_orders` | — | api-only |
-| `transactions` | `transactions` | Same column shape. Different `activity_id` value space — see §2.2 |
+| `transactions` | `transactions` | Same column shape. Different `activity_id` value space — see §2.2. web also states each row's amount, quantity and price as decimal text, and its description and action as printed, in columns of their own (migration 0014), whatever the payload's dialect |
 | `instruments` | — | api-only (present unless `--no-instruments`) |
 | — | `documents` | web-only. One row per downloaded PDF/XML/CSV, sha256-deduped |
 | — | `open_lots` | web-only. One row per tax lot a statement prints under a holding; see §9.1 |
 | — | `closed_lots` | web-only. One row per realized lot a year-end tax document prints; see §9.2 |
 | — | `cost_basis_methods` | web-only. The cost-basis methods a Gain/Loss Report prints; see §9.3 |
 | — | `parsed_documents` | web-only. The logical documents parsed under the current parser generation; see §4.4 |
+| — | `document_derivations` | web-only. The parser generation that read each document copy; see §4.4 |
+| — | `rebuild_level` | web-only. The rebuild advice level the silver was built at; see §6.0 |
 
 ### 3.1 The cash's interest rate
 
@@ -142,7 +144,7 @@ closing cash balance. Two shapes print it:
 - before 2025, the note "Bank Sweep: Interest Rate as of ... was
   ...%". The first such note stands.
 
-A statement that prints no rate gives none. `pdf_parsers.py`
+A statement that prints no rate gives none. `stmt_parse.py`
 (`parse_cash_interest_rate`) has the line shapes.
 
 ## 4. Irreconcilable differences (and gold-layer mitigations)
@@ -208,7 +210,7 @@ schedule breakdown. The api emits only TRADE transactions; it
 does NOT expose the IRS-level tax categorisation.
 
 **As built**: the 1099-aware parser lives in silver
-(`tax_form_parsers.py`, §6a); sale lots land in `transactions`
+(`form_1099b.py`, §6a); sale lots land in `transactions`
 with `source='form_1099b'` and in `closed_lots`. Gold reads them
 from `closed_lots` as realized lots; the statement and history
 feeds book the sales themselves ([INTEROP.md](INTEROP.md) §8). The
@@ -251,13 +253,43 @@ The tx-history exports carry no marker; they are skipped once they
 have transaction rows. Within one load, each logical document is
 parsed once, also under `--reparse`.
 
-**Parser generation (migration 0005)**: `parser_generations` records
-which generation of the document parsers wrote the rows in hand. A
-moved generation purges the statement snapshot tables and the parse
-markers, and the load re-walks every run as under `--reparse`. A load
-stamps the new generation only when every run and the account-number
-reconcile pass committed. After a failure the generation stays
-unstamped, so the next load re-walks the archive again.
+**Parser generations (migrations 0005, 0012, 0015)**: each document
+kind has a parser generation. It is a hash of the kind's parser code
+and of the extraction keys of what it reads, so a PDFium upgrade moves
+it too.
+
+- A pass records each document it parses in `document_derivations`
+  (`collectorkit.derivations`). A record names the copy read, the kind
+  and the generation, and counts the rows the parse wrote. It is
+  written with the document's parse marker.
+- A parse that fails is recorded with no rows and gets no marker. The
+  kind's next generation reads the document again.
+- A kind holding a record under another generation has moved. The load
+  clears that kind's parse markers (the statements' also purge the
+  statement snapshot tables) and re-derives that kind's documents from
+  every run. The rest of each run is not read again.
+- A load that fails nowhere then drops the kind's records under
+  another generation. They are the copies a moved kind did not read
+  again. The kind then reads as current.
+- The walk is how a run's manifest and its exports become rows. It is
+  not a set of documents, so it keeps a stamp of its own: the
+  `documents` scope of `parser_generations`. No parser moves it. A
+  migration that changes the walk clears it, and an empty silver has
+  none. The load then purges every marker and the snapshot tables and
+  re-walks every run as under `--reparse`.
+
+A load stamps the walk and drops the records only when every run and
+the account-number reconcile pass committed. After a failure the older
+records stay and the walk stays unstamped, so the next load re-derives
+again. A failed run is rolled back, the other runs still load, and the
+load exits 1.
+
+**Parse and extraction caches**: a load keeps each document's parse
+under the collector's cache root, keyed on the document's content and
+file name and on its kind's generation. A `load --force` or a
+re-derive of another kind reads it back instead of parsing again. The
+PDFium text and words of each PDF are cached the same way, keyed on
+the extraction. A cache only saves time: an empty one costs a parse.
 
 **Gold-layer mitigation for `documents`**: when consuming web silver
 `documents`, deduplicate on `(account_external_id, doc_date,
@@ -371,9 +403,10 @@ per document kind, parses these into `transactions`:
   CSV / XML twins are sha256-keyed into `documents` for traceability
   but not re-parsed — the JSON carries the same set plus Schwab's
   `AcctgRuleCd`. A row's id is stable across exports of overlapping
-  windows (§2.2). If `more-details.json` is present, the loader merges
-  each record into the matching transaction's `payload` under `_more`
-  (keyed by `_tx_history_row_key`).
+  windows (§2.2). If `more-details.json` is present, the loader parses
+  each record's dialog text (`more_detail.py`) into the matching
+  transaction's `payload` under `_more` (keyed by
+  `_tx_history_row_key`). See §6.0.
 - **1099-Composite XML / CSV** → `source='form_1099b'` (the 1099-B
   sale lots; see §6a). XML preferred over the CSV twin. The lots also
   land in `closed_lots` (§9.2).
@@ -387,20 +420,63 @@ statement pass writes `open_lots` (§9.1), and the realized-lot reports
 and the Gain/Loss Report) fill `closed_lots` and `cost_basis_methods`
 (§9.2, §9.3).
 
+Each kind has a parser module of its own:
+
+- [`stmt_parse.py`](stmt_parse.py): the statements;
+- [`letters.py`](letters.py): the distribution letters;
+- [`form_1099b.py`](form_1099b.py): the 1099-B;
+- [`realized_reports.py`](realized_reports.py): the realized-lot reports.
+
+[`pdf_parsers.py`](pdf_parsers.py) and
+[`tax_form_parsers.py`](tax_form_parsers.py) read a file and call them.
+
+### 6.0 The More detail in silver
+
+Each `more-details.json` record holds the dialog's whole text as
+`raw_text`. The loader parses that text. It ignores the record's
+`fields`, which the download leaves empty.
+
+- The dialog prints each label on its own line and the value on the
+  next line. Labels match without regard to case, so the older
+  "Trade Transaction Details" dialog and the newer "More Details"
+  dialog give the same keys.
+- The keys: `trade_date`, `settle_date`, `action`, `quantity`,
+  `price`, `principal`, `commission`, `industry_fee`,
+  `accrued_interest`, `total`, `order_id`, `description`.
+- `security_lines` holds the unlabeled security block (the name
+  first) verbatim. `cusip` holds its last line when that is a CUSIP
+  with a valid check digit.
+- Values are stored as printed. The loader converts nothing.
+- A label the newer dialog prints twice is stored once when both
+  values agree, and as a list of both, in order, when they differ.
+- The newer dialog's line after `Print` is stored as `action` when no
+  `Action` label is printed.
+- A line that is not one of the labels is never read as one. A wire
+  or deposit dialog holds none, so its row gets no `_more`.
+
+A row keeps the first detail it gets. A later export of the same row
+fills `_more` only when the row holds none, or an empty one. A
+`load --force` rebuild gives every row the detail its sidecars hold.
+A silver built before the dialog was parsed holds rows without it; each
+load of such a silver says so in one line, naming `load --force`, and
+goes on (`REBUILD_ADVICE` in `load.py`, the `rebuild_level` table of
+migration 0013).
+
 ### 6a. 1099-B sale lots (`source='form_1099b'`)
 
 The 1099 Composite is the **authoritative annual record of sales**,
 carrying cost basis and acquisition date per lot — data the
 statement parser cannot see when a sale prints only as a bare
 position delta rather than as an activity row. Parsed by
-[`tax_form_parsers.py`](tax_form_parsers.py).
+[`form_1099b.py`](form_1099b.py).
 
 - **Format precedence.** Schwab ships the form as a PDF and, where it
   offers them, as XML + CSV twins. The twins share one base filename;
   the PDF is named apart (§6). All three share the manifest row (date
   and document name). The loader prefers the **XML** (OFX-2.x, cleaner
   per-field structure, an explicit `DTVAR` "Various" flag, a
-  `TAXYEAR` element) and fall back to the **CSV**. The PDF's 1099-B
+  `TAXYEAR` element) and falls back to the **CSV**. The CSV is read
+  when the XML is not on disk or does not parse. The PDF's 1099-B
   pages are not read; its Year-End Summary half is (§9.2). The
   `logical_doc_key` keys on the **base filename without extension**,
   so the XML and CSV twins dedup to one set of rows (whichever is
@@ -428,7 +504,7 @@ These `Letters`-kind PDFs are the **only record of securities (and
 cash) moved out of an account to a third party** — gifts to people /
 DAFs, transfers to other custodians or accounts. The statements show
 such a move only as an unexplained position drop. Parsed by
-`pdf_parsers.parse_distribution_pdf`, with text from the same
+[`letters.py`](letters.py), with text from the same
 pypdfium2 extractor the statement parser uses.
 
 - Three known layout families, all outbound: a **wire** ("To the
@@ -500,7 +576,7 @@ the top of page 1, adjacent to the account number. Migration
 0003 promotes that label to a top-level column on `accounts`.
 
 The column carries the **raw** Schwab label, verbatim.
-`pdf_parsers.parse_account_registration` handles all three
+`stmt_header.parse_account_registration` handles all three
 layout eras (see §7). Each load sets the column on every row of an
 account, from the first label among the statements that load
 parsed. A later load that parses newer statements overwrites it. A
@@ -645,9 +721,9 @@ A holding with one lot prints no total, so its `cost_basis` in
 on the next page; its later lots and its total still belong to it.
 
 The statement passes write `open_lots` together with the holdings. A
-re-parse of a statement replaces its lots. A moved parser generation
-purges the table with the other statement tables (migration 0005), and
-the re-walk refills it.
+re-parse of a statement replaces its lots. A moved statement generation
+(§4.4) purges the table with the other statement tables, and the
+re-derive refills it.
 
 ### 9.2 Closed lots (migration 0007)
 

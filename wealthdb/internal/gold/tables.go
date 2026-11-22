@@ -82,11 +82,13 @@ var SourceTables = []SourceTable{
 	{Name: "dividend_calendar", TimeCol: "as_of", RefKind: canonical.RefDividendEvents, Class: ClassReference},
 	{Name: "stated_periods", TimeCol: "as_of", Account: true, Class: ClassReference},
 	{Name: "exposure_reports", TimeCol: "as_of", Class: ClassReference},
+	{Name: "capital_accounts", TimeCol: "as_of", Account: true, Class: ClassReference},
 
 	{Name: "transactions", TimeCol: "occurred_at", Account: true, Class: ClassFact},
 	{Name: "realized_lots", Account: true, Class: ClassFact},
 	{Name: "fx_rates", TimeCol: "snapshot_at", Class: ClassFact},
 	{Name: "cash_balances", TimeCol: "snapshot_at", Account: true, Class: ClassFact},
+	{Name: "snapshot_coverage", TimeCol: "snapshot_at", Account: true, Class: ClassFact},
 	{Name: "position_lots", TimeCol: "snapshot_at", Account: true, Class: ClassFact},
 	{Name: "positions", TimeCol: "snapshot_at", Account: true, Class: ClassFact},
 

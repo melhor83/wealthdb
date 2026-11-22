@@ -3,9 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
-	"flag"
 	"fmt"
-	"io"
 	"strconv"
 	"strings"
 	"time"
@@ -14,7 +12,6 @@ import (
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/config"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/errs"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/gold"
-	"github.com/smartpointer-com/wealthdb/wealthdb/internal/output"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/yield"
 )
 
@@ -43,12 +40,145 @@ import (
 // views do: a list of lines means the same thing however it is
 // bucketed.
 func init() {
-	register("cashflow", cmdCashflow)
+	// The usage lists the family's columns, so it joins the family here.
+	cashflowFamily.usage = cashflowUsage
+	register("cashflow", routeReport(cashflowFamily))
 }
 
-// cashflowViews are the grains `wealthdb cashflow <view>` supports: the
-// statement's, coarsest first, then the cash flow projection.
-var cashflowViews = []string{"summary", "flows", "sankey", "transactions", "coverage", "projection"}
+// cashflowFamily are the grains `wealthdb cashflow <view>` supports:
+// the statement's, coarsest first, then the cash flow projection. A flow
+// node nets the nodes under it, and coverage measures gaps: neither
+// adds up over its rows.
+var cashflowFamily = &family{
+	name: "cashflow",
+	views: []view{
+		{name: "summary", total: flowTotal, principal: fixedColumn("net_cash_flow"), header: periodHeader,
+			build: func(_ *config.Config, req request) *report {
+				part := reportPeriods[req.period]
+				return newReport(buildCashflowSummaryColumnRegistry(req.currency, req.period), defaultCashflowSummaryColumns,
+					func(ctx context.Context, db *sql.DB) ([]gold.CashflowSummaryRow, error) {
+						return gold.CashflowSummary(ctx, db, req.from, req.to, req.currency, part)
+					})
+			}},
+		{name: "flows", principal: fixedColumn("net"),
+			header: func(req request) []string {
+				return append([]string{"period=" + req.period, "level=" + req.level}, investingHeader(req)...)
+			},
+			build: func(_ *config.Config, req request) *report {
+				part := reportPeriods[req.period]
+				return newReport(buildCashflowFlowColumnRegistry(req.currency, req.period), defaultCashflowFlowColumns,
+					func(ctx context.Context, db *sql.DB) ([]gold.CashflowFlowRow, error) {
+						return gold.CashflowFlows(ctx, db, req.from, req.to, req.currency, part, req.level, req.investing)
+					})
+			}},
+		{name: "sankey", principal: fixedColumn("value"),
+			header: func(req request) []string {
+				return append([]string{"level=" + req.level}, investingHeader(req)...)
+			},
+			build: func(_ *config.Config, req request) *report {
+				return newReport(buildCashflowSankeyColumnRegistry(req.currency), defaultCashflowSankeyColumns,
+					func(ctx context.Context, db *sql.DB) ([]gold.CashflowSankeyRow, error) {
+						return gold.CashflowSankey(ctx, db, req.from, req.to, req.currency, req.level, req.investing)
+					})
+			}},
+		{name: "transactions", total: flowTotal, principal: fixedColumn("value"),
+			build: func(_ *config.Config, req request) *report {
+				kindOf, loadKinds := sourceKinds()
+				return withLoads(newReport(buildCashflowTransactionColumnRegistry(req.currency, kindOf, req.categories),
+					defaultCashflowTransactionColumns,
+					func(ctx context.Context, db *sql.DB) ([]gold.CashflowTransactionRow, error) {
+						return gold.CashflowTransactions(ctx, db, req.from, req.to, req.currency)
+					}), loadKinds)
+			}},
+		{name: "coverage", principal: fixedColumn("gap"), header: periodHeader,
+			ownCurrency: "each account in its own currency",
+			refuseWhy:   " — each account is measured against its own balances, in its own currency",
+			build: func(_ *config.Config, req request) *report {
+				part := reportPeriods[req.period]
+				kindOf, loadKinds := sourceKinds()
+				return withLoads(newReport(buildCashflowCoverageColumnRegistry(req.period, kindOf),
+					defaultCashflowCoverageColumns,
+					func(ctx context.Context, db *sql.DB) ([]gold.CashflowCoverageRow, error) {
+						return gold.CashflowCoverage(ctx, db, req.from, req.to, part)
+					}), loadKinds)
+			}},
+		{name: "projection", window: parsePlanWindow, total: flowTotal, principal: fixedColumn("net"),
+			header: func(req request) []string {
+				return append([]string{"period=" + req.period}, assumptionsHeader(req.assumptions)...)
+			},
+			build: func(cfg *config.Config, req request) *report {
+				req.lookback = cfg.CashflowLookback()
+				return newReport(buildCashflowPlanColumns(req.currency, req.period), defaultCashflowPlanColumns,
+					func(ctx context.Context, db *sql.DB) ([]gold.PlanRow, error) { return cashflowPlan(ctx, db, req) })
+			}},
+	},
+	options: append([]option{
+		{name: "period", cli: []string{"period"}, choices: reportPeriodNames, def: [2]string{"monthly", "total"}},
+		{name: "level", cli: []string{"level"}, choices: cashflowLevels, def: [2]string{"group", "group"}},
+		{name: "investing", cli: []string{"investing"}, choices: cashflowInvestingGrains,
+			def: [2]string{"whole", "whole"}},
+	}, forwardOptions...),
+	window:      trailingYear,
+	currency:    true,
+	narrow:      "from/to or a filter",
+	configFirst: true,
+	settle: func(_ *family, in optionSource, req *request, _ *[]string) error {
+		// The three refusals (the head of this file) come before the
+		// values are checked: each is refused for what it means, not for
+		// being misspelled.
+		switch req.view {
+		case "coverage":
+			// MCP refuses the currency before the settle (refuseMCP).
+			if in.cli() && in.has("currency") {
+				return errs.Newf(errs.ExitUsage, "cashflow: coverage takes no -x/--currency — "+
+					"each account is measured against its own balances, in its own currency")
+			}
+		case "sankey":
+			if in.has("period") {
+				if in.cli() {
+					return errs.Newf(errs.ExitUsage, "cashflow: sankey takes no --period — a diagram is a window, not a series; "+
+						"loop over the years instead")
+				}
+				return fmt.Errorf("cashflow: sankey takes no period — a diagram is a window, not a series; call it once per year instead")
+			}
+			if in.str("level") == "section" {
+				if in.cli() {
+					return errs.Newf(errs.ExitUsage, "cashflow: sankey --level section would draw no inner column (want class | group)")
+				}
+				return fmt.Errorf("cashflow: sankey at level=section would draw no inner column; use class or group")
+			}
+		}
+		period := in.str("period")
+		if req.view == "projection" && !in.has("period") {
+			period = "monthly"
+		}
+		if err := checkCashflowPlanOptions(req.view, period, in); err != nil {
+			return err
+		}
+		as, err := forwardAssumptions(in, "cashflow")
+		if err != nil {
+			return err
+		}
+		for _, name := range []string{"period", "level", "investing"} {
+			if _, err := choose(in, "cashflow", name); err != nil {
+				return err
+			}
+		}
+		req.period, req.level, req.investing = period, in.str("level"), in.str("investing")
+		if req.view == "projection" {
+			req.assumptions = as
+		}
+		return nil
+	},
+}
+
+// investingHeader names the investing grain where it is not the whole.
+func investingHeader(req request) []string {
+	if req.investing != "whole" {
+		return []string{"investing=" + req.investing}
+	}
+	return nil
+}
 
 // cashflowInvestingGrains is the `--investing` vocabulary: net the
 // section as one movement, or per asset class.
@@ -57,141 +187,17 @@ var cashflowInvestingGrains = []string{"whole", "class"}
 // cashflowLevels are the `--level` node grains, coarsest first.
 var cashflowLevels = []string{"section", "class", "group"}
 
-// cmdCashflow routes `wealthdb cashflow <view> ...` to the view's run.
-func cmdCashflow(ctx context.Context, g globalFlags, subargs []string, _ io.Reader, stdout, stderr io.Writer) error {
-	view, rest, err := routeView("cashflow", subargs, cashflowViews, cashflowUsage, stderr)
-	if err != nil {
-		return err
-	}
-	return runCashflowView(ctx, g, view, rest, stdout, stderr)
-}
-
-func runCashflowView(ctx context.Context, g globalFlags, view string, args []string, stdout, stderr io.Writer) error {
-	fs := flag.NewFlagSet("wealthdb cashflow "+view, flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	period := fs.String("period", "monthly", strings.Join(reportPeriodNames, " | "))
-	level := fs.String("level", "group", "section | class | group — the grain a node is netted at (flows, sankey)")
-	investing := fs.String("investing", "whole", strings.Join(cashflowInvestingGrains, " | ")+" — net investing as one node or per asset class")
-	ff := registerForwardFlags(fs)
-	rf := registerReportFlags(fs, true)
-	fs.Usage = func() { fmt.Fprintln(stderr, cashflowUsage()) }
-	if err := parseFlags(fs, args, "cashflow"); err != nil {
-		return err
-	}
-	// The refusals have to be asked before the values are validated:
-	// `coverage -x` is refused for the same reason the report has no
-	// output currency: a per-account gap belongs in the account's own
-	// money, and converting it would add a rate error to the very
-	// number the report exists to make trustworthy.
-	if view == "coverage" && isSet(fs, "x", "currency") {
-		return errs.Newf(errs.ExitUsage, "cashflow: coverage takes no -x/--currency — "+
-			"each account is measured against its own balances, in its own currency")
-	}
-	// `sankey --period annual` is refused for what it means, not for
-	// being misspelled.
-	if view == "sankey" {
-		if isSet(fs, "period") {
-			return errs.Newf(errs.ExitUsage, "cashflow: sankey takes no --period — a diagram is a window, not a series; "+
-				"loop over the years instead")
-		}
-		if *level == "section" {
-			return errs.Newf(errs.ExitUsage, "cashflow: sankey --level section would draw no inner column (want class | group)")
-		}
-	}
-
-	if err := checkCashflowPlanOptions(view, *period, func(name string) bool { return isSet(fs, name) },
-		func(name string) string { return "--" + name }); err != nil {
-		return err
-	}
-	if err := ff.checkChoices("cashflow"); err != nil {
-		return err
-	}
-	if err := checkChoice("cashflow", "period", *period, reportPeriodNames...); err != nil {
-		return err
-	}
-	if err := checkChoice("cashflow", "level", *level, cashflowLevels...); err != nil {
-		return err
-	}
-	if err := checkChoice("cashflow", "investing", *investing, cashflowInvestingGrains...); err != nil {
-		return err
-	}
-
-	fmtChoice, cfg, outCcy, err := rf.resolve(g, "cashflow")
-	if err != nil {
-		return err
-	}
-	now := g.clock()
-	var window windowParser
-	if view == "projection" {
-		window = parsePlanWindow
-	}
-	fromEpoch, toEpoch, err := reportWindow(fs, "cashflow", now, cfg.YieldHorizon(), window)
-	if err != nil {
-		return err
-	}
-
-	req := request{view: view, currency: outCcy, from: fromEpoch, to: toEpoch,
-		period: *period, level: *level, investing: *investing, categories: overrideCategories(cfg),
-		asOf: anchorToDay(now.UTC(), true).Unix(), assumptions: ff.assumptions(), lookback: cfg.CashflowLookback()}
-	rep := cashflowReport(req)
-	open := func() (*sql.DB, error) { return openGoldForRead(g, cfg) }
-	return writeReport(ctx, rep, rf.output(fmtChoice, "cashflow", cashflowFamily, req, cfg, now), open, stdout)
-}
-
-// cashflowReport is one view of the cash flow family, the runner the
-// CLI and the MCP server share. The refusals are the front-ends' to
-// make before they get here.
-func cashflowReport(req request) *report {
-	part := reportPeriods[req.period]
-	switch req.view {
-	case "projection":
-		return newReport(buildCashflowPlanColumns(req.currency, req.period), defaultCashflowPlanColumns,
-			func(ctx context.Context, db *sql.DB) ([]gold.PlanRow, error) { return cashflowPlan(ctx, db, req) })
-	case "summary":
-		return newReport(buildCashflowSummaryColumnRegistry(req.currency, req.period), defaultCashflowSummaryColumns,
-			func(ctx context.Context, db *sql.DB) ([]gold.CashflowSummaryRow, error) {
-				return gold.CashflowSummary(ctx, db, req.from, req.to, req.currency, part)
-			})
-	case "flows":
-		return newReport(buildCashflowFlowColumnRegistry(req.currency, req.period), defaultCashflowFlowColumns,
-			func(ctx context.Context, db *sql.DB) ([]gold.CashflowFlowRow, error) {
-				return gold.CashflowFlows(ctx, db, req.from, req.to, req.currency, part, req.level, req.investing)
-			})
-	case "sankey":
-		return newReport(buildCashflowSankeyColumnRegistry(req.currency), defaultCashflowSankeyColumns,
-			func(ctx context.Context, db *sql.DB) ([]gold.CashflowSankeyRow, error) {
-				return gold.CashflowSankey(ctx, db, req.from, req.to, req.currency, req.level, req.investing)
-			})
-	case "coverage":
-		kindOf, loadKinds := sourceKinds()
-		return withLoads(newReport(buildCashflowCoverageColumnRegistry(req.period, kindOf),
-			defaultCashflowCoverageColumns,
-			func(ctx context.Context, db *sql.DB) ([]gold.CashflowCoverageRow, error) {
-				return gold.CashflowCoverage(ctx, db, req.from, req.to, part)
-			}), loadKinds)
-	default:
-		kindOf, loadKinds := sourceKinds()
-		return withLoads(newReport(buildCashflowTransactionColumnRegistry(req.currency, kindOf, req.categories),
-			defaultCashflowTransactionColumns,
-			func(ctx context.Context, db *sql.DB) ([]gold.CashflowTransactionRow, error) {
-				return gold.CashflowTransactions(ctx, db, req.from, req.to, req.currency)
-			}), loadKinds)
-	}
-}
-
-// checkCashflowPlanOptions refuses the options a view does not take, the
-// CLI and the MCP server alike: the projection's assumptions off it; on
-// it the level, the investing grain, and a period that is none of
-// seriesPeriods. has says an option is given; flag spells an option's
-// name as the front-end does.
-func checkCashflowPlanOptions(view, period string, has func(string) bool, flag func(string) string) error {
+// checkCashflowPlanOptions refuses the options in a view does not take:
+// the projection's assumptions off it; on it the level, the investing
+// grain, and a period that is none of seriesPeriods.
+func checkCashflowPlanOptions(view, period string, in optionSource) error {
 	if view != "projection" {
-		return refuseAssumptions("cashflow", "the projection view", has, flag)
+		return refuseAssumptions("cashflow", "the projection view", in)
 	}
-	if has("level") || has("investing") {
-		return errs.Newf(errs.ExitUsage, "cashflow: projection takes no %s or %s", flag("level"), flag("investing"))
+	if in.has("level") || in.has("investing") {
+		return errs.Newf(errs.ExitUsage, "cashflow: projection takes no %s or %s", in.spell("level"), in.spell("investing"))
 	}
-	return checkSeriesPeriod("cashflow", "projection takes", period, flag)
+	return checkSeriesPeriod("cashflow", "projection takes", period, in)
 }
 
 // parsePlanWindow is the projection's window: the forward window of the
@@ -224,27 +230,11 @@ func checkPlanWindow(from, to int64, now time.Time) error {
 	return nil
 }
 
-// cashflowPlan is the projection view's rows: today's income projection
-// for the window's months, split by the pool (gold.PlanMonths), set
-// against the look-back's averages (gold.CashflowPlanLookback), the
-// mortgages that today's book holds continued to their maturity.
+// cashflowPlan is the projection view's rows (gold.CashflowPlanRows).
 func cashflowPlan(ctx context.Context, db *sql.DB, req request) ([]gold.PlanRow, error) {
-	b, w, err := forwardBook(ctx, db, req, "cashflow")
-	if err != nil {
-		return nil, err
-	}
-	pool, err := gold.CashflowPool(ctx, db)
-	if err != nil {
-		return nil, err
-	}
-	months := gold.PlanMonths(b, b.Amounts(nil, w, req.assumptions), w, pool)
-	from, to := gold.PlanWindow(time.Unix(req.asOf, 0), req.lookback)
-	lb, err := gold.CashflowPlanLookback(ctx, db, from, to, req.currency)
-	if err != nil {
-		return nil, err
-	}
-	return gold.CashflowPlan(lb, gold.PlanStanding(b), months, seriesPeriodMonths(req.period),
-		req.assumptions.Rule == yield.RuleRoll), nil
+	rows, err := gold.CashflowPlanRows(ctx, db, gold.PlanParams{ForwardParams: forwardParams(req),
+		Lookback: req.lookback, Period: seriesPeriodMonths(req.period)})
+	return rows, forwardErr("cashflow", err)
 }
 
 // ---- column registries ---------------------------------------------------
@@ -255,7 +245,7 @@ func cashflowPlan(ctx context.Context, db *sql.DB, req request) ([]gold.PlanRow,
 func buildCashflowPlanColumns(outCcy, period string) []columnSpec[gold.PlanRow] {
 	type row = gold.PlanRow
 	cols := []columnSpec[row]{
-		{Name: "period", Align: output.AlignLeft, Date: true, Extract: func(r row) string {
+		asDate(strCol("period", func(r row) string {
 			switch {
 			case r.Total:
 				return "total"
@@ -264,7 +254,7 @@ func buildCashflowPlanColumns(outCcy, period string) []columnSpec[gold.PlanRow] 
 			}
 			at := r.Period.Unix()
 			return periodLabel(&at, period)
-		}},
+		})),
 		floatValCol("investment_income", outCcy, func(r row) float64 { return r.InvestmentIncome }),
 		floatValCol("principal_returned", outCcy, func(r row) float64 { return r.PrincipalReturned }),
 		floatValCol("vehicles_income", outCcy, func(r row) float64 { return r.VehiclesIncome }),
@@ -310,10 +300,8 @@ func planClassColumns() string {
 
 func buildCashflowSummaryColumnRegistry(outCcy, period string) []columnSpec[gold.CashflowSummaryRow] {
 	return []columnSpec[gold.CashflowSummaryRow]{
-		{Name: "period", Align: output.AlignLeft, Date: true,
-			Extract: func(r gold.CashflowSummaryRow) string { return periodLabel(r.PeriodStart, period) }},
-		{Name: "period_start", Align: output.AlignLeft, Date: true,
-			Extract: func(r gold.CashflowSummaryRow) string { return periodStart(r.PeriodStart) }},
+		asDate(strCol("period", func(r gold.CashflowSummaryRow) string { return periodLabel(r.PeriodStart, period) })),
+		asDate(strCol("period_start", func(r gold.CashflowSummaryRow) string { return periodStart(r.PeriodStart) })),
 		countCol("txn_count", func(r gold.CashflowSummaryRow) int64 { return r.TxnCount }),
 		// The two halves of operating. NOT named `income` and
 		// `spending`: those are two other reports whose numbers differ
@@ -357,24 +345,18 @@ var defaultCashflowSummaryColumns = []string{
 
 func buildCashflowFlowColumnRegistry(outCcy, period string) []columnSpec[gold.CashflowFlowRow] {
 	return []columnSpec[gold.CashflowFlowRow]{
-		{Name: "period", Align: output.AlignLeft, Date: true,
-			Extract: func(r gold.CashflowFlowRow) string { return periodLabel(r.PeriodStart, period) }},
-		{Name: "period_start", Align: output.AlignLeft, Date: true,
-			Extract: func(r gold.CashflowFlowRow) string { return periodStart(r.PeriodStart) }},
-		{Name: "section", Align: output.AlignLeft,
-			Extract: func(r gold.CashflowFlowRow) string { return r.Section }},
+		asDate(strCol("period", func(r gold.CashflowFlowRow) string { return periodLabel(r.PeriodStart, period) })),
+		asDate(strCol("period_start", func(r gold.CashflowFlowRow) string { return periodStart(r.PeriodStart) })),
+		strCol("section", func(r gold.CashflowFlowRow) string { return r.Section }),
 		// `class` and `group` are what a reader sees; the _id columns
 		// are the keys behind them, and they carry the whole node key
 		// rather than the leaf alone — a gift given and a gift received
 		// are two nodes, and only the full key tells them apart.
 		textCol("class", func(r gold.CashflowFlowRow) *string { return r.ClassLabel }),
 		textCol("group", func(r gold.CashflowFlowRow) *string { return r.GroupLabel }),
-		{Name: "section_id", Align: output.AlignLeft,
-			Extract: func(r gold.CashflowFlowRow) string { return r.Section }},
-		{Name: "class_id", Align: output.AlignLeft,
-			Extract: func(r gold.CashflowFlowRow) string { return nodeKey(r.Section, r.Class, nil) }},
-		{Name: "group_id", Align: output.AlignLeft,
-			Extract: func(r gold.CashflowFlowRow) string { return nodeKey(r.Section, r.Class, r.Group) }},
+		strCol("section_id", func(r gold.CashflowFlowRow) string { return r.Section }),
+		strCol("class_id", func(r gold.CashflowFlowRow) string { return nodeKey(r.Section, r.Class, nil) }),
+		strCol("group_id", func(r gold.CashflowFlowRow) string { return nodeKey(r.Section, r.Class, r.Group) }),
 		countCol("txn_count", func(r gold.CashflowFlowRow) int64 { return r.TxnCount }),
 		outCcyCol("inflow", outCcy, func(r gold.CashflowFlowRow) *string { return r.Inflow }),
 		outCcyCol("outflow", outCcy, func(r gold.CashflowFlowRow) *string { return r.Outflow }),
@@ -410,14 +392,10 @@ func buildCashflowSankeyColumnRegistry(outCcy string) []columnSpec[gold.Cashflow
 		// Node names are vocabulary, never a merchant, a payer, an
 		// account or an instrument — which is why the privacy twin of
 		// this view needs normalisation alone and no redaction.
-		{Name: "source", Align: output.AlignLeft,
-			Extract: func(r gold.CashflowSankeyRow) string { return r.Source }},
-		{Name: "target", Align: output.AlignLeft,
-			Extract: func(r gold.CashflowSankeyRow) string { return r.Target }},
-		{Name: "source_id", Align: output.AlignLeft,
-			Extract: func(r gold.CashflowSankeyRow) string { return r.SourceID }},
-		{Name: "target_id", Align: output.AlignLeft,
-			Extract: func(r gold.CashflowSankeyRow) string { return r.TargetID }},
+		strCol("source", func(r gold.CashflowSankeyRow) string { return r.Source }),
+		strCol("target", func(r gold.CashflowSankeyRow) string { return r.Target }),
+		strCol("source_id", func(r gold.CashflowSankeyRow) string { return r.SourceID }),
+		strCol("target_id", func(r gold.CashflowSankeyRow) string { return r.TargetID }),
 		textCol("section", func(r gold.CashflowSankeyRow) *string { return r.Section }),
 		outCcyCol("value", outCcy, func(r gold.CashflowSankeyRow) *string { return r.Value }),
 		ratioCol("share", func(r gold.CashflowSankeyRow) *float64 { return r.Share }),
@@ -441,13 +419,10 @@ func buildCashflowCoverageColumnRegistry(period string,
 	kindOf func(string) string) []columnSpec[gold.CashflowCoverageRow] {
 	nickname := func(r gold.CashflowCoverageRow) bool { return r.Nickname != nil && r.Account == *r.Nickname }
 	return []columnSpec[gold.CashflowCoverageRow]{
-		{Name: "period", Align: output.AlignLeft, Date: true,
-			Extract: func(r gold.CashflowCoverageRow) string { return periodLabel(r.PeriodStart, period) }},
-		{Name: "period_start", Align: output.AlignLeft, Date: true,
-			Extract: func(r gold.CashflowCoverageRow) string { return periodStart(r.PeriodStart) }},
-		{Name: "silver_source", Align: output.AlignLeft,
-			Extract: func(r gold.CashflowCoverageRow) string { return r.SourceID }},
-		{Name: "account", Align: output.AlignLeft, Privacy: PrivacyAccountID,
+		asDate(strCol("period", func(r gold.CashflowCoverageRow) string { return periodLabel(r.PeriodStart, period) })),
+		asDate(strCol("period_start", func(r gold.CashflowCoverageRow) string { return periodStart(r.PeriodStart) })),
+		strCol("silver_source", func(r gold.CashflowCoverageRow) string { return r.SourceID }),
+		{Name: "account", Privacy: PrivacyAccountID,
 			PrivacyFunc: func(r gold.CashflowCoverageRow) PrivacyClass {
 				if typedAccountLabel(kindOf, r.SourceID) || typedAccountID(kindOf, r.SourceID) || nickname(r) {
 					return PrivacyPseudonym
@@ -461,55 +436,32 @@ func buildCashflowCoverageColumnRegistry(period string,
 				return typedPseudonym(kindOf, r.SourceID)
 			},
 			Extract: func(r gold.CashflowCoverageRow) string { return r.Account }},
-		{Name: "account_kind", Align: output.AlignLeft,
-			Extract: func(r gold.CashflowCoverageRow) string { return r.AccountKind }},
-		{Name: "currency", Align: output.AlignLeft,
-			Extract: func(r gold.CashflowCoverageRow) string { return r.Currency }},
+		strCol("account_kind", func(r gold.CashflowCoverageRow) string { return r.AccountKind }),
+		strCol("currency", func(r gold.CashflowCoverageRow) string { return r.Currency }),
 		countCol("txn_count", func(r gold.CashflowCoverageRow) int64 { return r.TxnCount }),
-		{Name: "ledger", Align: output.AlignRight, Privacy: PrivacyMoney,
-			Extract: func(r gold.CashflowCoverageRow) string { return strOrEmpty(r.Ledger) }},
-		{Name: "unsigned", Align: output.AlignRight, Privacy: PrivacyMoney,
-			Extract: func(r gold.CashflowCoverageRow) string { return strOrEmpty(r.UnsignedVolume) }},
-		{Name: "measured", Align: output.AlignRight, Privacy: PrivacyMoney,
-			Extract: func(r gold.CashflowCoverageRow) string { return strOrEmpty(r.Measured) }},
-		{Name: "gap", Align: output.AlignRight, Privacy: PrivacyMoney,
-			Extract: func(r gold.CashflowCoverageRow) string { return strOrEmpty(r.Gap) }},
-		{Name: "status", Align: output.AlignLeft,
-			Extract: func(r gold.CashflowCoverageRow) string { return r.Status }},
+		kindCol("ledger", MoneyColumn, func(r gold.CashflowCoverageRow) string { return strOrEmpty(r.Ledger) }),
+		kindCol("unsigned", MoneyColumn, func(r gold.CashflowCoverageRow) string { return strOrEmpty(r.UnsignedVolume) }),
+		kindCol("measured", MoneyColumn, func(r gold.CashflowCoverageRow) string { return strOrEmpty(r.Measured) }),
+		kindCol("gap", MoneyColumn, func(r gold.CashflowCoverageRow) string { return strOrEmpty(r.Gap) }),
+		strCol("status", func(r gold.CashflowCoverageRow) string { return r.Status }),
 	}
 }
 
 func buildCashflowTransactionColumnRegistry(outCcy string, kindOf func(string) string,
 	categories typedCategories) []columnSpec[gold.CashflowTransactionRow] {
-	ref := func(r gold.CashflowTransactionRow) accountRef {
-		return accountRef{source: r.SilverSourceID, name: r.DisplayName, nickname: r.Nickname, id: r.AccountExternalID}
-	}
+	line := txnLineCols(outCcy, kindOf, categories,
+		func(r gold.CashflowTransactionRow) gold.TxnLine { return r.TxnLine },
+		func(r gold.CashflowTransactionRow) gold.TxnValue { return r.TxnValue })
 	return []columnSpec[gold.CashflowTransactionRow]{
-		{Name: "silver_source", Align: output.AlignLeft,
-			Extract: func(r gold.CashflowTransactionRow) string { return r.SilverSourceID }},
-		{Name: "date", Align: output.AlignLeft, Date: true,
-			Extract: func(r gold.CashflowTransactionRow) string { return formatDate(r.OccurredAt) }},
-		{Name: "datetime", Align: output.AlignLeft, Date: true,
-			Extract: func(r gold.CashflowTransactionRow) string { return formatDateTime(r.OccurredAt) }},
-		accountCol(kindOf, ref),
-		accountIDCol("account_id", kindOf, ref),
-		textCol("account_kind", func(r gold.CashflowTransactionRow) *string { return r.AccountKind }),
-		nicknameCol("account_nickname", func(r gold.CashflowTransactionRow) *string { return r.Nickname }),
-		accountCategoryCol(categories, func(r gold.CashflowTransactionRow) *string { return r.AccountCategory }),
-		{Name: "kind", Align: output.AlignLeft,
-			Extract: func(r gold.CashflowTransactionRow) string { return r.Kind }},
-		{Name: "section", Align: output.AlignLeft,
-			Extract: func(r gold.CashflowTransactionRow) string { return r.Section }},
-		{Name: "class", Align: output.AlignLeft,
-			Extract: func(r gold.CashflowTransactionRow) string { return r.ClassLabel }},
-		{Name: "group", Align: output.AlignLeft,
-			Extract: func(r gold.CashflowTransactionRow) string { return r.GroupLabel }},
-		{Name: "class_id", Align: output.AlignLeft,
-			Extract: func(r gold.CashflowTransactionRow) string { return r.Section + "." + r.Class }},
-		{Name: "group_id", Align: output.AlignLeft,
-			Extract: func(r gold.CashflowTransactionRow) string {
-				return r.Section + "." + r.Class + "." + r.Group
-			}},
+		line("silver_source"), line("date"), line("datetime"), line("account"), line("account_id"),
+		line("account_kind"), line("account_nickname"), line("account_category"), line("kind"),
+		strCol("section", func(r gold.CashflowTransactionRow) string { return r.Section }),
+		strCol("class", func(r gold.CashflowTransactionRow) string { return r.ClassLabel }),
+		strCol("group", func(r gold.CashflowTransactionRow) string { return r.GroupLabel }),
+		strCol("class_id", func(r gold.CashflowTransactionRow) string { return r.Section + "." + r.Class }),
+		strCol("group_id", func(r gold.CashflowTransactionRow) string {
+			return r.Section + "." + r.Class + "." + r.Group
+		}),
 		// The instrument on an investing line, the payer or merchant on
 		// an operating one. It takes the FREE-TEXT class for the reason
 		// the families' payer column does: a column takes the class of
@@ -517,7 +469,7 @@ func buildCashflowTransactionColumnRegistry(outCcy string, kindOf func(string) s
 		// person. A typed holding's line names the holding, whose ids
 		// -p masks as the holding's own name column does
 		// (holdingNameCol).
-		holdingNameCol(columnSpec[gold.CashflowTransactionRow]{Name: "name", Align: output.AlignLeft,
+		holdingNameCol(columnSpec[gold.CashflowTransactionRow]{Name: "name",
 			Extract:     func(r gold.CashflowTransactionRow) string { return strOrEmpty(r.Name) },
 			PrivacyFunc: func(gold.CashflowTransactionRow) PrivacyClass { return PrivacyFreeText }},
 			kindOf, func(r gold.CashflowTransactionRow) (string, string) { return r.SilverSourceID, strOrEmpty(r.Name) }),
@@ -527,17 +479,7 @@ func buildCashflowTransactionColumnRegistry(outCcy string, kindOf func(string) s
 		textCol("spend_detailed", func(r gold.CashflowTransactionRow) *string { return r.SpendDetailed }),
 		textCol("income_detailed", func(r gold.CashflowTransactionRow) *string { return r.IncomeDetailed }),
 		textCol("provenance", func(r gold.CashflowTransactionRow) *string { return r.Provenance }),
-		{Name: "currency", Align: output.AlignLeft,
-			Extract: func(r gold.CashflowTransactionRow) string { return r.Currency }},
-		moneyCol("net_amount", "", func(r gold.CashflowTransactionRow) *string { return r.NetAmount }),
-		outCcyCol("value", outCcy, func(r gold.CashflowTransactionRow) *string { return r.ValueOutCcy }),
-		{Name: "counterparty", Align: output.AlignLeft, Privacy: PrivacyFreeText,
-			Extract: func(r gold.CashflowTransactionRow) string { return strOrEmpty(r.Counterparty) }},
-		{Name: "description", Align: output.AlignLeft, Privacy: PrivacyFreeText,
-			Extract: func(r gold.CashflowTransactionRow) string { return strOrEmpty(r.Description) }},
-		typedIDCol("tx_id", kindOf, func(r gold.CashflowTransactionRow) (string, string) {
-			return r.SilverSourceID, r.TransactionExternalID
-		}),
+		line("currency"), line("net_amount"), line("value"), line("counterparty"), line("description"), line("tx_id"),
 	}
 }
 
@@ -547,6 +489,7 @@ var defaultCashflowTransactionColumns = []string{
 }
 
 func cashflowUsage() string {
+	available, defaults := columnSets(cashflowFamily, 13, cashflowFamily.names(), request{currency: "CCY", period: "monthly"}, nil)
 	return "usage: wealthdb cashflow <view> [FROM [TO]] [--period P] [--level L] [--investing G]\n" +
 		"                            [--rates R] [--maturing M] [--shift BP] [-f FORMAT] [-C COLS] [-F COND]... [-x CCY] [-p]\n" +
 		`
@@ -673,23 +616,11 @@ Notes
   -C ` + planClassColumns() + ` splits
   operating_out by class. quality lists what a row rests on:` + tagNotes(cashflowPlanTags) + `
 
-Available columns (per view):
-  summary       ` + joinColumnNames(buildCashflowSummaryColumnRegistry("CCY", "monthly")) + `
-  flows         ` + joinColumnNames(buildCashflowFlowColumnRegistry("CCY", "monthly")) + `
-  sankey        ` + joinColumnNames(buildCashflowSankeyColumnRegistry("CCY")) + `
-  transactions  ` + joinColumnNames(buildCashflowTransactionColumnRegistry("CCY", nil, nil)) + `
-  coverage      ` + joinColumnNames(buildCashflowCoverageColumnRegistry("monthly", nil)) + `
-  projection    ` + joinColumnNames(buildCashflowPlanColumns("CCY", "monthly")) + `
+Available columns (per view):` + available + `
 
   (The money columns render as operating_in_<CCY> / net_<CCY> /
    value_<CCY>, reflecting your -x/--currency choice. Coverage's do
    not: every one of its amounts is in the account's own currency.)
 
-Default column sets:
-  summary       ` + strings.Join(defaultCashflowSummaryColumns, ", ") + `
-  flows         ` + strings.Join(defaultCashflowFlowColumns, ", ") + `
-  sankey        ` + strings.Join(defaultCashflowSankeyColumns, ", ") + `
-  transactions  ` + strings.Join(defaultCashflowTransactionColumns, ", ") + `
-  coverage      ` + strings.Join(defaultCashflowCoverageColumns, ", ") + `
-  projection    ` + strings.Join(defaultCashflowPlanColumns, ", ")
+Default column sets:` + defaults
 }

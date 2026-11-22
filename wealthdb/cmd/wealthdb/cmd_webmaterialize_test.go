@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -62,10 +63,7 @@ func TestWebMaterializeCLIEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantHash, err := gold.HashInputs(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
+	wantHash := gold.HashConfig(raw)
 	if stored, ok, err := gold.ReadMaterializeKey(context.Background(), db, gold.WebMaterializeScope); err != nil || !ok || stored.ConfigHash != wantHash {
 		t.Fatalf("stored key %+v ok=%v err=%v, want config hash %s", stored, ok, err, wantHash)
 	}
@@ -155,10 +153,18 @@ func TestRunMaterializePhasesStopsAtAFailure(t *testing.T) {
 	var errb strings.Builder
 	summary := func(n int) string { return fmt.Sprintf("materialized %d rows", n) }
 	ran := false
-	err := runMaterializePhases(&errb, []materializePhase{
-		{"serving", func() (int, error) { return 3, nil }, summary},
-		{"returns", func() (int, error) { return 5, fmt.Errorf("boom") }, summary},
-		{"gains", func() (int, error) { ran = true; return 0, nil }, summary},
+	phase := func(n int, err error, ran *bool) func(context.Context, *sql.DB, gold.MaterializeParams) (int, error) {
+		return func(context.Context, *sql.DB, gold.MaterializeParams) (int, error) {
+			if ran != nil {
+				*ran = true
+			}
+			return n, err
+		}
+	}
+	err := runMaterializePhases(context.Background(), &errb, nil, gold.MaterializeParams{}, []materializePhase{
+		{"serving", phase(3, nil, nil), summary},
+		{"returns", phase(5, fmt.Errorf("boom"), nil), summary},
+		{"gains", phase(0, nil, &ran), summary},
 	})
 	if err == nil || ran {
 		t.Fatalf("err=%v, later phase ran=%v", err, ran)
@@ -181,9 +187,10 @@ func TestEngineVersionMatchesThisExecutable(t *testing.T) {
 	}
 }
 
-// The transfer-overrides ledger is read beside the config when transfer
-// matching is on, so an edit to it alone makes the next run materialize.
-func TestWebMaterializeRerunsAfterALedgerEdit(t *testing.T) {
+// Returns reads the transfer pairs the load stored, so a stored link
+// makes the next run materialize, and an edit to the override ledger
+// alone does not: the load applies it when it pairs.
+func TestWebMaterializeFollowsTheStoredLinks(t *testing.T) {
 	t.Parallel()
 	cfg := setupEmptyGold(t)
 	dir := filepath.Dir(cfg)
@@ -198,18 +205,33 @@ func TestWebMaterializeRerunsAfterALedgerEdit(t *testing.T) {
 	if err := os.WriteFile(ledger, []byte(header), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	for i, want := range []bool{false, true} {
+	skipped := func(i int, want bool) {
+		t.Helper()
 		if _, se, code := runToday(t, "-c", cfg, "web-materialize"); code != 0 || strings.Contains(se, "inputs unchanged") != want {
 			t.Fatalf("run %d: exit=%d skipped=%v, want skipped=%v: %s", i, code, strings.Contains(se, "inputs unchanged"), want, se)
 		}
 	}
+	skipped(0, false)
+	skipped(1, true)
 	edited := header + "unmatch,schwab,BROK1,2024-01-02,100.00,USD,not a transfer\n"
 	if err := os.WriteFile(ledger, []byte(edited), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, se, code := runToday(t, "-c", cfg, "web-materialize"); code != 0 || strings.Contains(se, "inputs unchanged") {
-		t.Fatalf("after a ledger edit: exit=%d, want a materialize: %s", code, se)
+	skipped(2, true)
+	db, err := gold.Open(goldPathFromCfg(cfg), gold.ModeReadWrite)
+	if err != nil {
+		t.Fatal(err)
 	}
+	if _, err := db.ExecContext(context.Background(), `
+		INSERT INTO transfer_links (silver_source_id, transaction_external_id,
+		    far_silver_source_id, far_transaction_external_id, evidence, measure)
+		VALUES ('s1', 'out', 's2', 'in', 'named', 'cash')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	skipped(3, false)
 }
 
 // A gold with a migration still to apply is materialized, never

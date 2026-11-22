@@ -6,48 +6,53 @@ import (
 	"io"
 	"strconv"
 
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/config"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/gold"
-	"github.com/smartpointer-com/wealthdb/wealthdb/internal/output"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/yield"
 )
 
-// yieldDetailReport is one of the list views: securities, funds, cash,
-// curve and coverage.
-func yieldDetailReport(req request) *report {
+// The list views' reports: securities, funds, cash, curve and coverage.
+
+func yieldSecuritiesReport(_ *config.Config, req request) *report {
+	kindOf, loadKinds := sourceKinds()
+	return withLoads(bookView(req, buildYieldSecurityColumns(req.currency, kindOf), defaultYieldSecurityColumns,
+		gold.YieldSecurities), loadKinds)
+}
+
+func yieldFundsReport(_ *config.Config, req request) *report {
+	kindOf, loadKinds := sourceKinds()
+	return withLoads(bookView(req, buildYieldFundColumns(req.currency, kindOf), defaultYieldFundColumns,
+		func(_ context.Context, _ *sql.DB, b *yield.Book) ([]yield.FundRow, error) {
+			return b.Funds(), nil
+		}), loadKinds)
+}
+
+func yieldCashReport(_ *config.Config, req request) *report {
+	kindOf, loadKinds := sourceKinds()
+	return withLoads(bookView(req, buildYieldCashColumns(req.currency, kindOf), defaultYieldCashColumns,
+		func(_ context.Context, _ *sql.DB, b *yield.Book) ([]yield.CashRow, error) {
+			return b.Cash(), nil
+		}), loadKinds)
+}
+
+func yieldCurveReport(_ *config.Config, req request) *report {
 	ccy := req.currency
-	switch req.view {
-	case "securities":
-		kindOf, loadKinds := sourceKinds()
-		return withLoads(bookView(req, buildYieldSecurityColumns(ccy, kindOf), defaultYieldSecurityColumns,
-			gold.YieldSecurities), loadKinds)
-	case "funds":
-		kindOf, loadKinds := sourceKinds()
-		return withLoads(bookView(req, buildYieldFundColumns(ccy, kindOf), defaultYieldFundColumns,
-			func(_ context.Context, _ *sql.DB, b *yield.Book) ([]yield.FundRow, error) {
-				return b.Funds(), nil
-			}), loadKinds)
-	case "cash":
-		kindOf, loadKinds := sourceKinds()
-		return withLoads(bookView(req, buildYieldCashColumns(ccy, kindOf), defaultYieldCashColumns,
-			func(_ context.Context, _ *sql.DB, b *yield.Book) ([]yield.CashRow, error) {
-				return b.Cash(), nil
-			}), loadKinds)
-	case "curve":
-		return seriesView(req, buildYieldCurveColumns(ccy), defaultYieldCurveColumns,
-			func(ctx context.Context, db *sql.DB, at int64) ([]yield.CurveRow, error) {
-				b, err := yieldBook(ctx, db, at, ccy)
-				if err != nil {
-					return nil, err
-				}
-				return b.Curve(), nil
-			})
-	default: // coverage
-		kindOf, loadKinds := sourceKinds()
-		return withLoads(bookView(req, buildYieldCoverageColumns(ccy, kindOf), defaultYieldCoverageColumns,
-			func(_ context.Context, _ *sql.DB, b *yield.Book) ([]yield.CoverageRow, error) {
-				return b.Coverage(), nil
-			}), loadKinds)
-	}
+	return seriesView(req, buildYieldCurveColumns(ccy), defaultYieldCurveColumns,
+		func(ctx context.Context, db *sql.DB, at int64) ([]yield.CurveRow, error) {
+			b, err := yieldBook(ctx, db, at, ccy)
+			if err != nil {
+				return nil, err
+			}
+			return b.Curve(), nil
+		})
+}
+
+func yieldCoverageReport(_ *config.Config, req request) *report {
+	kindOf, loadKinds := sourceKinds()
+	return withLoads(bookView(req, buildYieldCoverageColumns(req.currency, kindOf), defaultYieldCoverageColumns,
+		func(_ context.Context, _ *sql.DB, b *yield.Book) ([]yield.CoverageRow, error) {
+			return b.Coverage(), nil
+		}), loadKinds)
 }
 
 // bookView is a view whose rows the book of req.asOf in req.currency
@@ -155,8 +160,7 @@ func buildYieldCashColumns(outCcy string, kindOf func(string) string) []columnSp
 		floatValCol("value", outCcy, func(r row) float64 { return r.Value }),
 		pctCol("rate", func(r row) *float64 { return r.Stated }),
 		countCol("tiers", func(r row) int64 { return int64(r.Tiers) }),
-		{Name: "tier_up_to", Align: output.AlignRight, Privacy: PrivacyMoney,
-			Extract: func(r row) string { return fixedOrBlank(r.UpTo, 2) }},
+		floatOwnMoneyCol("tier_up_to", func(r row) *float64 { return r.UpTo }),
 		asDate(strCol("valid_from", func(r row) string { return dateOrBlank(r.ValidFrom) })),
 		asDate(strCol("term_end", func(r row) string { return dateOrBlank(r.TermEnd) })),
 		pctCol("realized_yield", func(r row) *float64 { return r.Realized }),
@@ -197,15 +201,14 @@ func buildYieldCoverageColumns(outCcy string, kindOf func(string) string) []colu
 		pctCol("share", func(r row) *float64 { return r.SharePct }),
 		countCol("holdings", func(r row) int64 { return int64(r.Holdings) }),
 		// Only a record_day line counts payments: blank on the others.
-		{Name: "payments", Align: output.AlignRight, Extract: func(r row) string {
+		kindCol("payments", CountColumn, func(r row) string {
 			if r.Payments == 0 {
 				return ""
 			}
 			return strconv.Itoa(r.Payments)
-		}},
+		}),
 		strCol("silver_source", func(r row) string { return r.Source }),
-		holdingIDCol(columnSpec[row]{Name: "instrument", Align: output.AlignLeft, Privacy: PrivacyFreeText,
-			Extract: func(r row) string { return r.Instrument }}, kindOf, holding),
+		holdingIDCol(privateCol("instrument", PrivacyFreeText, func(r row) string { return r.Instrument }), kindOf, holding),
 		// A holding's line names its account by id alone.
 		accountIDCol("account", kindOf, func(r row) accountRef { return accountRef{source: r.Source, id: r.Account} }),
 		// -p masks an id typed into a typed holding's name.
@@ -220,23 +223,13 @@ var defaultYieldCoverageColumns = []string{"section", "reason", "value", "share"
 // coverage lists, once: its terms, its account's rate, its rating, its
 // dividend, a fund's factsheet figures. Each loads once filled in.
 func writeYieldSkeletons(ctx context.Context, open func() (*sql.DB, error), asOf int64, ccy string, w io.Writer) error {
-	db, err := open()
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	b, err := yieldBook(ctx, db, asOf, ccy)
-	if err != nil {
-		return err
-	}
-	out := newNDJSONWriter(w)
-	for _, r := range b.Coverage() {
-		if r.Skeleton == nil {
-			continue
-		}
-		if err := out.write(r.Skeleton); err != nil {
-			return err
-		}
-	}
-	return nil
+	return writeSkeletons(ctx, open, w,
+		func(ctx context.Context, db *sql.DB) ([]yield.CoverageRow, error) {
+			b, err := yieldBook(ctx, db, asOf, ccy)
+			if err != nil {
+				return nil, err
+			}
+			return b.Coverage(), nil
+		},
+		func(r yield.CoverageRow) *yield.Skeleton { return r.Skeleton })
 }

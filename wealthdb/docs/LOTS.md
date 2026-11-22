@@ -16,8 +16,9 @@ macros).
 
 ## 1. What it covers
 
-Each source kind registers a policy beside its adapter. The policy
-says how the engine treats the source:
+Each source kind states a lot policy in its `silver.Source`
+([DESIGN.md](DESIGN.md) §6.3). The policy says how the engine treats
+the source:
 
 | kind | mode | what the engine does |
 |---|---|---|
@@ -64,7 +65,10 @@ A key is an instrument held in one account of one source. A pooled
 source keys on the portfolio instead of the account (§6). A key's open
 lots are its book.
 
-The feed reads gold into events, per key, in time order.
+The feed reads gold into events, per key, in time order. A row reads
+by its kind and the sign of its quantity, or by its action where the
+adapter states one (`transactions.action`): the source's own words
+tell a deposit from an airdrop, or name a corporate action's rule.
 
 | event | from |
 |---|---|
@@ -149,8 +153,41 @@ Which snapshots observe:
 
 ### 3.4 Transfers
 
-A transfer out and a transfer in of the same instrument pair when they
-fall within 7 days of each other and their quantities within 5%:
+A move one row of the equity-transfer ledger states (DESIGN.md §13.9)
+pairs its two legs first, where they name one instrument at sources of
+one kind. Every other transfer out and transfer in of the same holding
+pair when they are one move, as the returns engine pairs them
+(RETURNS-NOTES "Netting and closure"):
+
+- **The same holding** is one where any identity of the two
+  instruments agrees: the same ISIN, the same CUSIP, or the same
+  instrument id among the sources of one kind, whose ids mean the same
+  thing. So shares moved between two brokers pair by ISIN whatever their
+  kinds, and a sender whose instrument states an ISIN still pairs with a
+  receiver whose instrument states only the CUSIP, or only the id, both
+  share.
+- **Days** count calendar days, not hours.
+
+What one move is depends on the asset class and vehicle, each the row's
+own where it states one, else the instrument's:
+
+- **A coin** (class `crypto`, vehicle `physical`) can arrive short by a
+  network fee, so it pairs by the coin rule the transfer matcher applies
+  (SPENDING.md §3, "The matcher"). The receipt lies within 2 days of the
+  departure, in either order. It is at most 0.1% more than the coin sent,
+  or short by a fee of at most the larger of 0.1% of the coin sent and
+  100 USD's worth at the coin's rate that day, and less than a quarter of
+  it. The rate is the latest one at most 7 days old. A coin with no such
+  rate may lose 1%. The smallest shortfall pairs first.
+- **Everything else is a security** (a share, an option contract, a fund
+  unit, a bond): a share of a fund or trust that holds coins (class
+  `crypto`, vehicle `etf` or `fund`), and a class or vehicle gold does not
+  state, among them. A security never arrives short. Its legs pair within
+  7 calendar days, on the exact quantity only: 100 shares out and 99 in
+  do not. A receipt late on the 7th day after the departure still pairs,
+  one on the 8th does not.
+
+Every pair then follows these rules:
 
 - **Across keys** they are a move. The lots leave the giving key by its
   method at the departure, and open on the receiving key with their
@@ -159,14 +196,21 @@ fall within 7 days of each other and their quantities within 5%:
   before its departure moves the lots at the receipt. The sender's
   snapshots until the departure still show them, so they are not
   reconciled.
-- **Across sources** they pair only between sources of one kind, whose
-  instrument ids mean the same thing.
+- **Across sources** they are a move as well: the lots leave one source
+  and open at the other.
 - **Inside one key** (two wallets of one pooled portfolio) nothing
   moves.
-- **What the receipt falls short by** leaves as a fee: a disposal of
-  that quantity at its market value.
-- **What the receipt exceeds the send by** opens a lot of unknown cost
-  and unknown date.
+- **The quantity both legs hold** moves. A pair the ledger links can
+  differ in quantity; one the quantities pair cannot, beyond the coin
+  rule.
+- **For a coin within the coin rule,** what the receipt falls short by
+  leaves as a fee: a disposal of that quantity at its market value. What
+  the receipt exceeds the send by opens a lot of unknown cost and unknown
+  date.
+- **For a security, and a coin beyond it,** the rest on the larger side
+  is a transfer nothing pairs, a finding (`unpaired_transfer`), never a
+  fee: 100 shares linked to 99 move 99, and the 100th leaves with no
+  proceeds.
 
 A transfer in nothing pairs opens a lot of unknown cost and unknown
 date. A row of the equity-transfer ledger (DESIGN.md §13.9) that
@@ -174,17 +218,37 @@ states a cost basis opens at that cost instead, and a basis config
 states for the instrument (§7) costs what neither does. A transfer out nothing
 pairs relieves lots with no proceeds.
 
+A source often books the shares a ledger row brings in as a transfer in
+of its own, at no value. That is one arrival recorded twice, and the
+ledger row stands for both, before anything pairs:
+
+- **The twin** is a transfer in of the same source, account and
+  instrument, on the exact quantity. It states no amount or a zero one,
+  and no link names it.
+- **The window** is the 7 calendar days a security's two legs pair
+  within, in either order: the two records of one arrival lie no
+  further apart than the two legs of one move.
+- **The nearest** such receipt is the twin, the earlier on a tie. One
+  twin stands for one ledger row.
+- **The ledger row** opens the lot, on its own day and at its cost.
+  The twin opens none and pairs with nothing.
+
+A receipt that states a value of its own, or another quantity, is a
+receipt of its own. A transfer out the source books beside a ledger
+out-row is not a twin: it stays, and pairs or relieves as any other.
+
 ### 3.5 Corporate actions
 
-A policy maps each corporate action to a rule:
+A corporate action's rule is its action. A row that states none is a
+reorganisation:
 
-| rule | the engine does |
+| action | the engine does |
 |---|---|
-| reorg | pairs the account's outgoing and incoming legs of the day (below) |
-| return of capital | lowers the cost of the open lots, pro rata by quantity |
-| cash in lieu | sells the shares for the amount |
-| expiry | disposes at zero proceeds: the premium is the loss |
-| ignore | nothing: a cash-only action |
+| `reorganisation` | pairs the account's outgoing and incoming legs of the day (below) |
+| `return_of_capital` | lowers the cost of the open lots, pro rata by quantity |
+| `cash_in_lieu` | sells the shares for the amount |
+| `expiry` | disposes at zero proceeds: the premium is the loss |
+| `cash_only` | nothing: a cash-only action |
 
 The reorg legs of one account and day:
 
@@ -206,7 +270,8 @@ Income received in kind (staking, interest, rewards) opens a lot at its
 market value on the day, from `fx_daily`. A day with no rate within
 seven days leaves the lot without a cost.
 
-A fee a policy marks as in a third currency is valued the same way.
+A trade whose action is `third_currency_fee` has its fee valued the
+same way.
 It is added to the cost of a buy and taken off the proceeds of a sale.
 A fee without a rate is a finding (`fee_unvalued`).
 
@@ -315,25 +380,28 @@ of a purchase of the same key is a `wash_sale_window` finding.
 ## 6. Per-source policies
 
 A policy holds what a kind knows of its feed: its mode and grain, what
-its fees mean, whether its trades are dated by settlement, the
-instruments that are never keys, and how its transactions read
-(`lots.Policy`).
+its fees mean, whether its trades are dated by settlement, and the
+instruments that are never keys (`lots.Policy`). The kind's adapter
+states the actions of its rows (§3.1).
 
 - **cointracking.** Pooled per portfolio: coins sweep between wallets on
   arrival, so a wallet holds no lots of its own. Fees included: the
   amounts are net of a trade's fee in either of its own currencies, so
   the cost holds it and nothing is added. A fee in a third currency is
-  valued and added. A fiat ticker is never a key. The adapter keeps
-  CoinTracking's type in the payload, which tells a deposit from an
+  valued and added (`third_currency_fee`). A fiat ticker is never a
+  key. The action is CoinTracking's type, which tells a deposit from an
   airdrop:
 
-  | CoinTracking type | the engine reads |
-  |---|---|
-  | Staking, Reward / Bonus, Income, Airdrop, Gift / Tip | income in kind |
-  | Other Fee | a fee disposal |
-  | Spend | a spend at market value |
-  | Lost, Stolen, Gift, Donation | lots that leave with no proceeds |
-  | `Income (non taxable)`, `Other Expense` with the comment "Dust Sweeping" | a dust sweep: the dust sells and the coin is bought at market value |
+  | CoinTracking type | action | the engine reads |
+  |---|---|---|
+  | Deposit, Income (non taxable) | `in` | a transfer in |
+  | Withdrawal, Expense (non taxable) | `out` | a transfer out |
+  | Staking, Reward / Bonus, Income, Airdrop, Gift / Tip | `income` | income in kind |
+  | Other Fee | `fee` | a fee disposal |
+  | Spend, Other Expense | `spend` | a spend at market value |
+  | Lost, Stolen | `lost` | lots that leave with no proceeds |
+  | Gift, Donation | `gift` | lots that leave with no proceeds |
+  | `Income (non taxable)`, `Other Expense` with the comment "Dust Sweeping" | `acquired`, `converted` | a dust sweep: the dust sells and the coin is bought at market value |
 
 - **fidelity**, which also reads the svb collector's sources. Fees
   unknown: the statements do not say whether commission is in an
@@ -341,12 +409,12 @@ instruments that are never keys, and how its transactions read
   effective date, so a term near the one-year line can be off. A
   corporate action reads by the action its description opens with. An
   option leg ("PUT (XYZ)", "CALL (XYZ)"), which the statements book
-  on the underlying's key, moves no lot of the stock. The core money
-  market fund is cash, and no key.
+  on the underlying's key, moves no lot of the stock (`ignore`). The
+  core money market fund is cash, and no key.
 - **schwab.** A corporate action reads by its stated action, else its
   description; rights redemptions, litigation proceeds and option
-  exchanges move no lot. A trade that moves no cash (a "System
-  transfer") moves no lot either.
+  exchanges move no lot (`cash_only`). A trade that moves no cash (a
+  "System transfer") moves no lot either (`ignore`).
 - **ubs, swissquote, viac.** Shadow, at the average method. They state
   an average cost and no lots, and a gap in a history would fill with
   seeds of unknown cost. `gains check` compares the ledger with the

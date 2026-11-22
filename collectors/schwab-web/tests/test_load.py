@@ -10,6 +10,7 @@ on transactions, and the per-run idempotency of load_run.
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import sys
 from pathlib import Path
@@ -19,7 +20,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import load  # noqa: E402
+import more_detail  # noqa: E402
 from collectorkit import bronze  # noqa: E402
+from collectorkit.words import Extracted, Page, params_key  # noqa: E402
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
 _HEAD_VERSION = int(max(MIGRATIONS_DIR.glob("[0-9]*.sql")).name[:4])
@@ -227,7 +230,7 @@ class TestMigrations:
         for path in sorted(MIGRATIONS_DIR.glob("000[1-8]_*.sql")):
             (early / path.name).write_text(path.read_text())
         load.silver.apply_migrations(conn, early)
-        load.silver.stamp_generation(conn, load.DOCUMENT_GENERATION_SCOPE, "g")
+        load.silver.stamp_generation(conn, load.WALK_SCOPE, "g")
         # Export 1 holds a pair of genuine twins ('t1', 't2'); export 2
         # repeats both under other ids ('u1', 'u2') and adds 'u3'. A
         # statement row with the same payload is another source: kept.
@@ -251,7 +254,7 @@ class TestMigrations:
         assert kept == {"t1", "t2", "u3", "s1"}
         # The ids move, so the next load re-derives the archive.
         assert load.silver.stale_generation(
-            conn, load.DOCUMENT_GENERATION_SCOPE, "g")
+            conn, load.WALK_SCOPE, "g")
         assert load.silver.current_schema_version(conn) == _HEAD_VERSION
 
     def test_0010_makes_the_next_load_reread_the_archive(self, conn,
@@ -261,10 +264,10 @@ class TestMigrations:
         for path in sorted(MIGRATIONS_DIR.glob("000[1-9]_*.sql")):
             (early / path.name).write_text(path.read_text())
         load.silver.apply_migrations(conn, early)
-        load.silver.stamp_generation(conn, load.DOCUMENT_GENERATION_SCOPE, "g")
+        load.silver.stamp_generation(conn, load.WALK_SCOPE, "g")
         load.silver.apply_migrations(conn, MIGRATIONS_DIR)
         assert load.silver.stale_generation(
-            conn, load.DOCUMENT_GENERATION_SCOPE, "g")
+            conn, load.WALK_SCOPE, "g")
         assert load.silver.current_schema_version(conn) == _HEAD_VERSION
 
 
@@ -542,18 +545,9 @@ class TestStatusGuard:
 # Money parser
 # ============================================================
 
-class TestParseMoney:
-    @pytest.mark.parametrize("s,expected", [
-        ("$1,234.56",   1234.56),
-        ("-$5.00",      -5.00),
-        ("($1.00)",     -1.00),
-        ("$0.00",       0.00),
-        ("",            None),
-        (None,          None),
-        ("not a number", None),
-    ])
-    def test_parses(self, s, expected):
-        assert load._parse_money(s) == expected
+def test_parse_money_reads_the_money_dialect():
+    # The dialect's cases are pinned in test_numparse.py.
+    assert load._parse_money("-$1,234.56") == -1234.56
 
 
 # ============================================================
@@ -651,40 +645,91 @@ class TestTxHistoryIngest:
                                   tzinfo=timezone.utc).timestamp())
         assert "as of 05/10/2024" in payload
 
-    def test_more_detail_sidecar_merged_into_payload(
+    _TX = {"Date": "05/12/2024", "Action": "Buy", "Symbol": "ABC",
+           "Description": "ACME CORP", "Quantity": "10",
+           "Price": "$10.00", "Fees & Comm": "$0.01",
+           "Amount": "-$100.01"}
+
+    @staticmethod
+    def _dialog(settle="05/14/2024"):
+        return "\n".join([
+            "Trade Transaction Details", "Print", "Transactions",
+            "Trade Details", "Trade Date", "05/12/2024",
+            "Settle Date", settle, "ACME CORP", "Action", "Buy",
+            "Quantity", "10", "Principal", "$100.00", "Total", "$100.01"])
+
+    def _sidecar(self, raw_text, fields=None):
+        return [{"row_key": load._tx_history_row_key(self._TX),
+                 "row_cells": ["05/12/2024", "-$100.01", "ACME CORP",
+                               "ABC", "Buy"],
+                 "fields": fields or {}, "raw_text": raw_text}]
+
+    def _more(self, conn):
+        rows = conn.execute("SELECT payload FROM transactions").fetchall()
+        assert len(rows) == 1
+        return json.loads(rows[0][0]).get("_more")
+
+    def test_the_dialog_text_is_parsed_into_the_payload(
             self, migrated, tmp_path):
-        import json as _json
-        # One transaction whose row_key matches a sidecar record.
-        tx = {"Date": "05/12/2024", "Action": "Buy", "Symbol": "ABC",
-              "Description": "ACME CORP", "Quantity": "10",
-              "Price": "$10.00", "Fees & Comm": "$0.01",
-              "Amount": "-$100.01"}
-        row_key = load._tx_history_row_key(tx)
-        sidecar = [{
-            "row_key": row_key,
-            "row_cells": ["05/12/2024", "-$100.01", "ACME CORP",
-                          "ABC", "Buy"],
-            "fields": {
-                "Settle Date": "05/14/2024",
-                "CUSIP #": "000000000",
-                "Principal": "$100.00",
-                "Commission": "$0.00",
-                "Industry Fee": "$0.01",
-            },
-            "raw_text": "Trade Date  05/12/2024\nSettle Date  05/14/2024",
-        }]
         run = _make_tx_history_bronze(
-            tmp_path, "20260520T120000Z", "000",
-            transactions=[tx], more_details=sidecar,
-        )
+            tmp_path, "20260520T120000Z", "000", transactions=[self._TX],
+            more_details=self._sidecar(self._dialog(),
+                                       {"Settle Date": "ignored"}))
         load.load_run(migrated, run)
         migrated.commit()
-        row = migrated.execute(
-            "SELECT payload FROM transactions"
-        ).fetchone()
-        payload = _json.loads(row[0])
-        assert payload.get("_more", {}).get("Settle Date") == "05/14/2024"
-        assert payload.get("_more", {}).get("Principal") == "$100.00"
+        more = self._more(migrated)
+        assert more["settle_date"] == "05/14/2024"
+        assert more["principal"] == "$100.00"
+        assert more["security_lines"] == ["ACME CORP"]
+        assert "Settle Date" not in more
+
+    def test_a_dialog_with_no_data_stores_nothing(self, migrated, tmp_path):
+        run = _make_tx_history_bronze(
+            tmp_path, "20260520T120000Z", "000", transactions=[self._TX],
+            more_details=self._sidecar("Wire Transaction Details\nLoading"))
+        load.load_run(migrated, run)
+        migrated.commit()
+        assert self._more(migrated) is None
+
+    @pytest.mark.parametrize("first", [None, "Deposit Details\nSome text"])
+    def test_a_later_run_fills_a_row_without_detail(
+            self, migrated, tmp_path, first):
+        """No sidecar, or one whose dialog holds no data, then a run whose
+        sidecar holds the detail."""
+        load.load_run(migrated, _make_tx_history_bronze(
+            tmp_path, "20260520T120000Z", "000", [self._TX],
+            more_details=None if first is None else self._sidecar(first)))
+        load.load_run(migrated, _make_tx_history_bronze(
+            tmp_path, "20260521T120000Z", "000", [self._TX],
+            more_details=self._sidecar(self._dialog())))
+        migrated.commit()
+        assert self._more(migrated)["settle_date"] == "05/14/2024"
+
+    def test_a_stored_empty_detail_is_filled(self, migrated, tmp_path):
+        load.load_run(migrated, _make_tx_history_bronze(
+            tmp_path, "20260520T120000Z", "000", [self._TX]))
+        payload = json.loads(migrated.execute(
+            "SELECT payload FROM transactions").fetchone()[0])
+        migrated.execute("UPDATE transactions SET payload = ?",
+                         (load.canonical_json({**payload, "_more": {}}),))
+        load.load_run(migrated, _make_tx_history_bronze(
+            tmp_path, "20260521T120000Z", "000", [self._TX],
+            more_details=self._sidecar(self._dialog())))
+        migrated.commit()
+        stored = migrated.execute(
+            "SELECT payload FROM transactions").fetchone()[0]
+        assert stored == load.canonical_json(
+            {**payload, "_more": more_detail.parse(self._dialog())})
+
+    def test_a_row_with_detail_keeps_it(self, migrated, tmp_path):
+        load.load_run(migrated, _make_tx_history_bronze(
+            tmp_path, "20260520T120000Z", "000", [self._TX],
+            more_details=self._sidecar(self._dialog())))
+        load.load_run(migrated, _make_tx_history_bronze(
+            tmp_path, "20260521T120000Z", "000", [self._TX],
+            more_details=self._sidecar(self._dialog(settle="05/15/2024"))))
+        migrated.commit()
+        assert self._more(migrated)["settle_date"] == "05/14/2024"
 
     def test_overlapping_exports_share_ids(self, migrated, tmp_path):
         """A transaction in two exports of overlapping windows is one row,
@@ -1065,6 +1110,26 @@ class TestAccountRegistrationLoad:
         ).fetchone()
         assert row == (None,)
 
+    def test_tax_form_fallback_in_a_run_without_statements(
+            self, migrated, tmp_path):
+        # The fallback runs when the run brings no statement to parse.
+        run = _make_bronze_run(tmp_path, "20260520T120000Z", [
+            {"suffix": "MMM", "label": "Demo …MMM",
+             "documents": [
+                 {"date": "05/01/2001", "type": "Tax Forms",
+                  "document": "5498",
+                  "filename": "5498---2000_2001-05-01_MMM.PDF"},
+             ]},
+        ])
+        stats = load.load_run(migrated, run, workers=1)
+        migrated.commit()
+        assert stats["account_registration_updated"] == 1
+        row = migrated.execute(
+            "SELECT account_registration FROM accounts "
+            "WHERE account_external_id = 'MMM'"
+        ).fetchone()
+        assert row == ("Contributory IRA",)
+
 
 class TestAccountNumberFullLoad:
     """Loader tests for `accounts.payload.account_number_full` —
@@ -1231,7 +1296,7 @@ class TestAccountNumberFullLoad:
         key on a plain re-run of load: the dump-run gate skips the
         bronze run (no statement re-parse), and the backfill re-reads
         just the headers from bronze."""
-        args = self._run_load_args(tmp_path)
+        args = _generation_args(tmp_path)
         self._bronze(args.bronze_dir, "20260520T120000Z",
                      ["Brokerage-Statement_2026-02-28_NNN.PDF"])
 
@@ -1293,16 +1358,6 @@ class TestAccountNumberFullLoad:
         assert load._reconcile_account_numbers(migrated, [run]) == 0
 
     @staticmethod
-    def _run_load_args(tmp_path):
-        import argparse
-        return argparse.Namespace(
-            silver_db=tmp_path / "silver.db",
-            bronze_dir=tmp_path / "bronze",
-            migrations_dir=MIGRATIONS_DIR,
-            reparse=False, workers=1, verbose=False, force=False,
-        )
-
-    @staticmethod
     def _patch_header_parser(monkeypatch, by_filename):
         """Monkeypatch the header-only reader the reconcile pass
         uses, mapping a filename substring to the number."""
@@ -1336,7 +1391,7 @@ class TestAccountNumberFullLoad:
         }
         self._patch_parser(monkeypatch, by_filename=by)
         self._patch_header_parser(monkeypatch, by)
-        args = self._run_load_args(tmp_path)
+        args = _generation_args(tmp_path)
 
         self._bronze(args.bronze_dir, "20260520T120000Z",
                      ["Brokerage-Statement_2026-01-31_NNN.PDF"])
@@ -1367,7 +1422,7 @@ class TestAccountNumberFullLoad:
         headers, finds the conflict, and leaves the key absent —
         the same end state a from-scratch rebuild of the identical
         bronze reaches."""
-        args = self._run_load_args(tmp_path)
+        args = _generation_args(tmp_path)
 
         # Parser-less era: statements load, no number surfaces.
         self._patch_parser(monkeypatch, number=None)
@@ -1390,7 +1445,7 @@ class TestAccountNumberFullLoad:
         assert all("account_number_full" not in p for p in incremental)
 
         # From-scratch rebuild of the same bronze tree.
-        rebuild_args = self._run_load_args(tmp_path)
+        rebuild_args = _generation_args(tmp_path)
         rebuild_args.silver_db = tmp_path / "rebuild.db"
         assert load.run_load(rebuild_args) == 0
         rebuilt = self._payloads_at(rebuild_args.silver_db)
@@ -1749,9 +1804,8 @@ class TestRollbackDoesNotPoisonSeenSet:
 
     def test_failing_run_does_not_skip_doc_in_later_run(
             self, monkeypatch, tmp_path):
-        import argparse
-
-        bronze = tmp_path / "bronze"
+        args = _generation_args(tmp_path)
+        bronze = args.bronze_dir
         filename = "Brokerage-Statement_2026-02-28_NNN.PDF"
         # Two runs carrying the same logical statement.
         for ts in ("20260301T000000Z", "20260302T000000Z"):
@@ -1783,12 +1837,9 @@ class TestRollbackDoesNotPoisonSeenSet:
 
         monkeypatch.setattr(load, "_insert_position_snapshots", _flaky_insert)
 
-        db = tmp_path / "silver.db"
-        args = argparse.Namespace(
-            silver_db=db, bronze_dir=bronze, migrations_dir=MIGRATIONS_DIR,
-            reparse=False, workers=1, verbose=False, force=False,
-        )
-        assert load.run_load(args) == 0
+        db = args.silver_db
+        # The rolled-back run makes the load exit 1; the later run loads.
+        assert load.run_load(args) == 1
 
         conn = sqlite3.connect(str(db))
         try:
@@ -1797,16 +1848,96 @@ class TestRollbackDoesNotPoisonSeenSet:
             ).fetchone()[0]
         finally:
             conn.close()
-        # Run 1 marked the doc seen then rolled back; run 2 must re-parse
-        # and insert it — two parses, one surviving position row. With a
-        # poisoned seen-set run 2 would skip the doc and leave zero rows.
-        assert len(parse_calls) == 2
+        # Run 1 marked the doc seen then rolled back; run 2 must take it
+        # up again and insert it — one surviving position row. Its copy
+        # holds the same bytes, so the parse cache serves run 1's parse.
+        # With a poisoned seen-set run 2 would skip the doc and leave zero
+        # rows.
+        assert len(parse_calls) == 1
         assert n_pos == 1
+
+
+class TestFailedCopyLeavesDocUnseen:
+    """A logical document whose first copy fails to parse is taken from a
+    later copy in the same invocation. Each document pass marks the doc
+    seen before it parses it; a failed parse takes the mark back, so the
+    later copy is not skipped as a duplicate of a copy that yielded
+    nothing."""
+
+    # (marker kind, manifest doc, patched module, parser name, result)
+    CASES = {
+        "statement": (
+            {"date": "02/28/2026", "type": "Statements",
+             "document": "Brokerage Statement",
+             "filename": "Brokerage-Statement_2026-02-28_NNN.PDF"},
+            "pp", "parse_statement_pdf",
+            TestRollbackDoesNotPoisonSeenSet.PARSED),
+        "third_party_distribution": (
+            {"date": "01/23/2024", "type": "Letters",
+             "document": "3rd Party Distribution",
+             "filename": "3rd-Party-Distribution_2024-01-23_NNN.PDF"},
+            "pp", "parse_distribution_pdf", []),
+        "form_1099b": (
+            {"date": "02/09/2022", "type": "Tax Forms",
+             "document": "1099 Composite and Year-End Summary - 2021",
+             "filename": "XXXX-X999.XML"},
+            "tf", "parse_1099b", {"lots": []}),
+        "gain_loss_report": (
+            {"date": "01/26/2022", "type": "Tax Forms",
+             "document": "Year End Gain Loss Reporting - 2021",
+             "filename": "Year-End-Gain-Loss-Reporting---2021_2022-01-26_NNN.PDF"},
+            "tf", "parse_realized_report_pdf",
+            {"lots": [], "incomplete": 0, "methods": [], "tax_year": 2021}),
+    }
+
+    @pytest.mark.parametrize("kind", list(CASES))
+    def test_a_later_copy_replaces_a_failed_first_copy(
+            self, monkeypatch, tmp_path, kind):
+        doc, module, name, result = self.CASES[kind]
+        args = _generation_args(tmp_path)
+        bronze_dir = args.bronze_dir
+        for ts in ("20260301T000000Z", "20260302T000000Z"):
+            _make_doc_bronze(bronze_dir, ts, "NNN", [
+                {**doc, "content": f"%PDF-1.4 stub {doc['filename']}\n"}])
+
+        calls: list[str] = []
+
+        def _first_fails(path, *a, **k):
+            calls.append(str(path))
+            if len(calls) == 1:
+                raise ValueError("synthetic parse failure")
+            return json.loads(json.dumps(result))
+
+        monkeypatch.setattr(getattr(load, module), name, _first_fails)
+        db = args.silver_db
+        assert load.run_load(args) == 0
+        conn = sqlite3.connect(str(db))
+        try:
+            markers = conn.execute(
+                "SELECT COUNT(*) FROM parsed_documents"
+                " WHERE document_kind = ?", (kind,)).fetchone()[0]
+            n_pos = conn.execute(
+                "SELECT COUNT(*) FROM historical_position_snapshots"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert len(calls) == 2
+        assert markers == 1
+        assert n_pos == (1 if kind == "statement" else 0)
 
 
 # ============================================================
 # 1099-B + 3rd-Party-Distribution load integration
 # ============================================================
+
+def _pdf_text(text):
+    """A stand-in for extraction.pdfium: every PDF reads as `text`, or as
+    what `text(path)` returns, on one page that holds no words."""
+    def pdfium(path, *_, **__):
+        page = text(path) if callable(text) else text
+        return Extracted("pdfium", (Page(page, ((params_key({}), ()),)),))
+    return pdfium
+
 
 def _make_doc_bronze(root: Path, run_ts: str, suffix: str,
                      docs: list[dict]) -> Path:
@@ -1957,6 +2088,78 @@ class TestForm1099bLoad:
         ).fetchone()[0]
         assert n == 2
 
+    def test_a_broken_first_copy_is_read_from_a_later_one(self, tmp_path):
+        args = _generation_args(tmp_path)
+        doc = {"date": "02/15/2022", "type": "Tax Forms",
+               "document": "1099 Composite and Year-End Summary - 2021",
+               "filename": "XXXX-X999.XML"}
+        _make_doc_bronze(args.bronze_dir, "20260520T120000Z", "999", [
+            {**doc, "content": _MINI_1099B_XML[:150]}])
+        _make_doc_bronze(args.bronze_dir, "20260521T120000Z", "999", [
+            {**doc, "content": _MINI_1099B_XML}])
+        db = args.silver_db
+        assert load.run_load(args) == 0
+        conn = sqlite3.connect(str(db))
+        try:
+            n = conn.execute("SELECT COUNT(*) FROM transactions"
+                             " WHERE source = 'form_1099b'").fetchone()[0]
+        finally:
+            conn.close()
+        assert n == 2
+
+    def _broken_xml_and_csv(self, tmp_path, xml_content):
+        twin = {"date": "02/15/2022", "type": "Tax Forms",
+                "document": "1099 Composite and Year-End Summary - 2021"}
+        return _make_doc_bronze(tmp_path, "20260520T120000Z", "999", [
+            {**twin, "filename": "XXXX-X999.XML", "content": xml_content},
+            {**twin, "filename": "XXXX-X999.CSV", "content": _MINI_1099B_CSV},
+        ])
+
+    def _form_1099b_names(self, conn):
+        return [r[0] for r in conn.execute(
+            "SELECT json_extract(payload,'$.security_name')"
+            " FROM transactions WHERE source='form_1099b'")]
+
+    def test_an_xml_that_does_not_parse_is_read_from_its_csv_twin(
+            self, migrated, tmp_path):
+        run = self._broken_xml_and_csv(tmp_path, _MINI_1099B_XML[:150])
+        stats = load.load_run(migrated, run, workers=1)
+        migrated.commit()
+        assert stats["form_1099b_transactions_inserted"] == 1
+        assert stats["form_1099b_parse_errors"] == 0
+        assert self._form_1099b_names(migrated) == ["CSV SENTINEL CORP"]
+        (sha,) = migrated.execute(
+            "SELECT source_sha256 FROM parsed_documents"
+            " WHERE document_kind = 'form_1099b'").fetchone()
+        assert sha == bronze.sha256_file(
+            run / "statements" / "999" / "XXXX-X999.CSV")[0]
+
+    def test_an_xml_missing_on_disk_is_read_from_its_csv_twin(
+            self, migrated, tmp_path):
+        run = self._broken_xml_and_csv(tmp_path, _MINI_1099B_XML)
+        (run / "statements" / "999" / "XXXX-X999.XML").unlink()
+        stats = load.load_run(migrated, run, workers=1)
+        migrated.commit()
+        assert stats["documents_missing_on_disk"] == 1
+        assert self._form_1099b_names(migrated) == ["CSV SENTINEL CORP"]
+
+    def test_a_form_whose_twins_both_fail_is_given_back(
+            self, monkeypatch, migrated, tmp_path):
+        calls = []
+
+        def _boom(path, fmt=None):
+            calls.append(fmt)
+            raise ValueError("synthetic parse failure")
+        monkeypatch.setattr(load.tf, "parse_1099b", _boom)
+        run = self._broken_xml_and_csv(tmp_path, _MINI_1099B_XML)
+        stats = load.load_run(migrated, run, workers=1)
+        migrated.commit()
+        assert calls == ["xml", "csv"]
+        assert stats["form_1099b_parse_errors"] == 1
+        assert self._form_1099b_names(migrated) == []
+        assert migrated.execute(
+            "SELECT COUNT(*) FROM parsed_documents").fetchone()[0] == 0
+
     def test_reparse_parse_failure_preserves_prior_rows(
             self, monkeypatch, migrated, tmp_path):
         """A parse that fails during --reparse must NOT drop the prior
@@ -2001,7 +2204,7 @@ class TestForm1099bLoad:
             self, monkeypatch, migrated, tmp_path):
         # The PDF is named apart from its XML twin; the manifest row they
         # share (date and document) pairs them.
-        monkeypatch.setattr(load.tf, "extract_text_pdfium", lambda path: "")
+        monkeypatch.setattr(load.extraction, "pdfium", _pdf_text(""))
         pdf = "1099-Composite-and-Year-End-Summary---2021_2022-02-15_999.PDF"
         run = _make_doc_bronze(tmp_path, "20260520T120000Z", "999", [
             {"date": "02/15/2022", "type": "Tax Forms",
@@ -2179,7 +2382,7 @@ def test_a_moved_parser_purges_the_snapshot_tables(tmp_path):
 
     conn = sqlite3.connect(str(args.silver_db))
     load.silver.stamp_generation(
-        conn, load.DOCUMENT_GENERATION_SCOPE, "an older parser")
+        conn, load.WALK_SCOPE, "an older parser")
     conn.commit()
     conn.close()
 
@@ -2195,7 +2398,7 @@ def test_a_failed_run_leaves_the_generation_unstamped(tmp_path, monkeypatch):
     assert load.run_load(args) == 0
     conn = sqlite3.connect(str(args.silver_db))
     load.silver.stamp_generation(
-        conn, load.DOCUMENT_GENERATION_SCOPE, "an older parser")
+        conn, load.WALK_SCOPE, "an older parser")
     conn.commit()
     conn.close()
 
@@ -2203,11 +2406,11 @@ def test_a_failed_run_leaves_the_generation_unstamped(tmp_path, monkeypatch):
         raise RuntimeError("synthetic failure")
 
     monkeypatch.setattr(load, "load_run", boom)
-    assert load.run_load(args) == 0
+    assert load.run_load(args) == 1
     conn = sqlite3.connect(str(args.silver_db))
     try:
         assert load.silver.stale_generation(
-            conn, load.DOCUMENT_GENERATION_SCOPE, load.DOCUMENT_GENERATION)
+            conn, load.WALK_SCOPE, load.WALK_GENERATION)
     finally:
         conn.close()
 
@@ -2233,7 +2436,7 @@ def test_an_explicit_reparse_still_purges_a_moved_generation(tmp_path):
 
     conn = sqlite3.connect(str(args.silver_db))
     load.silver.stamp_generation(
-        conn, load.DOCUMENT_GENERATION_SCOPE, "an older parser")
+        conn, load.WALK_SCOPE, "an older parser")
     conn.commit()
     conn.close()
 
@@ -2383,12 +2586,12 @@ def test_a_silver_loaded_before_open_lots_gains_them_on_the_next_load(
         " VALUES (?, 'NNN', 'XMPL', 10.0, 120.0, NULL, 'sha0', '{}')",
         (as_of,))
     load.silver.stamp_generation(
-        conn, load.DOCUMENT_GENERATION_SCOPE, "an older parser")
+        conn, load.WALK_SCOPE, "an older parser")
     conn.commit()
     conn.close()
 
-    monkeypatch.setattr(load.pp, "_extract_pdf_text",
-                        lambda path: _LEGACY_STATEMENT_TEXT)
+    monkeypatch.setattr(load.extraction, "pdfium",
+                        _pdf_text(_LEGACY_STATEMENT_TEXT))
     assert load.run_load(args) == 0
 
     conn = sqlite3.connect(str(args.silver_db))
@@ -2473,7 +2676,7 @@ class TestClosedLotsLoad:
                 calls.append(Path(path).name)
             return (_MINI_GLR_TEXT if "Gain-Loss" in str(path)
                     else _MINI_YES_TEXT)
-        monkeypatch.setattr(load.tf, "extract_text_pdfium", text)
+        monkeypatch.setattr(load.extraction, "pdfium", _pdf_text(text))
 
     def test_a_1099b_lot_lands_in_transactions_and_closed_lots(
             self, monkeypatch, migrated, tmp_path):
@@ -2529,9 +2732,9 @@ class TestClosedLotsLoad:
     def test_unreadable_lots_are_counted(self, monkeypatch, migrated, tmp_path):
         broken = _MINI_YES_TEXT.replace(
             "$ 80.00 $ 20.00 -- $ 60.00 \n", "$ 80.00 $\n")
-        monkeypatch.setattr(load.tf, "extract_text_pdfium", lambda path: broken)
-        # The page layout does not hold the lot either.
-        monkeypatch.setattr(load.tf, "_pdf_words", lambda path: [])
+        monkeypatch.setattr(load.extraction, "pdfium", _pdf_text(broken))
+        # The page layout does not hold the lot either: _pdf_text's
+        # pages carry no words.
         stats = load.load_run(migrated, self._bronze(tmp_path), workers=1)
         assert stats["realized_lots_unreadable"] == 1
 
@@ -2618,7 +2821,7 @@ class TestReportsWithoutRows:
             return orig_1099b(path, fmt)
 
         orig_1099b = load.tf.parse_1099b
-        monkeypatch.setattr(load.tf, "extract_text_pdfium", text)
+        monkeypatch.setattr(load.extraction, "pdfium", _pdf_text(text))
         monkeypatch.setattr(load.tf, "parse_1099b", parse_1099b)
         return calls
 
@@ -2770,7 +2973,7 @@ def test_a_moved_parser_clears_the_parse_markers(tmp_path):
     conn = sqlite3.connect(str(args.silver_db))
     load._mark_parsed(conn, "NNN|0|Brokerage-Statement.PDF", "statement", "sha0")
     load.silver.stamp_generation(
-        conn, load.DOCUMENT_GENERATION_SCOPE, "an older parser")
+        conn, load.WALK_SCOPE, "an older parser")
     conn.commit()
     conn.close()
 
@@ -2852,3 +3055,571 @@ class TestCashInterestRate:
                              " ('documents', 'old', 0)")
         assert conn.execute("SELECT COUNT(*) FROM parser_generations"
                             ).fetchone()[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# One generation per document kind; the parse cache
+# ---------------------------------------------------------------------------
+
+_LETTER_NAME = "3rd-Party-Distribution_2024-01-23_NNN.PDF"
+_FORM_NAME = "XXXX-XNNN.XML"
+_REPORT_NAME = "Year-End-Gain-Loss-Reporting---2021_2022-01-26_NNN.PDF"
+_LATER_STMT_NAME = "Brokerage-Statement_2026-03-31_NNN.PDF"
+
+# What the 1099-B and realized-report stubs return.
+_SALE = {"date": "2021-06-01", "kind": "Sell", "amount": 100.0,
+         "description": "SYN SALE", "symbol": "VTI", "instrument_key": "VTI",
+         "quantity": 1.0, "proceeds": 100.0, "cost_basis": 90.0,
+         "date_sold": "2021-06-01", "tax_year": 2021, "term": "LONG"}
+_REALIZED = {"lots": [{"tax_year": 2021, "security_name": "SYN",
+                       "instrument_key": "VTI", "quantity": 1.0,
+                       "disposed_date": "2021-06-01", "proceeds": 100.0,
+                       "cost_basis": 90.0, "term": "LONG"}],
+             "incomplete": 0, "tax_year": 2021,
+             "methods": [{"asset_class": "Stocks", "method": "FIFO"}]}
+
+
+class TestGenerationPerKind:
+    """Each document kind records the documents it parses under its
+    generation (`document_derivations`). A moved kind re-derives its own
+    documents from every run and no others; a routine load parses
+    nothing; a rebuilt silver reads its parses from the cache."""
+
+    def _setup(self, monkeypatch, tmp_path):
+        """Two runs holding a document of every kind. The second holds
+        another copy of the first's statement, which the load reads only
+        once, and a later statement with the same period end, which writes
+        no row. Returns the load's args and the kinds each parse is of."""
+        args = _generation_args(tmp_path)
+        stmt = {"date": "02/28/2026", "type": "Statements",
+                "document": "Brokerage Statement", "filename": _STMT_NAME}
+        _make_doc_bronze(args.bronze_dir, "20260301T000000Z", "NNN", [
+            {**stmt, "content": "%PDF-1.4 stub statement\n"},
+            {"date": "01/23/2024", "type": "Letters",
+             "document": "3rd Party Distribution", "filename": _LETTER_NAME,
+             "content": "%PDF-1.4 stub letter\n"},
+            {"date": "02/09/2022", "type": "Tax Forms",
+             "document": "1099 Composite and Year-End Summary - 2021",
+             "filename": _FORM_NAME, "content": "<OFX>stub form</OFX>\n"},
+            {"date": "01/26/2022", "type": "Tax Forms",
+             "document": "Year End Gain Loss Reporting - 2021",
+             "filename": _REPORT_NAME, "content": "%PDF-1.4 stub report\n"}])
+        _make_doc_bronze(args.bronze_dir, "20260302T000000Z", "NNN", [
+            {**stmt, "content": "%PDF-1.4 stub statement, downloaded again\n"},
+            {**stmt, "date": "03/31/2026", "filename": _LATER_STMT_NAME,
+             "content": "%PDF-1.4 stub later statement\n"}])
+        calls: list[str] = []
+
+        def stub(kind, result):
+            def parse(*_a, **_k):
+                calls.append(kind)
+                return json.loads(json.dumps(result))
+            return parse
+
+        parsed = {**TestRollbackDoesNotPoisonSeenSet.PARSED, "transactions": [
+            {"date": "2026-02-10", "category": "Dividend", "amount": 1.5,
+             "symbol": "SYN1", "description": "SYN DIVIDEND"}]}
+        monkeypatch.setattr(load.pp, "parse_statement_pdf",
+                            stub("statement", parsed))
+        monkeypatch.setattr(load.pp, "parse_distribution_pdf", stub(
+            "third_party_distribution", TestDistributionLoad._SYNTH_ROWS))
+        monkeypatch.setattr(load.tf, "parse_1099b",
+                            stub("form_1099b", {"lots": [_SALE]}))
+        monkeypatch.setattr(load.tf, "parse_realized_report_pdf",
+                            stub("realized_report", _REALIZED))
+        return args, calls
+
+    @staticmethod
+    def _empty_the_cache(monkeypatch, tmp_path):
+        """A cache root no load has filled, so a re-derive parses."""
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "other-cache"))
+
+    def test_every_kind_records_its_documents(self, monkeypatch, tmp_path):
+        args, calls = self._setup(monkeypatch, tmp_path)
+        assert load.run_load(args) == 0
+        assert sorted(calls) == ["form_1099b", "realized_report", "statement",
+                                 "statement", "third_party_distribution"]
+        records = _records(args.silver_db)
+        assert sorted((scope, generation, rows)
+                      for _, scope, generation, rows in records) == [
+            ("form_1099b", load.GENERATIONS["form_1099b"], 2),
+            ("realized_report", load.GENERATIONS["realized_report"], 2),
+            # A transaction and a position; the later statement repeats
+            # the period end and writes none.
+            ("statement", load.GENERATIONS["statement"], 0),
+            ("statement", load.GENERATIONS["statement"], 2),
+            ("third_party_distribution",
+             load.GENERATIONS["third_party_distribution"], 1)]
+        conn = sqlite3.connect(str(args.silver_db))
+        try:
+            # Each record names the copy its document's marker names.
+            assert {sha for sha, *_ in records} == {sha for (sha,) in conn.execute(
+                "SELECT source_sha256 FROM parsed_documents")}
+            # The walk keeps its stamp; the kinds have none.
+            assert conn.execute(
+                "SELECT scope, generation FROM parser_generations"
+            ).fetchall() == [(load.WALK_SCOPE, load.WALK_GENERATION)]
+        finally:
+            conn.close()
+
+    def test_a_routine_load_parses_nothing(self, monkeypatch, tmp_path):
+        args, calls = self._setup(monkeypatch, tmp_path)
+        assert load.run_load(args) == 0
+        records = _records(args.silver_db)
+        calls.clear()
+        assert load.run_load(args) == 0
+        assert calls == []
+        assert _records(args.silver_db) == records
+
+    @pytest.mark.parametrize("kind", list(load.PASSES))
+    def test_a_moved_kind_rederives_only_its_documents(
+            self, monkeypatch, tmp_path, caplog, kind):
+        args, calls = self._setup(monkeypatch, tmp_path)
+        assert load.run_load(args) == 0
+        before, records = _silver_rows(args.silver_db), _records(args.silver_db)
+        _record_earlier_parser(args.silver_db, kind)
+        self._empty_the_cache(monkeypatch, tmp_path)
+        calls.clear()
+        with caplog.at_level("INFO", logger=load.log.name):
+            assert load.run_load(args) == 0
+        assert f"{kind}: the parser has changed" in caplog.text
+        # The kind's documents, once each; no other kind's.
+        assert calls == [kind] * (2 if kind == "statement" else 1)
+        assert _silver_rows(args.silver_db) == before
+        assert _records(args.silver_db) == records
+        calls.clear()
+        assert load.run_load(args) == 0
+        assert calls == []
+
+    def test_a_moved_statement_kind_rederives_its_snapshot_tables(
+            self, monkeypatch, tmp_path):
+        # The snapshot tables have no delete path of their own: a moved
+        # statement kind purges them, and the re-derive refills them.
+        args, calls = self._setup(monkeypatch, tmp_path)
+        assert load.run_load(args) == 0
+        before = _silver_rows(args.silver_db)
+        _seed_snapshot_rows(args.silver_db)
+        _record_earlier_parser(args.silver_db, "statement")
+        self._empty_the_cache(monkeypatch, tmp_path)
+        calls.clear()
+        assert load.run_load(args) == 0
+        assert calls == ["statement", "statement"]
+        assert _silver_rows(args.silver_db) == before
+
+    def test_a_failed_re_derivation_leaves_the_kind_moved(
+            self, monkeypatch, tmp_path):
+        args, calls = self._setup(monkeypatch, tmp_path)
+        assert load.run_load(args) == 0
+        _record_earlier_parser(args.silver_db, "statement")
+        real_load_run = load.load_run
+
+        def second_run_fails(conn, run_dir, *a, **k):
+            stats = real_load_run(conn, run_dir, *a, **k)
+            if run_dir.name == "20260302T000000Z":
+                raise RuntimeError("synthetic failure")
+            return stats
+
+        monkeypatch.setattr(load, "load_run", second_run_fails)
+        assert load.run_load(args) == 1
+        assert _moved(args.silver_db, "statement")
+        monkeypatch.setattr(load, "load_run", real_load_run)
+        self._empty_the_cache(monkeypatch, tmp_path)
+        calls.clear()
+        assert load.run_load(args) == 0
+        assert calls == ["statement", "statement"]
+        assert not _moved(args.silver_db, "statement")
+
+    def test_a_moved_kind_drops_the_record_of_a_document_gone_from_bronze(
+            self, monkeypatch, tmp_path):
+        # The later statement's run is gone: the re-derive cannot read it,
+        # its record goes, and the kind reads as current.
+        args, calls = self._setup(monkeypatch, tmp_path)
+        assert load.run_load(args) == 0
+        _record_earlier_parser(args.silver_db, "statement")
+        shutil.rmtree(args.bronze_dir / "20260302T000000Z")
+        self._empty_the_cache(monkeypatch, tmp_path)
+        calls.clear()
+        assert load.run_load(args) == 0
+        assert calls == ["statement"]
+        assert not _moved(args.silver_db, "statement")
+        assert [r for r in _records(args.silver_db)
+                if r[1] == "statement"] == [
+            (_bronze_sha(args, "20260301T000000Z", _STMT_NAME), "statement",
+             load.GENERATIONS["statement"], 2)]
+        calls.clear()
+        assert load.run_load(args) == 0
+        assert calls == []
+
+    def test_a_reparse_records_the_copy_it_read(self, monkeypatch, tmp_path):
+        # `--reparse` reads each document's first copy and records it: here
+        # the second run's copy, which the first load did not read.
+        args, calls = self._setup(monkeypatch, tmp_path)
+        assert load.run_load(args) == 0
+        shutil.rmtree(args.bronze_dir / "20260301T000000Z")
+        args.reparse = True
+        self._empty_the_cache(monkeypatch, tmp_path)
+        assert load.run_load(args) == 0
+        assert {_bronze_sha(args, "20260302T000000Z", name)
+                for name in (_STMT_NAME, _LATER_STMT_NAME)} <= {
+            sha for sha, scope, generation, _ in _records(args.silver_db)
+            if scope == "statement"
+            and generation == load.GENERATIONS["statement"]}
+
+    def test_a_kind_that_never_parsed_is_read_once_its_parser_moves(
+            self, monkeypatch, tmp_path):
+        # A failed parse is recorded with no rows and gets no marker, so
+        # the kind's next generation reads the document again.
+        args, calls = self._setup(monkeypatch, tmp_path)
+        kind = "third_party_distribution"
+
+        def letter(result):
+            def parse(*_a, **_k):
+                calls.append(kind)
+                if result is None:
+                    raise ValueError("synthetic layout")
+                return json.loads(json.dumps(result))
+            return parse
+
+        monkeypatch.setattr(load.pp, "parse_distribution_pdf", letter(None))
+        assert load.run_load(args) == 0
+        assert [r[1:] for r in _records(args.silver_db) if r[1] == kind] == [
+            (kind, load.GENERATIONS[kind], 0)]
+        monkeypatch.setattr(load.pp, "parse_distribution_pdf",
+                            letter(TestDistributionLoad._SYNTH_ROWS))
+        monkeypatch.setitem(load.GENERATIONS, kind, "a-later-parser")
+        calls.clear()
+        assert load.run_load(args) == 0
+        assert calls == [kind]
+        assert [r[1:] for r in _records(args.silver_db) if r[1] == kind] == [
+            (kind, "a-later-parser", 1)]
+        calls.clear()
+        assert load.run_load(args) == 0
+        assert calls == []
+
+    def test_a_rebuilt_silver_reads_the_parse_cache(
+            self, monkeypatch, tmp_path):
+        args, calls = self._setup(monkeypatch, tmp_path)
+        assert load.run_load(args) == 0
+        before = _silver_rows(args.silver_db)
+        args.silver_db.unlink()
+        calls.clear()
+        assert load.run_load(args) == 0
+        assert calls == []
+        assert _silver_rows(args.silver_db) == before
+
+    # ---- migration 0015 ------------------------------------------------
+
+    def test_a_silver_migrated_from_its_stamps_derives_nothing_again(
+            self, monkeypatch, tmp_path, caplog):
+        """0015 seeds the records from the stamps a load that failed
+        nowhere wrote: the next load parses nothing, derives nothing and
+        keeps them."""
+        args, calls = self._setup(monkeypatch, tmp_path)
+        assert load.run_load(args) == 0
+        before, records = _silver_rows(args.silver_db), _records(args.silver_db)
+        _undo_document_derivations(args.silver_db)
+
+        conn = sqlite3.connect(str(args.silver_db))
+        try:
+            assert load.silver.apply_migrations(conn, MIGRATIONS_DIR) == 15
+            # The kinds' stamps go; the walk keeps its own.
+            assert conn.execute(
+                "SELECT scope FROM parser_generations").fetchall() == [
+                (load.WALK_SCOPE,)]
+        finally:
+            conn.close()
+        # Every copy of a kind in `documents` is seeded, under the kind's
+        # stamp; none reads as moved.
+        seeded = _records(args.silver_db)
+        assert set(records) < set(seeded)
+        assert not any(_moved(args.silver_db, kind) for kind in load.PASSES)
+
+        self._empty_the_cache(monkeypatch, tmp_path)
+        calls.clear()
+        with caplog.at_level("INFO", logger=load.log.name):
+            assert load.run_load(args) == 0
+        assert calls == []
+        for said in ("re-deriving", "has changed", "re-parsing"):
+            assert said not in caplog.text
+        assert _silver_rows(args.silver_db) == before
+        # The seeded copies no marker names stay, under the current
+        # generation.
+        assert _records(args.silver_db) == seeded
+
+    def test_a_kind_with_no_stamp_is_re_derived_after_the_migration(
+            self, monkeypatch, tmp_path):
+        args, calls = self._setup(monkeypatch, tmp_path)
+        assert load.run_load(args) == 0
+        _undo_document_derivations(args.silver_db)
+        conn = sqlite3.connect(str(args.silver_db))
+        conn.execute("DELETE FROM parser_generations WHERE scope = ?",
+                     ("third_party_distribution",))
+        conn.commit()
+        conn.close()
+        self._empty_the_cache(monkeypatch, tmp_path)
+        calls.clear()
+        assert load.run_load(args) == 0
+        assert calls == ["third_party_distribution"]
+        assert not _moved(args.silver_db, "third_party_distribution")
+
+    def test_a_kind_purged_before_a_failed_load_is_re_derived_after_it(
+            self, monkeypatch, tmp_path):
+        # A moved kind purges its markers and commits before the runs; a
+        # load that then failed left no marker and a stale stamp. Its
+        # documents in `documents` still carry that stamp.
+        args, calls = self._setup(monkeypatch, tmp_path)
+        assert load.run_load(args) == 0
+        _undo_document_derivations(args.silver_db)
+        conn = sqlite3.connect(str(args.silver_db))
+        load.silver.stamp_generation(conn, "statement", "an older parser")
+        conn.execute("DELETE FROM parsed_documents"
+                     " WHERE document_kind = 'statement'")
+        conn.commit()
+        conn.close()
+        self._empty_the_cache(monkeypatch, tmp_path)
+        calls.clear()
+        assert load.run_load(args) == 0
+        assert calls == ["statement", "statement"]
+        assert not _moved(args.silver_db, "statement")
+
+    def test_migration_0015_that_fails_leaves_the_silver_at_0014(
+            self, monkeypatch, tmp_path):
+        """0015 is one transaction: a failure at its last statement leaves
+        the silver as it was, and the next load applies it again."""
+        args, calls = self._setup(monkeypatch, tmp_path)
+        assert load.run_load(args) == 0
+        _undo_document_derivations(args.silver_db)
+        conn = sqlite3.connect(str(args.silver_db))
+        before = list(conn.iterdump())
+        conn.execute(
+            "CREATE TEMP TRIGGER fail_0015 BEFORE INSERT ON schema_meta"
+            " WHEN NEW.silver_schema_version = 15"
+            " BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END")
+        with pytest.raises(sqlite3.IntegrityError):
+            load.silver.apply_migrations(conn, MIGRATIONS_DIR)
+        conn.close()
+
+        conn = sqlite3.connect(str(args.silver_db))
+        try:
+            assert list(conn.iterdump()) == before
+            assert load.silver.current_schema_version(conn) == 14
+        finally:
+            conn.close()
+        calls.clear()
+        assert load.run_load(args) == 0
+        assert calls == []
+        assert not any(_moved(args.silver_db, kind) for kind in load.PASSES)
+
+
+def _records(db):
+    """The derivation records, but when each was written, sorted."""
+    conn = sqlite3.connect(str(db))
+    try:
+        return sorted(conn.execute(
+            "SELECT content_sha256, scope, generation, row_count"
+            " FROM document_derivations"))
+    finally:
+        conn.close()
+
+
+def _record_earlier_parser(db, scope):
+    """Record every document of `scope` under an earlier parser."""
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute("UPDATE document_derivations SET generation ="
+                     " 'an earlier parser' WHERE scope = ?", (scope,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _moved(db, scope):
+    conn = sqlite3.connect(str(db))
+    try:
+        return load.derivations.generation_moved(conn, scope,
+                                                 load.GENERATIONS[scope])
+    finally:
+        conn.close()
+
+
+def _bronze_sha(args, run_ts, filename):
+    sha, _ = bronze.sha256_file(
+        args.bronze_dir / run_ts / "statements" / "NNN" / filename)
+    return sha
+
+
+def _undo_document_derivations(db):
+    """Put a silver back as a load before migration 0015 left it: every
+    kind stamped in parser_generations under its generation, as a load
+    that failed nowhere stamped it, and no document_derivations."""
+    conn = sqlite3.connect(str(db))
+    try:
+        assert {g for (g,) in conn.execute(
+            "SELECT generation FROM document_derivations")} <= set(
+            load.GENERATIONS.values())
+        conn.executemany(
+            "INSERT INTO parser_generations VALUES (?, ?, 0)",
+            load.GENERATIONS.items())
+        conn.executescript("""
+            DROP TABLE document_derivations;
+            DELETE FROM schema_meta WHERE silver_schema_version = 15;
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _silver_rows(db):
+    """Every table's rows but the stamps, the records and the dump_runs
+    row, sorted."""
+    conn = sqlite3.connect(str(db))
+    try:
+        out = {}
+        for (t,) in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"):
+            if t in ("schema_meta", "parser_generations",
+                     "document_derivations", "dump_runs"):
+                continue
+            out[t] = sorted(map(repr, conn.execute(f"SELECT * FROM {t}")))
+        return out
+    finally:
+        conn.close()
+
+
+def test_runs_loaded_one_at_a_time_give_the_silver_of_one_force(tmp_path):
+    from collectorkit import incremental
+    src = tmp_path / "src"
+    runs = [
+        _make_doc_bronze(src, "20260301T000000Z", "NNN", [
+            {"date": "02/15/2022", "type": "Tax Forms",
+             "document": "1099 Composite and Year-End Summary - 2021",
+             "filename": "XXXX-XNNN.XML", "content": _MINI_1099B_XML}]),
+        _make_tx_history_bronze(src, "20260302T000000Z", "NNN",
+                                [TestTxHistoryIngest._TX]),
+        _make_doc_bronze(src, "20260303T000000Z", "NNN", [
+            {"date": "02/15/2022", "type": "Tax Forms",
+             "document": "1099 Composite and Year-End Summary - 2021",
+             "filename": "XXXX-XNNN.CSV", "content": _MINI_1099B_CSV}]),
+    ]
+    incremental.check(
+        load.main,
+        lambda db, bronze_dir: ["--silver-db", str(db), "--bronze-dir",
+                                str(bronze_dir), "--migrations-dir",
+                                str(MIGRATIONS_DIR), "--workers", "1"],
+        runs, tmp_path / "work")
+
+
+# ---------------------------------------------------------------------------
+# Rebuild advice
+# ---------------------------------------------------------------------------
+
+class TestRebuildAdvice:
+    LINE = "schwab-web load --force"
+
+    def _load(self, args, caplog):
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="collectorkit.rebuild"):
+            assert load.run_load(args) == 0
+        return [r.getMessage() for r in caplog.records
+                if r.name == "collectorkit.rebuild"]
+
+    def test_an_empty_silver_records_its_level_and_is_not_advised(
+            self, tmp_path, caplog):
+        args = _generation_args(tmp_path)
+        _make_tx_history_bronze(args.bronze_dir, "20260520T120000Z", "000",
+                                [TestTxHistoryIngest._TX])
+        assert self._load(args, caplog) == []
+        assert self._load(args, caplog) == []
+
+    def test_an_older_silver_is_advised_at_every_load_until_a_rebuild(
+            self, tmp_path, caplog):
+        args = _generation_args(tmp_path)
+        _make_tx_history_bronze(args.bronze_dir, "20260520T120000Z", "000",
+                                [TestTxHistoryIngest._TX])
+        assert load.run_load(args) == 0
+        conn = sqlite3.connect(str(args.silver_db))
+        conn.execute("DELETE FROM rebuild_level")     # built before it
+        conn.commit()
+        conn.close()
+        for _ in range(2):
+            lines = self._load(args, caplog)
+            assert len(lines) == 1 and self.LINE in lines[0]
+            assert "More dialog" in lines[0]
+        assert load.main([
+            "--silver-db", str(args.silver_db),
+            "--bronze-dir", str(args.bronze_dir),
+            "--migrations-dir", str(MIGRATIONS_DIR), "--workers", "1",
+            "--force"]) == 0
+        assert self._load(args, caplog) == []
+
+
+# ---------------------------------------------------------------------------
+# A transaction's figures and words as columns (migration 0014)
+# ---------------------------------------------------------------------------
+
+_DIALECTS = [
+    # statement rows
+    {"date": "2026-02-03", "category": "Sale", "action": None,
+     "symbol": "ABC", "description": "ACME CORP", "quantity": 10.0,
+     "price": 12.5, "amount": 125.0, "raw_lines": []},
+    {"date": "2026-02-03", "category": "Unknown", "action": " Journal ",
+     "description": "  ", "quantity": None, "price": None,
+     "amount": -0.30000000000000004},
+    {"amount": 1e-07, "quantity": 5, "price": 1.2345678901234567e+20},
+    # tx-history rows
+    {"Date": "05/12/2024", "Action": "Buy", "Symbol": "ABC",
+     "Description": "ACME CORP", "Quantity": "1,000", "Price": "$10.00",
+     "Fees & Comm": "$0.01", "Amount": "-$100.01",
+     "_more": {"amount": "x"}},
+    {"Action": "Unknown", "Amount": "($1,234.56)", "Quantity": "",
+     "Price": " $ 2.5 "},
+    {"Amount": "(-$5.00)", "Quantity": ".5", "Price": "5."},
+    {"Amount": "$", "Quantity": "1.2.3", "Price": "1e3", "Description": 7},
+    {"Amount": " $3.00　", "Action": "\tSell\n"},
+    {"Action": " ", "action": "unknown", "category": "Fee"},
+    {"action": 5, "category": "UNKNOWN"},
+    # distribution letters
+    {"amount": None, "market_value": 1250.0, "quantity": 12.5,
+     "description": "Securities transfer out to SYNTH TRUST"},
+    {"cash_amount": 3141.59, "description": "Cash transfer out"},
+    # payloads the figures cannot be read from
+    {"amount": "1.00", "Quantity": "2"},
+    {"Amount": 5, "quantity": 1.0},
+    {"amount": True},
+    {},
+]
+
+
+def test_the_backfill_writes_what_the_loader_writes(tmp_path):
+    early = tmp_path / "m"
+    early.mkdir()
+    for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        if int(path.name[:4]) < 14:
+            (early / path.name).write_text(path.read_text())
+    conn = sqlite3.connect(":memory:")
+    load.silver.apply_migrations(conn, early)
+    conn.executemany(
+        "INSERT INTO transactions (activity_id, timestamp,"
+        " account_external_id, kind, source, source_sha256, payload)"
+        " VALUES (?, 0, 'NNN', 'Unknown', 'statement_pdf', 'sha', ?)",
+        [(str(i), load.canonical_json(p)) for i, p in enumerate(_DIALECTS)])
+    load.silver.apply_migrations(conn, MIGRATIONS_DIR)
+    got = {aid: tuple(rest) for aid, *rest in conn.execute(
+        "SELECT activity_id, amount, quantity, price, description, action"
+        " FROM transactions")}
+    for i, payload in enumerate(_DIALECTS):
+        assert got[str(i)] == load._transaction_columns(payload), payload
+
+
+def test_the_columns_of_the_three_dialects():
+    cols = [load._transaction_columns(p) for p in _DIALECTS]
+    assert cols[0] == ("125.0", "10.0", "12.5", "ACME CORP", "Sale")
+    assert cols[1] == ("-0.30000000000000004", None, None, None, "Journal")
+    assert cols[3] == ("-100.01", "1000", "10.00", "ACME CORP", "Buy")
+    assert cols[4] == ("-1234.56", None, "2.5", None, None)
+    assert cols[5][:3] == ("5.00", ".5", "5.")
+    assert cols[6] == (None, None, None, None, None)
+    assert cols[8][4] == "Fee" and cols[9][4] is None
+    assert cols[10][:3] == ("1250.0", "12.5", None)
+    assert cols[11][0] == "3141.59"
+    assert cols[12][:3] == cols[13][:3] == cols[14][:3] == (None, None, None)

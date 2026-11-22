@@ -1,59 +1,69 @@
 package main
 
 import (
-	"fmt"
 	"math"
-	"regexp"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/config"
-	"github.com/smartpointer-com/wealthdb/wealthdb/internal/output"
 )
 
 // The MCP server's row layer: what it does to a report's rows after
 // the report has run. The named filters, search, sort and the column
 // names here are the server's alone, because a shell has jq and a model
-// has nothing to pipe into; the conditions (rowfilter.go) are shared
+// has nothing to pipe into; the conditions (filter_*.go) are shared
 // with the CLI. Aggregates and shares are computed before any of it, as
 // the CLI computes them, so a filtered categories result still shows
 // each category's share of the whole bucket.
 
-// filterColumns maps each named row filter to the registry columns it
-// reads: the label spelling and the id spelling of the same thing, so
-// "Cash withdrawal" and "cash_withdrawal" both match. A filter reads
-// the listed columns its view's registry has.
-var filterColumns = map[string][]string{
-	"source":      {"silver_source"},
-	"account":     {"account", "account_id", "account_nickname", "entity", "entity_id"},
-	"symbol":      {"symbol", "instrument_id", "position_key", "name", "description"},
-	"category":    {"category", "category_id", "category_primary", "spend_detailed", "spend_primary", "detailed"},
-	"type":        {"type", "type_id", "income_type", "income_type_id", "income_primary", "income_primary_id"},
-	"kind":        {"kind"},
-	"merchant":    {"merchant", "merchant_signature", "counterparty"},
-	"payer":       {"payer", "payer_signature", "counterparty"},
-	"section":     {"section", "section_id"},
-	"class":       {"class", "class_id"},
-	"group":       {"group", "group_id"},
-	"asset_class": {"asset_class"},
-	"tax_wrapper": {"tax_wrapper"},
-	"term":        {"term"},
+// namedFilter is one named row filter. columns are the registry columns
+// it reads: the label spelling and the id spelling of the same thing, so
+// "Cash withdrawal" and "cash_withdrawal" both match; a filter reads the
+// listed columns its view's registry has. keys are the columns that make
+// a view carry it: a view carries it exactly when it prints one of them
+// (family.carries). exact filters match whole cells.
+type namedFilter struct {
+	name          string
+	columns, keys []string
+	exact         bool
 }
 
-// filterKeys are the columns that make a view carry a named filter: a
-// view carries it exactly when it prints one of them (family.carries).
-var filterKeys = map[string][]string{
-	"source": {"silver_source"}, "account": {"account"}, "symbol": {"symbol"}, "category": {"category", "detailed"},
-	"type": {"type", "income_type"}, "kind": {"kind"}, "merchant": {"merchant"}, "payer": {"payer"},
-	"section": {"section"}, "class": {"class"}, "group": {"group"}, "asset_class": {"asset_class"},
-	"tax_wrapper": {"tax_wrapper"}, "term": {"term"},
+// namedFilters are the named filters, in the order they are applied and
+// reported in.
+var namedFilters = []namedFilter{
+	{name: "source", columns: []string{"silver_source"}, keys: []string{"silver_source"}, exact: true},
+	{name: "account", columns: []string{"account", "account_id", "account_nickname", "entity", "entity_id"},
+		keys: []string{"account"}},
+	{name: "symbol", columns: []string{"symbol", "instrument_id", "position_key", "name", "description"},
+		keys: []string{"symbol"}},
+	{name: "category", columns: []string{"category", "category_id", "category_primary", "spend_detailed", "spend_primary",
+		"detailed"}, keys: []string{"category", "detailed"}},
+	{name: "type", columns: []string{"type", "type_id", "income_type", "income_type_id", "income_primary",
+		"income_primary_id"}, keys: []string{"type", "income_type"}},
+	{name: "kind", columns: []string{"kind"}, keys: []string{"kind"}},
+	{name: "merchant", columns: []string{"merchant", "merchant_signature", "counterparty"}, keys: []string{"merchant"}},
+	{name: "payer", columns: []string{"payer", "payer_signature", "counterparty"}, keys: []string{"payer"}},
+	{name: "section", columns: []string{"section", "section_id"}, keys: []string{"section"}},
+	{name: "class", columns: []string{"class", "class_id"}, keys: []string{"class"}},
+	{name: "group", columns: []string{"group", "group_id"}, keys: []string{"group"}},
+	{name: "asset_class", columns: []string{"asset_class"}, keys: []string{"asset_class"}},
+	{name: "tax_wrapper", columns: []string{"tax_wrapper"}, keys: []string{"tax_wrapper"}},
+	{name: "term", columns: []string{"term"}, keys: []string{"term"}},
 }
 
-// filterOrder is the order filters are applied and reported in.
-var filterOrder = []string{"source", "account", "symbol", "category", "type", "kind",
-	"merchant", "payer", "section", "class", "group", "asset_class", "tax_wrapper", "term"}
+// namedFilterOf is the named filter of that name; the zero filter, which
+// reads no column, for none.
+func namedFilterOf(name string) namedFilter {
+	for _, f := range namedFilters {
+		if f.name == name {
+			return f
+		}
+	}
+	return namedFilter{name: name}
+}
 
 // genericMoneyWords name a view's principal column when no column of
 // the view carries the word itself: "-value" on spending categories is
@@ -65,31 +75,11 @@ var genericMoneyWords = map[string]bool{
 	"performance": true,
 }
 
-// resultSet is a fetched report ready to filter, sort and page. cells
-// are every registry column as the table format prints them, privacy
-// applied: the privacy endpoint filters and sorts over what it shows,
-// so no filter can probe a value it hides. names are the call's
-// pseudonyms, numbered over cells, so the page a call returns names a
-// typed value as its filters read it, whatever the page's rows and
-// columns.
-type resultSet struct {
-	rep     *report
-	rows    reportRows
-	cells   [][]string
-	privacy bool
-	names   *pseudonyms
-}
-
-func newResultSet(rep *report, rows reportRows, privacy bool) *resultSet {
-	names := newPseudonyms()
-	t := rows.table(nil, rep.allColumns(), privacy, output.FormatTable, names)
-	return &resultSet{rep: rep, rows: rows, cells: t.Rows, privacy: privacy, names: names}
-}
-
 // rowFilter is one named filter of a call: its needles (a comma list
-// keeps a row matching any) and the registry columns it reads. source
-// matches whole cells; every other filter matches substrings, but for a
-// pseudonym on the privacy endpoint (resultSet.needle).
+// keeps a row matching any) and the registry columns it reads. An exact
+// filter (source) matches whole cells; every other filter matches
+// substrings, but for a pseudonym on the privacy endpoint
+// (resultSet.needle).
 type rowFilter struct {
 	name    string
 	needles []string
@@ -99,13 +89,14 @@ type rowFilter struct {
 
 // newRowFilter resolves a filter's columns against a report.
 func newRowFilter(rep *report, name, value string) rowFilter {
-	f := rowFilter{name: name, exact: name == "source"}
+	nf := namedFilterOf(name)
+	f := rowFilter{name: name, exact: nf.exact}
 	for _, n := range strings.Split(value, ",") {
 		if n = normalizeCell(n); n != "" {
 			f.needles = append(f.needles, n)
 		}
 	}
-	for _, want := range filterColumns[name] {
+	for _, want := range nf.columns {
 		for i, c := range rep.columns {
 			if c.name == want {
 				f.cols = append(f.cols, i)
@@ -113,12 +104,6 @@ func newRowFilter(rep *report, name, value string) rowFilter {
 		}
 	}
 	return f
-}
-
-// normalizeCell is the form filters compare in: lower case, with an
-// underscore read as a space, so an id spelling matches a label.
-func normalizeCell(s string) string {
-	return strings.TrimSpace(strings.ReplaceAll(strings.ToLower(s), "_", " "))
 }
 
 // needle is a normalized text a filter or a search looks for: a whole
@@ -213,8 +198,8 @@ type sortKey struct {
 // largest amount.
 func (rs *resultSet) sortRows(idx []int, col int, desc bool) {
 	c := rs.rep.columns[col]
-	numeric := c.align == output.AlignRight
-	money := c.privacy == PrivacyMoney
+	numeric := c.numeric()
+	money := c.kind == MoneyColumn
 	keys := make(map[int]sortKey, len(idx))
 	for _, i := range idx {
 		cell := strings.TrimSpace(rs.cells[i][col])
@@ -255,255 +240,27 @@ func (rs *resultSet) sortRows(idx []int, col int, desc bool) {
 	})
 }
 
-// columnLookup resolves the names a model sends for columns: a
-// registry name, a header as the results print it, either without its
-// currency or percent suffix, the view's principal column for a
-// generic money word, and — when exactly one column is that close — a
-// name one typo off.
-type columnLookup struct {
-	cols      []reportColumn
-	currency  string
-	principal string // registry name; "" when the view has none
-}
-
-// resolve returns the registry index for name, and a note when the
-// name was not the column's own (the header says which column ran).
-// preferOutCcy reads a base-currency aggregate as its output-currency
-// twin: rows in their own currencies cannot be ordered against each
-// other, so a sort by total_value means total_value_<CCY>.
-func (l columnLookup) resolve(name string, preferOutCcy bool) (int, string, error) {
-	i, note, err := l.find(name)
-	if err != nil || !preferOutCcy {
-		return i, note, err
-	}
-	if twin := l.byName(outCcyTwinName(l.cols[i].name)); twin >= 0 {
-		return twin, l.note(name, twin, true), nil
-	}
-	return i, note, nil
-}
-
-// outCcyTwinName is the name of a money column's output-currency twin:
-// <name>_outccy, and value for market_value, as on holdings.
-func outCcyTwinName(name string) string {
-	if name == "market_value" {
-		return "value"
-	}
-	return name + "_outccy"
-}
-
-// currencySuffixed splits a name that ends in a currency code.
-var currencySuffixed = regexp.MustCompile(`^(.+)_([a-z]{3})$`)
-
-// find is resolve without the twin preference.
-func (l columnLookup) find(name string) (int, string, error) {
-	want := strings.ToLower(strings.TrimSpace(name))
-	ccy := strings.ToLower(l.currency)
-	if i := l.exact(name); i >= 0 {
-		return i, l.note(name, i, false), nil
-	}
-	// A name with a currency suffix means a converted column, even when
-	// it is misspelt or names another currency: total_valu_usd is
-	// total_value_<CCY>, never the base-currency total_value; _pct is
-	// the percentage suffix, not a currency. The
-	// result is in one currency, and the note says which.
-	if m := currencySuffixed.FindStringSubmatch(want); m != nil && m[2] != "pct" && ccy != "" {
-		var converted []string
-		for _, c := range l.cols {
-			if strings.HasSuffix(strings.ToLower(c.header), "_"+ccy) {
-				converted = append(converted, l.stem(c))
-			}
-		}
-		stem, ok := m[1], slices.Contains(converted, m[1])
-		if !ok {
-			stem, ok = nearMiss(m[1], converted)
-		}
-		if ok {
-			for i, c := range l.cols {
-				if strings.ToLower(c.header) == stem+"_"+ccy {
-					note := l.note(name, i, true)
-					if m[2] != ccy {
-						note += fmt.Sprintf(" (amounts are in %s; pass currency=%s for %s)",
-							l.currency, strings.ToUpper(m[2]), strings.ToUpper(m[2]))
-					}
-					return i, note, nil
-				}
-			}
-		}
-	}
-	for i, c := range l.cols {
-		if l.stem(c) == want {
-			return i, l.note(name, i, false), nil
-		}
-	}
-	if l.principal != "" && genericMoneyWords[want] {
-		if i := l.byName(l.principal); i >= 0 {
-			return i, l.note(name, i, true), nil
-		}
-	}
-	// A typo is matched only to a column of its own kind: a name ending
-	// in _pct never lands on a money column.
-	pct := strings.HasSuffix(want, "_pct")
-	candidates := make([]string, 0, 2*len(l.cols))
-	for _, c := range l.cols {
-		if !pct || strings.HasSuffix(strings.ToLower(c.header), "_pct") {
-			candidates = append(candidates, c.name, l.stem(c))
-		}
-	}
-	if guess, ok := nearMiss(want, candidates); ok {
-		for i, c := range l.cols {
-			if c.name == guess || l.stem(c) == guess {
-				return i, l.note(name, i, true), nil
-			}
-		}
-	}
-	return -1, "", fmt.Errorf("unknown column %q; available: %s", name, l.headers())
-}
-
-// exact is the column name names as its registry name or its header,
-// any case; -1 for none. The CLI's -C reads names this way.
-func (l columnLookup) exact(name string) int {
-	want := strings.ToLower(strings.TrimSpace(name))
-	for i, c := range l.cols {
-		if strings.ToLower(c.header) == want || c.name == want {
-			return i
-		}
-	}
-	return -1
-}
-
-// exactOrStem is the first column name names as its registry name, its
-// header or its stem, any case; -1 for none. A value that names a
-// column, and a column printed elsewhere, read names this way.
-func (l columnLookup) exactOrStem(name string) int {
-	want := strings.ToLower(strings.TrimSpace(name))
-	for i, c := range l.cols {
-		if strings.ToLower(c.header) == want || c.name == want || l.stem(c) == want {
-			return i
-		}
-	}
-	return -1
-}
-
-func (l columnLookup) byName(name string) int {
-	for i, c := range l.cols {
-		if c.name == name {
-			return i
-		}
-	}
-	return -1
-}
-
-// stem is a column's header without its currency suffix, lower case:
-// what a model writes when it means the column.
-func (l columnLookup) stem(c reportColumn) string {
-	return strings.TrimSuffix(strings.ToLower(c.header), "_"+strings.ToLower(l.currency))
-}
-
-func (l columnLookup) note(asked string, i int, always bool) string {
-	h := l.cols[i].header
-	if !always && (strings.EqualFold(asked, h) || strings.EqualFold(asked, l.cols[i].name)) {
-		return ""
-	}
-	return fmt.Sprintf("%s for %q", h, asked)
-}
-
-func (l columnLookup) headers() string {
-	hs := make([]string, len(l.cols))
-	for i, c := range l.cols {
-		hs[i] = c.header
-	}
-	return strings.Join(hs, ", ")
-}
-
-// pick resolves the columns parameter: "default" (or nothing), "all",
-// a comma list, or a +add,-remove delta on the defaults.
-func (l columnLookup) pick(expr string, defaults []string) ([]int, []string, error) {
-	var notes []string
-	resolve := func(names []string) ([]int, error) {
-		out := make([]int, 0, len(names))
-		for _, n := range names {
-			i, note, err := l.resolve(n, false)
-			if err != nil {
-				return nil, err
-			}
-			if note != "" {
-				notes = append(notes, note)
-			}
-			out = append(out, i)
-		}
-		return out, nil
-	}
-	defIdx, err := resolve(defaults)
-	if err != nil {
-		return nil, nil, err
-	}
-	expr = strings.TrimSpace(expr)
-	e := parseColumnsExpr(expr, true)
-	switch {
-	case e.defaults:
-		return defIdx, nil, nil
-	case e.all:
-		all := make([]int, len(l.cols))
-		for i := range all {
-			all[i] = i
-		}
-		return all, nil, nil
-	case e.delta:
-		addIdx, err := resolve(e.adds)
-		if err != nil {
-			return nil, nil, err
-		}
-		remIdx, err := resolve(e.removes)
-		if err != nil {
-			return nil, nil, err
-		}
-		drop := map[int]bool{}
-		for _, i := range remIdx {
-			drop[i] = true
-		}
-		var out []int
-		seen := map[int]bool{}
-		for _, i := range append(defIdx, addIdx...) {
-			if !seen[i] && !drop[i] {
-				seen[i] = true
-				out = append(out, i)
-			}
-		}
-		if len(out) == 0 {
-			return nil, nil, fmt.Errorf("columns %q leaves no column", expr)
-		}
-		return out, notes, nil
-	}
-	out, err := resolve(e.names)
-	if err != nil {
-		return nil, nil, err
-	}
-	if len(out) == 0 {
-		return nil, nil, fmt.Errorf("columns %q names no column", expr)
-	}
-	return out, notes, nil
-}
-
 // carries are the named filters each view takes, by view ("" for a
-// tool of one shape): those whose key column (filterKeys, or the
-// family's keyAlias) the view prints, but its excludes. Derived once
-// from the registries, so a column a view gains brings its filter.
+// tool of one shape): those whose key column (the filter's keys, or the
+// view's keyAlias) the view prints, but its excludes. Derived once from
+// the registries, so a column a view gains brings its filter.
 func (fam *family) carries() map[string][]string {
 	fam.derive.Do(func() {
 		fam.carried = map[string][]string{}
 		cfg := &config.Config{DefaultCurrency: "USD"}
-		for _, v := range fam.viewsOrOne() {
+		for i := range fam.views {
+			v := &fam.views[i]
 			printed := map[string]bool{}
-			for _, c := range fam.defaultLookup(cfg, v, false).cols {
+			for _, c := range fam.defaultLookup(cfg, v.name, false).cols {
 				printed[c.name] = true
 			}
-			for _, f := range filterOrder {
-				keys := filterKeys[f]
-				if alias := fam.keyAlias[v][f]; alias != "" {
+			for _, f := range namedFilters {
+				keys := f.keys
+				if alias := v.keyAlias[f.name]; alias != "" {
 					keys = append(slices.Clone(keys), alias)
 				}
-				if slices.ContainsFunc(keys, func(k string) bool { return printed[k] }) && !slices.Contains(fam.excludes[v], f) {
-					fam.carried[v] = append(fam.carried[v], f)
+				if slices.ContainsFunc(keys, func(k string) bool { return printed[k] }) && !slices.Contains(v.excludes, f.name) {
+					fam.carried[v.name] = append(fam.carried[v.name], f.name)
 				}
 			}
 		}
@@ -511,38 +268,16 @@ func (fam *family) carries() map[string][]string {
 	return fam.carried
 }
 
-// viewsOrOne is the family's views, or the one shape ("") of a tool
-// that has none.
-func (fam *family) viewsOrOne() []string {
-	if fam.views == nil {
-		return []string{""}
-	}
-	return fam.views
-}
-
-// buildDefault builds req's report with no call arguments: a view's
-// columns as describe lists them.
-func (fam *family) buildDefault(cfg *config.Config, req request) *report {
-	return fam.build(cfg, req, &toolArgs{values: map[string]any{}})
-}
-
 // defaultLookup is the column lookup of view at every option's default
-// (defaultRequest), in the configured currency. series reads the view
-// as a series, which prints its period column ahead of the view's own.
+// (family.defaultRequest), in the configured currency. series reads the
+// view as a series, which prints its period column ahead of the view's
+// own.
 func (fam *family) defaultLookup(cfg *config.Config, view string, series bool) columnLookup {
-	req := defaultRequest(view, cfg.DefaultCurrency)
+	req := fam.defaultRequest(view, cfg.DefaultCurrency, time.Now(), cfg.YieldHorizon())
 	if series {
 		req.series = []seriesPoint{{}}
 	}
-	return fam.lookup(fam.buildDefault(cfg, req), req)
-}
-
-// defaultRequest is a request for view with every option at its
-// default: what describe lists a view's columns from, and what the
-// view walk and the derived carries read a view's columns from.
-func defaultRequest(view, currency string) request {
-	return request{view: view, currency: currency, period: "total", method: "both", annualize: "auto",
-		inception: "full", netting: true, investing: "whole", level: "primary"}
+	return fam.lookup(fam.build(cfg, req), req)
 }
 
 // escalate picks the view a call's filters need. A small model starts
@@ -575,16 +310,4 @@ func carriesAll(carries map[string][]string, view string, filters []string) bool
 		}
 	}
 	return true
-}
-
-// thousands renders n with comma separators, for the paging line.
-func thousands(n int) string {
-	if n < 0 {
-		return "-" + thousands(-n)
-	}
-	s := strconv.Itoa(n)
-	for i := len(s) - 3; i > 0; i -= 3 {
-		s = s[:i] + "," + s[i:]
-	}
-	return s
 }

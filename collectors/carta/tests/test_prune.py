@@ -9,15 +9,16 @@ carta's PruneConfig decides, over tmp_path bronze trees in carta's layout
 (synthetic data only, no real ids or holdings):
   * a complete dump keeps its load inputs and loses screenshots/, the one
     debug subdir `download --debug` writes
-  * a statusless manifest counts as complete and is kept whole
   * `main()` wires that config: a dump with no run.json or a status other
     than complete is deleted, and the bronze-root siblings (silver DB,
     side-loaded override CSVs) are never touched
 
-Plus the load-side half of the lifecycle (load.load_run):
+Plus the load-side half of the lifecycle (the load frame):
   * a status="in-progress" dump or one with no run.json is NOT loaded (the
     guard keeps a crashed walk's partial capture out of silver)
   * a status="complete" dump and a statusless dump ARE loaded
+  * a dry-run dump and one whose run.json cannot be read write no
+    dump_runs row
 
 And `load --force` rebuilds exactly the silver an incremental load builds.
 """
@@ -30,6 +31,7 @@ from pathlib import Path
 
 import load
 import prune
+from conftest import load_one
 
 OLD_TS = "20260101T010000Z"
 
@@ -96,21 +98,6 @@ def test_complete_dump_screenshots_pruned_inputs_kept(tmp_path):
     assert_inputs_intact(d)
 
 
-def test_statusless_manifest_kept_as_complete(tmp_path):
-    # A download that writes no status writes its manifest only once the
-    # walk finished, so a statusless run.json means the dump is complete.
-    d = make_dump(tmp_path, OLD_TS, status=None, screenshots=False)
-    assert prune.main(["--bronze-dir", str(tmp_path),
-                       "--min-age-hours", "0"]) == 0
-    assert_inputs_intact(d)
-
-
-def test_validate_target_accepts_screenshots_subdir(tmp_path):
-    # The one subdir shape prune may target: the --debug capture dir.
-    (tmp_path / OLD_TS / "screenshots").mkdir(parents=True)
-    prune.CONFIG.validate_target(tmp_path / OLD_TS / "screenshots", tmp_path)
-
-
 def test_main_deletes_unfinished_dumps_and_nothing_at_the_root(tmp_path):
     complete = make_dump(tmp_path, OLD_TS)
     crashed = make_dump(tmp_path, "20260102T010000Z", status="in-progress")
@@ -158,14 +145,14 @@ def test_load_skips_dump_without_run_json(tmp_path, migrated):
     # reclaims the dir, and load neither loads nor records it.
     d = make_dump(tmp_path, OLD_TS, run_json=False,
                   entities=False, documents=False)
-    assert load.load_run(migrated, d) is False
+    assert load_one(migrated, d) is False
     assert _dump_runs_count(migrated) == 0
 
 
 def test_load_loads_complete_dump(tmp_path, migrated):
     d = make_dump(tmp_path, OLD_TS, status="complete",
                   entities=False, documents=False)
-    assert load.load_run(migrated, d) is True
+    assert load_one(migrated, d) is True
     assert _dump_runs_count(migrated) == 1
 
 
@@ -174,8 +161,28 @@ def test_load_loads_statusless_dump(tmp_path, migrated):
     # writes its manifest only at the end of a successful walk.
     d = make_dump(tmp_path, OLD_TS, status=None,
                   entities=False, documents=False)
-    assert load.load_run(migrated, d) is True
+    assert load_one(migrated, d) is True
     assert _dump_runs_count(migrated) == 1
+
+
+def test_load_skips_a_dry_run_dump(tmp_path, migrated, caplog):
+    d = make_dump(tmp_path, OLD_TS, entities=False, documents=False)
+    manifest = json.loads((d / "run.json").read_text())
+    (d / "run.json").write_text(json.dumps({**manifest, "dry_run": True}))
+    with caplog.at_level("INFO"):
+        assert load_one(migrated, d) is False
+    assert _dump_runs_count(migrated) == 0
+    assert any("dry-run dump" in m for m in caplog.messages)
+
+
+def test_load_skips_a_dump_whose_run_json_cannot_be_read(tmp_path, migrated,
+                                                         caplog):
+    # The loader needs the manifest's ids, so the frame passes over the run.
+    d = make_dump(tmp_path, OLD_TS, entities=False, documents=False)
+    (d / "run.json").write_text("{not json")
+    assert load_one(migrated, d) is False
+    assert _dump_runs_count(migrated) == 0
+    assert any("run.json cannot be read" in m for m in caplog.messages)
 
 
 # ============================================================

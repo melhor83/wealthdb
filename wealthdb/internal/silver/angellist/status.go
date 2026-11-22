@@ -9,106 +9,65 @@ import (
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver"
 )
 
-// contentExtrema yields the MIN/MAX content date — the position event
-// dates (position_snapshots.as_of_date) unioned with the funding-ledger
-// dates (funding_transactions.occurred_at) — plus MAX(dump_runs). The
-// window must span both, since a funding cash flow can predate the first
-// investment (an opening deposit) or postdate the last valuation.
-const contentExtrema = `
-SELECT
-    (SELECT MIN(t) FROM (SELECT MIN(as_of_date) t FROM position_snapshots
-                          UNION ALL SELECT MIN(occurred_at) FROM funding_transactions)),
-    (SELECT MAX(t) FROM (SELECT MAX(as_of_date) t FROM position_snapshots
-                          UNION ALL SELECT MAX(occurred_at) FROM funding_transactions)),
-    (SELECT MAX(snapshot_at) FROM dump_runs)`
-
-// Status reports the content date range and pins LatestChangeNumber to
-// MAX(dump_runs.snapshot_at) — a new download is the only thing that
-// advances the watermark, so idle reloads stay no-ops. Transaction extrema
-// come from the funding-account cash ledger.
-func (c *Connection) Status(ctx context.Context) (canonical.Status, error) {
-	s := canonical.UnknownStatus()
-	var oldest, latest, latestRun sql.NullInt64
-	if err := c.db.QueryRowContext(ctx, contentExtrema).
-		Scan(&oldest, &latest, &latestRun); err != nil {
-		return s, fmt.Errorf("angellist Status: %w", err)
+// clock: a new download, any dump past the watermark, re-emits the full
+// event history (silver.FullSpan). A download can revise any position's
+// marks at any past event date (a K-1 finalises, a statement restates),
+// and the adapter forward-fills complete per-event portfolios, so
+// re-emit-all is the natural unit. The snapshot range runs from the
+// earliest content date to the latest: the position event dates
+// (position_snapshots.as_of_date, an inception, an early K-1 year) and
+// the funding-ledger dates (funding_transactions.occurred_at), since a
+// funding cash flow can predate the first investment (an opening deposit)
+// or postdate the last valuation. It reaches the latest removal, K-1
+// period end or stated wallet balance where that is later (reachDates). The transaction range is
+// the funding-account cash ledger. A silver without the ledger has
+// neither ledger range.
+func (c *Connection) clock() silver.Clock {
+	k := silver.Clock{
+		Kind:     "angellist",
+		Runs:     silver.LatestDump,
+		Snapshot: []string{silver.Range("position_snapshots", "as_of_date")},
+		Extra:    c.reachDates,
+		Mode:     silver.FullSpan{},
 	}
-	if oldest.Valid {
-		s.OldestSnapshotAt = oldest.Int64
+	if c.schema.fundingTransactions {
+		ledger := silver.Range("funding_transactions", "occurred_at")
+		k.Snapshot = append(k.Snapshot, ledger)
+		k.Ledger = []string{ledger}
 	}
-	if latest.Valid {
-		s.LatestSnapshotAt = latest.Int64
-	}
-	// A dump that stopped listing a position, and a K-1's period end, are
-	// snapshot times (snapshots.go) that can lie after every mark.
-	removals, err := c.removals(ctx)
-	if err != nil {
-		return s, err
-	}
-	k, _, err := c.readInKind(ctx)
-	if err != nil {
-		return s, err
-	}
-	s.LatestSnapshotAt = k.Reach(removals.Reach(s.LatestSnapshotAt))
-	if latestRun.Valid {
-		s.LatestChangeNumber = latestRun.Int64
-	}
-
-	// transaction extrema: the funding-account cash ledger.
-	var txMin, txMax sql.NullInt64
-	if err := c.db.QueryRowContext(ctx,
-		`SELECT MIN(occurred_at), MAX(occurred_at) FROM funding_transactions`).
-		Scan(&txMin, &txMax); err != nil {
-		return s, fmt.Errorf("angellist Status (tx): %w", err)
-	}
-	if txMin.Valid {
-		s.OldestTransactionAt = txMin.Int64
-	}
-	if txMax.Valid {
-		s.LatestTransactionAt = txMax.Int64
-	}
-	if err := silver.ObserveByRuns(ctx, c.db, "angellist", `SELECT MAX(snapshot_at) FROM dump_runs`, &s); err != nil {
-		return s, err
-	}
-	return s, nil
+	return k
 }
 
-// ChangeWindow triggers on a new download — any dump_run past `since`.
-// When triggered it re-emits the FULL event history: Start is the
-// earliest position event date (an inception / early K-1 year), End the
-// latest, or the latest dump that stopped listing a position or the
-// latest K-1 period end when that is later. Re-emit-all is the natural unit here because a new download can
-// revise any position's marks at any past event date (a K-1 finalises, a
-// statement restates), and the adapter forward-fills complete per-event
-// portfolios; gold's deleteWindow over [Start,End] makes the re-emit
-// idempotent. NewChangeNumber advances to the latest dump_run so an idle
-// reload doesn't re-trigger.
-func (c *Connection) ChangeWindow(ctx context.Context, since int64) (canonical.Window, error) {
-	w := canonical.Window{NewChangeNumber: since}
-	var oldest, latest, latestRun sql.NullInt64
-	if err := c.db.QueryRowContext(ctx, contentExtrema).
-		Scan(&oldest, &latest, &latestRun); err != nil {
-		return w, fmt.Errorf("angellist ChangeWindow: %w", err)
-	}
-	if !latestRun.Valid || latestRun.Int64 <= since {
-		return w, nil // no new download since the watermark
-	}
-	w.HasChanges = true
-	w.NewChangeNumber = latestRun.Int64
-	if oldest.Valid {
-		w.Start = oldest.Int64
-	}
-	if latest.Valid {
-		w.End = latest.Int64
-	}
+// reachDates reach the latest dump that stopped listing a position, the
+// latest K-1 period end and the dump that states the wallet's balance:
+// snapshot times (snapshots.go, cash.go) that can lie after every mark.
+func (c *Connection) reachDates(ctx context.Context) (lo, hi int64, err error) {
 	removals, err := c.removals(ctx)
 	if err != nil {
-		return w, err
+		return -1, -1, err
 	}
 	k, _, err := c.readInKind(ctx)
 	if err != nil {
-		return w, err
+		return -1, -1, err
 	}
-	w.End = k.Reach(removals.Reach(w.End))
-	return w, nil
+	hi = k.Reach(removals.Reach(-1))
+	if c.schema.fundingAccounts && c.schema.fundingTransactions {
+		var at sql.NullInt64
+		if err := c.db.QueryRowContext(ctx, `SELECT MAX(snapshot_at) FROM funding_accounts`).Scan(&at); err != nil {
+			return -1, -1, fmt.Errorf("angellist wallet balance date: %w", err)
+		}
+		if at.Valid && at.Int64 > hi {
+			hi = at.Int64
+		}
+	}
+	return -1, hi, nil
+}
+
+// Status and ChangeWindow are the clock's (silver.Clock).
+func (c *Connection) Status(ctx context.Context) (canonical.Status, error) {
+	return c.clock().Status(ctx, c.db)
+}
+
+func (c *Connection) ChangeWindow(ctx context.Context, since int64) (canonical.Window, error) {
+	return c.clock().ChangeWindow(ctx, c.db, since)
 }

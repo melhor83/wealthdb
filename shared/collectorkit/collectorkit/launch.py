@@ -54,7 +54,7 @@ The pref helpers return fresh copies, so a caller may mutate the result
 without affecting the next call.
 
 `persistent_camoufox` is the hardened launch most sign-ins open, and
-`pump` / `wait_for` / `page_url` drive the page it yields.
+`pump` / `wait_for` / `page_url` / `live_url` drive the page it yields.
 `camoufox_context` is the same launch for a collector that drives the
 context itself, with an optional trace and a close that logs a failure
 rather than hiding it.
@@ -290,7 +290,32 @@ def prepare_profile_dir(profile_dir: Path, mode: int = PROFILE_DIR_MODE,
     return profile_dir
 
 
+def prepare_profile(profile_dir: Path, *, fresh: bool, note: str,
+                    log: logging.Logger) -> None:
+    """Wipe the profile when `fresh`, then ready it for Camoufox. `note`
+    says what the wipe costs the next sign-in."""
+    if fresh and profile_dir.exists():
+        log.warning("--fresh: wiping profile dir %s (%s)", profile_dir, note)
+        shutil.rmtree(profile_dir)
+    prepare_profile_dir(profile_dir)
+    log.info("profile dir: %s", profile_dir)
+
+
 # ---- the sign-in browser -----------------------------------------------------
+
+
+def require_browser(camoufox_cls: type) -> None:
+    """Stop a launch of the real `camoufox_cls` in an image built without the
+    browser (base-camoufox's CAMOUFOX_BROWSER=none, the image the unit tests
+    run in), which would otherwise try to download it at sign-in. A stand-in
+    class from a test passes, and so does every launch in an image with the
+    browser."""
+    if (os.environ.get("WEALTHDB_CAMOUFOX_BROWSER") == "none"
+            and camoufox_cls.__module__.partition(".")[0] == "camoufox"):
+        raise SystemExit("this image has no Camoufox browser: it is a test "
+                         "build (CAMOUFOX_BROWSER=none). Build the collector "
+                         "with `make build-<name>` or `make all`, then run "
+                         "it again")
 
 
 def headed_camoufox(profile_dir: Path, *, humanize: bool = True,
@@ -303,6 +328,7 @@ def headed_camoufox(profile_dir: Path, *, humanize: bool = True,
     WebRTC blocking)."""
     from camoufox.sync_api import Camoufox
 
+    require_browser(Camoufox)
     return Camoufox(
         persistent_context=True,
         user_data_dir=str(profile_dir),
@@ -425,3 +451,23 @@ def page_url(page) -> str:
         return page.url or ""
     except Exception:
         return ""
+
+
+def live_url(page) -> str:
+    """The page's current URL, asked of the browser itself.
+
+    On the pinned Camoufox and Playwright, `frameNavigated` does not
+    reliably reach the driver, so `page.url` can stay on the
+    pre-redirect URL after a top-level navigation. `location.href`,
+    read in the page, answers from the document Firefox actually shows.
+
+    Falls back to `page.url` when the read raises (mid-navigation, a
+    closing page) or returns no URL, so a transient error does not end
+    a polling loop. Unlike `page_url`, the fallback is unguarded."""
+    try:
+        result = page.evaluate("() => location.href")
+        if isinstance(result, str) and result:
+            return result
+    except Exception:
+        pass
+    return page.url

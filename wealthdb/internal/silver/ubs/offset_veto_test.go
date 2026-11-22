@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
-	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/silvertest"
 )
 
@@ -23,7 +22,7 @@ CREATE TABLE accounts (
     PRIMARY KEY (snapshot_at, account_external_id));
 CREATE TABLE transactions (
     transaction_external_id TEXT NOT NULL, account_external_id TEXT NOT NULL,
-    snapshot_at INTEGER NOT NULL, value_date INTEGER NOT NULL,
+    snapshot_at INTEGER NOT NULL, booking_date INTEGER, value_date INTEGER NOT NULL,
     currency_iso TEXT NOT NULL, amount_debit REAL, amount_credit REAL,
     counterparty TEXT, description_kind TEXT, payload TEXT NOT NULL,
     PRIMARY KEY (transaction_external_id, account_external_id));`
@@ -62,7 +61,7 @@ func seedWebTx(t *testing.T, r *webReader, txID, acct string, day int64, ccy str
 	t.Helper()
 	payload, kind := `{}`, ""
 	if pdfRail {
-		payload = `{"source":"account_statement_pdf","booking_type":"E-BANKING PAYMENT ORDER","internal_transfer":false,"counter_account":null}`
+		payload = `{"source":"account_statement_pdf","booking_type":"E-BANKING PAYMENT ORDER","counter_account":null}`
 		kind = "E-BANKING PAYMENT ORDER"
 	}
 	seedWebTxRaw(t, r, txID, acct, day, ccy, amt, kind, payload)
@@ -92,11 +91,7 @@ func seedWebTxRaw(t *testing.T, r *webReader, txID, acct string, day int64, ccy 
 // TransactionExternalID → kind.
 func emittedKinds(t *testing.T, r *webReader, psn *psnReader) map[string]canonical.TxKind {
 	t.Helper()
-	stream, _, err := r.transactionsBeforePSNStart(context.Background(),
-		canonical.Window{Start: 0, End: 1 << 40, HasChanges: true}, psn, nil)
-	if err != nil {
-		t.Fatalf("transactionsBeforePSNStart: %v", err)
-	}
+	stream := connTransactions(t, r, psn, nil)
 	out := map[string]canonical.TxKind{}
 	for {
 		batch, more, err := stream.Next(context.Background())
@@ -119,11 +114,7 @@ func emittedKinds(t *testing.T, r *webReader, psn *psnReader) map[string]canonic
 // supermarket payment vanished from spending along with the flow.
 func emittedInternal(t *testing.T, r *webReader, psn *psnReader) map[string]bool {
 	t.Helper()
-	stream, _, err := r.transactionsBeforePSNStart(context.Background(),
-		canonical.Window{Start: 0, End: 1 << 40, HasChanges: true}, psn, nil)
-	if err != nil {
-		t.Fatalf("transactionsBeforePSNStart: %v", err)
-	}
+	stream := connTransactions(t, r, psn, nil)
 	out := map[string]bool{}
 	for {
 		batch, more, err := stream.Next(context.Background())
@@ -359,11 +350,11 @@ func TestOffsetVetoTwinPhaseIsGlobal(t *testing.T) {
 	}
 }
 
-// TestOffsetVetoInternalLegPairsItsMirror pins the parser-internal true-pair
-// class: an UEBERTRAG-marked PDF payment order's receiving leg lands in the
-// MT940 feed as a bare credit, and the veto must demote that mirror too —
-// the parser flag already proves the money stayed inside the relationship,
-// so a surviving mirror would book a phantom external inflow.
+// TestOffsetVetoInternalLegPairsItsMirror pins the internal-transfer
+// true-pair class: an UEBERTRAG-marked PDF payment order's receiving leg
+// lands in the MT940 feed as a bare credit, and the veto must demote that
+// mirror too — the marker already proves the money stayed inside the
+// relationship, so a surviving mirror would book a phantom external inflow.
 func TestOffsetVetoInternalLegPairsItsMirror(t *testing.T) {
 	r := newWebTxFixture(t)
 	seedRailEraAnchor(t, r)
@@ -374,7 +365,7 @@ func TestOffsetVetoInternalLegPairsItsMirror(t *testing.T) {
             snapshot_at, value_date, currency_iso, amount_debit, amount_credit,
             description_kind, payload)
         VALUES ('T1', ?, 1000, ?, 'CHF', 20000, NULL, 'SPECIAL PAYMENT ORDER',
-                '{"source":"account_statement_pdf","booking_type":"SPECIAL PAYMENT ORDER","internal_transfer":true,"counter_account":null}')`,
+                '{"source":"account_statement_pdf","booking_type":"SPECIAL PAYMENT ORDER","counter_account":null,"continuation":["UEBERTRAG EXAMPLE MANDATE"]}')`,
 		vetoAcctA, vetoDay1); err != nil {
 		t.Fatalf("seed internal debit: %v", err)
 	}
@@ -382,7 +373,7 @@ func TestOffsetVetoInternalLegPairsItsMirror(t *testing.T) {
 
 	internal := emittedInternal(t, r, nil)
 	if !internal["T1@"+vetoAcctA] {
-		t.Errorf("parser-internal debit: want the conduit verdict on its payload")
+		t.Errorf("internal-transfer debit: want the conduit verdict on its payload")
 	}
 	if !internal["T2@"+vetoAcctB] {
 		t.Error("its MT940 mirror: want the conduit verdict too (both sides of the move drop)")
@@ -412,12 +403,8 @@ func TestOffsetVetoProbeSkipsSuppressedWebRows(t *testing.T) {
 	// of its own, too small to pair with anything.
 	_, psnDB := newFixtureSilver(t)
 	seedPSNCashAmount(t, psnDB, "COVER-B", vetoAcctB, "1", "D", "CHF", "FEE", vetoDay1-86400)
-	stream, _, err := r.transactionsBeforePSNStart(context.Background(),
-		canonical.Window{Start: 0, End: 1 << 40, HasChanges: true}, &psnReader{db: psnDB},
-		[]silver.RelationshipPair{{WebID: "REL1", PSNStartOverride: vetoDay1 - 86400}})
-	if err != nil {
-		t.Fatalf("transactionsBeforePSNStart: %v", err)
-	}
+	stream := connTransactions(t, r, &psnReader{db: psnDB},
+		[]RelationshipPair{{WebID: "REL1", PSNStartOverride: vetoDay1 - 86400}})
 	kinds := map[string]canonical.TxKind{}
 	for {
 		batch, more, err := stream.Next(context.Background())
@@ -496,7 +483,7 @@ func TestConduitVerdictLeavesTheRowSpendable(t *testing.T) {
 	seedWebTxRaw(t, r, "CARD", vetoAcctA, vetoDay1, "CHF", -111.11,
 		"DEBIT CARD PAYMENT",
 		`{"source":"account_statement_pdf","booking_type":"DEBIT CARD PAYMENT",`+
-			`"internal_transfer":false,"counter_account":null,"continuation":[]}`)
+			`"counter_account":null,"continuation":[]}`)
 
 	kinds := emittedKinds(t, r, nil)
 	internal := emittedInternal(t, r, nil)
@@ -663,12 +650,8 @@ func TestAnAccountTheFeedNeverReachesKeepsItsExportRows(t *testing.T) {
 	_, psnDB := newFixtureSilver(t)
 	// The feed speaks for some other account of the relationship, not B.
 	seedPSNCashAmount(t, psnDB, "COVER-C", "CH0000000000000000CCC", "1", "D", "CHF", "FEE", vetoDay1-86400)
-	stream, _, err := r.transactionsBeforePSNStart(context.Background(),
-		canonical.Window{Start: 0, End: 1 << 40, HasChanges: true}, &psnReader{db: psnDB},
-		[]silver.RelationshipPair{{WebID: "REL1", PSNStartOverride: vetoDay1 - 86400}})
-	if err != nil {
-		t.Fatalf("transactionsBeforePSNStart: %v", err)
-	}
+	stream := connTransactions(t, r, &psnReader{db: psnDB},
+		[]RelationshipPair{{WebID: "REL1", PSNStartOverride: vetoDay1 - 86400}})
 	got := drainTx(t, stream)
 	credit, ok := got["T2@"+vetoAcctB]
 	if !ok {

@@ -36,7 +36,7 @@ Subcommands:
                       vesting_events, fund_metrics, cap_calls,
                       capital_events, cash_flows, documents,
                       k1_capital_accounts.
-                      --force deletes the silver DB and rebuilds from all bronze.
+                      --force rebuilds the silver from all bronze.
   prune [args...]     Delete non-complete dumps (a crashed walk left
                       run.json status="in-progress", or a walk that crashed
                       before writing run.json left none) from the bronze
@@ -55,7 +55,9 @@ Mounted into the container:
   <TMP>/w-carta/home/.secrets  ->  /secrets
   <TMP>/w-carta/xdgdata/wealthdb/carta     ->  /data
   <TMP>/w-carta/xdgcache/wealthdb/startupcache  ->  /cache/startupcache
+  <TMP>/w-carta/xdgcache/wealthdb/carta  ->  /cache/collector
   <TMP>/w-carta/xdgcache/wealthdb/debug/carta    ->  /debug
+  <TMP>/w-carta/tree/collectors/carta  ->  /app
 
 Override mounts via env:
   CARTA_SECRETS_DIR=/path/to/secrets
@@ -108,7 +110,7 @@ Subcommands:
                       vesting_events, fund_metrics, cap_calls,
                       capital_events, cash_flows, documents,
                       k1_capital_accounts.
-                      --force deletes the silver DB and rebuilds from all bronze.
+                      --force rebuilds the silver from all bronze.
   prune [args...]     Delete non-complete dumps (a crashed walk left
                       run.json status="in-progress", or a walk that crashed
                       before writing run.json left none) from the bronze
@@ -127,7 +129,9 @@ Mounted into the container:
   <TMP>/w-carta/home/.secrets  ->  /secrets
   <TMP>/w-carta/xdgdata/wealthdb/carta     ->  /data
   <TMP>/w-carta/xdgcache/wealthdb/startupcache  ->  /cache/startupcache
+  <TMP>/w-carta/xdgcache/wealthdb/carta  ->  /cache/collector
   <TMP>/w-carta/xdgcache/wealthdb/debug/carta    ->  /debug
+  <TMP>/w-carta/tree/collectors/carta  ->  /app
 
 Override mounts via env:
   CARTA_SECRETS_DIR=/path/to/secrets
@@ -212,6 +216,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-carta/xdgcache/wealthdb/carta:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-carta/xdgcache/wealthdb/debug/carta:/debug
   -v
   <TMP>/w-carta/tree/collectors/carta:/app
@@ -259,6 +267,10 @@ docker
   <TMP>/w-carta/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-carta/xdgcache/wealthdb/carta:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-carta/xdgcache/wealthdb/debug/carta:/debug
   -v
@@ -308,6 +320,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-carta/xdgcache/wealthdb/carta:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-carta/xdgcache/wealthdb/debug/carta:/debug
   -v
   <TMP>/w-carta/tree/collectors/carta:/app
@@ -355,6 +371,10 @@ docker
   <TMP>/w-carta/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-carta/xdgcache/wealthdb/carta:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-carta/xdgcache/wealthdb/debug/carta:/debug
   -v
@@ -415,6 +435,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-carta/xdgcache/wealthdb/carta:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-carta/xdgcache/wealthdb/debug/carta:/debug
   -v
   <TMP>/w-carta/tree/collectors/carta:/app
@@ -462,6 +486,10 @@ docker
   <TMP>/w-carta/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-carta/xdgcache/wealthdb/carta:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-carta/xdgcache/wealthdb/debug/carta:/debug
   -v
@@ -511,6 +539,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-carta/xdgcache/wealthdb/carta:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-carta/xdgcache/wealthdb/debug/carta:/debug
   -v
   <TMP>/w-carta/tree/collectors/carta:/app
@@ -559,6 +591,10 @@ docker
   <TMP>/w-carta/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-carta/xdgcache/wealthdb/carta:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-carta/xdgcache/wealthdb/debug/carta:/debug
   -v
@@ -610,6 +646,10 @@ docker
   <TMP>/w-carta/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-carta/xdgcache/wealthdb/carta:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-carta/silver:/silver
   -v
@@ -663,6 +703,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-carta/xdgcache/wealthdb/carta:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-carta/silver:/silver
   -v
   <TMP>/w-carta/xdgcache/wealthdb/debug/carta:/debug
@@ -715,6 +759,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-carta/xdgcache/wealthdb/carta:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-carta/xdgcache/wealthdb/debug/carta:/debug
   -v
   <TMP>/w-carta/tree/collectors/carta:/app
@@ -762,6 +810,10 @@ docker
   <TMP>/w-carta/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-carta/xdgcache/wealthdb/carta:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-carta/xdgcache/wealthdb/debug/carta:/debug
   -v
@@ -811,6 +863,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-carta/xdgcache/wealthdb/carta:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-carta/xdgcache/wealthdb/debug/carta:/debug
   -v
   <TMP>/w-carta/tree/collectors/carta:/app
@@ -859,6 +915,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-carta/xdgcache/wealthdb/carta:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-carta/xdgcache/wealthdb/debug/carta:/debug
   -v
   <TMP>/w-carta/tree/collectors/carta:/app
@@ -906,6 +966,10 @@ docker
   <TMP>/w-carta/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-carta/xdgcache/wealthdb/carta:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-carta/xdgcache/wealthdb/debug/carta:/debug
   -v

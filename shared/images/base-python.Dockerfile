@@ -1,6 +1,7 @@
 # Shared base image for REST-only (no-browser) collectors: slim Python
-# with collectorkit pre-installed, so collectors that `FROM` it can
-# `import collectorkit` with no per-collector plumbing.
+# with collectorkit and the entrypoint engine pre-installed, so
+# collectors that `FROM` it can `import collectorkit` with no
+# per-collector plumbing.
 #
 # Build context is shared/ (so collectorkit/ is reachable):
 #   docker build -f images/base-python.Dockerfile -t wealthdb/base-python:latest .
@@ -16,3 +17,7 @@ WORKDIR /app
 # Bake in the shared collector library.
 COPY collectorkit /opt/collectorkit
 RUN pip install /opt/collectorkit
+
+# The entrypoint engine, sourced by every collector's entrypoint. Its
+# browser setup is inert here.
+COPY images/entrypoint-lib.sh /opt/entrypoint-lib.sh

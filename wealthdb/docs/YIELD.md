@@ -210,9 +210,11 @@ under these keys:
 | Key | States | Read as |
 | --- | --- | --- |
 | `interest_rate` | the rate | percent a year: `0.75` or `0.75%` |
-| `interest_tiers` | a tiered rate, in place of `interest_rate` | a list of `{"rate": 0.5, "up_to": 10000}`; the last tier's `up_to` is null |
+| `interest_tiers` | a tiered rate, in place of `interest_rate` | a list of `{"rate": 0.5, "up_to": 10000}`; the last tier's `up_to` is null or absent; a tier may state its own number as `tier` (below) |
 | `interest_valid_from` | the day the rate holds from | `2026-01-01` |
 | `interest_side` | who pays it | `credit` (the balance earns it, the default) or `debit` (it pays it) |
+| `interest_term_end` | the day a term deposit's rate ends | `2027-03-31` |
+| `interest_day_count` | how the rate counts its days | `ACT/360`, `ACT/365`, `ACT/ACT`, `30/360` or `30E/360` |
 | `interest_conditions` | several rates, such as a credit and a debit side | a list of objects, each with the keys above |
 
 A rate on a cash balance is read at that balance's snapshot. A source
@@ -231,10 +233,13 @@ It is read only on a kind of account that holds cash: `cash`,
 `brokerage`, `custody` or `safekeeping`. Each condition in
 `interest_conditions` states its own keys, one per side and day. A
 value that does not read states nothing, and neither does the condition
-it sits in. A balance that states UBS PSN's tiers reads those, and the
-keys beside them state nothing. A liability's rate is its terms'
-(below), never these keys. UBS PSN's balance records, Raiffeisen's
-account details and VIAC's strategy rate are read in their own shapes.
+it sits in. A source that numbers its tiers and may leave one out
+states each tier's `tier`: every tier of the list states one, each
+above the one before, and a tier before the last may then state no
+limit. A liability's rate is its terms' (below), never these keys.
+UBS PSN's balance records, Raiffeisen's account details and VIAC's
+strategy rate state their rates in shapes of their own. Their adapters
+write them under these keys.
 
 An account that states no rate has none: its cash reads unknown, never
 zero.
@@ -293,9 +298,8 @@ bond's row ([fidelity-web](../../collectors/fidelity-web/DESIGN.md)
 §4.5, [svb](../../collectors/svb/DESIGN.md#modelling-decisions)). Two
 other sources add to them:
 
-- UBS: the `Rating` column of the positions export is one more grade,
-  read off the newest position that carries it. Text that is no grade
-  (`No rating av.`) gives no rating.
+- UBS: the `Rating` column of the positions export is the position's
+  `rating_sp`. Text that is no grade (`No rating av.`) gives no rating.
 - manual: a note's record gives `interest_rate` and `maturity_date`.
 
 Every bond's price is clean, per 100 of face, in default or not. It is
@@ -487,16 +491,30 @@ twelve months to the day over the mean daily value.
   holding named.
 - A dividend counts at its gross where its source states one, else at
   its net (INCOME.md §5).
-- A line of an account that held the instrument once and sold it stays
-  with that sold position, as `income` lists it. A coupon does too. A
-  line of an account that never held it belongs to a holding of it in
-  its portfolio: a bank books a dividend to the cash account beside the
-  custody account. Where no account of the portfolio holds it but one
-  held it once, the line stays with its own sold position. Else it
-  belongs to a holding of it at its source. Where the source holds none,
-  and one account of the source alone held it, the line is that
-  account's sold position: a bank may book a dividend in another
-  portfolio.
+- A line belongs to the account that held its instrument as the line
+  happened. That is its own account where it held it then, or at any
+  time before: a dividend paid after the holding moved on is paid on
+  what the account held on its record day. Else it is the one other
+  account of its portfolio that held it then: a bank books a dividend
+  to the cash account beside the custody account. Else it is the one
+  account of its source that held it then, under the id the line's own
+  account knows it by: a bank may book a dividend in another
+  portfolio. The yield pass decides this once per line
+  (`transaction_holdings`, DESIGN.md §7.6).
+- The line is that account's holding of the instrument. Where the
+  account holds none of it at the day, the line is the account's sold
+  position, as `income` lists it. A coupon does too. So a dividend paid
+  before a move between two accounts of a portfolio stays with the
+  earlier account, and one paid after it is the later account's.
+- Where no account held the instrument as the line happened, or
+  several did, the holdings of the day place it. A line of an account
+  that held the instrument once and sold it stays with that sold
+  position. A line of an account that never held it belongs to a
+  holding of it in its portfolio. Where no account of the portfolio
+  holds it but one held it once, the line stays with its own sold
+  position. Else it belongs to a holding of it at its source. Where the
+  source holds none, and one account of the source alone held it, the
+  line is that account's sold position.
 - A line meets its holding under any id its source gives the
   instrument. A source may key one security by its CUSIP and by its
   ticker. The config may give one holding two keys (`holding_aliases`,
@@ -760,14 +778,17 @@ the instrument included.
 - That quantity comes from the account's newest snapshot by then. The
   account's trades since that snapshot move it. The day's own trades
   earn none of the payment.
-- A trade booked on a cash account that holds none of its instrument as
-  the trade happens moves another account's holding. That is the one
-  other account of its portfolio that holds it then. A bank books a
-  trade on the cash account beside the custody account. Where several
-  accounts hold it then, or none, the trade moves no holding, since its
-  account is not known. A payment that reads all the portfolio's
-  accounts then reads their snapshots without that trade. A trade of any
-  other kind of account moves only its own holding.
+- A trade moves the holding of the account that held its instrument as
+  it happened, as a line belongs to one. A trade booked on an account
+  that holds none of its instrument then moves another account's
+  holding: the one other account of its portfolio that holds it then,
+  else the one account of its source that holds it under the trade's
+  id. A bank books a trade on the cash
+  account beside the custody account. A buy reads the first snapshot
+  after it too, since its units land there. Where several accounts hold
+  it, or none, the trade moves no holding, since its account is not
+  known. A payment that reads all the portfolio's accounts then reads
+  their snapshots without that trade.
 - A trade stamped at a snapshot's instant counts in it, as the lot
   engine reads a snapshot. Some statements leave out their last day's
   trades: where the snapshot shows the previous one's quantity without
@@ -1051,7 +1072,10 @@ The `yield` block of `wealthdb.cfg` holds what no source states
 - `withholding` maps a situs country to the tax it withholds at source,
   in percent, per tax wrapper. The situs is the holding's legal situs
   (EXPOSURE.md §13), the wrapper its account's. A country's `default`
-  stands for every wrapper it names no rate for. With the block above:
+  stands for every wrapper it names no rate for. An account with no
+  stated wrapper prints as `taxable_personal` but takes the country's
+  `default`, since only a wrapper that a source or the config states
+  selects a row. With the block above:
 
   | holding | account's wrapper | withheld from a dividend of 100 |
   |---|---|---|
@@ -1216,7 +1240,7 @@ The MCP server has a `yield` tool with the same views, an `as_of` day,
 equal the command's, cell for cell. A series' header names its window:
 its first and last period ends.
 
-## Benchmarks
+## 12. Benchmarks
 
 `web refresh` writes each benchmark's yield and duration to
 `benchmark_yield`, at the instants the dashboard reads. Each is the
@@ -1237,7 +1261,7 @@ A fund's lines are read for today alone, and a fund's page states
 its figures from the day they were first fetched. So the over-time lines
 of a benchmark start short and grow as refdata runs.
 
-## 12. What yield is not
+## 13. What yield is not
 
 - Not a dividend model. A stock has no yield to maturity and no
   duration.

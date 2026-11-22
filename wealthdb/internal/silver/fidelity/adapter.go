@@ -62,30 +62,78 @@ package fidelity
 import (
 	"context"
 	"database/sql"
+	"path/filepath"
 
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/returns"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver"
 )
 
 const kindName = "fidelity"
 
+// init registers the kind (silver.Source).
+//
+// Returns: flow-complete bank/pension (every capital kind counts),
+// forward knobs defaulted (no-op). The statements
+// and the API state a corporate action's cash signed, and the adapter
+// passes it through (canonical.CashSignedKinds); the svb families load
+// as this kind.
 func init() {
-	silver.Register(&Adapter{})
+	rp := returns.DefaultReturnsPolicy(returns.BankFlowPolicy())
+	silver.Register(silver.Source{
+		Kind:       kindName,
+		Open:       (&Adapter{}).Open,
+		Returns:    &rp,
+		Lots:       lotPolicy(),
+		CashSigned: []canonical.TxKind{canonical.TxKindCorporateAction},
+	})
 }
 
 type Adapter struct{}
 
-func (*Adapter) Kind() string { return kindName }
-
-func (*Adapter) Open(_ context.Context, spec silver.OpenSpec) (silver.Connection, error) {
+func (*Adapter) Open(ctx context.Context, spec silver.OpenSpec) (silver.Connection, error) {
 	db, err := silver.OpenReadOnlySQLite(spec.Path, "fidelity silver")
 	if err != nil {
 		return nil, err
 	}
-	return &Connection{db: db}, nil
+	c := &Connection{db: db}
+	note, err := silver.ProbeOptional(ctx, c.db, filepath.Base(spec.Path), c.schema.optional()...)
+	if err != nil {
+		c.db.Close()
+		return nil, err
+	}
+	c.Note(note)
+	return c, nil
 }
 
 type Connection struct {
-	db *sql.DB
+	db     *sql.DB
+	schema schema
+	silver.Advice
 }
 
 func (c *Connection) Close() error { return silver.CloseDB(&c.db) }
+
+// schema is which optional parts of the silver schema a file holds,
+// probed once at open.
+type schema struct {
+	historical      bool // the statement corpus (silver migration 0004)
+	historicalCost  bool // a statement's cost basis (silver migration 0009)
+	managementStyle bool // accounts.management_style
+	openLots        bool // the open_lots table
+	openLotCUSIP    bool // open_lots.cusip
+	closedLotNames  bool // closed_lots.security_name, with disposed_date and the closed_positions kind (silver migration 0012)
+	stated          bool // the stated_periods table
+}
+
+func (s *schema) optional() []silver.Optional {
+	return []silver.Optional{
+		{Table: "historical_position_snapshots", Version: 4, Has: &s.historical},
+		{Table: "historical_position_snapshots", Columns: []string{"cost_basis"}, Version: 9, Has: &s.historicalCost},
+		{Table: "accounts", Columns: []string{"management_style"}, Version: 3, Has: &s.managementStyle},
+		{Table: "open_lots", Version: 11, Has: &s.openLots},
+		{Table: "open_lots", Columns: []string{"cusip"}, Version: 11, Has: &s.openLotCUSIP},
+		{Table: "closed_lots", Columns: []string{"security_name"}, Version: 12, Has: &s.closedLotNames},
+		{Table: statedPeriodsTable, Version: 15, Has: &s.stated},
+	}
+}

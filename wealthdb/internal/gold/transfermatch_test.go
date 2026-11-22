@@ -4,8 +4,6 @@ import (
 	"maps"
 	"reflect"
 	"testing"
-
-	"github.com/smartpointer-com/wealthdb/wealthdb/internal/returns"
 )
 
 // leg is a shorthand for a same-currency matcher input.
@@ -13,46 +11,7 @@ func leg(group, owner, id string, day int64, amt float64) TransferLeg {
 	return TransferLeg{Group: group, Owner: owner, ID: id, Day: day, Ccy: "USD", Amt: amt}
 }
 
-// TestMatchCrossTransfersIndexesTransferLike pins the returns wrapper's SECOND
-// side effect: linking an account must also index its transferLike slice, or
-// crossMatchedDrops silently reads every linked leg as a nonTransfer one and
-// applies the wrong subsumption rule. Accounts without links stay unindexed.
-func TestMatchCrossTransfersIndexesTransferLike(t *testing.T) {
-	t.Parallel()
-	byKey := map[string]*accountData{
-		acctKey("s1", "A"): {src: "s1", acct: "A", transferLike: []returns.Flow{
-			{Day: 100, Amount: -5000, ID: "t1"},
-			{Day: 100, Amount: -25, ID: "fee"},
-		}},
-		acctKey("s2", "B"): {src: "s2", acct: "B", nonTransfer: []returns.Flow{
-			{Day: 102, Amount: 5000, ID: "t2"},
-		}},
-		acctKey("s2", "C"): {src: "s2", acct: "C", transferLike: []returns.Flow{
-			{Day: 100, Amount: 42, ID: "unlinked"},
-		}},
-	}
-	matchCrossTransfers([]crossCandidate{
-		{src: "s1", acct: "A", txID: "t1", day: 100, ccy: "USD", amt: -5000},
-		{src: "s2", acct: "B", txID: "t2", day: 102, ccy: "USD", amt: 5000},
-	}, &TransferMatching{WindowDays: 5, TolerancePct: 0.5}, byKey)
-
-	want := map[string]bool{"t1": true, "fee": true}
-	if got := byKey[acctKey("s1", "A")].transferLikeIDs; !reflect.DeepEqual(got, want) {
-		t.Errorf("sender index = %v, want the whole transferLike slice %v", got, want)
-	}
-	// The receiver's leg is a nonTransfer one, but the account is linked, so it
-	// still gets an (empty, non-nil) index — crossMatchedDrops distinguishes
-	// "not transfer-like" from "never indexed".
-	if got := byKey[acctKey("s2", "B")].transferLikeIDs; got == nil || len(got) != 0 {
-		t.Errorf("receiver index = %v, want empty and non-nil", got)
-	}
-	if got := byKey[acctKey("s2", "C")].transferLikeIDs; got != nil {
-		t.Errorf("unlinked account index = %v, want nil (the map stays sparse)", got)
-	}
-}
-
-// TestMatchTransferLegsWithinGroup pins the knob the returns path never sets:
-// two accounts of the SAME group pair; CrossGroupOnly forbids it.
+// TestMatchTransferLegsWithinGroup: two accounts of the SAME group pair.
 func TestMatchTransferLegsWithinGroup(t *testing.T) {
 	t.Parallel()
 	legs := []TransferLeg{
@@ -63,16 +22,13 @@ func TestMatchTransferLegsWithinGroup(t *testing.T) {
 	if len(got) != 1 || got[0].Debit.ID != "out" || got[0].Credit.ID != "in" {
 		t.Errorf("within-group pair = %+v, want out→in", got)
 	}
-	if got := MatchTransferLegs(legs, TransferMatchOpts{WindowDays: 5, TolerancePct: 0.5, CrossGroupOnly: true}); len(got) != 0 {
-		t.Errorf("CrossGroupOnly must reject the same-group pair, got %+v", got)
-	}
 }
 
-// TestSameAccountLegsNeverPair is the returns caller's matcher, without the
-// reversal phase: an out and a back of one size on one account, days apart
-// and inside the window, stay two legs. A credit on the debit's own account
-// is no candidate in any cross-account phase, so it neither wins a tie nor
-// beats a far partner by being exact.
+// TestSameAccountLegsNeverPair is the matcher without the reversal phase:
+// an out and a back of one size on one account, days apart and inside the
+// window, stay two legs. A credit on the debit's own account is no
+// candidate in any cross-account phase, so it neither wins a tie nor beats
+// a far partner by being exact.
 func TestSameAccountLegsNeverPair(t *testing.T) {
 	t.Parallel()
 	opts := TransferMatchOpts{WindowDays: 5, TolerancePct: 0.5}
@@ -445,9 +401,7 @@ func TestSharedReferenceRefusesWhatItCannotResolve(t *testing.T) {
 
 // A reference is an identity only inside one source's id space. Two banks can
 // mint the same string, so a pair drawn across the seam would be a
-// coincidence wearing the clothes of a fact — and under CrossGroupOnly, which
-// forbids same-group pairing outright, the phase has nothing left to do at
-// all.
+// coincidence wearing the clothes of a fact.
 func TestSharedReferenceNeverCrossesSources(t *testing.T) {
 	t.Parallel()
 	legs := []TransferLeg{
@@ -456,14 +410,6 @@ func TestSharedReferenceNeverCrossesSources(t *testing.T) {
 	}
 	if got := MatchTransferLegs(append([]TransferLeg(nil), legs...), TransferMatchOpts{}); len(got) != 0 {
 		t.Errorf("a bare reference must not pair across sources, got %+v", got)
-	}
-	sameSource := []TransferLeg{
-		refLeg("checking", "out", 100, "USD", -500, "TXN-8"),
-		refLeg("savings", "in", 100, "CHF", 440, "TXN-8"),
-	}
-	if got := MatchTransferLegs(append([]TransferLeg(nil), sameSource...),
-		TransferMatchOpts{CrossGroupOnly: true}); len(got) != 0 {
-		t.Errorf("CrossGroupOnly must leave the reference phase with nothing to pair, got %+v", got)
 	}
 }
 
@@ -727,6 +673,78 @@ func TestNamedPairsStrandNoLegANearerChoiceWouldStrand(t *testing.T) {
 	}
 }
 
+// A named debit takes a free deposit dated on or after its own day over an
+// earlier one, though the earlier one is as near or nearer, and the deposit
+// it leaves goes back to the pool for a later phase.
+func TestANamedPairPrefersADepositOnOrAfterItsWithdrawal(t *testing.T) {
+	t.Parallel()
+	opts := TransferMatchOpts{WindowDays: 5, TolerancePct: 0.5}
+	for _, tc := range []struct {
+		name         string
+		early, later int64
+	}{
+		{"a tie in days", 99, 101},
+		{"the earlier nearer", 99, 102},
+		{"the later on the same day", 98, 100},
+	} {
+		got := pairIDs(MatchTransferLegs([]TransferLeg{
+			namedLeg("bank", "checking", "named", 100, -1000, "exchange"),
+			leg("exchange", "wallet", "early", tc.early, 1000),
+			leg("exchange", "wallet", "later", tc.later, 1000),
+			leg("bank", "savings", "silent", tc.early, -1000),
+		}, opts))
+		want := map[string]string{"named": "later", "silent": "early"}
+		if !maps.Equal(got, want) {
+			t.Errorf("%s: pairs = %v, want %v", tc.name, got, want)
+		}
+	}
+}
+
+// The preference moves a debit only to a deposit no other debit holds, and
+// never to one further off in amount: a pair without such an alternative
+// stays as it was.
+func TestTheDateOrderPreferenceMovesNoOtherPair(t *testing.T) {
+	t.Parallel()
+	opts := TransferMatchOpts{WindowDays: 5, TolerancePct: 0.5}
+	// The later deposit is the other debit's own.
+	held := pairIDs(MatchTransferLegs([]TransferLeg{
+		namedLeg("bank", "checking", "first", 100, -1000, "exchange"),
+		namedLeg("bank", "checking", "second", 101, -1000, "exchange"),
+		leg("exchange", "wallet", "early", 98, 1000),
+		leg("exchange", "wallet", "later", 102, 1000),
+	}, opts))
+	if want := map[string]string{"first": "early", "second": "later"}; !maps.Equal(held, want) {
+		t.Errorf("held: pairs = %v, want %v", held, want)
+	}
+	// The later deposit is short by a fee, the earlier one exact.
+	gap := pairIDs(MatchTransferLegs([]TransferLeg{
+		namedLeg("bank", "checking", "named", 100, -1000, "exchange"),
+		leg("exchange", "wallet", "exact", 99, 1000),
+		leg("exchange", "wallet", "short", 101, 998),
+	}, opts))
+	if want := map[string]string{"named": "exact"}; !maps.Equal(gap, want) {
+		t.Errorf("gap: pairs = %v, want %v", gap, want)
+	}
+}
+
+// A debit moves only to its best candidate dated on or after it, never past
+// a held one to a farther one, and a move frees a deposit an earlier debit,
+// already passed over, then takes: no two pairs cross.
+func TestTheDateOrderPreferenceRepeatsUntilNoDebitMoves(t *testing.T) {
+	t.Parallel()
+	opts := TransferMatchOpts{WindowDays: 5, TolerancePct: 0.5}
+	got := pairIDs(MatchTransferLegs([]TransferLeg{
+		namedLeg("bank", "checking", "first", 100, -1000, "exchange"),
+		namedLeg("bank", "checking", "second", 103, -1000, "exchange"),
+		leg("exchange", "wallet", "a", 99, 1000),
+		leg("exchange", "wallet", "b", 101, 1000),
+		leg("exchange", "wallet", "c", 105, 1000),
+	}, opts))
+	if want := map[string]string{"first": "b", "second": "c"}; !maps.Equal(got, want) {
+		t.Errorf("pairs = %v, want %v", got, want)
+	}
+}
+
 // Where both narratives name each other, that pair is claimed before a credit
 // that names only a group can be taken by a silent debit of that group.
 func TestMutuallyNamedPairsOutrankOneSidedOnes(t *testing.T) {
@@ -760,5 +778,228 @@ func TestATieGoesToTheDebitsOwnSource(t *testing.T) {
 	}, opts)
 	if len(got) != 1 || got[0].Credit.ID != "journal-in" {
 		t.Errorf("pairs = %+v, want journal-out→journal-in", got)
+	}
+}
+
+// A leg whose amount is zero moved nothing: it pairs in no phase, neither
+// as the credit a small debit would take inside the cent's floor nor as
+// half of a forced pair.
+func TestAZeroAmountLegPairsInNoPhase(t *testing.T) {
+	t.Parallel()
+	opts := TransferMatchOpts{WindowDays: 5, TolerancePct: 0.5, SameAccountReversals: true}
+	if got := MatchTransferLegs([]TransferLeg{
+		leg("bank", "checking", "small", 100, -0.005),
+		leg("broker", "cash", "zero", 100, 0),
+		namedLeg("bank", "savings", "named", 100, -0.004, "broker"),
+		signedLeg("bank", "checking", "back", 101, 0, "", true),
+	}, opts); len(got) != 0 {
+		t.Errorf("pairs with a zero-amount leg: %+v", got)
+	}
+	forced, err := newTransferOverrides(nil, nil, []ForcedPair{{
+		Debit: LegRef{"bank", "checking", "out"}, Credit: LegRef{"broker", "cash", "zero"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts.Overrides = forced
+	if got := MatchTransferLegs([]TransferLeg{
+		leg("bank", "checking", "out", 100, -500),
+		leg("broker", "cash", "zero", 100, 0),
+	}, opts); len(got) != 0 {
+		t.Errorf("a forced pair with a zero-amount leg: %+v", got)
+	}
+}
+
+// coinLeg is a matcher input that moves a coin, its amount a quantity of
+// it, at usd dollars a coin (0 for no price that day).
+func coinLeg(owner, id string, day int64, amt, usd float64) TransferLeg {
+	return TransferLeg{Group: "wallets", Owner: owner, ID: id, Day: day, Ccy: "BTC", Amt: amt, Coin: true, USD: usd}
+}
+
+// TestCoinLegsPairByTheCoinRule pins the coin rule in the banded phases:
+// within two days either way, at most 0.1% more received, a fee up to the
+// larger of 0.1% and 100 USD's worth and under a quarter, 1% where the coin
+// has no price. A cent and the 40-unit cap are no bound in a coin's unit.
+func TestCoinLegsPairByTheCoinRule(t *testing.T) {
+	t.Parallel()
+	opts := TransferMatchOpts{WindowDays: 5, TolerancePct: 0.5, ToleranceMaxAbs: DefaultTransferFeeCap}
+	for _, c := range []struct {
+		name    string
+		out, in TransferLeg
+		pairs   bool
+	}{
+		{"a small transfer short by a fee worth under 100 USD",
+			coinLeg("a", "out", 100, -0.002, 30000), coinLeg("b", "in", 100, 0.0017, 30000), true},
+		{"a fee worth over 100 USD",
+			coinLeg("a", "out", 100, -0.1, 30000), coinLeg("b", "in", 100, 0.095, 30000), false},
+		{"a token worth fractions of a cent short by a tenth",
+			coinLeg("a", "out", 100, -1e6, 0.0001), coinLeg("b", "in", 100, 9e5, 0.0001), true},
+		{"a token short by three tenths, worth under 100 USD",
+			coinLeg("a", "out", 100, -1e6, 0.0001), coinLeg("b", "in", 100, 7e5, 0.0001), false},
+		{"a 30% loss",
+			coinLeg("a", "out", 100, -0.01, 30000), coinLeg("b", "in", 100, 0.007, 30000), false},
+		{"a surplus within 0.1%",
+			coinLeg("a", "out", 100, -1, 30000), coinLeg("b", "in", 100, 1.0005, 30000), true},
+		{"a surplus over 0.1%",
+			coinLeg("a", "out", 100, -1, 30000), coinLeg("b", "in", 100, 1.002, 30000), false},
+		{"three days apart",
+			coinLeg("a", "out", 100, -1, 30000), coinLeg("b", "in", 103, 1, 30000), false},
+		{"two days apart, the receipt first",
+			coinLeg("a", "out", 102, -1, 30000), coinLeg("b", "in", 100, 1, 30000), true},
+		{"no price: a fee of half a percent",
+			coinLeg("a", "out", 100, -1, 0), coinLeg("b", "in", 100, 0.995, 0), true},
+		{"no price: a fee of 2%",
+			coinLeg("a", "out", 100, -1, 0), coinLeg("b", "in", 100, 0.98, 0), false},
+	} {
+		got := MatchTransferLegs([]TransferLeg{c.out, c.in}, opts)
+		if (len(got) == 1) != c.pairs {
+			t.Errorf("%s: pairs %v, want a pair %t", c.name, got, c.pairs)
+		}
+	}
+	// A currency that is money pairs as before: the window and the cent.
+	cash := []TransferLeg{leg("bank", "a", "out", 100, -0.01), leg("bank", "b", "in", 103, 0.005)}
+	if got := MatchTransferLegs(cash, opts); len(got) != 1 {
+		t.Errorf("cash legs three days apart within a cent = %v, want one pair", got)
+	}
+	// The coin's days hold under a narrower window too.
+	narrow := opts
+	narrow.WindowDays = 0
+	if got := MatchTransferLegs([]TransferLeg{coinLeg("a", "out", 100, -1, 30000), coinLeg("b", "in", 102, 1, 30000)}, narrow); len(got) != 1 {
+		t.Errorf("coin legs two days apart at a window of 0 = %v, want one pair", got)
+	}
+}
+
+// TestCoinDustNeverPairsCrosswise: a small leg sorts first and the larger
+// leg's partner is within a cent of it, but a receipt of twice what it
+// sent is no transfer of it. The larger leg takes its own partner, and the
+// small one stays unpaired. Of two receipts of nearby sizes, each sender
+// takes the one of the smallest shortfall.
+func TestCoinDustNeverPairsCrosswise(t *testing.T) {
+	t.Parallel()
+	opts := TransferMatchOpts{WindowDays: 5, TolerancePct: 0.5, ToleranceMaxAbs: DefaultTransferFeeCap}
+	got := MatchTransferLegs([]TransferLeg{
+		coinLeg("a1", "small", 100, -0.01, 30000),
+		coinLeg("a2", "large", 100, -0.02, 30000),
+		coinLeg("b", "in", 101, 0.0199, 30000),
+	}, opts)
+	if want := map[string]string{"large": "in"}; !reflect.DeepEqual(pairIDs(got), want) {
+		t.Errorf("pairs = %v, want %v", pairIDs(got), want)
+	}
+	got = MatchTransferLegs([]TransferLeg{
+		coinLeg("a1", "first", 100, -0.0110, 30000),
+		coinLeg("a2", "second", 100, -0.0100, 30000),
+		coinLeg("b", "in-second", 101, 0.0099, 30000),
+		coinLeg("c", "in-first", 101, 0.0108, 30000),
+	}, opts)
+	if want := map[string]string{"first": "in-first", "second": "in-second"}; !reflect.DeepEqual(pairIDs(got), want) {
+		t.Errorf("pairs = %v, want %v", pairIDs(got), want)
+	}
+}
+
+// TestALedgerLineBindsCoinLegsAtAnyGap: a coin staked and returned weeks
+// later with its reward pairs only as the ledger states it, and the
+// ledger's selector names a coin's leg by the coin rule, not by a cent: a
+// cent of a coin would also name the smaller leg beside it.
+func TestALedgerLineBindsCoinLegsAtAnyGap(t *testing.T) {
+	t.Parallel()
+	legs := []TransferLeg{
+		coinLeg("wallet", "stake", 100, -1.2, 30000),
+		coinLeg("wallet", "small", 100, -1.195, 30000),
+		coinLeg("staking", "returned", 121, 1.25, 30000),
+	}
+	opts := TransferMatchOpts{WindowDays: 5}
+	if got := MatchTransferLegs(append([]TransferLeg(nil), legs...), opts); len(got) != 0 {
+		t.Fatalf("fixture is wrong: three weeks and a surplus pair nothing unaided, got %v", got)
+	}
+	sel := func(owner string, day int64, amount float64) *TransferOverrideSelector {
+		return &TransferOverrideSelector{Source: "wallets", Account: owner, Day: day * SecondsPerDay, Amount: amount, Currency: "BTC"}
+	}
+	o, unresolved, err := ResolveTransferOverrides([]TransferOverrideRule{
+		{Verb: VerbMatch, A: *sel("wallet", 100, -1.2), B: sel("staking", 121, 1.25)},
+	}, legs)
+	if err != nil || len(unresolved) != 0 {
+		t.Fatalf("resolve: %v, unresolved %v", err, unresolved)
+	}
+	opts.Overrides = o
+	got := MatchTransferLegs(legs, opts)
+	if want := map[string]string{"stake": "returned"}; !reflect.DeepEqual(pairIDs(got), want) || got[0].By != MatchedByOverride {
+		t.Errorf("pairs = %v, want %v by the ledger", got, want)
+	}
+	// The selector names the leg a person reads off, rounded: the coin
+	// rule's share, not the coin's sixth decimal.
+	idx := indexLegs(legs)
+	if got := idx.legsAt(*sel("wallet", 100, -1.2001)); len(got) != 1 || got[0].ID != "stake" {
+		t.Errorf("a rounded amount names %v, want the stake alone", got)
+	}
+	if got := idx.legsAt(*sel("wallet", 100, 1.2)); len(got) != 0 {
+		t.Errorf("an amount of the other sign names %v, want none", got)
+	}
+}
+
+// TestALedgerLineNamesTheNearestCoinLeg: two withdrawals of one coin on one
+// day lie inside each other's coin-rule bound, so a selector answers to
+// both. It names the nearer alone: an exact amount binds its own leg, never
+// its neighbour, for a match and for a one-legged unmatch alike.
+func TestALedgerLineNamesTheNearestCoinLeg(t *testing.T) {
+	t.Parallel()
+	legs := []TransferLeg{
+		coinLeg("wallet", "near", 100, -1.002, 30000),
+		coinLeg("wallet", "exact", 100, -1.0, 30000),
+		coinLeg("vault", "in", 101, 0.999, 30000),
+	}
+	sel := func(owner string, day int64, amount float64) *TransferOverrideSelector {
+		return &TransferOverrideSelector{Source: "wallets", Account: owner, Day: day * SecondsPerDay, Amount: amount, Currency: "BTC"}
+	}
+	if !legs[0].answers(-1.0) {
+		t.Fatal("fixture is wrong: the neighbour must answer to the exact amount too")
+	}
+	idx := indexLegs(legs)
+	if got := idx.legsAt(*sel("wallet", 100, -1.0)); len(got) != 1 || got[0].ID != "exact" {
+		t.Errorf("an exact amount names %v, want its own leg alone", got)
+	}
+	o, unresolved, err := ResolveTransferOverrides([]TransferOverrideRule{
+		{Verb: VerbMatch, A: *sel("wallet", 100, -1.0), B: sel("vault", 101, 0.999)},
+	}, legs)
+	if err != nil || len(unresolved) != 0 {
+		t.Fatalf("resolve: %v, unresolved %v", err, unresolved)
+	}
+	got := MatchTransferLegs(append([]TransferLeg(nil), legs...), TransferMatchOpts{WindowDays: 5, Overrides: o})
+	if want := map[string]string{"exact": "in"}; !reflect.DeepEqual(pairIDs(got), want) || got[0].By != MatchedByOverride {
+		t.Errorf("pairs = %v, want %v by the ledger", got, want)
+	}
+	o, _, err = ResolveTransferOverrides([]TransferOverrideRule{
+		{Verb: VerbUnmatch, A: *sel("wallet", 100, -1.0)},
+	}, legs)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	got = MatchTransferLegs(append([]TransferLeg(nil), legs...), TransferMatchOpts{WindowDays: 5, Overrides: o})
+	if want := map[string]string{"near": "in"}; !reflect.DeepEqual(pairIDs(got), want) {
+		t.Errorf("pairs = %v, want %v: the unmatch isolates the exact leg alone", got, want)
+	}
+}
+
+// TestACoinReversalPairsByTheCoinRule: the reversal phase pairs a coin sent
+// and returned to its own wallet by the coin rule, as every banded phase
+// does: within two days whatever the window, short by a fee it allows.
+func TestACoinReversalPairsByTheCoinRule(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		window int
+		back   TransferLeg
+		paired bool
+	}{
+		{"short by a fee, two days on, past the window", 1, coinLeg("wallet", "back", 102, 0.999, 30000), true},
+		{"three days on, inside the window", 5, coinLeg("wallet", "back", 103, 1.0, 30000), false},
+		{"short by more than the fee bound", 5, coinLeg("wallet", "back", 101, 0.99, 30000), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			legs := []TransferLeg{coinLeg("wallet", "out", 100, -1.0, 30000), tc.back}
+			got := MatchTransferLegs(legs, TransferMatchOpts{WindowDays: tc.window, TolerancePct: 0.5, SameAccountReversals: true})
+			if paired := len(got) == 1 && got[0].By == MatchedByReversal; paired != tc.paired || len(got) > 1 {
+				t.Errorf("pairs = %v, want a reversal %t", got, tc.paired)
+			}
+		})
 	}
 }

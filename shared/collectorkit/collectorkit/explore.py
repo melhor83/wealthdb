@@ -26,8 +26,12 @@ to catch a secret the site issues at runtime or one typed by hand.
 What stays in each collector's own ``explore.py`` is what is particular to
 its source: the entry URL, the host gate, the credential env names and the
 sign-in form's selectors. :func:`click_recorder_js` builds the in-page
-detector from them, :func:`prefill_login` fills the form (a collector's
-``login.py`` often reuses it), and :class:`Session` composes the rest.
+detector from them, :func:`prefill_login` fills the form, and
+:class:`Session` composes the rest. A Camoufox harness declares them as
+a :class:`Site` and hands it to :func:`main`, which runs the session.
+The fill and its credentials are :mod:`collectorkit.loginform` (a
+collector's ``login.py`` often reuses them), and the profile prep is
+:func:`collectorkit.launch.prepare_profile`; both are re-exported here.
 
 Playwright and Camoufox are imported where they are used, so the library
 stays importable without them.
@@ -37,11 +41,10 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import dataclasses
 import json
 import logging
-import os
 import re
-import shutil
 import signal
 import threading
 import time
@@ -49,7 +52,16 @@ from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import urlparse
 
-from collectorkit import bronze, cli, debugcap, envfile, launch
+from collectorkit import bronze, cli, debugcap, launch
+# The form fill and the profile prep, re-exported: harnesses and logins
+# read them from here.
+from collectorkit.launch import prepare_profile
+from collectorkit.loginform import (  # noqa: F401
+    DEFAULT_OTP_SELECTOR,
+    DEFAULT_PASSWORD_SELECTOR,
+    load_credentials,
+    prefill_login,
+)
 from collectorkit.session import iso_now
 
 DEFAULT_DEBUG_ROOT = Path("/debug")
@@ -180,56 +192,7 @@ def add_args(p: argparse.ArgumentParser, *, url: str,
     cli.add_common_args(p)
 
 
-def prepare_profile(profile_dir: Path, *, fresh: bool, note: str,
-                    log: logging.Logger) -> None:
-    """Wipe the profile when `fresh`, then ready it for Camoufox. `note`
-    says what the wipe costs the next sign-in."""
-    if fresh and profile_dir.exists():
-        log.warning("--fresh: wiping profile dir %s (%s)", profile_dir, note)
-        shutil.rmtree(profile_dir)
-    launch.prepare_profile_dir(profile_dir)
-    log.info("profile dir: %s", profile_dir)
-
-
-def load_credentials(env_file: Path | None, user_envs: tuple[str, ...],
-                     pass_envs: tuple[str, ...], *, no_prefill: bool,
-                     host: str, log: logging.Logger) -> tuple[str, str, bool]:
-    """Source the env file and read the login credentials.
-
-    Each is the first non-empty of its env names; a value already in the
-    environment wins over the file's. Returns (username, password,
-    prefill), where `prefill` says whether both are there to fill and
-    ``--no-prefill`` did not refuse them.
-    """
-    if env_file is not None and envfile.source_env_file(env_file):
-        log.info("env file:    %s (sourced)", env_file)
-    username = _first_set(user_envs)
-    password = _first_set(pass_envs)
-    if no_prefill:
-        log.info("--no-prefill: login form pre-fill disabled")
-    elif not (username and password):
-        log.warning("%s / %s not set; login-form pre-fill disabled. Drop "
-                    "credentials into %s to enable.", "/".join(user_envs),
-                    "/".join(pass_envs), env_file)
-    else:
-        log.info("pre-fill ready (origin-gated to %s)", host)
-    return username, password, bool(username and password) and not no_prefill
-
-
-def _first_set(names: tuple[str, ...]) -> str:
-    return next((os.environ[k] for k in names if os.environ.get(k)), "")
-
-
-# ---- the in-page detector and the login-form fill --------------------------
-
-# The fields a sign-in form is recognised by when a source names none of its
-# own. A source with a known control passes its own selector first.
-DEFAULT_PASSWORD_SELECTOR = "input[type='password']"
-DEFAULT_OTP_SELECTOR = (
-    "input[autocomplete='one-time-code'], input[inputmode='numeric'], "
-    "input[name*='otp' i], input[name*='code' i], input[id*='otp' i], "
-    "input[id*='code' i], input[maxlength='6'], input[maxlength='8']"
-)
+# ---- the in-page detector --------------------------------------------------
 
 _RECORDER_JS = r"""
 (() => {
@@ -380,90 +343,6 @@ def click_recorder_js(event_prefix: str, *, host_re,
     for marker, value in values.items():
         js = js.replace(marker, json.dumps(value))
     return js
-
-
-def prefill_login(page, username: str, password: str, filled: set, *,
-                  host_re: re.Pattern, user_selector: str,
-                  password_selector: str = DEFAULT_PASSWORD_SELECTOR,
-                  user_alt_selector: str | None = None,
-                  overwrite: bool = False, log: logging.Logger) -> bool:
-    """Fill the username and password fields of a sign-in form, each AT
-    MOST ONCE per page (tracked in `filled`, keyed by (id(page), kind)).
-    Never submits. Returns True iff a field was newly filled and verified.
-
-    Frame-aware: the form is looked for in every frame whose host matches
-    `host_re`, so the credentials never touch a third-party frame. The
-    password is filled only beside a username control in the SAME frame,
-    so it can never land in a lone code-entry field. That control is the
-    `user_selector` input, or the `user_alt_selector` control (a
-    remembered-username drop-down), which is left alone. The first frame
-    holding the form is the only one filled.
-
-    Each fill is verified by read-back, with one clear-and-retry, so a
-    stray autofill can never concatenate onto a correct value. A field is
-    marked done whatever the outcome, so a later DOM mutation never
-    re-fills over a hand-typed value. A field that already has content is
-    marked done untouched, unless `overwrite`: a source that pre-fills a
-    masked username of its own needs the real one written over it.
-    """
-    did = False
-    for frame in page.frames:
-        try:
-            host = urlparse(frame.url).hostname or ""
-        except Exception:  # noqa: BLE001
-            continue
-        if not host_re.search(host):
-            continue
-        try:
-            # count() / is_visible() are instant (no auto-wait), so a frame
-            # without the form costs nothing per poll.
-            pwd_field = frame.locator(password_selector).first
-            if pwd_field.count() == 0 or not pwd_field.is_visible():
-                continue
-            user_field = frame.locator(user_selector).first
-            has_user = user_field.count() > 0 and user_field.is_visible()
-            has_alt = False
-            if user_alt_selector:
-                alt = frame.locator(user_alt_selector).first
-                has_alt = alt.count() > 0 and alt.is_visible()
-            if not (has_user or has_alt):
-                continue
-        except Exception as exc:  # noqa: BLE001
-            log.debug("prefill frame probe failed: %s",
-                      debugcap.safe_error(exc))
-            continue
-        targets = [("pwd", pwd_field, password)]
-        if has_user:
-            targets.insert(0, ("user", user_field, username))
-        for kind, field, value in targets:
-            key = (id(page), kind)
-            if key in filled:
-                continue
-            try:
-                if field.input_value(timeout=1000) and not overwrite:
-                    filled.add(key)       # hand-typed: leave it alone
-                    continue
-                field.fill(value, timeout=2000)
-                got = field.input_value(timeout=1500)
-                if got != value:
-                    field.fill("", timeout=1500)
-                    field.fill(value, timeout=2000)
-                    got = field.input_value(timeout=1500)
-                filled.add(key)
-                if got == value:
-                    did = True
-                else:
-                    log.warning(
-                        "pre-fill of %s field did not stick (got len %d, "
-                        "want %d) — type it by hand",
-                        kind, len(got or ""), len(value))
-            except Exception as exc:  # noqa: BLE001
-                # safe_error, never %r: a failed fill() renders the typed
-                # value verbatim inside Playwright's call log.
-                log.debug("prefill %s field failed: %s", kind,
-                          debugcap.safe_error(exc))
-        break
-    return did
 
 
 class Session:
@@ -916,3 +795,106 @@ class Session:
                      "`playwright show-trace chunk-NNN.zip`). UNREDACTED: a "
                      "trace carries the typed credential — never commit it",
                      self.trace_chunks_dir, self.chunks)
+
+
+# ---- one harness run -------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class Site:
+    """What a Camoufox explore harness knows of its source. The rest of a
+    run is the same for every such harness, and :func:`main` composes it.
+
+    - `name` is the collector; the run logs as ``<name>.explore``.
+    - `url`, `profile_dir` and `env_file` are the flags' defaults.
+    - `user_envs` and `pass_envs` name the credentials; the first set
+      name of each wins.
+    - `host` is the origin the fill is gated to, as the log names it.
+      `host_re` is the gate itself, and `user_selector`,
+      `password_selector` and `user_alt_selector` are the controls the
+      fill writes to (see :func:`prefill_login`).
+    - `init_js` is the in-page detector (:func:`click_recorder_js`). It
+      reports through console lines tagged `event_prefix`.
+    - `walk` tells the person at the VNC session what to do, and
+      `fresh_note` what ``--fresh`` costs the next sign-in.
+    - `observe_re` gates the DOM snapshots to the site's frames, and
+      `label` names those frames in the log.
+    - `dom_snapshots` offers ``--dom-interval``. `poll_prefill` offers
+      the fill on the wait loop's poll, not only when a form mounts.
+    """
+    name: str
+    url: str
+    profile_dir: Path
+    env_file: Path
+    user_envs: tuple[str, ...]
+    pass_envs: tuple[str, ...]
+    host: str
+    host_re: re.Pattern
+    user_selector: str
+    event_prefix: str
+    init_js: str
+    walk: str
+    fresh_note: str
+    password_selector: str = DEFAULT_PASSWORD_SELECTOR
+    user_alt_selector: str | None = None
+    observe_re: re.Pattern | None = None
+    label: str = "site"
+    dom_snapshots: bool = True
+    poll_prefill: bool = True
+
+
+def parser(site: Site, doc: str) -> argparse.ArgumentParser:
+    """The harness's argument parser: its module docstring `doc` as the
+    description, and the shared flags with the site's defaults."""
+    p = argparse.ArgumentParser(
+        description=doc.strip(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    add_args(p, url=site.url, env_file=site.env_file,
+             profile_dir=site.profile_dir, dom_snapshots=site.dom_snapshots)
+    return p
+
+
+def main(site: Site, argv: list[str], doc: str,
+         prefill: Callable | None = None) -> int:
+    """One explore session of `site`, from the command line `argv`: ready
+    the profile, read the credentials, record until the browser closes,
+    then report where the artefacts are. `doc` is the harness's docstring.
+
+    `prefill(page, username, password, filled)` fills the sign-in form
+    and says whether it filled anything. Without it, :func:`prefill_login`
+    fills the site's own selectors. Nothing is filled when a credential is
+    missing or ``--no-prefill`` is given.
+    """
+    log = logging.getLogger(f"{site.name}.explore")
+    args = parser(site, doc).parse_args(argv)
+    cli.configure_logging(args.verbose)
+    prepare_profile(args.profile_dir, fresh=args.fresh, log=log,
+                    note=site.fresh_note)
+    username, password, ready = load_credentials(
+        args.env_file, site.user_envs, site.pass_envs,
+        no_prefill=args.no_prefill, host=site.host, log=log)
+
+    def site_fill(page, username: str, password: str, filled: set) -> bool:
+        return prefill_login(
+            page, username, password, filled, host_re=site.host_re,
+            user_selector=site.user_selector,
+            password_selector=site.password_selector,
+            user_alt_selector=site.user_alt_selector, log=log)
+
+    fill = prefill or site_fill
+    filled: set = set()
+
+    with contextlib.ExitStack() as stack:
+        session = Session.from_args(
+            stack, args, redact=debugcap.secret_redactor(username, password),
+            log=log, observe=site.observe_re, label=site.label)
+        context = session.open_camoufox(stack, args.profile_dir)
+        session.attach(
+            context, init_js=site.init_js, event_prefix=site.event_prefix,
+            prefill=(lambda page: fill(
+                page, username, password, filled)) if ready else None)
+        session.open(args.url)
+        session.record(site.walk, max_duration=args.max_duration,
+                       poll_prefill=site.poll_prefill)
+    session.report()
+    return 0

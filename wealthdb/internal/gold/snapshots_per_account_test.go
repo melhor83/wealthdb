@@ -419,7 +419,7 @@ func TestAnInstantBetweenRunsKeepsEveryAccount(t *testing.T) {
 		global.MaxSnapshotAt != partial {
 		t.Errorf("global %+v %v", global, err)
 	}
-	positions, err := PositionsAsOf(ctx, db, noon, "USD", lots.MissingIgnore)
+	positions, err := PositionsAsOf(ctx, db, noon, "USD", lots.MissingIgnore, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -484,12 +484,12 @@ func TestYieldUnitsTakeTheHistorysEnding(t *testing.T) {
 		at   int64
 		want float64
 	}{
-		{unitKey{src, "X-0000", "QX"}, day(35), 1},
-		{unitKey{src, "X-0000", "QX"}, day(45), 0},
-		{unitKey{src, "Q-0000", "QQ"}, day(30), 1},
+		{unitKey{Source: src, Account: "X-0000", Instrument: "QX"}, day(35), 1},
+		{unitKey{Source: src, Account: "X-0000", Instrument: "QX"}, day(45), 0},
+		{unitKey{Source: src, Account: "Q-0000", Instrument: "QQ"}, day(30), 1},
 	} {
 		if got := u.heldOn(c.k, c.at); got == nil || *got != c.want {
-			t.Errorf("%s/%s at day %d: %v, want %v", c.k.acct, c.k.iid, c.at/86400, fmtFloatPtr(got), c.want)
+			t.Errorf("%s/%s at day %d: %v, want %v", c.k.Account, c.k.Instrument, c.at/86400, fmtFloatPtr(got), c.want)
 		}
 	}
 }

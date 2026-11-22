@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 
 	_ "modernc.org/sqlite" // SQLite driver registration for all adapters.
 
@@ -45,25 +46,17 @@ func CloseDB(db **sql.DB) error {
 	return err
 }
 
-// HasColumn reports whether `table` has a column named `column`,
-// via PRAGMA table_info. Adapters use it to read newer
-// promoted columns from a silver DB when present without breaking
-// on older silvers that predate the column. SQLite-only.
-func HasColumn(ctx context.Context, db *sql.DB, table, column string) (bool, error) {
-	return HasColumns(ctx, db, table, column)
-}
-
-// HasColumns reports whether `table` has every named column, for a
-// migration that adds several at once. The names are distinct.
-// SQLite-only.
-func HasColumns(ctx context.Context, db *sql.DB, table string, columns ...string) (bool, error) {
-	return hasAll(ctx, db, "HasColumns "+table, `SELECT COUNT(*) FROM pragma_table_info(?) WHERE TRUE`,
+// hasColumns reports whether `table` has every named column, via PRAGMA
+// table_info: the newer columns a silver migration adds, which an older
+// silver lacks (ProbeOptional). The names are distinct. SQLite-only.
+func hasColumns(ctx context.Context, db *sql.DB, table string, columns ...string) (bool, error) {
+	return hasAll(ctx, db, "hasColumns "+table, `SELECT COUNT(*) FROM pragma_table_info(?) WHERE TRUE`,
 		[]any{table}, columns)
 }
 
-// HasTables reports whether a silver DB has every named table.
-// Adapters use it to read the tables a newer silver migration adds
-// without breaking on older silvers that predate them. SQLite-only.
+// HasTables reports whether a silver DB has every named table: the
+// tables a newer silver migration adds, which an older silver lacks
+// (ProbeOptional). SQLite-only.
 func HasTables(ctx context.Context, db *sql.DB, names ...string) (bool, error) {
 	return hasAll(ctx, db, "HasTables", `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'`, nil, names)
 }
@@ -128,20 +121,12 @@ func readPage[T any](ctx context.Context, db *sql.DB, span canonical.Span, budge
 // a holding changes without a row of its own, such as a removal.
 func SnapshotTimes(ctx context.Context, db *sql.DB, w canonical.Window, extra []int64,
 	q string, args ...any) ([]int64, error) {
-	rows, err := db.QueryContext(ctx, q, args...)
-	if err != nil {
-		return nil, fmt.Errorf("snapshot times: %w", err)
-	}
-	defer rows.Close()
-	var out []int64
-	for rows.Next() {
+	out, err := Query(ctx, db, "snapshot times", q, func(rows *sql.Rows) (int64, error) {
 		var t int64
-		if err := rows.Scan(&t); err != nil {
-			return nil, err
-		}
-		out = append(out, t)
-	}
-	if err := rows.Err(); err != nil {
+		err := rows.Scan(&t)
+		return t, err
+	}, args...)
+	if err != nil {
 		return nil, err
 	}
 	for _, t := range extra {
@@ -188,12 +173,13 @@ func Extrema(ctx context.Context, db *sql.DB, what string, queries []string, arg
 }
 
 // ScanRows runs q bound by args and hands each row to fn, in the query's
-// order. The first error fn returns ends the loop and is returned; the
-// result is closed on every return.
-func ScanRows(ctx context.Context, db *sql.DB, q string, fn func(*sql.Rows) error, args ...any) error {
+// order. The first error fn returns ends the loop and is returned as it
+// is; the result is closed on every return. label prefixes the errors of
+// the query and of the rows, "" none.
+func ScanRows(ctx context.Context, db *sql.DB, label, q string, fn func(*sql.Rows) error, args ...any) error {
 	rows, err := db.QueryContext(ctx, q, args...)
 	if err != nil {
-		return err
+		return labelled(label, err)
 	}
 	defer rows.Close()
 	for rows.Next() {
@@ -201,8 +187,220 @@ func ScanRows(ctx context.Context, db *sql.DB, q string, fn func(*sql.Rows) erro
 			return err
 		}
 	}
-	return rows.Err()
+	return labelled(label, rows.Err())
 }
+
+// Query is ScanRows collecting: the record scan reads from each row, in
+// the query's order.
+func Query[T any](ctx context.Context, db *sql.DB, label, q string, scan func(*sql.Rows) (T, error), args ...any) ([]T, error) {
+	var out []T
+	err := ScanRows(ctx, db, label, q, func(rows *sql.Rows) error {
+		r, err := scan(rows)
+		if err != nil {
+			return err
+		}
+		out = append(out, r)
+		return nil
+	}, args...)
+	return out, err
+}
+
+// labelled prefixes err with label, a nil err and an empty label giving
+// err as it is.
+func labelled(label string, err error) error {
+	if err == nil || label == "" {
+		return err
+	}
+	return fmt.Errorf("%s: %w", label, err)
+}
+
+// DecPath is how a nullable money column of silver reaches a decimal. The
+// two paths can differ in the last digits, so each read keeps the one it
+// has.
+type DecPath int
+
+const (
+	// DecText reads the column as text, its value as the query yields it
+	// (a cast to text where the column is REAL), and parses it.
+	DecText DecPath = iota
+	// DecFloat reads the column as a float and converts it
+	// (canonical.NewDecimalFromFloat).
+	DecFloat
+)
+
+// Dec is a scan target for a nullable decimal read by path: NULL leaves
+// *into nil, and so does text that is empty or no number
+// (DecimalPtrOrNil).
+func Dec(into **canonical.Decimal, path DecPath) sql.Scanner {
+	return decScanner{into, path}
+}
+
+type decScanner struct {
+	into **canonical.Decimal
+	path DecPath
+}
+
+func (d decScanner) Scan(src any) error {
+	if d.path == DecFloat {
+		var f sql.NullFloat64
+		if err := f.Scan(src); err != nil {
+			return err
+		}
+		*d.into = DecimalPtrFromNullFloat(f)
+		return nil
+	}
+	var s sql.NullString
+	if err := s.Scan(src); err != nil {
+		return err
+	}
+	*d.into = DecimalPtrOrNil(s)
+	return nil
+}
+
+// Optional is a part of a silver that a newer silver schema adds: a
+// table, or columns of one, present together or not. An adapter lists
+// its optional parts once and probes them at open (ProbeOptional). A
+// silver older than a part is read as far as it goes: an absent column
+// reads as NULL (ColumnOr) and a read of an absent table is skipped.
+type Optional struct {
+	Table string
+	// Columns are the columns of Table; none names the table itself.
+	Columns []string
+	// Version is the silver schema version that adds the part: the
+	// number of the collector migration that creates it. 0 marks a part
+	// the adapter never advises: one a silver of any version may lack,
+	// which no load adds, or one it reads in full without (a payload
+	// fallback).
+	Version int
+	// Has is set to whether the silver holds the part.
+	Has *bool
+}
+
+// name is the part as the advice names it: the table, or its columns.
+func (p Optional) name() string {
+	if len(p.Columns) == 0 {
+		return p.Table
+	}
+	return p.Table + "." + strings.Join(p.Columns, ", "+p.Table+".")
+}
+
+// SchemaNote is what a silver older than its adapter lacks: the parts its
+// schema version predates, which a load of the silver's collector adds.
+type SchemaNote struct {
+	// Silver is the silver file's base name.
+	Silver string
+	// Version is the silver's schema version; Reads the newest version
+	// a part the adapter reads needs.
+	Version, Reads int
+	// Missing are the parts it lacks, by name.
+	Missing []string
+}
+
+// String is the advice the load prints for the note. It names no
+// command: a kind is no collector, and several collectors write some
+// kinds.
+func (n SchemaNote) String() string {
+	parts := strings.Join(n.Missing, ", ")
+	if k := len(n.Missing); k > 1 {
+		parts = strings.Join(n.Missing[:k-1], ", ") + " and " + n.Missing[k-1]
+	}
+	return fmt.Sprintf("%s is at silver schema %d and the adapter reads %d; %s load empty until its collector's load applies the migrations",
+		n.Silver, n.Version, n.Reads, parts)
+}
+
+// schemaVersion is a silver's schema version, the newest of schema_meta;
+// 0 for a silver without the table. SQLite-only.
+func schemaVersion(ctx context.Context, db *sql.DB) (int, error) {
+	has, err := HasTables(ctx, db, "schema_meta")
+	if err != nil || !has {
+		return 0, err
+	}
+	var v sql.NullInt64
+	if err := db.QueryRowContext(ctx, `SELECT MAX(silver_schema_version) FROM schema_meta`).Scan(&v); err != nil {
+		return 0, fmt.Errorf("schema version: %w", err)
+	}
+	return int(v.Int64), nil
+}
+
+// ProbeOptional sets each part's Has to whether the silver holds it, and
+// notes the parts it lacks because its schema version predates them. A
+// silver whose schema_meta states no version gets no note.
+// silver is the file's base name, for the note. A note that names no
+// part is the zero note. SQLite-only.
+func ProbeOptional(ctx context.Context, db *sql.DB, silver string, parts ...Optional) (SchemaNote, error) {
+	note := SchemaNote{Silver: silver}
+	var absent []Optional
+	for _, p := range parts {
+		var err error
+		if len(p.Columns) == 0 {
+			*p.Has, err = HasTables(ctx, db, p.Table)
+		} else {
+			*p.Has, err = hasColumns(ctx, db, p.Table, p.Columns...)
+		}
+		if err != nil {
+			return SchemaNote{}, err
+		}
+		note.Reads = max(note.Reads, p.Version)
+		if !*p.Has && p.Version > 0 {
+			absent = append(absent, p)
+		}
+	}
+	if len(absent) == 0 {
+		return SchemaNote{}, nil
+	}
+	v, err := schemaVersion(ctx, db)
+	if err != nil || v == 0 {
+		// A silver that states no version, which no collector writes,
+		// gets no advice.
+		return SchemaNote{}, err
+	}
+	note.Version = v
+	for _, p := range absent {
+		if p.Version > v {
+			note.Missing = append(note.Missing, p.name())
+		}
+	}
+	if len(note.Missing) == 0 {
+		return SchemaNote{}, nil
+	}
+	return note, nil
+}
+
+// ColumnOr is the select list of exprs where the silver holds them, else
+// as many NULLs: the read of optional columns (Optional).
+func ColumnOr(has bool, exprs ...string) string {
+	if has {
+		return strings.Join(exprs, ", ")
+	}
+	return strings.TrimSuffix(strings.Repeat("NULL, ", len(exprs)), ", ")
+}
+
+// Advice keeps the schema notes of a connection's silvers. A connection
+// embeds it, and so offers SchemaAdvice.
+type Advice struct{ notes []SchemaNote }
+
+// Note keeps n, where it names a part. A second note of the same silver
+// joins the first, so each silver has one.
+func (a *Advice) Note(n SchemaNote) {
+	if len(n.Missing) == 0 {
+		return
+	}
+	for i := range a.notes {
+		if m := &a.notes[i]; m.Silver == n.Silver {
+			m.Reads = max(m.Reads, n.Reads)
+			m.Missing = append(m.Missing, n.Missing...)
+			return
+		}
+	}
+	a.notes = append(a.notes, n)
+}
+
+// SchemaAdvice is the notes kept, one per silver that lacks a part.
+func (a *Advice) SchemaAdvice() []SchemaNote { return a.notes }
+
+// SchemaAdviser is a connection whose silvers can be older than its
+// adapter; the load prints each note (SchemaNote.String).
+type SchemaAdviser interface{ SchemaAdvice() []SchemaNote }
 
 // DecimalPtrOrNil parses a string-encoded decimal from a silver
 // column. Returns nil for NULL / empty input, and nil (not an
@@ -251,16 +449,6 @@ func NullStringPtr(n sql.NullString) *string {
 	return &v
 }
 
-// NullInt64Ptr converts a sql.NullInt64 to a *int64: nil when not
-// valid, else a pointer to the value.
-func NullInt64Ptr(n sql.NullInt64) *int64 {
-	if !n.Valid {
-		return nil
-	}
-	v := n.Int64
-	return &v
-}
-
 // StrPtrIfNonEmpty returns nil for the empty string, else a pointer
 // to s. Use for optional free-text columns where "" means absent.
 func StrPtrIfNonEmpty(s string) *string {
@@ -295,6 +483,20 @@ func JoinText(parts ...string) string {
 		}
 	}
 	return strings.Join(kept, "; ")
+}
+
+// HasWord reports whether any of words is a word of s: a run of letters
+// and digits between any other runes. A slugged code ("fees_bank") and
+// free text split alike.
+func HasWord(s string, words ...string) bool {
+	for _, w := range strings.FieldsFunc(s, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}) {
+		if slices.Contains(words, w) {
+			return true
+		}
+	}
+	return false
 }
 
 // JSONOrNil returns nil for NULL / empty input, else the raw JSON
@@ -339,120 +541,6 @@ func DatePtrFromNullUnix(n sql.NullInt64) *time.Time {
 	t := time.Unix(n.Int64, 0).UTC()
 	d := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
 	return &d
-}
-
-// The load clock, shared by every collector whose silver records its
-// dumps in a `dump_runs` table.
-//
-// Those sources have no change feed of their own: a dump is a whole
-// re-read of what the source will show, so the only honest trigger is
-// "a dump was loaded since the last watermark", and the only honest
-// response is to re-emit the full history and let gold's deleteWindow
-// over [Start,End] make that idempotent. What differs between sources is
-// which tables bound the span. That arrives as `spanExtrema`, a query
-// yielding (MIN, MAX) over every date the source's projection touches. A
-// silver whose ledger is not one `transactions` table also passes the
-// query that bounds its ledger (LoadClockStatusOver). `kind` names the
-// source in errors.
-
-// LoadClockStatus reports the content ranges and pins LatestChangeNumber
-// to MAX(dump_runs.snapshot_at). Each bronze dump loaded bumps it and a
-// subsequent `wealthdb load` re-emits; an idle reload is a no-op. The
-// same run is the observed watermark of both streams: each dump reads
-// the holdings, and the ledger from the last run or the start of the
-// history.
-func LoadClockStatus(ctx context.Context, db *sql.DB, kind, spanExtrema string) (canonical.Status, error) {
-	return LoadClockStatusOver(ctx, db, kind, spanExtrema,
-		`SELECT MIN(posted_at), MAX(posted_at) FROM transactions`)
-}
-
-// LoadClockStatusOver is LoadClockStatus with the transaction range read by
-// ledgerExtrema, for a silver whose ledger is not one `transactions` table.
-func LoadClockStatusOver(ctx context.Context, db *sql.DB, kind, spanExtrema, ledgerExtrema string) (canonical.Status, error) {
-	s := canonical.UnknownStatus()
-
-	var oldS, newS sql.NullInt64
-	if err := db.QueryRowContext(ctx, spanExtrema).Scan(&oldS, &newS); err != nil {
-		return s, fmt.Errorf("%s Status snapshot: %w", kind, err)
-	}
-	if oldS.Valid {
-		s.OldestSnapshotAt = oldS.Int64
-	}
-	if newS.Valid {
-		s.LatestSnapshotAt = newS.Int64
-	}
-
-	var oldT, newT sql.NullInt64
-	if err := db.QueryRowContext(ctx, ledgerExtrema).Scan(&oldT, &newT); err != nil {
-		return s, fmt.Errorf("%s Status transactions: %w", kind, err)
-	}
-	if oldT.Valid {
-		s.OldestTransactionAt = oldT.Int64
-	}
-	if newT.Valid {
-		s.LatestTransactionAt = newT.Int64
-	}
-
-	var latestLoad sql.NullInt64
-	if err := db.QueryRowContext(ctx,
-		`SELECT MAX(snapshot_at) FROM dump_runs`).Scan(&latestLoad); err != nil {
-		return s, fmt.Errorf("%s Status load: %w", kind, err)
-	}
-	if latestLoad.Valid {
-		s.LatestChangeNumber = latestLoad.Int64
-		s.ObservedSnapshotsThrough = latestLoad.Int64
-		s.ObservedTransactionsThrough = latestLoad.Int64
-	}
-	return s, nil
-}
-
-// ContentStatus runs q, which yields one row: the oldest and latest
-// snapshot, the oldest and latest transaction, and the latest change
-// number, each NULL or -1 where there is none. It returns the Status
-// those describe, its observed watermarks still unknown.
-func ContentStatus(ctx context.Context, db *sql.DB, kind, q string) (canonical.Status, error) {
-	s := canonical.UnknownStatus()
-	var v [5]sql.NullInt64
-	if err := db.QueryRowContext(ctx, q).Scan(&v[0], &v[1], &v[2], &v[3], &v[4]); err != nil {
-		return s, fmt.Errorf("%s Status: %w", kind, err)
-	}
-	for i, dst := range []*int64{&s.OldestSnapshotAt, &s.LatestSnapshotAt,
-		&s.OldestTransactionAt, &s.LatestTransactionAt, &s.LatestChangeNumber} {
-		if v[i].Valid {
-			*dst = v[i].Int64
-		}
-	}
-	return s, nil
-}
-
-// LoadClockChangeWindow triggers on a new load — any dump_run past
-// `since` — and then re-emits the FULL history: Start/End span every
-// date spanExtrema covers, so gold's deleteWindow over [Start,End]
-// makes the re-emit idempotent. NewChangeNumber advances to the latest
-// load so an idle reload does not re-trigger.
-func LoadClockChangeWindow(ctx context.Context, db *sql.DB, kind, spanExtrema string, since int64) (canonical.Window, error) {
-	w := canonical.Window{NewChangeNumber: since}
-
-	var latestLoad sql.NullInt64
-	if err := db.QueryRowContext(ctx,
-		`SELECT MAX(snapshot_at) FROM dump_runs`).Scan(&latestLoad); err != nil {
-		return w, fmt.Errorf("%s ChangeWindow load: %w", kind, err)
-	}
-	if !latestLoad.Valid || latestLoad.Int64 <= since {
-		return w, nil // no new load since the watermark
-	}
-
-	var start, end sql.NullInt64
-	if err := db.QueryRowContext(ctx, spanExtrema).Scan(&start, &end); err != nil {
-		return w, fmt.Errorf("%s ChangeWindow span: %w", kind, err)
-	}
-	w.NewChangeNumber = latestLoad.Int64
-	if start.Valid && end.Valid {
-		w.Start = start.Int64
-		w.End = end.Int64
-		w.HasChanges = true
-	}
-	return w, nil
 }
 
 // ISODate parses a silver date written YYYY-MM-DD, nil for anything

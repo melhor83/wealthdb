@@ -1,5 +1,5 @@
 # camoufox + playwright pins live in shared/images/base-camoufox.Dockerfile
-# (camoufox[geoip]>=0.4.11,<0.5 + playwright==1.49.0 + the CAMOUFOX_BUILD
+# (camoufox[geoip], the matching Playwright pin and the CAMOUFOX_BUILD
 # browser pin). Bump them there, together: the browser build's juggler
 # patches target a specific Playwright, and camoufox-py's own fetch is
 # unpinned across Firefox majors (see fetch-camoufox.py), which is why the
@@ -7,12 +7,9 @@
 # FROM wealthdb/base-camoufox. See DESIGN.md §6 for Fidelity's
 # Akamai-driven need for camoufox.
 
-# pdfplumber sits on top of pdfminer.six and exposes a clean table-
-# extraction API. Used by load.py to reconstruct historical position
-# snapshots from Fidelity's monthly 529 statement PDFs (the trust
-# accounts get no statements — see DESIGN.md §4.5). pypdfium2 is
-# faster but pdfplumber's table-aware extraction is a better fit for
-# the statement layout; revisit if perf matters later.
+# pdfplumber (on pdfminer.six) extracts every statement PDF and
+# Consolidated 1099 that load.py reads (pdf_readers.py).
+# pdf_parsers_supplied.py says why it is not pypdfium2.
 pdfplumber>=0.11,<1
 
 # download.py zstd-compresses each HTML/CSV export as it lands

@@ -50,7 +50,9 @@ Mounted into the container:
   <TMP>/w-fidelity-web/home/.secrets  ->  /secrets
   <TMP>/w-fidelity-web/xdgdata/wealthdb/fidelity-web     ->  /data
   <TMP>/w-fidelity-web/xdgcache/wealthdb/startupcache  ->  /cache/startupcache
+  <TMP>/w-fidelity-web/xdgcache/wealthdb/fidelity-web  ->  /cache/collector
   <TMP>/w-fidelity-web/xdgcache/wealthdb/debug/fidelity-web    ->  /debug
+  <TMP>/w-fidelity-web/tree/collectors/fidelity-web  ->  /app
 
 Override mounts via env:
   FIDELITY_WEB_SECRETS_DIR=/path/to/secrets
@@ -124,7 +126,9 @@ Mounted into the container:
   <TMP>/w-fidelity-web/home/.secrets  ->  /secrets
   <TMP>/w-fidelity-web/xdgdata/wealthdb/fidelity-web     ->  /data
   <TMP>/w-fidelity-web/xdgcache/wealthdb/startupcache  ->  /cache/startupcache
+  <TMP>/w-fidelity-web/xdgcache/wealthdb/fidelity-web  ->  /cache/collector
   <TMP>/w-fidelity-web/xdgcache/wealthdb/debug/fidelity-web    ->  /debug
+  <TMP>/w-fidelity-web/tree/collectors/fidelity-web  ->  /app
 
 Override mounts via env:
   FIDELITY_WEB_SECRETS_DIR=/path/to/secrets
@@ -209,6 +213,10 @@ docker
   <TMP>/w-fidelity-web/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-fidelity-web/xdgcache/wealthdb/fidelity-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-fidelity-web/xdgcache/wealthdb/debug/fidelity-web:/debug
   -v
@@ -300,6 +308,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-fidelity-web/xdgcache/wealthdb/fidelity-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-fidelity-web/xdgcache/wealthdb/debug/fidelity-web:/debug
   -v
   <TMP>/w-fidelity-web/tree/collectors/fidelity-web:/app
@@ -359,6 +371,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-fidelity-web/xdgcache/wealthdb/fidelity-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-fidelity-web/xdgcache/wealthdb/debug/fidelity-web:/debug
   -v
   <TMP>/w-fidelity-web/tree/collectors/fidelity-web:/app
@@ -410,6 +426,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-fidelity-web/xdgcache/wealthdb/fidelity-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-fidelity-web/xdgcache/wealthdb/debug/fidelity-web:/debug
   -v
   <TMP>/w-fidelity-web/tree/collectors/fidelity-web:/app
@@ -460,6 +480,10 @@ docker
   <TMP>/w-fidelity-web/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-fidelity-web/xdgcache/wealthdb/fidelity-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-fidelity-web/xdgcache/wealthdb/debug/fidelity-web:/debug
   -v
@@ -529,6 +553,10 @@ docker
   <TMP>/w-fidelity-web/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-fidelity-web/xdgcache/wealthdb/fidelity-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-fidelity-web/xdgcache/wealthdb/debug/fidelity-web:/debug
   -v
@@ -628,6 +656,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-fidelity-web/xdgcache/wealthdb/fidelity-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-fidelity-web/xdgcache/wealthdb/debug/fidelity-web:/debug
   -v
   <TMP>/w-fidelity-web/tree/collectors/fidelity-web:/app
@@ -679,6 +711,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-fidelity-web/xdgcache/wealthdb/fidelity-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-fidelity-web/xdgcache/wealthdb/debug/fidelity-web:/debug
   -v
   <TMP>/w-fidelity-web/tree/collectors/fidelity-web:/app
@@ -729,6 +765,10 @@ docker
   <TMP>/w-fidelity-web/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-fidelity-web/xdgcache/wealthdb/fidelity-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-fidelity-web/xdgcache/wealthdb/debug/fidelity-web:/debug
   -v

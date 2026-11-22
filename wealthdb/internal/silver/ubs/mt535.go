@@ -23,6 +23,10 @@ import (
 //   :AGGR//UNIT/10000,        → aggregate quantity, 10000 units
 //   :AGGR//FAMT/100000,       → aggregate FACE amount, for bonds
 //   :INDC//ACTU/USD150,123456 → indicative actual price USD 150.123456
+//   :HOLD//NUSD2500,          → market value USD -2,500.00: a leading
+//                               N is ISO 15022's sign for a negative
+//                               amount, as the collector reads it
+//   :AGGR//UNIT/N100,         → aggregate quantity, -100 units
 //
 // The :70C::SUBB// narrative adds the average unit cost (AVER), the
 // holding cost (AHOD, equal to BOOK) and, when the instrument currency
@@ -33,8 +37,8 @@ import (
 // (psnBookValue).
 
 var (
-	re19A = regexp.MustCompile(`^:([A-Z]{3,4})//([A-Z]{3})([0-9,]+?),?$`)
-	re93B = regexp.MustCompile(`^:([A-Z]{3,4})//([A-Z]+)/([0-9,]+?),?$`)
+	re19A = regexp.MustCompile(`^:([A-Z]{3,4})//(N?)([A-Z]{3})([0-9,]+?),?$`)
+	re93B = regexp.MustCompile(`^:([A-Z]{3,4})//([A-Z]+)/(N?)([0-9,]+?),?$`)
 )
 
 // mt535Money is one parsed 19A entry.
@@ -58,21 +62,27 @@ type mt535Qty struct {
 func parse19A(raw []string) []mt535Money {
 	out := make([]mt535Money, 0, len(raw))
 	for _, s := range raw {
-		m := re19A.FindStringSubmatch(s)
-		if m == nil {
-			continue
+		if m, ok := read19A(s); ok {
+			out = append(out, m)
 		}
-		amt, err := parseSwiftDecimal(m[3])
-		if err != nil {
-			continue
-		}
-		out = append(out, mt535Money{
-			Qualifier: m[1],
-			Currency:  m[2],
-			Amount:    amt,
-		})
 	}
 	return out
+}
+
+// read19A reads one `:QUAL//[N]CCYamount` value (re19A). The N before
+// the currency is the sign; a currency that itself begins with N is
+// none, which the pattern's backtracking resolves (`NNOK12,` is -12 NOK,
+// `NOK12,` is +12 NOK).
+func read19A(s string) (mt535Money, bool) {
+	m := re19A.FindStringSubmatch(s)
+	if m == nil {
+		return mt535Money{}, false
+	}
+	amt, err := parseSwiftSigned(m[2] + m[4])
+	if err != nil {
+		return mt535Money{}, false
+	}
+	return mt535Money{Qualifier: m[1], Currency: m[3], Amount: amt}, true
 }
 
 // parse93B maps the raw array of strings into typed mt535Qty
@@ -84,7 +94,7 @@ func parse93B(raw []string) []mt535Qty {
 		if m == nil {
 			continue
 		}
-		amt, err := parseSwiftDecimal(m[3])
+		amt, err := parseSwiftSigned(m[3] + m[4])
 		if err != nil {
 			continue
 		}
@@ -152,8 +162,8 @@ func findQuantity(qtys []mt535Qty) (canonical.Decimal, bool) {
 // parseSwiftDecimal converts a SWIFT amount string (comma as
 // decimal separator, trailing-comma terminator) into a Decimal.
 // Inputs that come through the regex have already been stripped
-// of the trailing terminator comma; here we only need to swap
-// the embedded comma for a dot.
+// of the trailing terminator comma; this only swaps the
+// embedded comma for a dot.
 //
 //	"1500000"     → 1500000
 //	"150,123456"  → 150.123456
@@ -161,4 +171,15 @@ func findQuantity(qtys []mt535Qty) (canonical.Decimal, bool) {
 func parseSwiftDecimal(s string) (canonical.Decimal, error) {
 	s = strings.ReplaceAll(s, ",", ".")
 	return canonical.NewDecimalFromString(s)
+}
+
+// parseSwiftSigned reads a SWIFT figure that a leading N, ISO 15022's
+// sign for a negative value, may sign.
+func parseSwiftSigned(s string) (canonical.Decimal, error) {
+	unsigned, negative := strings.CutPrefix(s, "N")
+	d, err := parseSwiftDecimal(unsigned)
+	if err == nil && negative {
+		d = d.Neg()
+	}
+	return d, err
 }

@@ -33,7 +33,12 @@ import (
 // which collector migration 0007 creates together. A DB written before
 // it has none, and must keep loading rather than fail.
 func (r *webReader) hasCardTables(ctx context.Context) (bool, error) {
-	return silver.HasTables(ctx, r.db, "card_accounts", "card_transactions", "card_invoices")
+	for _, t := range []string{"card_accounts", "card_transactions", "card_invoices"} {
+		if ok, err := r.hasTable(ctx, t); err != nil || !ok {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 // appendWebCards emits, per snapshot in the window, one AccountChange
@@ -60,13 +65,8 @@ SELECT snapshot_at, account_external_id, currency_iso, balance,
        product_name, account_number, payload
   FROM card_accounts
  WHERE snapshot_at BETWEEN ? AND ?`
-	rows, err := r.db.QueryContext(ctx, q, w.Start, w.End)
-	if err != nil {
-		return fmt.Errorf("appendWebCards: %w", err)
-	}
-	defer rows.Close()
 	skipped := 0
-	for rows.Next() {
+	if err := silver.ScanRows(ctx, r.db, "appendWebCards", q, func(rows *sql.Rows) error {
 		var (
 			snap                     int64
 			extID, payload           string
@@ -79,7 +79,7 @@ SELECT snapshot_at, account_external_id, currency_iso, balance,
 		}
 		batch, ok := byTime[snap]
 		if !ok {
-			continue
+			return nil
 		}
 		batch.Accounts = append(batch.Accounts, canonical.AccountChange{
 			AccountExternalID: extID,
@@ -102,7 +102,7 @@ SELECT snapshot_at, account_external_id, currency_iso, balance,
 			if balance.Valid {
 				skipped++
 			}
-			continue
+			return nil
 		}
 		batch.CashBalances = append(batch.CashBalances, canonical.CashBalanceChange{
 			SnapshotAt:        snap,
@@ -112,11 +112,14 @@ SELECT snapshot_at, account_external_id, currency_iso, balance,
 			Amount:            canonical.NewDecimalFromFloat(balance.Float64),
 			Payload:           json.RawMessage(`{"basis":"roster"}`),
 		})
+		return nil
+	}, w.Start, w.End); err != nil {
+		return err
 	}
 	if skipped > 0 {
 		log.Printf("ubs adapter: skipped %d card balance(s) with no currency", skipped)
 	}
-	return rows.Err()
+	return nil
 }
 
 func cardDisplayName(product, accountNumber sql.NullString) string {
@@ -153,13 +156,8 @@ SELECT period_end, account_external_id, COALESCE(currency_iso, ''),
   FROM card_invoices
  WHERE reconciles = 1 AND due_amount IS NOT NULL
    AND period_end BETWEEN ? AND ?`
-	rows, err := r.db.QueryContext(ctx, q, w.Start, w.End)
-	if err != nil {
-		return fmt.Errorf("appendCardStatementBalances: %w", err)
-	}
-	defer rows.Close()
 	skipped := 0
-	for rows.Next() {
+	if err := silver.ScanRows(ctx, r.db, "appendCardStatementBalances", q, func(rows *sql.Rows) error {
 		var (
 			periodEnd int64
 			extID     string
@@ -173,7 +171,7 @@ SELECT period_end, account_external_id, COALESCE(currency_iso, ''),
 		if currency == "" {
 			// Same rule as the roster balance: no unit, no row.
 			skipped++
-			continue
+			return nil
 		}
 		// A period end is a billing date, not a dump time, so it rarely
 		// coincides with a snapshot the run already has. It gets its own
@@ -188,11 +186,14 @@ SELECT period_end, account_external_id, COALESCE(currency_iso, ''),
 			Amount:            canonical.NewDecimalFromFloat(due),
 			Payload:           json.RawMessage(`{"basis":"statement_closing"}`),
 		})
+		return nil
+	}, w.Start, w.End); err != nil {
+		return err
 	}
 	if skipped > 0 {
 		log.Printf("ubs adapter: skipped %d statement balance(s) with no currency", skipped)
 	}
-	return rows.Err()
+	return nil
 }
 
 // cardTxKind classifies one card ledger row.
@@ -283,10 +284,9 @@ func isWholeDescriptor(descriptor string, descriptors []string) bool {
 // No PSN cutoff applies: PSN carries no card rows, so there is nothing
 // for the cut to arbitrate between.
 //
-// The amounts are UBS's own and already canonical for a liability, but
-// they still pass through ApplyCanonicalSign, because the card kinds
-// have a fixed direction — a purchase is negative and a refund or card
-// payment positive whatever the row said.
+// The amounts are UBS's own and already canonical for a liability, and
+// each row keeps its sign. The kind is read off that sign (cardTxKind),
+// so the two always agree.
 func (r *webReader) cardTransactions(ctx context.Context, w canonical.Window) (canonical.TransactionBatch, error) {
 	var out canonical.TransactionBatch
 	ok, err := r.hasCardTables(ctx)
@@ -299,12 +299,7 @@ SELECT transaction_external_id, value_date, account_external_id, amount,
   FROM card_transactions
  WHERE value_date BETWEEN ? AND ?
  ORDER BY value_date, transaction_external_id`
-	rows, err := r.db.QueryContext(ctx, q, w.Start, w.End)
-	if err != nil {
-		return out, fmt.Errorf("ubs-web card transactions: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
+	if err := silver.ScanRows(ctx, r.db, "ubs-web card transactions", q, func(rows *sql.Rows) error {
 		var (
 			txID, accountID, ccy, payload string
 			valueDate                     int64
@@ -313,7 +308,7 @@ SELECT transaction_external_id, value_date, account_external_id, amount,
 		)
 		if err := rows.Scan(&txID, &valueDate, &accountID, &amount, &ccy,
 			&merchant, &category, &payload); err != nil {
-			return out, fmt.Errorf("ubs-web card transactions scan: %w", err)
+			return fmt.Errorf("ubs-web card transactions scan: %w", err)
 		}
 		kind := cardTxKind(amount, merchant.String)
 		net := canonical.NewDecimalFromFloat(amount)
@@ -325,7 +320,7 @@ SELECT transaction_external_id, value_date, account_external_id, amount,
 			AccountExternalID:     accountID,
 			Kind:                  kind,
 			Currency:              ccy,
-			NetAmount:             canonical.ApplyCanonicalSign(kind, &net),
+			NetAmount:             &net,
 			// The terminal descriptor, verbatim. It is the input to
 			// gold's merchant signature, so any reformatting here would
 			// re-key every merchant it touched.
@@ -337,8 +332,11 @@ SELECT transaction_external_id, value_date, account_external_id, amount,
 			ProviderCategory: silver.StrPtrIfNonEmpty(category.String),
 			Payload:          json.RawMessage(payload),
 		})
+		return nil
+	}, w.Start, w.End); err != nil {
+		return out, err
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // cardRange is the span of every date the card projection emits at:

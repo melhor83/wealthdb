@@ -1,6 +1,7 @@
 """Bronze helpers shared by collectors.
 
-UTC-timestamped run directories, the one classification of a run that
+UTC-timestamped run directories and the one writer of a download's run
+dir and manifest (:func:`open_run`), the one classification of a run that
 loaders and prune share (:func:`classify_run`), atomic writes (tmp +
 rename so an interrupted run never leaves a half-written artifact), and
 the canonical-JSON form used for content-based dedup.
@@ -96,6 +97,11 @@ def run_status(run_json_path: Path) -> str | None:
 
 # The run.json status of a finished dump.
 COMPLETE_STATUS = "complete"
+# The status from the run dir's creation until the terminal write. A run
+# that keeps it crashed or is still running.
+IN_PROGRESS = "in-progress"
+# The terminal status of a dry run that leaves its run dir in place.
+DRY_RUN = "dry-run"
 
 
 def is_loadable_status(status: str | None) -> bool:
@@ -268,6 +274,87 @@ def manifest_is_complete(run_dir: Path, manifest_name: str = "run.json") -> bool
     download that writes no status writes its manifest only at the end.
     """
     return classify_run(run_dir, manifest_name=manifest_name)[0] == COMPLETE
+
+
+# What a dry run leaves under the bronze dir:
+#   "none"   no run dir at all; every write of the run is skipped;
+#   "stamp"  a run dir like a real run's, its status DRY_RUN at the end.
+DRY_POLICIES = ("none", "stamp")
+
+
+class Run:
+    """One download's run dir and its manifest, from :func:`open_run`.
+
+    `dir` is the run dir, or ``None`` on a dry run that writes nothing;
+    every write is then skipped. The manifest is written with the
+    IN_PROGRESS status at the start and on each :meth:`update`, and with
+    its terminal status once, by :meth:`finish`. A run that raises before
+    :meth:`finish` keeps its run dir with the IN_PROGRESS status.
+    """
+
+    def __init__(self, dir: Path | None, slug: str, *, dry_run: bool,
+                 meta: dict | None) -> None:
+        self.dir = dir
+        self.slug = slug
+        self.dry_run = dry_run
+        self._manifest = dict(meta or {})
+
+    def write_json(self, rel, obj) -> Path | None:
+        """Write `obj` as JSON at `rel` under the run dir (see
+        :func:`atomic_write_json`); the path, or ``None`` when the run
+        writes nothing."""
+        if self.dir is None:
+            return None
+        path = self.dir / rel
+        atomic_write_json(path, obj)
+        return path
+
+    def write_bytes(self, rel, data: bytes) -> Path | None:
+        """Write `data` at `rel` under the run dir (see
+        :func:`atomic_write_bytes`); the path, or ``None`` when the run
+        writes nothing."""
+        if self.dir is None:
+            return None
+        path = self.dir / rel
+        atomic_write_bytes(path, data)
+        return path
+
+    def _write_manifest(self, status: str) -> None:
+        self.write_json("run.json", {**self._manifest, "status": status})
+
+    def update(self, **fields) -> None:
+        """Merge `fields` into the manifest and rewrite it, still
+        IN_PROGRESS."""
+        self._manifest.update(fields)
+        self._write_manifest(IN_PROGRESS)
+
+    def finish(self, manifest: dict | None = None,
+               status: str = COMPLETE_STATUS) -> None:
+        """Write the terminal manifest: `manifest` when given, else the
+        one built by :meth:`update`. The status is `status`, or DRY_RUN
+        on a dry run."""
+        if manifest is not None:
+            self._manifest = dict(manifest)
+        self._write_manifest(DRY_RUN if self.dry_run else status)
+
+
+def open_run(bronze_dir: Path, slug: str | None = None, *,
+             dry_run: bool = False, dry_policy: str = "none",
+             meta: dict | None = None) -> Run:
+    """Open a download's run dir `<bronze_dir>/<slug>` (a fresh UTC slug
+    by default) and write `meta` as its IN_PROGRESS manifest.
+
+    A load skips the run and prune reclaims it until :meth:`Run.finish`
+    writes the terminal status. `dry_policy` says what a dry run leaves
+    (:data:`DRY_POLICIES`).
+    """
+    if dry_policy not in DRY_POLICIES:
+        raise ValueError(f"dry_policy must be one of {DRY_POLICIES}, not {dry_policy!r}")
+    slug = slug or ts_slug()
+    path = run_dir(bronze_dir, slug) if not dry_run or dry_policy == "stamp" else None
+    run = Run(path, slug, dry_run=dry_run, meta=meta)
+    run._write_manifest(IN_PROGRESS)
+    return run
 
 
 def pending_run_dirs(conn, bronze_dir: Path, *, log) -> list[Path]:

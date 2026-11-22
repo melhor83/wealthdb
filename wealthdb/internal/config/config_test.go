@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -10,6 +11,9 @@ import (
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/returns"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver"
+	_ "github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/all"
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/schwab"
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/ubs"
 )
 
 func writeConfig(t *testing.T, body string) string {
@@ -526,15 +530,46 @@ func TestValidateRefusesAMalformedPSNStartOverride(t *testing.T) {
 	c := &Config{
 		GoldDB: "/x", DefaultCurrency: "USD",
 		SilverSources: []SilverSource{{ID: "u", Kind: "ubs", Subsources: []SilverSubsource{{Kind: "ubs-psn", Path: "/p"}},
-			Relationships: []RelationshipPair{{Label: "main", PSNID: "SYNTH01", PSNStartOverride: "2024-13-01"}}}},
+			Relationships: json.RawMessage(`[{"label": "main", "psn_id": "SYNTH01", "psn_start_override": "2024-13-01"}]`)}},
 	}
 	err := c.Validate()
 	if err == nil || !strings.Contains(err.Error(), "relationships[0].psn_start_override") {
 		t.Fatalf("Validate = %v, want a psn_start_override refusal", err)
 	}
-	c.SilverSources[0].Relationships[0].PSNStartOverride = "2024-01-31"
+	c.SilverSources[0].Relationships = json.RawMessage(`[{"label": "main", "psn_id": "SYNTH01", "psn_start_override": "2024-01-31"}]`)
 	if err := c.Validate(); err != nil {
 		t.Fatalf("Validate with a valid psn_start_override: %v", err)
+	}
+}
+
+// The relationships parser refuses an entry without a label, one without
+// an id, and a field it does not know. A source of another kind may carry
+// a valid array: it validates, and the source opens with no settings.
+func TestValidateRefusesAMalformedRelationship(t *testing.T) {
+	source := func(kind, rels string) *Config {
+		s := SilverSource{ID: "u", Kind: kind, Relationships: json.RawMessage(rels)}
+		if kind == "ubs" {
+			s.Subsources = []SilverSubsource{{Kind: "ubs-psn", Path: "/p"}}
+		} else {
+			s.Path = "/p"
+		}
+		return &Config{GoldDB: "/x", DefaultCurrency: "USD", SilverSources: []SilverSource{s}}
+	}
+	for rels, want := range map[string]string{
+		`[{"psn_id": "SYNTH01"}]`:                     "relationships[0].label is required",
+		`[{"label": "main"}]`:                         "relationships[0]: at least one of web_id or psn_id must be set",
+		`[{"label": "main", "psn_ident": "SYNTH01"}]`: "unknown field",
+	} {
+		if err := source("ubs", rels).Validate(); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: Validate = %v, want %q", rels, err, want)
+		}
+	}
+	c := source("chase", `[{"label": "main", "psn_id": "SYNTH01"}]`)
+	if err := c.Validate(); err != nil {
+		t.Fatalf("a valid array on a chase source: %v", err)
+	}
+	if got := c.SilverSources[0].ToSilverOpenSpec().Settings; got != nil {
+		t.Errorf("chase settings = %+v, want none", got)
 	}
 }
 
@@ -547,7 +582,7 @@ func TestSchwabMarkGuard(t *testing.T) {
 		return Load(writeConfig(t, `{"gold_db": "/tmp/g.db", "default_currency": "USD", "silver_sources": [`+
 			source+`]}`))
 	}
-	for source, want := range map[string]silver.MarkGuard{
+	for source, want := range map[string]schwab.MarkGuard{
 		`{"id": "s", "kind": "schwab", "path": "/tmp/s.db"}`:                                                          {SpikePct: 10, RevertPct: 2},
 		`{"id": "s", "kind": "schwab", "path": "/tmp/s.db", "schwab": {}}`:                                            {SpikePct: 10, RevertPct: 2},
 		`{"id": "s", "kind": "schwab", "path": "/tmp/s.db", "schwab": {"mark_spike_pct": 15}}`:                        {SpikePct: 15, RevertPct: 2},
@@ -559,7 +594,8 @@ func TestSchwabMarkGuard(t *testing.T) {
 			t.Errorf("%s: %v", source, err)
 			continue
 		}
-		if got := c.SilverSources[0].ToSilverOpenSpec().MarkGuard.WithDefaults(); got != want {
+		g, _ := c.SilverSources[0].ToSilverOpenSpec().Settings.(schwab.MarkGuard)
+		if got := g.WithDefaults(); got != want {
 			t.Errorf("%s: guard %+v, want %+v", source, got, want)
 		}
 	}
@@ -583,13 +619,13 @@ func TestSchwabMarkGuard(t *testing.T) {
 func TestToSilverOpenSpecCarriesTheSource(t *testing.T) {
 	c := &Config{GoldDB: "/x", DefaultCurrency: "USD", SilverSources: []SilverSource{{ID: "u", Kind: "ubs",
 		Subsources:    []SilverSubsource{{Kind: "ubs-psn", Path: "/p"}},
-		Relationships: []RelationshipPair{{Label: "main", WebID: "W1", PSNID: "SYNTH01", PSNStartOverride: "2024-01-31"}}}}}
+		Relationships: json.RawMessage(`[{"label": "main", "web_id": "W1", "psn_id": "SYNTH01", "psn_start_override": "2024-01-31"}]`)}}}
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
 	}
 	spec := c.SilverSources[0].ToSilverOpenSpec()
 	want := silver.OpenSpec{ID: "u", Subsources: []silver.Subsource{{Kind: "ubs-psn", Path: "/p"}},
-		Relationships: []silver.RelationshipPair{{Label: "main", WebID: "W1", PSNID: "SYNTH01",
+		Settings: []ubs.RelationshipPair{{Label: "main", WebID: "W1", PSNID: "SYNTH01",
 			PSNStartOverride: time.Date(2024, 1, 31, 0, 0, 0, 0, time.UTC).Unix()}}}
 	if !reflect.DeepEqual(spec, want) {
 		t.Errorf("ToSilverOpenSpec = %+v, want %+v", spec, want)
@@ -912,24 +948,31 @@ func TestLoadReturnsHide(t *testing.T) {
 func TestLoadReturnsTransferMatching(t *testing.T) {
 	base := `{"gold_db":"/tmp/x","default_currency":"USD","silver_sources":[{"id":"sq","kind":"swissquote","path":"/tmp/sq.db"}],`
 
-	// Enabled with explicit knobs.
-	c, err := Load(writeConfig(t, base+`"returns_transfer_matching":{"enabled":true,"window_days":3,"tolerance_pct":1.5}}`))
+	c, err := Load(writeConfig(t, base+`"returns_transfer_matching":{"enabled":true}}`))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	m := c.ReturnsTransferMatching
-	if m == nil || !m.Enabled || m.Window() != 3 || m.Tolerance() != 1.5 {
-		t.Errorf("explicit knobs: got %+v (window %d, tol %g)", m, m.Window(), m.Tolerance())
+	if m := c.ReturnsTransferMatching; m == nil || !m.Enabled {
+		t.Errorf("enabled block: got %+v", m)
+	}
+	if n := c.Notices(); n != nil {
+		t.Errorf("enabled block: notices %q, want none", n)
 	}
 
-	// Enabled with knobs omitted: the documented defaults apply.
-	c2, err := Load(writeConfig(t, base+`"returns_transfer_matching":{"enabled":true}}`))
-	if err != nil {
-		t.Fatalf("Load defaults: %v", err)
-	}
-	m2 := c2.ReturnsTransferMatching
-	if m2.Window() != DefaultTransferMatchWindowDays || m2.Tolerance() != DefaultTransferMatchTolerancePct {
-		t.Errorf("defaults: window %d tol %g", m2.Window(), m2.Tolerance())
+	// The two knobs are accepted and ignored, and a set one is a notice.
+	for _, block := range []string{
+		`"returns_transfer_matching":{"enabled":true,"window_days":3,"tolerance_pct":1.5}}`,
+		`"returns_transfer_matching":{"enabled":false,"window_days":99,"tolerance_pct":-1}}`,
+		`"returns_transfer_matching":{"enabled":true,"tolerance_pct":1.5}}`,
+	} {
+		c, err := Load(writeConfig(t, base+block))
+		if err != nil {
+			t.Errorf("%s: %v", block, err)
+			continue
+		}
+		if n := c.Notices(); len(n) != 1 || n[0] != ignoredKnobsNotice {
+			t.Errorf("%s: notices %q, want the ignored-knobs notice", block, n)
+		}
 	}
 
 	// Absent block: nil (feature off).
@@ -940,25 +983,8 @@ func TestLoadReturnsTransferMatching(t *testing.T) {
 	if c3.ReturnsTransferMatching != nil {
 		t.Error("absent block must stay nil")
 	}
-
-	// Nil-receiver accessors report the defaults (safe on the absent block).
-	var nilM *ReturnsTransferMatching
-	if nilM.Window() != DefaultTransferMatchWindowDays || nilM.Tolerance() != DefaultTransferMatchTolerancePct {
-		t.Error("nil receiver must yield the defaults")
-	}
-
-	// Out-of-range knobs fail the load — even when the block is disabled.
-	cases := map[string]string{
-		"window too wide":    `"returns_transfer_matching":{"enabled":true,"window_days":31}}`,
-		"window negative":    `"returns_transfer_matching":{"enabled":true,"window_days":-1}}`,
-		"tolerance too big":  `"returns_transfer_matching":{"enabled":true,"tolerance_pct":6}}`,
-		"tolerance negative": `"returns_transfer_matching":{"enabled":true,"tolerance_pct":-0.1}}`,
-		"disabled but bad":   `"returns_transfer_matching":{"enabled":false,"window_days":99}}`,
-	}
-	for name, block := range cases {
-		if _, err := Load(writeConfig(t, base+block)); err == nil {
-			t.Errorf("%s: Load should have failed", name)
-		}
+	if n := c3.Notices(); n != nil {
+		t.Errorf("absent block: notices %q, want none", n)
 	}
 }
 
@@ -982,14 +1008,13 @@ func TestLoadSpending(t *testing.T) {
 		t.Errorf("knobs = (window %d, tol %g)", m.Window(), m.Tolerance())
 	}
 
-	// Omitted knobs take the defaults, which are deliberately the same
-	// as the returns matcher's — one matching core, one banding.
+	// Omitted knobs take the defaults.
 	c2, err := Load(writeConfig(t, base+`"spending":{}}`))
 	if err != nil {
 		t.Fatalf("Load empty block: %v", err)
 	}
-	if m := c2.SpendMatching(); m.Window() != DefaultTransferMatchWindowDays ||
-		m.Tolerance() != DefaultTransferMatchTolerancePct {
+	if m := c2.SpendMatching(); m.Window() != DefaultSpendMatchWindowDays ||
+		m.Tolerance() != DefaultSpendMatchTolerancePct {
 		t.Errorf("defaults = (window %d, tol %g)", m.Window(), m.Tolerance())
 	}
 

@@ -24,68 +24,70 @@ func taxWrapperFor(productCode string) canonical.TaxWrapper {
 	return canonical.TaxWrapperTaxablePersonal
 }
 
-// assetClassFor maps silver's already-canonicalised `asset_class`
-// string to the coarse canonical AssetClass enum — the intermediate
-// 1-D class taxonomyFor then maps to an (exposure, vehicle) pair.
-// Silver does the VIAC-raw → canonical translation (e.g. EQUITIES →
-// equity); we just type-cast and validate against the coarse
-// vocabulary. Unknown values fall through to AssetClassOther.
-func assetClassFor(raw string) canonical.AssetClass {
-	c := canonical.AssetClass(raw)
-	if c.ValidCoarse() {
-		return c
-	}
-	return canonical.AssetClassOther
-}
-
-// listedPrivateEquityRe matches the one exchange-traded holding in the
-// otherwise all-CSIF VIAC universe: the iShares Listed Private Equity
-// UCITS ETF. Silver's coarse asset_class (equity / other) can't tell it
-// apart from the CSIF equity funds, so it's recognised by name.
+// listedPrivateEquityRe recognises a listed private-equity ETF by its
+// name. Silver's asset_class (equity / other) cannot tell it apart from
+// an equity index fund.
 var listedPrivateEquityRe = regexp.MustCompile(`(?i)private\s+equity`)
+
+// reportSectionClass maps a Reporting-PDF section, as the report prints
+// it, to the class string the live rows carry. Silver's report rows hold
+// the printed section in `asset_class`; its live rows hold the class the
+// loader mapped from the API's key (EQUITIES → equity). A report row
+// written before the section was stored as printed holds the mapped
+// class already, which passes through unchanged. A section not listed
+// here (Alternative Investments, or none) reads as 'other'.
+var reportSectionClass = map[string]string{
+	"Liquidity":   "money_market",
+	"Equity":      "equity",
+	"Equities":    "equity",
+	"Bonds":       "bond",
+	"Real Estate": "fund",
+	"Commodities": "metal",
+}
 
 // taxonomyFor derives the 2-D taxonomy pair (exposure, vehicle) — see
 // docs/TAXONOMY.md — from silver's `asset_class` plus the instrument
-// name. It uses assetClassFor internally to canonicalise the coarse
-// class, then maps that intermediate to the emitted pair.
+// name. A report row's printed section is first read as a class
+// (reportSectionClass); the switch below reads the class string.
 //
-// Every VIAC holding is a Credit Suisse Index Fund (CSIF) — a
-// non-exchange-traded institutional index fund, so the vehicle is
-// `fund` throughout — except the one listed private-equity ETF, which
-// is exchange-traded (`etf`). Exposure comes from silver's already-
-// canonicalised class where it's unambiguous; the coarse 'other'
+// A VIAC holding reads as an institutional index fund that is not
+// exchange-traded, so its vehicle is `fund`, unless its name marks a
+// listed private-equity ETF (`etf`). Exposure comes from silver's already-
+// canonicalised class where it's unambiguous; silver's 'other'
 // (VIAC's ALTERNATIVES sleeve) falls back to a name-derived exposure.
 //
 // The returned pair always satisfies canonical.ValidTaxonomyPair.
 func taxonomyFor(rawClass, name string) (canonical.AssetClass, canonical.Vehicle) {
-	// Name-based special case first: the iShares Listed Private Equity
-	// ETF, regardless of whether silver filed it under EQUITIES or
-	// ALTERNATIVES. Listed PE is private-equity exposure in an ETF
+	// Name-based special case first: a listed private-equity ETF,
+	// whether silver filed it under EQUITIES or ALTERNATIVES. Listed PE is private-equity exposure in an ETF
 	// wrapper (TAXONOMY.md §5.3).
 	if listedPrivateEquityRe.MatchString(name) {
 		return canonical.AssetClassPrivateEquity, canonical.VehicleETF
 	}
-	switch assetClassFor(rawClass) {
-	case canonical.AssetClassEquity:
+	if class, ok := reportSectionClass[rawClass]; ok {
+		rawClass = class
+	}
+	switch rawClass {
+	case "equity":
 		// CSIF equity index funds.
 		return canonical.AssetClassPublicEquity, canonical.VehicleFund
-	case canonical.AssetClassBond:
+	case "bond":
 		// CSIF bond index funds.
 		return canonical.AssetClassFixedIncome, canonical.VehicleFund
-	case canonical.AssetClassFund:
-		// Silver maps VIAC's REAL_ESTATE section to coarse 'fund': a
+	case "fund":
+		// VIAC's REAL_ESTATE class (Real Estate section) is 'fund': a
 		// property CSIF is real-estate exposure in a fund wrapper.
 		return canonical.AssetClassRealEstate, canonical.VehicleFund
-	case canonical.AssetClassMetal:
+	case "metal":
 		// COMMODITIES sleeve — a physical-precious-metal CSIF.
 		return canonical.AssetClassMetal, canonical.VehicleFund
-	case canonical.AssetClassMoneyMarket:
+	case "money_market":
 		// LIQUIDITY money-market fund → cash exposure, fund wrapper
 		// (TAXONOMY.md §5.8: money-market funds are cash, not fixed
 		// income).
 		return canonical.AssetClassCash, canonical.VehicleFund
 	}
-	// Coarse 'other' (VIAC's ALTERNATIVES sleeve) and any unknown class:
+	// Silver's 'other' (VIAC's ALTERNATIVES sleeve) and any unknown class:
 	// recover the exposure from the fund name where it's unambiguous.
 	// silver.RefineETFExposure returns public_equity as its "name reveals
 	// nothing" default; for an ALTERNATIVES holding that default isn't
@@ -102,7 +104,7 @@ func taxonomyFor(rawClass, name string) (canonical.AssetClass, canonical.Vehicle
 // txKindFor maps silver's already-canonicalised `transactions.kind`
 // string to the canonical TxKind enum. Silver does the
 // VIAC-raw → canonical translation (TRADE_BUY → buy, FUSION_*
-// → corporate_action, etc.); we just type-cast and validate.
+// → corporate_action, etc.); txKindFor casts and validates it.
 // Unknown values fall through to TxKindOther.
 func txKindFor(raw string) canonical.TxKind {
 	k := canonical.TxKind(raw)

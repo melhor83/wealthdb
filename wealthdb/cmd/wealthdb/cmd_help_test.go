@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -47,26 +48,13 @@ func TestUsageListsEverySubcommand(t *testing.T) {
 	}
 }
 
-// A report's listing line ends with every view its command accepts, in
-// the command's order.
-func TestUsageListsEveryReportsViews(t *testing.T) {
+// Every report family is a command the listing names.
+func TestUsageListsEveryReport(t *testing.T) {
 	t.Parallel()
-	families := map[string][]string{
-		"holdings": holdingsViews, "returns": returnsViews, "gains": gainsViews, "exposure": exposureViews,
-		"yield": yieldViews, "spending": spendingViews, "income": incomeViews, "cashflow": cashflowViews,
-	}
-	for _, c := range commandHelps {
-		views, ok := families[c.name]
-		if !ok {
-			continue
+	for _, fam := range reportFamilies {
+		if !slices.ContainsFunc(commandHelps, func(c commandHelp) bool { return c.name == fam.name }) {
+			t.Errorf("%s is not listed", fam.name)
 		}
-		delete(families, c.name)
-		if want := ": " + strings.Join(views, ", "); !strings.HasSuffix(c.short, want) {
-			t.Errorf("%s's line %q does not end with its views %q", c.name, c.short, want)
-		}
-	}
-	for name := range families {
-		t.Errorf("%s is not listed", name)
 	}
 }
 
@@ -94,7 +82,7 @@ func TestEveryListedCommandSaysWhatItDoes(t *testing.T) {
 // as unknown.
 func TestHelpForAViewIsTheViewsOwnHelp(t *testing.T) {
 	t.Parallel()
-	for _, view := range holdingsViews {
+	for _, view := range holdingsFamily.names() {
 		got := runUsage(t, "help", view)
 		want := runUsage(t, "holdings", view, "-h")
 		if got != want {

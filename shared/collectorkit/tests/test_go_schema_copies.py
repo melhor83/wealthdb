@@ -47,26 +47,29 @@ class Copy:
 # Keyed by the collector, as its directory under collectors/ names it.
 COPIES = {
     "amex": Copy(("amex/testdata/silver_schema.sql",), {
-        "schema_meta": VERSION, "parser_generations": BOOKKEEPING}),
+        "schema_meta": VERSION, "document_derivations": BOOKKEEPING}),
     "angellist": Copy(("angellist/testdata/silver_schema.sql",), {
         "commitments": UNREAD, "portfolio_timeseries": UNREAD,
         "tax_documents": UNREAD, "vehicles": UNREAD}),
     "carta": Copy(("carta/testdata/silver_schema.sql",), {
-        "k1_capital_accounts": "read; basis_test.go creates it inline"}),
+        "k1_capital_accounts": "read; basis_test.go creates it inline",
+        "document_derivations": BOOKKEEPING}),
     "chase": Copy(("chase/testdata/silver_schema.sql",), {
-        "loader_state": BOOKKEEPING, "parser_generations": BOOKKEEPING}),
+        "loader_state": BOOKKEEPING, "document_derivations": BOOKKEEPING}),
     "curves": Copy(("curves/testdata/silver_schema.sql",), {
         "schema_meta": VERSION}),
     "equityzen": Copy(("equityzen/testdata/silver_schema.sql",), {
         "schema_meta": VERSION, "capital_account_statements": UNREAD,
-        "k1_documents": UNREAD, "tax_documents": UNREAD}),
+        "k1_documents": UNREAD, "tax_documents": UNREAD,
+        "document_derivations": BOOKKEEPING}),
+    "erstebank_at": Copy(("erstebank_at/testdata/silver_schema.sql",)),
     "fidelity-web": Copy((
         "fidelity/testdata/silver_schema.sql",
         "fidelity/testdata/lots_schema.sql"), {
-        "schema_meta": VERSION, "parser_generations": BOOKKEEPING,
+        "schema_meta": VERSION, "document_derivations": BOOKKEEPING,
         "documents": UNREAD}),
     "firstcitizens": Copy(("firstcitizens/testdata/silver_schema.sql",), {
-        "parsed_statements": BOOKKEEPING, "parser_generations": BOOKKEEPING}),
+        "document_derivations": BOOKKEEPING}),
     "fred": Copy(("fred/testdata/silver_schema.sql",), {
         "schema_meta": VERSION}),
     "manual": Copy(("manual/testdata/silver_schema.sql",)),
@@ -75,23 +78,24 @@ COPIES = {
         "run_windows": BOOKKEEPING}),
     "refdata": Copy(("refdata/testdata/silver_schema.sql",)),
     "relevate": Copy(("relevate/testdata/silver_schema.sql",), {
-        "schema_meta": VERSION, "parser_generations": BOOKKEEPING,
-        "documents": UNREAD, "performance_points": UNREAD,
-        "historical_position_snapshots": "read by historical.go; no test holds it",
-        "historical_cash_balances": "read by historical.go; no test holds it"}),
+        "schema_meta": VERSION, "document_derivations": BOOKKEEPING,
+        "documents": UNREAD, "performance_points": UNREAD}),
     "schwab-api": Copy(("schwab/testdata/silver_schema.sql",), {
         "schema_meta": VERSION, "open_orders": UNREAD, "user_preference": UNREAD}),
     "schwab-web": Copy(("schwab/testdata/web_silver_schema.sql",), {
         "schema_meta": VERSION, "parser_generations": BOOKKEEPING,
+        "document_derivations": BOOKKEEPING,
         "parsed_documents": BOOKKEEPING, "documents": UNREAD,
-        "cost_basis_methods": UNREAD}),
+        "cost_basis_methods": UNREAD, "rebuild_level": BOOKKEEPING}),
     "swissquote": Copy(("swissquote/testdata/silver_schema.sql",), {
-        "schema_meta": VERSION, "documents": UNREAD}),
+        "schema_meta": VERSION, "documents": UNREAD,
+        "document_derivations": BOOKKEEPING}),
     "ubs-psn": Copy(("ubs/testdata/silver_schema.sql",), {
         "schema_meta": VERSION, "cash_account_pricing": UNREAD,
         "portfolio_performance": UNREAD}),
+    "ubs-web": Copy(("ubs/testdata/web_silver_schema.sql",)),
     "viac": Copy(("viac/testdata/silver_schema.sql",), {
-        "schema_meta": VERSION, "parser_generations": BOOKKEEPING,
+        "schema_meta": VERSION, "document_derivations": BOOKKEEPING,
         "documents": UNREAD, "wealth_history": UNREAD}),
 }
 
@@ -102,8 +106,6 @@ EXEMPT = {
     "synthetic/testdata/silver_schema.sql":
         "no collector writes it; fred and refdata check their tables in it",
 }
-# The ubs adapter also reads the ubs-web silver; its tests build that
-# schema inline, so there is no copy here to check.
 
 
 def _columns(conn: sqlite3.Connection) -> dict[str, dict[str, str]]:

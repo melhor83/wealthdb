@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	_ "embed"
-	"reflect"
 	"testing"
 	"time"
 
@@ -76,13 +75,7 @@ func seed(t *testing.T, db *sql.DB) {
 
 func openConn(t *testing.T, path string) silver.Connection {
 	t.Helper()
-	return silvertest.Open(t, &Adapter{}, path)
-}
-
-func TestKind(t *testing.T) {
-	if (&Adapter{}).Kind() != "raiffeisen_at" {
-		t.Fatalf("Kind = %q", (&Adapter{}).Kind())
-	}
+	return silvertest.Open(t, adapter, path)
 }
 
 func TestStatusAndChangeWindow(t *testing.T) {
@@ -111,12 +104,12 @@ func TestStatusAndChangeWindow(t *testing.T) {
 		t.Errorf("tx range = [%d,%d]", st.OldestTransactionAt, st.LatestTransactionAt)
 	}
 
-	w := silvertest.FullWindow(t, conn)
+	w := silvertest.WindowSince0(t, conn)
 	if w.NewChangeNumber != loadUnix {
 		t.Errorf("NewChangeNumber = %d, want %d", w.NewChangeNumber, loadUnix)
 	}
-	if w.Start != firstClose || w.End != loadUnix {
-		t.Errorf("window = [%d,%d]", w.Start, w.End)
+	if !w.Full {
+		t.Errorf("window = %+v, want the whole history, [%d,%d] in it", w, firstClose, loadUnix)
 	}
 
 	// An idle reload (watermark already at the latest load) yields nothing.
@@ -146,8 +139,8 @@ func TestSpanReachesTheLastClosingStamp(t *testing.T) {
 	if want := day + silver.DayEndOffset; st.LatestSnapshotAt != want {
 		t.Errorf("LatestSnapshotAt = %d, want the day's last second %d", st.LatestSnapshotAt, want)
 	}
-	if w := silvertest.FullWindow(t, conn); w.End != day+silver.DayEndOffset {
-		t.Errorf("window end = %d, want %d", w.End, day+silver.DayEndOffset)
+	if w := silvertest.WindowSince0(t, conn); !w.Full {
+		t.Errorf("window = %+v, want the whole history, %d in it", w, day+silver.DayEndOffset)
 	}
 }
 
@@ -156,7 +149,7 @@ func TestSnapshots(t *testing.T) {
 	seed(t, db)
 	conn := openConn(t, path)
 	ctx := context.Background()
-	w := silvertest.FullWindow(t, conn)
+	w := silvertest.WindowSince0(t, conn)
 
 	stream, err := conn.Snapshots(ctx, w)
 	if err != nil {
@@ -225,7 +218,7 @@ func TestTransactions(t *testing.T) {
 	seed(t, db)
 	conn := openConn(t, path)
 	ctx := context.Background()
-	w := silvertest.FullWindow(t, conn)
+	w := silvertest.WindowSince0(t, conn)
 
 	stream, err := conn.Transactions(ctx, w)
 	if err != nil {
@@ -308,54 +301,5 @@ func TestTxKind(t *testing.T) {
 		if got := txKind(tc.category, tc.desc, tc.amt); got != tc.want {
 			t.Errorf("%s: txKind(%q,%q) = %q, want %q", tc.name, tc.category, tc.desc, got, tc.want)
 		}
-	}
-}
-
-// TestCurrentBalanceAtEachRunThatListedTheAccount pins a CURRENT balance at
-// each run whose roster listed the account (run_accounts), valued at its
-// roster row as of that run. Silver content-dedups an unchanged roster row,
-// so the quiet account stands at every run that still lists it, the latest
-// included, while its account record keeps its own row. The account the
-// latest runs left out stops at its last listing run, so gold can end it
-// (wealthdb/docs/DESIGN.md §10.7) rather than reading it as open at the
-// source's latest run. A run that changed no roster row still bounds the
-// window.
-func TestCurrentBalanceAtEachRunThatListedTheAccount(t *testing.T) {
-	const quietIBAN, leftIBAN = "ATkkBBBBBKKKKKKK0002", "ATkkBBBBBKKKKKKK0003"
-	path, db := newFixture(t)
-	seed(t, db)
-	r0, r1, r2, r3 := silvertest.SeedRuns(t, db, loadUnix, iban, quietIBAN, leftIBAN)
-	conn := openConn(t, path)
-	w := silvertest.FullWindow(t, conn)
-	if w.End != r3 {
-		t.Errorf("window end = %d, want the latest run %d", w.End, r3)
-	}
-	batch := silvertest.Merged(t, conn, w)
-	want := map[string]map[int64]string{
-		iban:      {r2: "1500 EUR", r3: "1500 EUR"},
-		quietIBAN: {r0: "250 EUR", r1: "250 EUR", r2: "250 EUR", r3: "250 EUR"},
-		leftIBAN:  {r0: "75 EUR", r1: "80 EUR"},
-	}
-	if got := silvertest.CurrentsByInstant(batch); !reflect.DeepEqual(got, want) {
-		t.Errorf("CURRENT balances =\n %v\nwant\n %v", got, want)
-	}
-	for _, a := range batch.Accounts {
-		if a.AccountExternalID == quietIBAN && a.LastSeenAt != r0 {
-			t.Errorf("quiet account LastSeenAt = %d, want its own latest row %d", a.LastSeenAt, r0)
-		}
-	}
-}
-
-// TestSnapshotsNeedRunAccounts pins a silver loaded before run_accounts
-// (silver migration 0003): its runs say nothing about a quiet account, so
-// the snapshots fail and name the load that adds the table.
-func TestSnapshotsNeedRunAccounts(t *testing.T) {
-	path, db := newFixture(t)
-	seed(t, db)
-	silvertest.Exec(t, db, `DROP TABLE run_accounts`)
-	conn := openConn(t, path)
-	_, err := conn.Snapshots(context.Background(), silvertest.FullWindow(t, conn))
-	if want := "raiffeisen_at silver has no run_accounts; run `raiffeisen_at load` first"; err == nil || err.Error() != want {
-		t.Errorf("Snapshots = %v, want %q", err, want)
 	}
 }

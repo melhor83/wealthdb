@@ -357,20 +357,36 @@ lives in `positions`; the ledgers key by stable source id.
 | `cash_flows` | cash_flow_external_id | One row per purchase / distribution (CLOSED transactions): `deal_external_id`, `flow_date`, `kind` (`purchase` / `distribution`), `method` (e.g. `ACH`), `amount`, `shares` and `price_per_share` (the event's `sharesPostSplit` / `pricePostSplit`), `execution_fee` (gold books it as its own leg, and a purchase's fee as part of the book value), `currency`, `description`, `payload`. From `primaryTransaction` + `primaryTransaction.distributedTransactions`. |
 | `tax_documents` | document_external_id | Per-offering document metadata + archive: `document_type`, `download_url`, and once `download` fetches the blob (by default; `--no-documents` skips it), `local_path` + `content_hash` + `retrieved_at`. |
 | `capital_account_statements` | document_external_id | Parsed quarterly partner's Statement of Capital Account: `period_end`, `beginning_balance`, `contributions`, `withdrawals`, `transfers`, `profit_loss`, `carried_interest`, **`ending_nav`** (Net Ending Capital Account Balance = the fund's fair-value NAV). Funds only (SPVs issue no capital-account statements). |
-| `k1_documents` | document_external_id | Parsed Schedule K-1 (Form 1065): `tax_year`, `is_final`, and Item L tax-basis capital account (`beginning_capital`, `current_year_income`, `withdrawals_distributions`, **`ending_capital`**). Part III box amounts are not extracted (form-grid; see statements.py). |
+| `k1_documents` | document_external_id | Parsed Schedule K-1 (Form 1065): `tax_year`, `is_final`, and Item L tax-basis capital account (`beginning_capital`, `current_year_income`, `withdrawals_distributions`, **`ending_capital`**), read from the text, a figure it misses from the face page's word boxes (`collectorkit.k1`). Part III box amounts are not stored. |
+| `document_derivations` | (content_sha256, scope) | Which K-1 reader derived each K-1 row (scope `k1`, migration 0003; `collectorkit.derivations`). |
 | `schema_meta`, `dump_runs` | — | collectorkit migration / snapshot bookkeeping. |
 
 **Document parsing** (`statements.py`, via `pdftotext`): `download` (default)
 fetches each offering's document PDFs (`node.documents[].downloadUrl`) into
-`documents/<deal-slug>/<doc-slug>.pdf`; `load` parses them. **Capital-account
-statements give the multi-company funds the fair-value NAV the holdings API
-lacks** — each statement's `ending_nav` is injected into `positions` as a
+`documents/<deal-slug>/<doc-slug>.pdf`; `load` parses them. Every later
+run holds the same PDFs again, so each extraction is kept in the
+collector's cache (`collectorkit.extract`), and a PDF is extracted once.
+**Capital-account statements give the multi-company funds the fair-value
+NAV the holdings API lacks** — each statement's `ending_nav` is injected into `positions` as a
 `statement` revaluation event (kind=`private_fund` only; SPVs stay
 tender-driven), so a fund's `positions` history runs investment → quarterly
 NAV revaluations. The API reports only cost for a fund, so a fall below
 cost can show only in its statements. K-1s contribute the tax-basis
-capital account. Only Item L of a K-1 is parsed; the Part III grid is not
-(`pdftotext` reads the box numbers, not the amounts).
+capital account. Only Item L of a K-1 is kept. It is read from the text,
+a printed minus sign kept. A figure the text misses, one printed off its
+caption's line, is read from the face page's word boxes (`pdftotext
+-bbox`) by the fleet's K-1 reader (`collectorkit.k1`). The Part III box
+amounts are not stored. A run records each K-1 under the reader's
+generation (`K1_GENERATION`: `statements.py`, the kit code it imports and
+both extraction keys). After the runs, the load reads again each K-1
+that an older reader read. It reads the copy in the run the row came from.
+So a reader change reaches every stored K-1. A stored K-1 that the new
+reader no longer reads as a K-1 loses its K-1 row and its record. If it
+reads as a capital-account statement, it gets the statement row of its
+run, unless a later run wrote one. When that run is the offering's
+latest, its positions are replayed again. The silver then equals what
+`load --force` builds. A stored statement is not read again. One that a
+new reader would read as a K-1 becomes a K-1 only in `load --force`.
 
 The GraphQL feed is the primary cash-flow source; these PDFs corroborate
 it and backstop anything it misses — a distribution can reach a bank
@@ -394,12 +410,11 @@ So this collector stays on the documented default — the same call
 ## 6. Gold adapter
 
 The gold adapter lives at `wealthdb/internal/silver/equityzen/` and is
-registered with the gold engine by the blank import in
-`cmd/wealthdb/main.go`. It is the closest sibling of `angellist` (an
+registered with the gold engine by its import in
+`internal/silver/all`. It is the closest sibling of `angellist` (an
 event-sourced LP book with distributions) and a cousin of `carta`. The
 package doc comment in `adapter.go` is the canonical spec; there is no
-separate `docs/adapters/*.md`. Gold migration `0015` admits
-`'equityzen'` as a `silver_kind`.
+separate `docs/adapters/*.md`.
 
 ### Enums — no gold change needed
 
@@ -439,13 +454,16 @@ exist in gold.
 
 ### Adapter shape
 
-- `adapter.go` — `silver.Register`, `Open` (read-only SQLite), `Connection`.
+- `adapter.go` — `Open` (read-only SQLite), `Connection`, and the
+  `silver.Source` it registers: the shared
+  `returns.PrivateMarketLedgerPolicy` and `lots.StatedPolicy`.
 - `status.go` — `Status` + `ChangeWindow`, driven by `dump_runs`
   (`LatestChangeNumber = MAX(dump_runs.snapshot_at)`, idle reload = no-op;
   the latest dump is also the source's observed watermark).
   Snapshot extrema = MIN/MAX `positions.as_of_date`, stretched to the
   latest dump that dropped a deal; transaction extrema = MIN/MAX
-  `cash_flows.flow_date`; the change window spans both. Silver dates
+  `cash_flows.flow_date`. A dump past the watermark re-emits the whole
+  history (`Window.Full`). Silver dates
   are source ISO TEXT → converted with `strftime('%s', …)` to the canonical
   unix seconds.
 - `snapshots.go` — **forward-fill**: for each distinct position event date
@@ -494,13 +512,12 @@ exist in gold.
 - `basis.go` — the book value and its basis stamp (derived; `average` for
   an SPV, `paid_in` for a fund).
 - `classmap.go` — `offerings.kind` → `asset_class`.
-- `policy.go` — registers the shared `returns.PrivateMarketLedgerPolicy`:
-  the ledger's `deposit`/`withdrawal` legs are real dated cash crossings of
+- The returns policy: the ledger's `deposit`/`withdrawal` legs are real dated cash crossings of
   the EquityZen boundary and count as external capital; the paired
   investment legs stay internal (counting both halves would cancel every
   event). `CapitalCallRisk` keeps the `nav_only_capital_call_risk` tag on
   flow-less windows.
-- `lotpolicy.go` — registers `lots.StatedPolicy`: the cost basis is what
+- The lot policy: the cost basis is what
   the source states, so the lot engine builds no lots and realizes a sale
   against that basis (`wealthdb/docs/LOTS.md`).
 

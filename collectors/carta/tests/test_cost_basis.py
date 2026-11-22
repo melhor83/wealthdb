@@ -3,8 +3,8 @@ Unit tests for the cost-basis facts silver carries (migrations 0004, 0005).
 
 Covers the exercise detail matched to the certificate it produced, the
 capital-account statement's inception-to-date lines, the fund's accepted
-date, the federal Schedule K-1 face page and a fiscal year's period, the
-migrations' effect on rows loaded before them, and one bronze run loaded
+date, the K-1 rows of each tax document (collectorkit.k1 reads the
+face page; its tests cover the reader), the migrations' effect on rows loaded before them, and one bronze run loaded
 end to end. Synthetic data only: invented ids, labels, dates and figures.
 """
 from __future__ import annotations
@@ -15,9 +15,13 @@ import sqlite3
 import zipfile
 from pathlib import Path
 
-import k1
+import captable
+import common
+import exercises
+import fund_documents
 import load
-from conftest import MIGRATIONS_DIR, docs_dir
+from collectorkit import extract, pdftotext, silver
+from conftest import MIGRATIONS_DIR, docs_dir, load_one
 
 
 # ---- exercise detail -> certificate ----------------------------------------
@@ -84,14 +88,14 @@ def _captable_edir(root: Path) -> Path:
 def test_exercise_xlsx_reads_the_grant_from_its_title(tmp_path):
     p = tmp_path / "x.xlsx"
     _xlsx(p, label="ES-9", date="12/31/2098", shares=40, price=1, fmv=3.5)
-    assert load._parse_exercise_xlsx(p) == {
+    assert exercises._parse_exercise_xlsx(p) == {
         "grant_label": "ES-9", "date": "12/31/2098", "shares": "40",
         "exercise_price": "1", "fmv": "3.5"}
 
 
 def test_each_certificate_takes_the_exercise_behind_it(tmp_path):
     edir = _captable_edir(tmp_path)
-    matched = load._match_exercises(edir, load._read_exercises(edir))
+    matched = exercises._match_exercises(edir, exercises._read_exercises(edir))
     # Within a grant and a quantity, each certificate, oldest first, takes
     # the oldest exercise dated on or before its issue date.
     assert {cid: (ex["date"], ex["fmv"]) for cid, ex in matched.items()} == {
@@ -106,7 +110,7 @@ def test_a_certificate_issued_before_any_exercise_is_left_unmatched(tmp_path):
     shares = json.loads((edir / "shares.json").read_text())
     shares["rows"][0]["issue_date"] = "02/01/2098"   # before its exercise
     (edir / "shares.json").write_text(json.dumps(shares))
-    matched = load._match_exercises(edir, load._read_exercises(edir))
+    matched = exercises._match_exercises(edir, exercises._read_exercises(edir))
     # CS-1 cannot take an exercise dated after it; CS-2 still takes the
     # older of the two 1000-share exercises.
     assert 21 not in matched
@@ -116,14 +120,14 @@ def test_a_certificate_issued_before_any_exercise_is_left_unmatched(tmp_path):
 def test_the_xlsx_title_names_the_grant_when_no_grant_list_does(tmp_path):
     edir = _captable_edir(tmp_path)
     (edir / "options.json").write_text(json.dumps({"rows": []}))
-    matched = load._match_exercises(edir, load._read_exercises(edir))
+    matched = exercises._match_exercises(edir, exercises._read_exercises(edir))
     assert sorted(matched) == [21, 22, 23]
 
 
 def test_share_rows_carry_their_exercise_and_its_type(migrated, tmp_path):
     edir = _captable_edir(tmp_path)
-    matched = load._match_exercises(edir, load._read_exercises(edir))
-    load.load_securities(migrated, 0, 7, edir, held=True, val_price=None,
+    matched = exercises._match_exercises(edir, exercises._read_exercises(edir))
+    captable.load_securities(migrated, 0, 7, edir, held=True, val_price=None,
                          exercises=matched)
     rows = migrated.execute(
         "SELECT security_type, security_external_id, exercise_type, "
@@ -140,8 +144,8 @@ def test_share_rows_carry_their_exercise_and_its_type(migrated, tmp_path):
 
 def test_last_exercise_fmv_is_the_latest_exercise(tmp_path):
     edir = _captable_edir(tmp_path)
-    assert load._last_exercise_fmv(load._read_exercises(edir)) == 2.5
-    assert load._last_exercise_fmv([]) is None
+    assert exercises._last_exercise_fmv(exercises._read_exercises(edir)) == 2.5
+    assert exercises._last_exercise_fmv([]) is None
 
 
 # ---- capital-account statement ---------------------------------------------
@@ -162,7 +166,7 @@ Ending balance               $         106,753   $     106,753   $        106,75
 
 
 def test_statement_states_every_inception_to_date_line():
-    assert load._statement_from_text(_STATEMENT) == {
+    assert fund_documents._statement_from_text(_STATEMENT) == {
         "net_asset_value": "106753",
         "capital_contributed": "103457.00",
         "management_fees": "-6139",
@@ -176,12 +180,12 @@ def test_statement_states_every_inception_to_date_line():
 def test_a_statement_without_a_line_leaves_it_null():
     text = "\n".join(line for line in _STATEMENT.splitlines()
                      if not line.startswith("Carried interest"))
-    assert load._statement_from_text(text)["carried_interest"] is None
+    assert fund_documents._statement_from_text(text)["carried_interest"] is None
 
 
 def test_statement_flows_read_the_nil_dash_as_zero():
     text = "Capital distributions     —     —     —\n"
-    assert load._statement_flows_from_text(text) == (None, 0.0)
+    assert fund_documents._statement_flows_from_text(text) == (None, 0.0)
 
 
 def _partner_metrics(edir: Path, *, sharing: str, accepted: str | None) -> None:
@@ -212,12 +216,12 @@ def test_a_statement_adds_its_lines_to_partner_metrics_of_the_same_day(
     # the statement lines it lacks.
     edir = tmp_path / "fund_9"
     _partner_metrics(edir, sharing="12/31/2098", accepted=None)
-    snap = load._date_ts("12/31/2098")
+    snap = common._date_ts("12/31/2098")
     load.load_fund_metrics(migrated, snap, 9, edir)
     docs = docs_dir(tmp_path, [{"id": 5, "document_type": "Capital account statements",
                              "document_date": "12/31/2098", "fund_id": 9}])
-    monkeypatch.setattr(load, "_pdf_text", lambda pdf: _STATEMENT)
-    assert load.load_statement_nav(migrated, docs, 9) == 1
+    monkeypatch.setattr(fund_documents, "_pdf_text", lambda pdf: _STATEMENT)
+    assert fund_documents.load_statement_nav(migrated, docs, 9) == 1
     assert migrated.execute(
         "SELECT net_asset_value, capital_contributed, management_fees, "
         "carried_interest, json_extract(payload, '$.source') "
@@ -248,17 +252,17 @@ def test_a_run_without_documents_keeps_the_statement_lines(
     # statements rewrites the partner-metrics figures and leaves the
     # statement lines merged onto that row in place, and the fund's calls
     # and distributions as the run with documents built them.
-    monkeypatch.setattr(load, "_pdf_text", lambda pdf: _STATEMENT)
-    conn = load.silver.open_db(tmp_path / "carta.db")
-    load.silver.apply_migrations(conn, MIGRATIONS_DIR)
-    assert load.load_run(conn, _fund_run(tmp_path, "20990101T000000Z",
+    monkeypatch.setattr(fund_documents, "_pdf_text", lambda pdf: _STATEMENT)
+    conn = silver.open_db(tmp_path / "carta.db")
+    silver.apply_migrations(conn, MIGRATIONS_DIR)
+    assert load_one(conn, _fund_run(tmp_path, "20990101T000000Z",
                                          documents=True))
     ledger = ("SELECT cash_flow_external_id, kind, flow_date, amount "
               "FROM cash_flows ORDER BY 1")
     full = [tuple(r) for r in conn.execute(ledger)]
     assert full == [("call:9:5", "capital_call", "12/31/2098", 103457.0),
                     ("dist:9:5", "distribution", "12/31/2098", 1623.0)]
-    assert load.load_run(conn, _fund_run(tmp_path, "20990102T000000Z",
+    assert load_one(conn, _fund_run(tmp_path, "20990102T000000Z",
                                          documents=False))
     assert [tuple(r) for r in conn.execute(
         "SELECT net_asset_value, management_fees, net_operating_income, "
@@ -288,10 +292,6 @@ def _phrase(x0: float, y0: float, phrase: str) -> list[str]:
 _K1_CAPTIONS = {"heading": "Partner's Capital Account Analysis",
                 "net_income": "Current year net income (loss)",
                 "withdrawals": "Withdrawals and distributions"}
-# Item L as forms before 2020 print it.
-_K1_CAPTIONS_PRE_2020 = {"heading": "Partner's capital account analysis:",
-                         "net_income": "Current year increase (decrease)",
-                         "withdrawals": "Withdrawals &amp; distributions"}
 
 
 def _k1_face(captions: dict[str, str] = _K1_CAPTIONS) -> list[str]:
@@ -343,63 +343,6 @@ def _bbox(*pages: list[str]) -> str:
 _COVER = _phrase(36, 100, "Attached is your Schedule K-1 package.")
 
 
-def test_k1_face_page_reads_item_l_gains_and_distributions():
-    got = k1.parse_bbox(_bbox(_COVER, _k1_face()))
-    assert {k: v for k, v in got.items() if k != "printed"} == {
-        "tax_year": 2098,
-        "period_start": None,          # a calendar-year form
-        "period_end": None,
-        "beginning_capital": "104286",
-        "contributions": "51374",
-        "net_income": "-3127",
-        "other_change": None,          # left blank on the form
-        "distributions": "3618",       # inside the form's own parentheses
-        "ending_capital": "148915",
-        "short_term_gain": "-1247",
-        "long_term_gain": "12483",
-        "cash_distributions": "1529",
-        "property_distributions": "2089",
-    }
-    assert got["printed"]["short_term_gain"] == "(1,247.)"
-
-
-def _item_l(got: dict) -> tuple:
-    return tuple(got[c] for c in ("beginning_capital", "contributions",
-                                  "net_income", "distributions",
-                                  "ending_capital"))
-
-
-def test_a_face_page_from_before_2020_reads_its_item_l():
-    got = k1.parse_bbox(_bbox(_COVER, _k1_face(_K1_CAPTIONS_PRE_2020)))
-    assert _item_l(got) == ("104286", "51374", "-3127", "3618", "148915")
-
-
-def test_a_typographic_apostrophe_marks_the_face_page_too():
-    captions = dict(_K1_CAPTIONS, heading="Partner\u2019s Capital Account Analysis")
-    got = k1.parse_bbox(_bbox(_COVER, _k1_face(captions)))
-    assert _item_l(got) == ("104286", "51374", "-3127", "3618", "148915")
-
-
-def test_k1_caption_numbers_are_not_amounts():
-    lines = k1._lines(k1.bbox_pages(_bbox(_k1_face()))[0])
-    boxes = k1._boxes(lines, 329, 446)
-    assert k1._first_amount(boxes.get(("mid", "9c"), [])) is None
-    assert k1._first_amount(boxes.get(("mid", "9b"), [])) is None
-    assert k1._first_amount(boxes[("mid", "1")]) == "389."
-
-
-def test_a_document_with_no_federal_face_page_yields_nothing():
-    assert k1.parse_bbox(_bbox(_COVER)) is None
-
-
-def test_k1_decimal():
-    assert k1._decimal("1,234.") == "1234"
-    assert k1._decimal("(1,234.50)") == "-1234.50"
-    assert k1._decimal("-$12.") == "-12"
-    assert k1._decimal("(9.)", magnitude=True) == "9"
-    assert k1._decimal("STMT") is None
-
-
 def test_k1_rows_load_once_per_document(migrated, tmp_path, monkeypatch,
                                         caplog):
     docs = docs_dir(tmp_path, [
@@ -413,8 +356,8 @@ def test_k1_rows_load_once_per_document(migrated, tmp_path, monkeypatch,
         calls.append(pdf.name)
         return _bbox(_COVER, _k1_face()) if pdf.name == "doc_1.pdf" else _bbox(_COVER)
 
-    monkeypatch.setattr(k1, "bbox_xhtml", fake_bbox)
-    assert load.load_k1_capital_accounts(migrated, docs) == 1
+    monkeypatch.setattr(extract, "_bbox_xhtml", fake_bbox)
+    assert fund_documents.load_k1_capital_accounts(migrated, docs) == 1
     assert calls == ["doc_1.pdf", "doc_2.pdf"]   # statements are not tax documents
     row = migrated.execute(
         "SELECT doc_id, entity_external_id, tax_year, beginning_capital, "
@@ -423,10 +366,42 @@ def test_k1_rows_load_once_per_document(migrated, tmp_path, monkeypatch,
         "FROM k1_capital_accounts").fetchone()
     assert row == (1, 9, 2098, "104286", "3618", "2089", "12483", "12,483.")
     assert caplog.messages == []   # the 1042-S is not typed as a K-1
-    # The same bytes in a later run are not parsed again.
+    # The same bytes in a later run are not parsed again, the 1042-S with
+    # no face page included.
     calls.clear()
-    assert load.load_k1_capital_accounts(migrated, docs) == 0
-    assert calls == ["doc_2.pdf"]
+    assert fund_documents.load_k1_capital_accounts(migrated, docs) == 0
+    assert calls == []
+    assert migrated.execute(
+        "SELECT scope, generation, row_count FROM document_derivations "
+        "ORDER BY row_count").fetchall() == [
+            ("k1", fund_documents.K1_GENERATION, 0),
+            ("k1", fund_documents.K1_GENERATION, 1)]
+
+
+def test_a_new_k1_generation_derives_the_tax_documents_again(
+        migrated, tmp_path, monkeypatch, caplog):
+    docs = docs_dir(tmp_path, [
+        {"id": 1, "document_type": "Tax - Schedule K-1", "fund_id": 9},
+        {"id": 2, "document_type": "Tax", "fund_id": 9}])
+    calls = []
+
+    def fake_bbox(pdf, timeout=None):
+        calls.append(pdf.name)
+        return _bbox(_COVER, _k1_face()) if pdf.name == "doc_1.pdf" else _bbox(_COVER)
+
+    monkeypatch.setattr(extract, "_bbox_xhtml", fake_bbox)
+    fund_documents.load_k1_capital_accounts(migrated, docs)
+    before = migrated.execute("SELECT * FROM k1_capital_accounts").fetchall()
+    calls.clear()
+    monkeypatch.setattr(fund_documents, "K1_GENERATION", "next")
+    with caplog.at_level("INFO"):
+        assert fund_documents.load_k1_capital_accounts(migrated, docs) == 1
+    assert calls == []        # the words are cached; only the reader runs
+    assert "k1: deriving 2 document(s) under parser generation next" in (
+        caplog.messages)
+    assert migrated.execute("SELECT * FROM k1_capital_accounts").fetchall() == before
+    assert {g for (g,) in migrated.execute(
+        "SELECT generation FROM document_derivations")} == {"next"}
 
 
 def test_a_k1_without_its_year_takes_the_index_year(migrated, tmp_path,
@@ -434,8 +409,8 @@ def test_a_k1_without_its_year_takes_the_index_year(migrated, tmp_path,
     docs = docs_dir(tmp_path, [{"id": 1, "document_type": "Tax", "fund_id": 9,
                              "tax_year": "2097"}])
     face = [w for w in _k1_face() if 'yMin="84.' not in w]   # the year line
-    monkeypatch.setattr(k1, "bbox_xhtml", lambda pdf, timeout=None: _bbox(face))
-    load.load_k1_capital_accounts(migrated, docs)
+    monkeypatch.setattr(extract, "_bbox_xhtml", lambda pdf, timeout=None: _bbox(face))
+    fund_documents.load_k1_capital_accounts(migrated, docs)
     assert migrated.execute(
         "SELECT tax_year FROM k1_capital_accounts").fetchone() == (2097,)
 
@@ -444,8 +419,8 @@ def test_a_k1_typed_document_without_a_face_page_warns(migrated, tmp_path,
                                                       monkeypatch, caplog):
     docs = docs_dir(tmp_path, [{"id": 1, "document_type": "Tax - Schedule K-1",
                              "fund_id": 9}])
-    monkeypatch.setattr(k1, "bbox_xhtml", lambda pdf, timeout=None: _bbox(_COVER))
-    assert load.load_k1_capital_accounts(migrated, docs) == 0
+    monkeypatch.setattr(extract, "_bbox_xhtml", lambda pdf, timeout=None: _bbox(_COVER))
+    assert fund_documents.load_k1_capital_accounts(migrated, docs) == 0
     assert any("doc_1.pdf" in m and "no federal K-1 face page" in m
                for m in caplog.messages)
 
@@ -453,13 +428,20 @@ def test_a_k1_typed_document_without_a_face_page_warns(migrated, tmp_path,
 def test_a_reissued_k1_replaces_the_row_for_its_document(migrated, tmp_path,
                                                          monkeypatch):
     docs = docs_dir(tmp_path, [{"id": 1, "document_type": "Tax", "fund_id": 9}])
-    monkeypatch.setattr(k1, "bbox_xhtml",
+    monkeypatch.setattr(extract, "_bbox_xhtml",
                         lambda pdf, timeout=None: _bbox(_k1_face()))
-    load.load_k1_capital_accounts(migrated, docs)
+    fund_documents.load_k1_capital_accounts(migrated, docs)
+    first = (docs / "doc_1.pdf").read_bytes()
     (docs / "doc_1.pdf").write_bytes(b"%PDF- amended")
-    load.load_k1_capital_accounts(migrated, docs)
+    fund_documents.load_k1_capital_accounts(migrated, docs)
     assert migrated.execute(
         "SELECT COUNT(*) FROM k1_capital_accounts").fetchone() == (1,)
+    # The first bytes come back under the id: they are read again and
+    # replace the amended row, as a first sighting would.
+    (docs / "doc_1.pdf").write_bytes(first)
+    assert fund_documents.load_k1_capital_accounts(migrated, docs) == 1
+    assert migrated.execute(
+        "SELECT COUNT(*) FROM document_derivations").fetchone() == (1,)
 
 
 def test_a_tax_document_that_is_not_a_pdf_is_not_parsed(migrated, tmp_path,
@@ -469,11 +451,49 @@ def test_a_tax_document_that_is_not_a_pdf_is_not_parsed(migrated, tmp_path,
                              "fund_id": 9}])
     (docs / "doc_1.pdf").write_text('{"url": "https://cdn.example/doc_1"}')
     calls = []
-    monkeypatch.setattr(k1, "bbox_xhtml",
+    monkeypatch.setattr(extract, "_bbox_xhtml",
                         lambda pdf, timeout=None: calls.append(pdf.name))
-    assert load.load_k1_capital_accounts(migrated, docs) == 0
+    assert fund_documents.load_k1_capital_accounts(migrated, docs) == 0
     assert calls == []
     assert caplog.messages == []
+
+
+def test_a_k1_that_cannot_be_extracted_is_read_at_the_next_load(
+        migrated, tmp_path, monkeypatch, caplog):
+    docs = docs_dir(tmp_path, [{"id": 1, "document_type": "Tax - Schedule K-1",
+                             "fund_id": 9}])
+
+    def broken(pdf, timeout=None):
+        raise pdftotext.ExtractionError("pdftotext exited 1: damaged")
+
+    monkeypatch.setattr(extract, "_bbox_xhtml", broken)
+    with caplog.at_level("WARNING"):
+        assert fund_documents.load_k1_capital_accounts(migrated, docs) == 0
+    assert any("pdftotext -bbox failed on doc_1.pdf" in m
+               for m in caplog.messages)
+    for table in ("k1_capital_accounts", "document_derivations"):
+        assert migrated.execute(
+            f"SELECT COUNT(*) FROM {table}").fetchone() == (0,)
+    monkeypatch.setattr(extract, "_bbox_xhtml",
+                        lambda pdf, timeout=None: _bbox(_k1_face()))
+    assert fund_documents.load_k1_capital_accounts(migrated, docs) == 1
+
+
+def test_the_load_sweeps_extractions_no_extractor_reads(tmp_path, extract_dir):
+    # An entry under a key neither extractor has (an older engine or code)
+    # goes; the current keys' entries and other files stay.
+    keep = {extract.extraction_key(e)
+            for e in (fund_documents._LAYOUT, fund_documents._BBOX)}
+    extract_dir.mkdir(parents=True)
+    stale = extract_dir / f"{'a' * 64}.{'0' * 32}.json.gz"
+    kept = [extract_dir / f"{'a' * 64}.{key}.json.gz" for key in keep]
+    other = extract_dir / "notes.txt"
+    for path in (stale, other, *kept):
+        path.write_bytes(b"")
+    bronze, db = tmp_path / "bronze", tmp_path / "carta.db"
+    bronze.mkdir()
+    assert load.main(["--bronze-dir", str(bronze), "--silver-db", str(db)]) == 0
+    assert sorted(extract_dir.iterdir()) == sorted([other, *kept])
 
 
 # ---- fiscal-year K-1 --------------------------------------------------------
@@ -489,25 +509,6 @@ def _heading_period(start: str | None = None, end: str | None = None) -> list[st
     return p
 
 
-def test_a_fiscal_year_k1_states_its_period():
-    got = k1.parse_bbox(_bbox(_COVER, _k1_face()
-                              + _heading_period("07/01/2098", "06/30/2099")))
-    assert (got["tax_year"], got["period_start"], got["period_end"]) == (
-        2098, "2098-07-01", "2099-06-30")
-    assert got["printed"]["period_end"] == "06/30/2099"
-    assert _item_l(got) == ("104286", "51374", "-3127", "3618", "148915")
-
-
-def test_a_calendar_year_k1_leaves_its_period_blank():
-    # Blank fields, or only the year the form edition preprints in them.
-    for face in (_k1_face() + _heading_period(),
-                 _k1_face() + _heading_period("2098", "20")):
-        got = k1.parse_bbox(_bbox(face))
-        assert (got["tax_year"], got["period_start"], got["period_end"]) == (
-            2098, None, None)
-        assert "period_start" not in got["printed"]
-
-
 def test_a_fiscal_year_k1_takes_the_tax_year_its_period_begins_in(
         migrated, tmp_path, monkeypatch):
     # The index files the form under the year the fiscal year ends in, and
@@ -517,8 +518,8 @@ def test_a_fiscal_year_k1_takes_the_tax_year_its_period_begins_in(
                              "tax_year": "2099"}])
     face = [w for w in _k1_face() if 'yMin="84.' not in w]   # the year line
     face += _heading_period("07/01/2098", "06/30/2099")
-    monkeypatch.setattr(k1, "bbox_xhtml", lambda pdf, timeout=None: _bbox(face))
-    load.load_k1_capital_accounts(migrated, docs)
+    monkeypatch.setattr(extract, "_bbox_xhtml", lambda pdf, timeout=None: _bbox(face))
+    fund_documents.load_k1_capital_accounts(migrated, docs)
     assert migrated.execute(
         "SELECT tax_year, period_start, period_end, "
         "json_extract(payload, '$.period_start') "
@@ -526,15 +527,11 @@ def test_a_fiscal_year_k1_takes_the_tax_year_its_period_begins_in(
             2098, "2098-07-01", "2099-06-30", "07/01/2098")
 
 
-def test_k1_date():
-    for raw in ("07/01/2098", "7/1/98", "07 / 01 / 2098", "07/01 2098",
-                "07-01-2098", "2098-07-01", "July 1, 2098", "Jul. 1, 2098"):
-        assert k1._date(raw) == "2098-07-01", raw
-    for raw in ("2098", "/ / 20", "13/01/2098", "07/01/298", "STMT 1"):
-        assert k1._date(raw) is None, raw
-
-
 # ---- migration 0004 backfill ------------------------------------------------
+
+# The schema version the whole chain ends at.
+_LATEST = int(sorted(MIGRATIONS_DIR.glob("[0-9]*_*.sql"))[-1].name[:4])
+
 
 def test_migration_backfills_rows_loaded_before_it(tmp_path):
     older = tmp_path / "migrations"
@@ -542,7 +539,7 @@ def test_migration_backfills_rows_loaded_before_it(tmp_path):
     for f in MIGRATIONS_DIR.glob("000[1-3]_*.sql"):
         shutil.copy(f, older)
     c = sqlite3.connect(":memory:")
-    load.silver.apply_migrations(c, older)
+    silver.apply_migrations(c, older)
     c.execute(
         "INSERT INTO securities (snapshot_at, entity_external_id, "
         " security_type, security_external_id, payload) VALUES "
@@ -554,7 +551,7 @@ def test_migration_backfills_rows_loaded_before_it(tmp_path):
         (json.dumps({"partner": {"accepted_date": "2097-05-06T00:00:00"}}),
          json.dumps({"source": "capital_account_statement"})))
     c.commit()
-    assert load.silver.apply_migrations(c, MIGRATIONS_DIR) == 5
+    assert silver.apply_migrations(c, MIGRATIONS_DIR) == _LATEST
     assert c.execute("SELECT security_external_id, exercise_type, "
                      "exercise_fmv FROM securities ORDER BY 1").fetchall() == [
         (11, None, None), (21, "NSO", None)]
@@ -569,11 +566,11 @@ def test_migration_0005_leaves_the_period_of_existing_k1_rows_empty(tmp_path):
     for f in MIGRATIONS_DIR.glob("000[1-4]_*.sql"):
         shutil.copy(f, older)
     c = sqlite3.connect(":memory:")
-    load.silver.apply_migrations(c, older)
+    silver.apply_migrations(c, older)
     c.execute("INSERT INTO k1_capital_accounts (content_sha256, tax_year, "
               "payload) VALUES ('ab12', 2098, '{}')")
     c.commit()
-    assert load.silver.apply_migrations(c, MIGRATIONS_DIR) == 5
+    assert silver.apply_migrations(c, MIGRATIONS_DIR) == _LATEST
     assert c.execute("SELECT tax_year, period_start, period_end "
                      "FROM k1_capital_accounts").fetchall() == [(2098, None, None)]
 
@@ -600,13 +597,13 @@ def test_a_run_loads_every_cost_basis_fact(tmp_path, monkeypatch):
     ])
     (run / "run.json").write_text(json.dumps(
         {"status": "complete", "individual_id": "ind-1"}))
-    monkeypatch.setattr(load, "_pdf_text", lambda pdf: _STATEMENT)
-    monkeypatch.setattr(k1, "bbox_xhtml",
+    monkeypatch.setattr(fund_documents, "_pdf_text", lambda pdf: _STATEMENT)
+    monkeypatch.setattr(extract, "_bbox_xhtml",
                         lambda pdf, timeout=None: _bbox(_k1_face()))
 
-    conn = load.silver.open_db(tmp_path / "carta.db")
-    load.silver.apply_migrations(conn, MIGRATIONS_DIR)
-    assert load.load_run(conn, run)
+    conn = silver.open_db(tmp_path / "carta.db")
+    silver.apply_migrations(conn, MIGRATIONS_DIR)
+    assert load_one(conn, run)
 
     def q(sql):
         return [tuple(r) for r in conn.execute(sql).fetchall()]

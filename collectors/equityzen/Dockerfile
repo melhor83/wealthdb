@@ -10,8 +10,9 @@ FROM wealthdb/base-camoufox:${WEALTHDB_IMAGE_TAG}
 
 WORKDIR /app
 
-# poppler-utils provides `pdftotext`, used by statements.py to parse the
-# capital-account-statement + K-1 PDFs (load step). Single apt layer.
+# poppler-utils provides `pdftotext`: its `-layout` text for the
+# capital-account statements and its `-bbox` word boxes for the K-1
+# (load step). Single apt layer.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends poppler-utils \
     && rm -rf /var/lib/apt/lists/*
@@ -21,9 +22,8 @@ RUN apt-get update \
 COPY requirements.txt /app/
 RUN pip install -r requirements.txt
 
-# No source: every run and every test mounts the checkout over /app
-# (HAS_APP_MOUNT in the wrapper), entrypoint.sh included, so the image
-# holds only what the code runs on.
+# No source: every run and every test mounts the checkout over /app,
+# entrypoint.sh included, so the image holds only what the code runs on.
 
 # Image default user is root. The wrapper runs the container with
 # `--user $(id -u):$(id -g)` so files written to mounted volumes have

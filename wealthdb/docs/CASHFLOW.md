@@ -320,8 +320,9 @@ joined on one of:
 - a reference the source stamped on both halves;
 - the other leg the source described on one of them.
 
-Each leg then names the other's account (`far_silver_source_id`,
-`far_account_external_id`, migration 0079).
+Each leg then names the other's account and leg in `transfer_links`
+(`far_silver_source_id`, `far_account_external_id`,
+`far_transaction_external_id`).
 
 The joins are not interchangeable. A pairing on amount is an inference,
 so its two legs agree in currency and nearly in size. A pairing on a
@@ -355,8 +356,7 @@ already holds:
 That road answers **where the money went and nothing else**. What the
 movement was stays the tiers' question. A stated counter account places
 no verdict, so a row still needs a matcher, a rule or a pin to be
-called an own-account move. Where neither road knows a far account, the
-rules that place the verdict can carry a class instead (`far_class`).
+called an own-account move.
 
 The ladder is ordered, and the first match wins. **The wrapper is
 asked before the kind**: any account kind can sit inside any wrapper,
@@ -376,15 +376,13 @@ and the wrapper says whose money moved.
 3. The far account is kind `mortgage` → `financing · Mortgage`, either
    direction. A drawdown is an inflow.
 4. The far account is **in the pool** → invisible.
-5. The rule recorded `far_class` `mortgage` (the built-in mortgage rule
-   does) → `financing · Mortgage`.
-6. Anything else → `vehicles · Unpaired transfers`. At group grain the
+5. Anything else → `vehicles · Unpaired transfers`. At group grain the
    node splits by what is missing:
    - **No far account** (`unnamed`): nothing paired the row.
    - **Fenced-out account** (`out_of_pool`): the far account is one
      gold holds, which `cashflow.accounts` excluded from the pool.
 
-Step 6 closes a hole the rule tier opens. A config rule exists to place
+Step 5 closes a hole the rule tier opens. A config rule exists to place
 a wire to the holder's own account at a bank the product does not
 track. That money **leaves the pool**. Drawn as invisible, it would
 vanish into the residual. Drawn as `Unpaired transfers`, it is visible
@@ -421,9 +419,9 @@ A declaration is how the holder opens the closed world, one account at
 a time. A move to an undeclared, untracked account is income or
 spending. Nothing the product measures can contradict a declaration, so
 the load prints how many sit inside the pool. The inbound leg is the
-income family's verdict. Its far account is written onto the spending
-overlay, the one overlay with far columns, so both directions place
-alike.
+income family's verdict. Its far account is linked from the spending
+family's row in `transfer_links`, as the outbound leg's is, so both
+directions place alike.
 
 **The investing class has three roads, in order:**
 
@@ -448,8 +446,8 @@ REIT traded share a class node and separate at group grain.
 This ladder runs for `internal_transfer` only, so it is not the only
 road to the nodes it reaches. `mortgage_transfer` (§5) resolves to
 `financing · Mortgage` on the verdict alone, before any far-account
-test. Both ladder steps that reach that node read a far side, and a
-servicer the product holds no account for has none.
+test. The ladder reaches that node only by step 3, which needs a far
+account. A servicer the product holds no account for has none.
 
 ---
 
@@ -685,12 +683,16 @@ is a distribution.
 
 `mortgage_transfer` is also family **both**, but it is not a crossing.
 It reaches `financing · Mortgage`, where the interest/principal split
-applies, not the vehicles section. Without it that node has two roads
-in, and both read the far side: a far account of kind `mortgage`, or
-`far_class`, which only the built-in tier writes. A servicer whose
-narrative is its own legal entity cannot go in a tracked built-in. So
-an instalment to one has no other road and would fall to
-`vehicles · Unpaired transfers`. `debt_repayment` stays the value for
+applies, not the vehicles section. Two tiers place it:
+
+- the built-in mortgage rule, on a row whose narrative names a mortgage;
+- a config rule or a pin, for a servicer whose narrative is its own
+  legal entity. That name cannot go in a tracked built-in.
+
+An `internal_transfer` reaches the same node when its far account is a
+mortgage gold holds (§4, step 3). An instalment splits into interest and
+principal where a link names the mortgage account: a matched pair, or a
+counter account the source stated. `debt_repayment` stays the value for
 every other untracked lender, because a mortgage is split into interest
 and principal and a car loan is not. A servicer with no balance series
 in gold has no principal to apportion against, so its instalments draw
@@ -706,11 +708,9 @@ value, the far-account ladder would draw it as `vehicles · Unpaired
 transfers`, the node for a destination nothing identifies. This
 destination is identified on every row.
 
-It is a verdict rather than a far account for a reason. `far_class`
-lives on the spending overlay, which holds the outflow leg and not the
-return. That road would name the money going in and leave the money
-coming back anonymous. A verdict can be placed by either family, so
-both legs carry it.
+It is a verdict rather than a far account for a reason. Nothing names
+an account for the product, so no link can. A verdict can be placed by
+either family, so both legs carry it.
 
 Two things it does not change:
 
@@ -1134,12 +1134,13 @@ month's.
 
 ## 10. Storage and lifecycle
 
-Cashflow has no store of its own. It adds columns to the family
-overlays, four stamped tables, and one serving table:
+Cashflow has no store of its own. It adds one column to each family
+overlay, reads `transfer_links`, and keeps four stamped tables and one
+serving table:
 
 | table / column | grain | survives `reset`? | carried by `reload -a`? |
 |---|---|---|---|
-| `spend_txn_enrichment.far_*` (three columns) | per transaction | no | n/a, re-derived |
+| `transfer_links` | one row per leg whose far side is known | no | n/a, re-derived |
 | `spend_txn_enrichment.stated_asset_class`, `income_txn_enrichment.stated_asset_class` | per transaction | no | n/a, re-derived |
 | `cashflow_wrapper_sides` | one row per tax wrapper | yes | yes, so the rebuilt file's first pass is not read as the first ever; then re-stamped from config |
 | `cashflow_account_scope` | config, stamped into gold | yes | re-stamped from config |
@@ -1206,16 +1207,16 @@ Two consequences:
 
 ### Until the first load, the statement is wrong
 
-The cashflow migrations create the two boundary tables and the far
-columns **empty**. Nothing backfills them. The enrichment pass writes
-them, and it runs inside `wealthdb load` and `reload`. Before that pass
-the statement is not just incomplete. It is wrong in a way that reads
-like a finding:
+The cashflow migrations create the two boundary tables and
+`transfer_links` **empty**. Nothing backfills them. The enrichment
+pass writes them, and it runs inside `wealthdb load` and `reload`.
+Before that pass the statement is not just incomplete. It is wrong in
+a way that reads like a finding:
 
 - `cashflow_wrapper_sides` is empty, so every wrapper reads as
   household, and the pool is **every account**, vehicles included;
-- no enrichment row carries a far account, so the far-account ladder
-  (§4) falls to its last step, and **every matched own-account move**
+- `transfer_links` holds no row, so the far-account ladder (§4) falls
+  to its last step, and **every matched own-account move**
   resolves to `vehicles · Unpaired transfers`.
 
 The dashboard then shows one enormous `Unpaired transfers` node. It

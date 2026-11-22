@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	_ "embed"
 	"encoding/json"
+	"maps"
 	"path/filepath"
 	"testing"
 
@@ -46,12 +47,6 @@ func newFixtureSilver(t *testing.T, seed string) string {
 func openAdapter(t *testing.T, path string) silver.Connection {
 	t.Helper()
 	return silvertest.Open(t, &Adapter{}, path)
-}
-
-func TestKindIsCointracking(t *testing.T) {
-	if got := (&Adapter{}).Kind(); got != "cointracking" {
-		t.Errorf("Kind() = %q, want %q", got, "cointracking")
-	}
 }
 
 func TestStatusEmpty(t *testing.T) {
@@ -99,7 +94,7 @@ func TestSnapshotsCryptoPositionAndFiatCash(t *testing.T) {
 	// Drain to the snapshot batch carrying the 2024-01-01 holdings.
 	var crypto canonical.PositionChange
 	var cash canonical.CashBalanceChange
-	var btcInst canonical.InstrumentChange
+	var btcInst, usdInst canonical.InstrumentChange
 	var nPos, nCash int
 	for _, batch := range silvertest.Snapshots(t, conn, w) {
 		for _, p := range batch.Positions {
@@ -111,8 +106,11 @@ func TestSnapshotsCryptoPositionAndFiatCash(t *testing.T) {
 			cash = c
 		}
 		for _, ins := range batch.Instruments {
-			if ins.InstrumentExternalID == "BTC" {
+			switch ins.InstrumentExternalID {
+			case "BTC":
 				btcInst = ins
+			case "USD":
+				usdInst = ins
 			}
 		}
 	}
@@ -123,6 +121,14 @@ func TestSnapshotsCryptoPositionAndFiatCash(t *testing.T) {
 	}
 	if btcInst.Vehicle != canonical.VehiclePhysical {
 		t.Errorf("instrument vehicle = %q, want physical", btcInst.Vehicle)
+	}
+
+	// A fiat ticker's instrument is money, as its balance is.
+	if usdInst.AssetClass != canonical.AssetClassCash || usdInst.Vehicle != canonical.VehicleDemandDeposit {
+		t.Errorf("USD instrument = (%q, %q), want (cash, demand_deposit)", usdInst.AssetClass, usdInst.Vehicle)
+	}
+	if !canonical.ValidTaxonomyPair(usdInst.AssetClass, usdInst.Vehicle) {
+		t.Errorf("(%q, %q) is not a valid taxonomy pair", usdInst.AssetClass, usdInst.Vehicle)
 	}
 
 	if nPos != 1 {
@@ -187,10 +193,12 @@ func TestSnapshotsCryptoPositionAndFiatCash(t *testing.T) {
 	}
 }
 
-// The payload carries the CT fields the lot engine reads: the type, the
-// comment, the trade's currencies and its fee. The kind alone cannot
-// tell a deposit from an airdrop.
-func TestTransactionsCarryTheLotFields(t *testing.T) {
+// A row states what it does to the lots, which the kind alone cannot
+// tell: a deposit from an airdrop, or a trade whose fee is in a third
+// currency. Such a fee goes on the row that buys, never on the sell leg
+// of a trade split in two, and rides the payload with the type, the
+// comment and the trade's currencies.
+func TestTransactionsStateTheLotAction(t *testing.T) {
 	path := newFixtureSilver(t, `
         INSERT INTO dump_runs VALUES (1000, 2, '/x/1', NULL);
         INSERT INTO portfolios VALUES ('cu1', 1, 'aaa', 1000, NULL);
@@ -201,7 +209,11 @@ func TestTransactionsCarryTheLotFields(t *testing.T) {
             ('t1', 'cu1', 'cu1:Kraken', 1000, TIMESTAMP '2024-01-01 10:00:00', 'Trade',
              2.0, 'BTC', 60000.0, 'USD', 0.01, 'BNB', NULL),
             ('t2', 'cu1', 'cu1:Kraken', 1000, TIMESTAMP '2024-01-02 10:00:00', 'Airdrop',
-             5.0, 'ETH', NULL, NULL, 0, NULL, 'promo');
+             5.0, 'ETH', NULL, NULL, 0, NULL, 'promo'),
+            ('t3', 'cu1', 'cu1:Kraken', 1000, TIMESTAMP '2024-01-03 10:00:00', 'Trade',
+             10.0, 'ETH', 0.5, 'BTC', 0.02, 'BNB', NULL),
+            ('t4', 'cu1', 'cu1:Kraken', 1000, TIMESTAMP '2024-01-04 10:00:00', 'Trade',
+             1.0, 'BTC', 30000.0, 'USD', 5.0, 'usd', NULL);
         INSERT INTO portfolio_prices VALUES (DATE '2024-01-01', 'cu1', 'BTC', 'USD', 30000.0, 1000);
     `)
 	conn := openAdapter(t, path)
@@ -215,6 +227,7 @@ func TestTransactionsCarryTheLotFields(t *testing.T) {
 	}
 	defer stream.Close()
 	payloads := map[string]map[string]any{}
+	actions := map[string]canonical.TxAction{}
 	for {
 		batch, more, err := stream.Next(context.Background())
 		if err != nil {
@@ -226,6 +239,7 @@ func TestTransactionsCarryTheLotFields(t *testing.T) {
 				t.Fatalf("%s payload %q: %v", tx.TransactionExternalID, tx.Payload, err)
 			}
 			payloads[tx.TransactionExternalID] = m
+			actions[tx.TransactionExternalID] = tx.Action
 		}
 		if !more {
 			break
@@ -241,5 +255,12 @@ func TestTransactionsCarryTheLotFields(t *testing.T) {
 	}
 	if _, ok := drop["fee_amount"]; ok {
 		t.Errorf("a zero fee is left out: %v", drop)
+	}
+	want := map[string]canonical.TxAction{
+		"t1": canonical.TxActionThirdCurrencyFee, "t2": canonical.TxActionIncome,
+		"t3:s": "", "t3:b": canonical.TxActionThirdCurrencyFee, "t4": "",
+	}
+	if !maps.Equal(actions, want) {
+		t.Errorf("actions %v, want %v", actions, want)
 	}
 }

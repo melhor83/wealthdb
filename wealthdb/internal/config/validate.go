@@ -143,20 +143,19 @@ func validateNested[V any](at, noun string, m map[string]map[string]V, seenIDs m
 	return nil
 }
 
-// validateMatchKnobs bounds one transfer matcher's knobs. Both matchers
-// (returns_transfer_matching, spending.internal_transfer_matching) run
-// on the same core and are checked whether or not their block is
-// enabled or even reachable, so a mis-typed value fails at load rather
-// than lying in wait: the window cap keeps it from pairing unrelated
-// month-apart flows, the tolerance cap from pairing unrelated amounts.
-// There is no income twin — one matcher runs, and income reads its
-// verdicts.
+// validateMatchKnobs bounds the transfer matcher's knobs
+// (spending.internal_transfer_matching). They are checked whether or not
+// the block is reachable, so a mis-typed value fails at load rather than
+// lying in wait: the window cap keeps it from pairing unrelated month-apart
+// flows, the tolerance cap from pairing unrelated amounts. There is no
+// income or returns twin — one matcher runs, and the families read its
+// pairs.
 //
-// Both knobs bound the matcher's banded passes — the named pass and the
-// amount pass — which are the phases that guess. A pair the holder stated
-// in the override ledger, or one the source asserted by stamping a
-// reference on both legs, spends neither: neither is a guess, so there is
-// no band to widen or narrow around it.
+// Both knobs bound the banded passes, the named pass and the amount pass,
+// which are the phases that guess. A pair the override ledger states, or
+// one a source asserts (a reference stamped on both legs, or one leg
+// describing the other's currency and figure), is no guess and is not
+// banded.
 func validateMatchKnobs(block string, windowDays *int, tolerancePct *float64) error {
 	if windowDays != nil && (*windowDays < 0 || *windowDays > 30) {
 		return fmt.Errorf("config: %s.window_days %d out of range [0, 30]", block, *windowDays)

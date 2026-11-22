@@ -238,28 +238,28 @@ func TestExposureBucketClassShares(t *testing.T) {
 	}
 }
 
+// A bucket's class share is its share of what its dimension describes.
 // A dimension that describes nothing of the book, or whose rows sum to
-// zero or less, leaves every class share blank, and a value that is no
-// number fails the read.
-func TestSetClassShares(t *testing.T) {
+// less than zero, gives no bucket a class share.
+func TestExposureClassShare(t *testing.T) {
 	t.Parallel()
-	val := func(s string) *string { return &s }
-	for name, rows := range map[string][]ExposureBucketRow{
-		"a book of no debt": {{Bucket: "fixed", Value: val("0")}, {Bucket: "(none)", Value: val("6000")}},
-		"an overdraft beyond the debt": {{Bucket: "AAA", Value: val("10000")}, {Bucket: "cash", Value: val("-11000")},
-			{Bucket: "(none)", Value: val("6000")}},
+	db, ctx := openMigrated(t)
+	for name, c := range map[string]struct {
+		value, total float64
+		want         string
+	}{
+		"a quarter":                    {25, 100, "25.0"},
+		"a book of no debt":            {0, 0, "-"},
+		"an overdraft beyond the debt": {-11000, -1000, "-"},
 	} {
-		if err := setClassShares(rows); err != nil {
-			t.Fatalf("%s: %v", name, err)
+		var got string
+		if err := db.QueryRowContext(ctx, `SELECT COALESCE(CAST(exposure_class_share(?::DOUBLE, ?::DOUBLE) AS VARCHAR), '-')`,
+			c.value, c.total).Scan(&got); err != nil {
+			t.Fatal(err)
 		}
-		for _, r := range rows {
-			if r.ClassSharePct != nil {
-				t.Errorf("%s: %s has a class share of %v", name, r.Bucket, *r.ClassSharePct)
-			}
+		if got != c.want {
+			t.Errorf("%s: class share %s, want %s", name, got, c.want)
 		}
-	}
-	if err := setClassShares([]ExposureBucketRow{{Bucket: "fixed", Value: val("n/a")}}); err == nil {
-		t.Error("a value that is no number read")
 	}
 }
 
@@ -496,9 +496,7 @@ func TestExposureYieldEdges(t *testing.T) {
 func TestMaterializeExposureDebtMatchesTheViews(t *testing.T) {
 	t.Parallel()
 	db, ctx, at := seedYieldBookFX(t)
-	if _, err := MaterializeExposure(ctx, db, at, 42); err != nil {
-		t.Fatal(err)
-	}
+	materializeExposureAt(t, db, ctx, at, 42)
 	for _, ccy := range materializeCurrencies {
 		for dim, read := range map[string]func(context.Context, *sql.DB, int64, string) ([]ExposureBucketRow, error){
 			debtDimensionCredit: ExposureCredit, debtDimensionMaturity: ExposureMaturities,
@@ -613,14 +611,14 @@ func TestAFloatingLineWithARealYieldIsFloating(t *testing.T) {
 	}
 }
 
-// A fund line of a kind the yield report reads as floating
-// (floatingLineKinds) is floating in the coupons view too, and one it
-// does not is not. The fund is invented.
+// A fund line's coupon kind reads as the coupon-kind label map says, in
+// the coupons view and in the yield report alike: N-PORT's Floating and
+// Variable float, Fixed is fixed and None a zero. The fund is invented.
 func TestFloatingLineKindsAgree(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)
 	snap := time.Date(2026, 6, 30, 0, 0, 0, 0, time.UTC).Unix()
-	kinds := append(slices.Clone(floatingLineKinds), "Fixed")
+	kinds := []string{"Floating", "Variable", "Fixed", "None"}
 	q := []string{
 		`INSERT INTO accounts (silver_source_id, account_external_id, account_kind, display_name, base_currency,
 		    first_seen_at, last_seen_at) VALUES ('test-src', 'A', 'brokerage', 'Brokerage', 'USD', 0, 0)`,
@@ -644,16 +642,114 @@ func TestFloatingLineKindsAgree(t *testing.T) {
 	rebuildExposureWithDefaults(t, db, ctx)
 	got := scanStrings(t, db, `SELECT line_coupon_kind || ' ' || coupon_bucket FROM exposure_yield_leaves(?, 'USD')
 	    WHERE depth > 0 AND line_coupon_kind IS NOT NULL ORDER BY 1`, snap+86399)
-	var want []string
-	for _, k := range kinds {
-		bucket := "fixed"
-		if floatingLine(k) {
-			bucket = "floating"
-		}
-		want = append(want, k+" "+bucket)
-	}
-	slices.Sort(want)
-	if strings.Join(got, ", ") != strings.Join(want, ", ") || floatingLine("Fixed") {
+	if want := []string{"Fixed fixed", "Floating floating", "None zero", "Variable floating"}; !slices.Equal(got, want) {
 		t.Errorf("line kinds %v, want %v", got, want)
+	}
+	in, err := YieldInputs(ctx, db, snap+86399, "USD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f := in.Funds["symbol:QFL"]; f == nil || f.Lines == nil || f.Lines.FloatingPct != 50 {
+		t.Errorf("the yield report's fund %+v, want half its lines floating", f)
+	}
+}
+
+// issuerBond is one bond of seedIssuerBonds: its instrument, its CUSIP,
+// its currency and value, and the LEI and the name GLEIF states for it.
+type issuerBond struct {
+	id, cusip, name, ccy string
+	mv                   float64
+	lei, gleifName       string
+}
+
+// seedIssuerBonds is a book of bonds held directly in one account on
+// 2026-06-30, each with its LEI from GLEIF, and the rates by their
+// "base/quote" pair as fx_rates holds them. It returns the instant to
+// read.
+func seedIssuerBonds(t *testing.T, bonds []issuerBond, rates map[string]float64) (*sql.DB, context.Context, int64) {
+	t.Helper()
+	db, ctx := openMigrated(t)
+	snap := time.Date(2026, 6, 30, 0, 0, 0, 0, time.UTC).Unix()
+	mustExec(t, db, `INSERT INTO accounts (silver_source_id, account_external_id, account_kind, display_name, base_currency,
+	    first_seen_at, last_seen_at) VALUES ('test-src', 'A', 'brokerage', 'Brokerage', 'USD', 0, 0)`)
+	for _, b := range bonds {
+		mustExec(t, db, `INSERT INTO instruments (silver_source_id, instrument_external_id, asset_class, vehicle, cusip, name,
+		    currency, first_seen_at, last_seen_at) VALUES ('test-src', ?, 'fixed_income', 'bond', ?, ?, ?, 0, 0)`,
+			b.id, b.cusip, b.name, b.ccy)
+		mustExec(t, db, `INSERT INTO positions (silver_source_id, snapshot_at, account_external_id, position_key, instrument_external_id,
+		    asset_class, vehicle, currency, quantity, market_value) VALUES ('test-src', ?, 'A', ?, ?, 'fixed_income', 'bond', ?, 1, ?)`,
+			snap, b.id, b.id, b.ccy, b.mv)
+		mustExec(t, db, `INSERT INTO security_identities (silver_source_id, security_key, as_of, provider, lei, name)
+		    VALUES ('ref', ?, 0, 'gleif', ?, NULLIF(?, ''))`, "cusip:"+b.cusip, b.lei, b.gleifName)
+	}
+	for pair, rate := range rates {
+		base, quote, _ := strings.Cut(pair, "/")
+		mustExec(t, db, `INSERT INTO fx_rates (silver_source_id, snapshot_at, base_currency, quote_currency, mid_rate)
+		    VALUES ('fx', ?, ?, ?, ?)`, snap, base, quote, rate)
+	}
+	rebuildExposureWithDefaults(t, db, ctx)
+	return db, ctx, snap + 86399
+}
+
+// Issuers of one printed value rank by their key, in the CLI's list,
+// its running share and the dashboard's ranks alike, whatever the last
+// bits of their sums: Bravo's two bonds sum, as floats, a little above
+// Alpha's one of the same printed value. Every name and LEI is invented.
+func TestExposureIssuersOfOnePrintedValueRankByKey(t *testing.T) {
+	t.Parallel()
+	db, ctx, at := seedIssuerBonds(t, []issuerBond{
+		{"AB", "0000000A1", "ALPHA EXAMPLE 3% 2030", "USD", 2000.3, "QQQQ00000000000000A1", "Alpha Example Corp"},
+		{"BB1", "0000000B1", "BRAVO EXAMPLE 3% 2030", "USD", 1000.1, "QQQQ00000000000000B1", "Bravo Example Corp"},
+		{"BB2", "0000000B2", "BRAVO EXAMPLE 4% 2032", "USD", 1000.2, "QQQQ00000000000000B1", "Bravo Example Corp"},
+	}, nil)
+	iss, err := ExposureIssuers(ctx, db, at, "USD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, r := range iss {
+		got = append(got, r.Issuer+"="+*r.Value+"/"+strconv.FormatFloat(*r.CumulativeSharePct, 'f', 0, 64))
+	}
+	if want := []string{"Alpha Example Corp=2000.3/50", "Bravo Example Corp=2000.3/100"}; !slices.Equal(got, want) {
+		t.Errorf("issuers %v, want %v", got, want)
+	}
+	materializeExposureAt(t, db, ctx, at, 42)
+	ranks := scanStrings(t, db, `SELECT issuer || '=' || printf('%.4f', value) || '/' || printf('%.0f', cumulative_share_pct)
+	    FROM report_exposure_issuer_ranks WHERE as_of = ? AND currency = 'USD' ORDER BY rank`, at)
+	if want := []string{"Alpha Example Corp=2000.3000/50", "Bravo Example Corp=2000.3000/100"}; !slices.Equal(ranks, want) {
+		t.Errorf("ranks %v, want %v", ranks, want)
+	}
+}
+
+// The dashboard names an issuer by its largest leaf in the row's
+// currency, as the CLI does in the currency it is asked for. The franc
+// rates of the dollar and the euro do not cross: the euro bond is worth
+// 1,100 dollars and 800 francs, the dollar bond 1,050 dollars and 840
+// francs. Every name and LEI is invented.
+func TestMaterializedIssuerNameIsTheCurrencysLargestLeaf(t *testing.T) {
+	t.Parallel()
+	db, ctx, at := seedIssuerBonds(t, []issuerBond{
+		{"CD", "0000000C1", "CHARLIE DOLLAR CORP 3% 2030", "USD", 1050, "QQQQ00000000000000C1", ""},
+		{"CE", "0000000C2", "CHARLIE EURO AG 4% 2032", "EUR", 1000, "QQQQ00000000000000C1", ""},
+	}, map[string]float64{"USD/EUR": 1.1, "EUR/USD": 1 / 1.1, "CHF/USD": 0.8, "USD/CHF": 1.25,
+		"CHF/EUR": 0.8, "EUR/CHF": 1.25})
+	materializeExposureAt(t, db, ctx, at, 42)
+	names := map[string]string{}
+	for _, ccy := range []string{"USD", "CHF"} {
+		iss, err := ExposureIssuers(ctx, db, at, ccy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(iss) != 1 {
+			t.Fatalf("%s issuers %+v, want one", ccy, iss)
+		}
+		names[ccy] = iss[0].Issuer
+		if got := scanStrings(t, db, `SELECT issuer FROM report_exposure_issuer_ranks WHERE as_of = ? AND currency = ?`,
+			at, ccy); !slices.Equal(got, []string{iss[0].Issuer}) {
+			t.Errorf("%s ranks name %v, want %q", ccy, got, iss[0].Issuer)
+		}
+	}
+	if names["USD"] == names["CHF"] {
+		t.Errorf("one name %q in both currencies: the fixture's rates no longer part the leaves", names["USD"])
 	}
 }

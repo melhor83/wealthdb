@@ -75,7 +75,7 @@ func setupGainsGold(t *testing.T) string {
 // front-ends, plus the realized view's own options.
 func gainsCases() []goldenCase {
 	var out []goldenCase
-	for _, v := range gainsViews {
+	for _, v := range gainsFamily.names() {
 		out = append(out, goldenCase{"gains " + v, []string{"gains", v, "1970", "--period", "total"}, "gains",
 			map[string]any{"view": v, "from": "1970", "to": "1970"}})
 	}
@@ -92,7 +92,7 @@ func TestGainsCLIEndToEnd(t *testing.T) {
 	t.Parallel()
 	cfg := setupGainsGold(t)
 
-	for _, view := range gainsViews {
+	for _, view := range gainsFamily.names() {
 		so, se, code := run(t, "-c", cfg, "gains", view, "-", "today", "-x", "CHF")
 		if code != 0 {
 			t.Errorf("gains %s: exit=%d stderr=%s", view, code, se)
@@ -128,18 +128,13 @@ func TestGainsCLIEndToEnd(t *testing.T) {
 	}
 }
 
-// TestGainsViewsResolveTheirDefaults pins each view's default column
-// set against its registry, and the aggregate views' reconciling
-// grains against the usage text.
-func TestGainsViewsResolveTheirDefaults(t *testing.T) {
+// TestGainsUsageListsEveryView: the usage's hand-written view list names
+// every view.
+func TestGainsUsageListsEveryView(t *testing.T) {
 	t.Parallel()
-	usage := gainsUsage()
-	for _, view := range gainsViews {
-		rep := gainsReport(request{view: view, currency: "USD", period: "monthly"})
-		if _, err := rep.pick("default"); err != nil {
-			t.Errorf("%s defaults: %v", view, err)
-		}
-		if !strings.Contains(usage, "\n  "+view+" ") {
+	views, _, _ := strings.Cut(gainsUsage(), "Available columns (per view):")
+	for _, view := range gainsFamily.names() {
+		if !strings.Contains(views, "\n  "+view+" ") {
 			t.Errorf("usage does not list the %s view", view)
 		}
 	}
@@ -155,13 +150,13 @@ func TestReportHeadersAreIdentifiers(t *testing.T) {
 	ident := regexp.MustCompile(`^[A-Za-z0-9_]+$`)
 	cfg := &config.Config{DefaultCurrency: "USD"}
 	reports := map[string]*report{"status marks": marksReport(request{view: "marks", currency: "USD"})}
-	for _, rf := range reportFamilies {
-		for _, v := range rf.fam.viewsOrOne() {
-			reports[strings.TrimSpace(rf.name+" "+v)] = rf.fam.buildDefault(cfg, defaultRequest(v, "USD"))
+	for _, fam := range reportFamilies {
+		for _, v := range fam.viewsOrOne() {
+			reports[strings.TrimSpace(fam.name+" "+v)] = fam.build(cfg, fam.defaultRequest(v, "USD", fixtureToday, 12))
 		}
 	}
 	// A series adds its period column ahead of the view's own.
-	reports["exposure classes series"] = exposureReport(request{view: "classes", currency: "USD",
+	reports["exposure classes series"] = exposureFamily.build(nil, request{view: "classes", currency: "USD",
 		series: []seriesPoint{{label: "2026-06", at: 1}}})
 	for name, rep := range reports {
 		for _, c := range rep.columns {

@@ -13,13 +13,10 @@
 set -euo pipefail
 
 NAME=angellist
-ENV_PREFIX=ANGELLIST
 ENV_VARS=(ANGELLIST_USERNAME ANGELLIST_PASSWORD)
 HAS_DEBUG=1
-HAS_APP_MOUNT=1     # the checkout's source over /app on every verb
 HAS_SAFETY=1        # refuse to evict a live container mid-2FA / mid-VNC
-HAS_VNC=1           # forward a free 5900-6000 port
-VNC_SUBCOMMANDS=(explore login)   # replaces the default {vnc-login} — no vnc-login verb here
+VNC_SUBCOMMANDS=(explore login)   # the browser-over-VNC verbs
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck disable=SC1091
@@ -70,7 +67,7 @@ Subcommands:
                       portfolio_summary / timeseries, commitments,
                       funding_accounts + funding_transactions,
                       k1_capital_accounts, tax_documents.
-                      --force deletes the silver DB and rebuilds from all bronze.
+                      --force rebuilds the silver from all bronze.
   prune [args...]     Delete non-complete dumps (crashed / interrupted
                       downloads that never wrote a terminal run.json)
                       from the bronze tree. Runs host-side (pure stdlib;

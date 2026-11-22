@@ -56,18 +56,13 @@ type Connection struct {
 
 	// bridge resolves the web account_external_id (suffix) to the
 	// gold account id: the api hashValue, or with web alone the full
-	// account number. Built lazily on the first Snapshots/Transactions
-	// call.
-	bridge      map[string]string
-	bridgeBuilt bool
-	bridgeErr   error
+	// account number. Built on the first Snapshots/Transactions call.
+	bridge silver.Lazy[map[string]string]
 
 	// apiStartByHash caches where each api account's history
-	// begins (apiCoverageStart) for the transactions splice. Same
-	// lazy-build pattern as bridge.
-	apiStartByHash map[string]int64
-	apiStartBuilt  bool
-	apiStartErr    error
+	// begins (apiCoverageStart) for the transactions splice. Built on
+	// first use, as bridge is.
+	apiStartByHash silver.Lazy[map[string]int64]
 
 	// symbolToCUSIP resolves a ticker (the schwab-web silver's
 	// instrument_key) to the matching CUSIP (the schwab-api
@@ -76,9 +71,7 @@ type Connection struct {
 	// instruments row the api side registered — so the symbol /
 	// name / asset_class columns populate via the LEFT JOIN
 	// without a second instrument-emit on the web side.
-	symbolToCUSIP     map[string]string
-	symbolBridgeBuilt bool
-	symbolBridgeErr   error
+	symbolToCUSIP silver.Lazy[map[string]string]
 }
 
 // Close releases both readers. Safe to call multiple times, and on a
@@ -96,55 +89,28 @@ func (c *Connection) Close() error {
 	return errors.Join(apiErr, webErr)
 }
 
-// feed is a configured subsource, named for error messages, with what
-// the orchestrator asks of each.
-type feed struct {
-	name  string
-	clock interface {
-		Status(context.Context) (canonical.Status, error)
-		ChangeWindow(context.Context, int64) (canonical.Window, error)
-	}
-}
-
-// feeds lists the configured subsources, api first.
-func (c *Connection) feeds() []feed {
-	var out []feed
+// feeds are the configured subsources, api first. Each reads every
+// account of the source: it is observed through the later of the two.
+func (c *Connection) feeds() silver.Feeds {
+	f := silver.Feeds{Kind: "schwab", Whole: true}
 	if c.api != nil {
-		out = append(out, feed{"api", c.api})
+		f.List = append(f.List, silver.Feed{Name: "api", Status: c.api.Status, ChangeWindow: c.api.ChangeWindow})
 	}
 	if c.web != nil {
-		out = append(out, feed{"web", c.web})
+		f.List = append(f.List, silver.Feed{Name: "web", Status: c.web.Status, ChangeWindow: c.web.ChangeWindow})
 	}
-	return out
+	return f
 }
 
-// Status merges the per-subsource Status (silver.MergeStatuses).
+// Status merges the per-subsource Status (silver.Feeds).
 func (c *Connection) Status(ctx context.Context) (canonical.Status, error) {
-	var statuses []canonical.Status
-	for _, f := range c.feeds() {
-		s, err := f.clock.Status(ctx)
-		if err != nil {
-			return canonical.Status{}, fmt.Errorf("schwab %s status: %w", f.name, err)
-		}
-		statuses = append(statuses, s)
-	}
-	// Each feed reads every account of the source: it is observed
-	// through the later of the two.
-	return silver.MergeStatuses(statuses, true), nil
+	return c.feeds().Status(ctx)
 }
 
 // ChangeWindow merges the per-subsource windows past sinceN
-// (silver.MergeWindows).
+// (silver.Feeds).
 func (c *Connection) ChangeWindow(ctx context.Context, sinceN int64) (canonical.Window, error) {
-	var windows []canonical.Window
-	for _, f := range c.feeds() {
-		w, err := f.clock.ChangeWindow(ctx, sinceN)
-		if err != nil {
-			return canonical.Window{}, fmt.Errorf("schwab %s ChangeWindow: %w", f.name, err)
-		}
-		windows = append(windows, w)
-	}
-	return silver.MergeWindows(sinceN, windows), nil
+	return c.feeds().ChangeWindow(ctx, sinceN)
 }
 
 // Snapshots emits the merged stream. When only api is configured,
@@ -242,7 +208,7 @@ func (c *Connection) Transactions(ctx context.Context, w canonical.Window) (silv
 		if err != nil {
 			return nil, fmt.Errorf("schwab api Transactions: %w", err)
 		}
-		streams = append(streams, &apiFromCoverageStart{inner: s, start: apiStart})
+		streams = append(streams, silver.MapTransactions(s, apiFromCoverageStart(apiStart)))
 	}
 	return silver.NewConcatTransactionStream(streams), nil
 }
@@ -251,98 +217,79 @@ func (c *Connection) Transactions(ctx context.Context, w canonical.Window) (silv
 // coverage start: the strays apiCoverageStart set aside, whose period
 // the web side books. Where an account has no strays its start is its
 // first row, so nothing is dropped.
-type apiFromCoverageStart struct {
-	inner silver.TransactionStream
-	start map[string]int64
-}
-
-func (s *apiFromCoverageStart) Next(ctx context.Context) (canonical.TransactionBatch, bool, error) {
-	batch, more, err := s.inner.Next(ctx)
-	if err != nil {
-		return batch, more, err
+func apiFromCoverageStart(start map[string]int64) func(*canonical.TransactionBatch) {
+	return func(b *canonical.TransactionBatch) {
+		b.Transactions = slices.DeleteFunc(b.Transactions, func(tx canonical.TransactionChange) bool {
+			at, ok := start[tx.AccountExternalID]
+			return ok && tx.OccurredAt < at
+		})
 	}
-	kept := batch.Transactions[:0]
-	for _, tx := range batch.Transactions {
-		if start, ok := s.start[tx.AccountExternalID]; ok && tx.OccurredAt < start {
-			continue
-		}
-		kept = append(kept, tx)
-	}
-	batch.Transactions = kept
-	return batch, more, nil
 }
-
-func (s *apiFromCoverageStart) Close() error { return s.inner.Close() }
 
 // ensureBridge builds the web suffix → account id map on first use and
 // caches the result. The id is the api hashValue, or with web alone the
 // full account number. Returns the cached value on
 // subsequent calls; returns the cached error if the build failed.
 func (c *Connection) ensureBridge(ctx context.Context) (map[string]string, error) {
-	if c.bridgeBuilt {
-		return c.bridge, c.bridgeErr
-	}
-	c.bridgeBuilt = true
-	if c.web == nil {
-		c.bridge = map[string]string{}
-		return c.bridge, nil
-	}
-	if c.api == nil {
-		c.bridge, c.bridgeErr = webOnlyBridge(ctx, c.web.db)
-	} else {
-		c.bridge, c.bridgeErr = buildAccountBridge(ctx, c.api.db, c.web.db)
-	}
-	return c.bridge, c.bridgeErr
+	return c.bridge.Get(func() (map[string]string, error) {
+		switch {
+		case c.web == nil:
+			return map[string]string{}, nil
+		case c.api == nil:
+			return webOnlyBridge(ctx, c.web.db)
+		}
+		return buildAccountBridge(ctx, c.api.db, c.web.db)
+	})
 }
 
 // ensureSymbolBridge builds the web ticker → api CUSIP map on
 // first use and caches the result.
 func (c *Connection) ensureSymbolBridge(ctx context.Context) (map[string]string, error) {
-	if c.symbolBridgeBuilt {
-		return c.symbolToCUSIP, c.symbolBridgeErr
-	}
-	c.symbolBridgeBuilt = true
-	if c.api == nil {
-		// Web alone: no CUSIPs to resolve a ticker to, so a web row keeps
-		// its own key, as the historical positions do.
-		c.symbolToCUSIP = map[string]string{}
-		return c.symbolToCUSIP, nil
-	}
-	c.symbolToCUSIP, c.symbolBridgeErr = buildSymbolToCUSIPBridge(ctx, c.api.db)
-	return c.symbolToCUSIP, c.symbolBridgeErr
+	return c.symbolToCUSIP.Get(func() (map[string]string, error) {
+		if c.api == nil {
+			// Web alone: no CUSIPs to resolve a ticker to, so a web row
+			// keeps its own key, as the historical positions do.
+			return map[string]string{}, nil
+		}
+		return c.api.symbolToCUSIPBridge(ctx)
+	})
 }
 
-// buildSymbolToCUSIPBridge scans schwab-api silver positions for
-// (symbol, cusip) pairs. When a symbol maps unambiguously to one
-// CUSIP, it's added to the bridge. Symbol→CUSIP conflicts (the
-// same ticker reused by Schwab for different securities over
-// time, which is rare but possible) are skipped — the web side
+// symbolToCUSIPBridge scans schwab-api silver positions for
+// (symbol, cusip) pairs: in the columns of migration 0006, or in the
+// payload of an older silver (holdingRead). When a symbol maps
+// unambiguously to one CUSIP, it's added to the bridge. Symbol→CUSIP
+// conflicts (the same ticker reused by Schwab for different securities
+// over time, which is rare but possible) are skipped — the web side
 // then falls back to the ticker, leaving the symbol column
 // blank rather than mismapping.
-func buildSymbolToCUSIPBridge(ctx context.Context, api *sql.DB) (map[string]string, error) {
-	const q = `
-SELECT DISTINCT json_extract(payload,'$.instrument.symbol') AS sym,
-                json_extract(payload,'$.instrument.cusip')  AS cusip
+func (c *apiReader) symbolToCUSIPBridge(ctx context.Context) (map[string]string, error) {
+	holding, err := c.holdingRead(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pair := `symbol AS sym, cusip`
+	if !holding.columns {
+		pair = `json_extract(payload,'$.instrument.symbol') AS sym,
+                json_extract(payload,'$.instrument.cusip')  AS cusip`
+	}
+	q := `
+SELECT DISTINCT ` + pair + `
   FROM positions
  WHERE sym  IS NOT NULL AND sym  != ''
    AND cusip IS NOT NULL AND cusip != ''`
-	rows, err := api.QueryContext(ctx, q)
-	if err != nil {
-		return nil, fmt.Errorf("schwab symbol bridge: %w", err)
-	}
-	defer rows.Close()
 	candidates := map[string]map[string]struct{}{}
-	for rows.Next() {
+	if err := silver.ScanRows(ctx, c.db, "schwab symbol bridge", q, func(rows *sql.Rows) error {
 		var sym, cusip string
 		if err := rows.Scan(&sym, &cusip); err != nil {
-			return nil, err
+			return err
 		}
 		if candidates[sym] == nil {
 			candidates[sym] = map[string]struct{}{}
 		}
 		candidates[sym][cusip] = struct{}{}
-	}
-	if err := rows.Err(); err != nil {
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 	out := make(map[string]string, len(candidates))
@@ -402,20 +349,15 @@ SELECT a.account_external_id, a.account_number
     ON a.account_external_id = m.account_external_id
    AND a.snapshot_at = m.s
  WHERE a.account_number IS NOT NULL`
-	rows, err := api.QueryContext(ctx, qAPI)
-	if err != nil {
-		return nil, fmt.Errorf("schwab bridge api scan: %w", err)
-	}
-	defer rows.Close()
 	apiAccts := make(map[string]string) // hashValue → accountNumber
-	for rows.Next() {
+	if err := silver.ScanRows(ctx, api, "schwab bridge api scan", qAPI, func(rows *sql.Rows) error {
 		var hash, num string
 		if err := rows.Scan(&hash, &num); err != nil {
-			return nil, err
+			return err
 		}
 		apiAccts[hash] = num
-	}
-	if err := rows.Err(); err != nil {
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 
@@ -501,21 +443,16 @@ func webOnlyBridge(ctx context.Context, web *sql.DB) (map[string]string, error) 
 // newest non-empty `account_number_full`, empty where none states one.
 // Both bridges read it, so they agree on which number an account has.
 func webFullNumbers(ctx context.Context, web *sql.DB) ([]string, map[string]string, error) {
-	rows, err := web.QueryContext(ctx, `
+	var suffixes []string
+	fulls := map[string]string{}
+	if err := silver.ScanRows(ctx, web, "schwab bridge web scan", `
 SELECT account_external_id,
        COALESCE(json_extract(payload, '$.account_number_full'), '')
   FROM accounts
- ORDER BY snapshot_at, rowid`)
-	if err != nil {
-		return nil, nil, fmt.Errorf("schwab bridge web scan: %w", err)
-	}
-	defer rows.Close()
-	var suffixes []string
-	fulls := map[string]string{}
-	for rows.Next() {
+ ORDER BY snapshot_at, rowid`, func(rows *sql.Rows) error {
 		var suffix, full string
 		if err := rows.Scan(&suffix, &full); err != nil {
-			return nil, nil, err
+			return err
 		}
 		if _, seen := fulls[suffix]; !seen {
 			suffixes = append(suffixes, suffix)
@@ -523,8 +460,11 @@ SELECT account_external_id,
 		} else if full != "" {
 			fulls[suffix] = full
 		}
+		return nil
+	}); err != nil {
+		return nil, nil, err
 	}
-	return suffixes, fulls, rows.Err()
+	return suffixes, fulls, nil
 }
 
 // digitsOnly reduces an account number to its digit sequence,
@@ -548,66 +488,56 @@ func digitsOnly(s string) string {
 // Accounts with no api transactions at all (start absent from the
 // map) get NO web-side filter — web rows pass through unfiltered.
 func (c *Connection) ensureAPIStart(ctx context.Context) (map[string]int64, error) {
-	if c.apiStartBuilt {
-		return c.apiStartByHash, c.apiStartErr
-	}
-	c.apiStartBuilt = true
-	c.apiStartByHash = map[string]int64{}
-	if c.api == nil {
-		return c.apiStartByHash, nil // web alone: no cut
-	}
-	apiTimes, err := accountTimestamps(ctx, c.api.db, nil)
-	if err != nil {
-		c.apiStartErr = fmt.Errorf("schwab apiStartByHash: %w", err)
-		return nil, c.apiStartErr
-	}
-	webTimes := map[string][]int64{}
-	if c.web != nil {
-		bridge, err := c.ensureBridge(ctx)
+	return c.apiStartByHash.Get(func() (map[string]int64, error) {
+		out := map[string]int64{}
+		if c.api == nil {
+			return out, nil // web alone: no cut
+		}
+		apiTimes, err := accountTimestamps(ctx, c.api.db, nil)
 		if err != nil {
-			c.apiStartErr = err
-			return nil, err
+			return nil, fmt.Errorf("schwab apiStartByHash: %w", err)
 		}
-		if webTimes, err = accountTimestamps(ctx, c.web.db, bridge); err != nil {
-			c.apiStartErr = fmt.Errorf("schwab apiStartByHash: %w", err)
-			return nil, c.apiStartErr
+		webTimes := map[string][]int64{}
+		if c.web != nil {
+			bridge, err := c.ensureBridge(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if webTimes, err = accountTimestamps(ctx, c.web.db, bridge); err != nil {
+				return nil, fmt.Errorf("schwab apiStartByHash: %w", err)
+			}
 		}
-	}
-	for hash, times := range apiTimes {
-		c.apiStartByHash[hash] = apiCoverageStart(times, webTimes[hash])
-	}
-	return c.apiStartByHash, nil
+		for hash, times := range apiTimes {
+			out[hash] = apiCoverageStart(times, webTimes[hash])
+		}
+		return out, nil
+	})
 }
 
 // accountTimestamps reads every transaction timestamp of a silver,
 // ascending per account. With a bridge the web suffixes are translated
 // to api hashes and an unbridged account is skipped.
 func accountTimestamps(ctx context.Context, db *sql.DB, bridge map[string]string) (map[string][]int64, error) {
-	rows, err := db.QueryContext(ctx, `
+	out := map[string][]int64{}
+	if err := silver.ScanRows(ctx, db, "", `
 SELECT account_external_id, timestamp
   FROM transactions
- ORDER BY account_external_id, timestamp`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := map[string][]int64{}
-	for rows.Next() {
+ ORDER BY account_external_id, timestamp`, func(rows *sql.Rows) error {
 		var account string
 		var ts int64
 		if err := rows.Scan(&account, &ts); err != nil {
-			return nil, err
+			return err
 		}
 		if bridge != nil {
 			hash, ok := bridge[account]
 			if !ok {
-				continue
+				return nil
 			}
 			account = hash
 		}
 		out[account] = append(out[account], ts)
-	}
-	if err := rows.Err(); err != nil {
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 	// Several web suffixes can bridge to one hash; each arrived sorted

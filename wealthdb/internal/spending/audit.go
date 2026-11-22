@@ -59,7 +59,7 @@ type Leg struct {
 	Account   string
 	Day       int64 // epoch day
 	Currency  string
-	Amount    float64 // native, signed
+	Amount    float64 // native, signed; the matcher's (a coin's dust by its quantity)
 	Signature string
 	// InPopulation reports whether the leg is in the enrichment
 	// population — a row spending would have counted had the matcher
@@ -126,7 +126,7 @@ func MatchedPairs(ctx context.Context, db querier) ([]Pair, []Leg, error) {
 	// The pool's legs with no partner. A leg with no amount was never
 	// offered to the matcher (loadMatcherPool).
 	rows, err := db.QueryContext(ctx, `
-        SELECT `+legColumns("p")+`
+        SELECT `+legColumns("p", "p.match_amount")+`
           FROM spend_matcher_pool(?, ?) p
          WHERE p.net_amount IS NOT NULL`+paired, int64(0), gold.MaxEpoch)
 	if err != nil {
@@ -174,13 +174,16 @@ func TransferLinksStored(ctx context.Context, db querier) (bool, error) {
 	return found, rows.Err()
 }
 
-// readLinkedPairs reads the stored pairs, sorted (sortPairs).
+// readLinkedPairs reads the stored pairs, sorted (sortPairs). Only cash
+// links are pairs a matcher phase formed: an in-kind link is a move one
+// equity-transfer ledger row states (writeStatedMoveLinks).
 func readLinkedPairs(ctx context.Context, db querier, inPopulation map[txKey]bool) ([]Pair, error) {
 	// One row per pair: the leg that sent the money, joined to its
-	// partner. A pair is one debit and one credit (gold.TransferLeg.Amt),
-	// so its debit names it once.
+	// partner. A pair is one debit and one credit (gold.TransferLeg.Amt,
+	// the matcher's amount), so its debit names it once.
 	rows, err := db.QueryContext(ctx, `
-        SELECT l.evidence, `+legColumns("d")+`, `+legColumns("c")+`
+        SELECT l.evidence, `+legColumns("d", txnMatchAmount("d"))+`,
+               `+legColumns("c", txnMatchAmount("c"))+`
           FROM transfer_links l
           JOIN transactions d
             ON d.silver_source_id        = l.silver_source_id
@@ -189,7 +192,8 @@ func readLinkedPairs(ctx context.Context, db querier, inPopulation map[txKey]boo
             ON c.silver_source_id        = l.far_silver_source_id
            AND c.transaction_external_id = l.far_transaction_external_id
          WHERE l.far_transaction_external_id IS NOT NULL
-           AND CAST(d.net_amount AS DOUBLE) < 0`)
+           AND l.measure = ?
+           AND CAST(`+txnMatchAmount("d")+` AS DOUBLE) < 0`, gold.LinkMeasureCash)
 	if err != nil {
 		return nil, fmt.Errorf("spending: read transfer links: %w", err)
 	}
@@ -216,13 +220,21 @@ func readLinkedPairs(ctx context.Context, db querier, inPopulation map[txKey]boo
 	return pairs, nil
 }
 
-// legColumns are the columns of the transactions row alias that a Leg
-// is read from, in legScan's order.
-func legColumns(alias string) string {
+// legColumns are the columns of the row alias that a Leg is read from,
+// in legScan's order. amount is the leg's matcher amount on that row:
+// a pool row's match_amount, or txnMatchAmount of a transactions row.
+func legColumns(alias, amount string) string {
 	return alias + ".silver_source_id, " + alias + ".transaction_external_id, " +
 		alias + ".account_external_id, " + alias + ".occurred_at, " + alias + ".currency, " +
-		"CAST(" + alias + ".net_amount AS DOUBLE), " +
+		"CAST(" + amount + " AS DOUBLE), " +
 		"COALESCE(" + alias + ".counterparty, ''), COALESCE(" + alias + ".description, '')"
+}
+
+// txnMatchAmount is the matcher's amount of the transactions row alias
+// (spend_match_amount), the amount the pool offered the matcher.
+func txnMatchAmount(alias string) string {
+	return "spend_match_amount(" + alias + ".net_amount, " + alias + ".quantity, " +
+		alias + ".instrument_external_id, " + alias + ".currency)"
 }
 
 // legScan is one leg as legColumns reads it.

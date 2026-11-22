@@ -49,7 +49,7 @@ func setupYieldGold(t *testing.T) string {
 		 ('ref', 'symbol:QBF', ?, 'inbox', 'distribution_yield', '', 3.6)`,
 		`INSERT INTO cash_balances (silver_source_id, snapshot_at, account_external_id, currency, balance_kind, amount, payload)
 		 VALUES ('brk', ?, 'ACCT7781', 'USD', 'current', 5000,
-		  '{"CdtIntrstRate1": "1.5", "CdtLmtAmt1": "0", "CalIntrstBasisDesc": "act/360", "EndOfDurtn": "9999-12-31"}')`,
+		  '{"interest_rate": "1.5", "interest_day_count": "ACT/360"}')`,
 		`INSERT INTO rate_observations (silver_source_id, series_id, as_of, value) VALUES
 		 ('rates', 'USD-3M', ?, 4.0), ('rates', 'USD-1Y', ?, 4.0), ('rates', 'USD-10Y', ?, 4.0)`,
 		`INSERT INTO yield_curves (currency, tenor, tenor_months, silver_source_id, series_id) VALUES
@@ -307,28 +307,21 @@ func TestYieldPrivacyAndFlags(t *testing.T) {
 	}
 }
 
-// Each view's default column set resolves against its registry, and the
-// usage lists every view with its columns and defaults, and names the
-// views --period and --converted apply to, every flag line within the
-// usage's width.
+// The usage's hand-written view list names every view, and the usage
+// names the views --period and --converted apply to, every flag line
+// within the usage's width.
 func TestYieldUsageListsEveryView(t *testing.T) {
 	t.Parallel()
 	usage := yieldUsage()
-	_, columns, _ := strings.Cut(usage, "Available columns (per view):")
-	_, defaults, _ := strings.Cut(columns, "Default column sets:")
-	for _, view := range yieldViews {
-		if _, err := yieldReport(request{view: view, currency: "USD"}).pick("default"); err != nil {
-			t.Errorf("%s defaults: %v", view, err)
-		}
-		for what, text := range map[string]string{"views": usage, "columns": columns, "defaults": defaults} {
-			if !strings.Contains(text, "\n  "+view+" ") {
-				t.Errorf("usage does not list the %s view under its %s", view, what)
-			}
+	views, _, _ := strings.Cut(usage, "Available columns (per view):")
+	for _, view := range yieldFamily.names() {
+		if !strings.Contains(views, "\n  "+view+" ") {
+			t.Errorf("usage does not list the %s view", view)
 		}
 	}
 	flat := strings.Join(strings.Fields(usage), " ")
-	for _, want := range []string{"a period column first; on " + andList(yieldSeriesViews),
-		"currencies; on " + andList(yieldAggregateViews)} {
+	for _, want := range []string{"a period column first; on " + andList(yieldFamily.seriesViews()),
+		"currencies; on " + andList(yieldFamily.taking("converted"))} {
 		if !strings.Contains(flat, want) {
 			t.Errorf("usage does not say %q", want)
 		}

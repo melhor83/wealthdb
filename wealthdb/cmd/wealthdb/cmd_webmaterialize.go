@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/config"
@@ -28,15 +27,17 @@ func init() {
 // day, it returns without writing.
 // The serving tables hold the daily histories, the latest holdings and
 // every transaction line the serving views read, each its report
-// macro's rows verbatim (gold.MaterializeServingTables). report_returns holds the
-// full RunReturns matrix (every grain × period × reporting currency,
-// plus the per-year windowed since-<year> summaries) with the
+// macro's rows verbatim (gold.MaterializeServingTables). report_returns
+// holds the full RunReturns matrix (every grain × period × reporting
+// currency, plus the per-year windowed since-<year> summaries) with the
 // CLI-default knobs and the same wealthdb.cfg returns settings a CLI
 // run applies (returnsCfgSettings) — each base partition is the
 // verbatim output of a bare
 // `wealthdb returns <grain> --period <granularity> --method both -x <CCY>`.
-// report_gains holds the monthly gains rows per reporting currency, the
-// rows `wealthdb gains <grain> --period monthly -x <CCY>` sums.
+// report_private_markets holds the rows of `wealthdb returns private -x
+// <CCY>` per reporting currency. report_gains holds the monthly gains
+// rows per reporting currency, the rows
+// `wealthdb gains <grain> --period monthly -x <CCY>` sums.
 // report_exposure holds the look-through at every month end and today
 // per reporting currency; an instant's class totals are those of
 // `wealthdb exposure classes -d <day> -x <CCY>`. The yield tables hold
@@ -61,7 +62,7 @@ func cmdWebMaterialize(ctx context.Context, g globalFlags, _ []string, _ io.Read
 	// edit between the two reads leaves a key older than the tables, so
 	// the next run rebuilds rather than skip over them.
 	raw, readErr := os.ReadFile(g.ConfigPath)
-	cfg, err := config.Load(g.ConfigPath)
+	cfg, err := g.loadConfig()
 	if err != nil {
 		return err
 	}
@@ -77,11 +78,7 @@ func cmdWebMaterialize(ctx context.Context, g globalFlags, _ []string, _ io.Read
 		return err
 	}
 	defer lock.unlock()
-	hash, err := gold.HashInputs(raw, returnsCfgFiles(cfg)...)
-	if err != nil {
-		return err
-	}
-	key := gold.MaterializeKey{ConfigHash: hash, EngineVersion: engineVersion(),
+	key := gold.MaterializeKey{ConfigHash: gold.HashConfig(raw), EngineVersion: engineVersion(),
 		AsOf: anchorToDay(g.clock().UTC(), true).Unix()}
 	same, err := materializeInputsSame(ctx, cfg, key)
 	if err != nil {
@@ -103,7 +100,8 @@ func cmdWebMaterialize(ctx context.Context, g globalFlags, _ []string, _ io.Read
 	defer db.Close()
 	printTiming(stderr, "open", opened)
 	// The load key of the migrated gold. No phase writes a table the key
-	// stamps, so it still holds once the phases are done.
+	// stamps (gold's TestNoPhaseWritesALoadKeyTable), so it still holds
+	// once the phases are done.
 	if key.LoadKey, err = gold.LoadKey(ctx, db); err != nil {
 		return err
 	}
@@ -114,49 +112,14 @@ func cmdWebMaterialize(ctx context.Context, g globalFlags, _ []string, _ io.Read
 		return err
 	}
 
-	toEpoch := key.AsOf
-	// One computed_at for every phase that stamps it, read as the first
-	// of them starts.
-	computedAt := sync.OnceValue(func() int64 { return time.Now().Unix() })
-	ccys := len(gold.MaterializedCurrencies())
-	if err := runMaterializePhases(stderr, []materializePhase{
-		{"serving", func() (int, error) {
-			return gold.MaterializeServingTables(ctx, db)
-		}, func(n int) string {
-			return fmt.Sprintf("serving tables: materialized %d rows (histories, latest holdings, transaction lines)", n)
-		}},
-		{"returns", func() (int, error) {
-			inceptionOv, exclude, hide, policyOv, matching := returnsCfgSettings(cfg)
-			return gold.MaterializeReturns(ctx, db, gold.MaterializeParams{
-				ToEpoch:            toEpoch,
-				ComputedAt:         computedAt(),
-				InceptionOverrides: inceptionOv,
-				ReturnsExclude:     exclude,
-				ReturnsHide:        hide,
-				PolicyOverrides:    policyOv,
-				TransferMatching:   matching,
-			})
-		}, func(n int) string {
-			return fmt.Sprintf("returns: materialized %d rows (4 grains x 4 periods x %d currencies, plus per-year windows)", n, ccys)
-		}},
-		{"gains", func() (int, error) {
-			return gold.MaterializeGains(ctx, db, toEpoch, computedAt())
-		}, func(n int) string {
-			return fmt.Sprintf("gains: materialized %d rows (monthly x %d currencies x %d readings of a missing cost basis)",
-				n, ccys, len(lots.MissingBasisReadings))
-		}},
-		{"exposure", func() (int, error) {
-			return gold.MaterializeExposure(ctx, db, toEpoch, computedAt())
-		}, func(n int) string {
-			return fmt.Sprintf("exposure: materialized %d rows (month ends x %d currencies)", n, ccys)
-		}},
-		{"yield", func() (int, error) {
-			return gold.MaterializeYield(ctx, db, toEpoch, computedAt(), cfg.CashflowLookback())
-		}, func(n int) string {
-			return fmt.Sprintf("yield: materialized %d rows (holdings at today and %d month ends x %d currencies, today's projection)",
-				n, gold.YieldHistoryMonths, ccys)
-		}},
-	}); err != nil {
+	// One computed_at for every phase that stamps it.
+	p := gold.MaterializeParams{
+		ToEpoch:          key.AsOf,
+		ComputedAt:       time.Now().Unix(),
+		ReturnsSettings:  returnsCfgSettings(cfg),
+		CashflowLookback: cfg.CashflowLookback(),
+	}
+	if err := runMaterializePhases(ctx, stderr, db, p, webMaterializePhases); err != nil {
 		return err
 	}
 	closing := time.Now()
@@ -169,27 +132,50 @@ func cmdWebMaterialize(ctx context.Context, g globalFlags, _ []string, _ io.Read
 }
 
 // materializePhase is one phase of web-materialize: its name on the
-// timing line, the run that returns its row count, and the summary line
-// of that count.
+// timing line, the run that rewrites its tables and returns their row
+// count, and the summary line of that count.
 type materializePhase struct {
 	name    string
-	run     func() (int, error)
+	run     func(context.Context, *sql.DB, gold.MaterializeParams) (int, error)
 	summary func(n int) string
 }
 
-// runMaterializePhases runs each phase in order under timedPass and
-// prints its summary once it succeeds. It stops at the first failure,
-// which prints its timing line and no summary.
-func runMaterializePhases(stderr io.Writer, phases []materializePhase) error {
-	for _, p := range phases {
+// webMaterializePhases are web-materialize's phases, in the order they
+// run.
+var webMaterializePhases = []materializePhase{
+	{"serving", gold.MaterializeServingTables, func(n int) string {
+		return fmt.Sprintf("serving tables: materialized %d rows (histories, latest holdings, transaction lines)", n)
+	}},
+	{"returns", gold.MaterializeReturns, func(n int) string {
+		return fmt.Sprintf("returns: materialized %d rows (%d grains x %d periods x %d currencies, plus per-year windows)",
+			n, len(gold.ReturnsGrains()), len(returnsPeriods), len(gold.MaterializedCurrencies()))
+	}},
+	{"gains", gold.MaterializeGains, func(n int) string {
+		return fmt.Sprintf("gains: materialized %d rows (monthly x %d currencies x %d readings of a missing cost basis)",
+			n, len(gold.MaterializedCurrencies()), len(lots.MissingBasisReadings))
+	}},
+	{"exposure", gold.MaterializeExposure, func(n int) string {
+		return fmt.Sprintf("exposure: materialized %d rows (month ends x %d currencies)", n, len(gold.MaterializedCurrencies()))
+	}},
+	{"yield", gold.MaterializeYield, func(n int) string {
+		return fmt.Sprintf("yield: materialized %d rows (holdings at today and %d month ends x %d currencies, today's projection)",
+			n, gold.YieldHistoryMonths, len(gold.MaterializedCurrencies()))
+	}},
+}
+
+// runMaterializePhases runs each phase in order over db with p, under
+// timedPass, and prints its summary once it succeeds. It stops at the
+// first failure, which prints its timing line and no summary.
+func runMaterializePhases(ctx context.Context, stderr io.Writer, db *sql.DB, p gold.MaterializeParams, phases []materializePhase) error {
+	for _, ph := range phases {
 		var n int
-		if err := timedPass(stderr, p.name, func() (err error) {
-			n, err = p.run()
+		if err := timedPass(stderr, ph.name, func() (err error) {
+			n, err = ph.run(ctx, db, p)
 			return err
 		}); err != nil {
 			return err
 		}
-		fmt.Fprintln(stderr, p.summary(n))
+		fmt.Fprintln(stderr, ph.summary(n))
 	}
 	return nil
 }

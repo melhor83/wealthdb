@@ -22,11 +22,18 @@ import (
 // statement's own figure for the trailing months spread evenly.
 
 // projectedIncomeDetailed are the income values the income projection
-// projects (incomeTypeSQL): their lines are its received half, so the
-// cash flow projection's other income leaves them out and counts none
-// twice.
-var projectedIncomeDetailed = []string{"INCOME_INTEREST_EARNED", "INCOME_DIVIDENDS", "INCOME_DISTRIBUTIONS",
-	"INCOME_RENTAL", "INCOME_RETIREMENT_PENSION"}
+// projects (canonical.CategoryRoles.ProjectedIncome, incomeTypeSQL):
+// their lines are its received half, so the cash flow projection's
+// other income leaves them out and counts none twice.
+var projectedIncomeDetailed = func() []string {
+	var out []string
+	for _, c := range canonical.SpendCategories {
+		if c.Roles().ProjectedIncome {
+			out = append(out, c.Detailed)
+		}
+	}
+	return out
+}()
 
 // PlanOutClasses are the operating-out classes the cash flow projection
 // breaks operating_out into (`-C +<class>`), in the vocabulary's order, the
@@ -38,8 +45,9 @@ var PlanOutClasses = []string{string(canonical.ClassConsumption), string(canonic
 const planUncategorized = "(uncategorized)"
 
 // PlanParts are the look-back's parts of report_cashflow_plan (migration
-// 0149), PlanOutsidePart and PlanPoolPart aside, in the order web/provision.py's
-// PLAN_LOOKBACK_PARTS reads them; operating_out holds a row per class of
+// 0149), PlanOutsidePart and PlanPoolPart aside, in the order
+// PLAN_LOOKBACK_PARTS (web/dashboards/cashflow.py) reads them;
+// operating_out holds a row per class of
 // PlanOutClasses, and other_income a row per class and account
 // (OtherIncomeBy, migration 0169).
 var PlanParts = []string{"other_income", "operating_out", "debt_service", "vehicles"}
@@ -131,7 +139,7 @@ mortgages AS (
      GROUP BY ALL),
 hist AS MATERIALIZED (
     SELECT n.occurred_at, n.class, n.net_amount, n.far_silver_source_id, n.far_account_external_id
-      FROM cashflow_txn_nodes(0, ?2) n` + poolSpanJoin + `
+      FROM cashflow_pool_nodes(0, ?2) n
      WHERE n.disposition = 'line'),
 firsts AS (
     SELECT h.far_silver_source_id AS src, h.far_account_external_id AS acct, MIN(h.occurred_at) AS first
@@ -232,53 +240,22 @@ const PlanOutsidePart = "outside_income"
 // other_income; an income reader reads this part with PlanOutsidePart.
 const PlanPoolPart = "pool_income"
 
-// planIncomeClasses are the operating-in classes of the cash flow
-// statement (cashflow_txn_nodes) by an income line's detailed type, the
-// projected types (projectedIncomeDetailed) aside: a line of no type is
-// the unresolved class, one of any other type other receipts. A test
-// holds it to the statement's CASE.
-var planIncomeClasses = map[string][]string{
-	string(canonical.ClassEarnings): {"INCOME_SALARY", "INCOME_GIG_ECONOMY", "INCOME_CONTRACTOR"},
-	string(canonical.ClassYield):    {"INCOME_STAKING", "INCOME_ROYALTIES", "INCOME_ENERGY_FEED_IN"},
-	string(canonical.ClassBenefits): {"INCOME_GOVERNMENT_BENEFITS", "INCOME_UNEMPLOYMENT", "INCOME_LONG_TERM_DISABILITY",
-		"INCOME_MILITARY", "INCOME_CHILD_SUPPORT", "INCOME_ALIMONY"},
-}
-
-// planIncomeClassSQL is planIncomeClasses as the SQL class of an income
-// line w.
-var planIncomeClassSQL = func() string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "CASE WHEN w.income_detailed IS NULL THEN '%s'", planUncategorized)
-	for _, c := range slices.Sorted(maps.Keys(planIncomeClasses)) {
-		fmt.Fprintf(&b, " WHEN w.income_detailed IN ('%s') THEN '%s'",
-			strings.Join(planIncomeClasses[c], "', '"), c)
-	}
-	return b.String() + " ELSE '" + string(canonical.ClassOtherReceipts) + "' END"
-}()
-
-// outsidePool keeps an income line b off the pool on its own day: no
-// span of cashflow_pool_spans holds it (poolSpanOn), so a line on a
-// dated wrapper override's day reads the override's wrapper, as
-// poolSpanJoin does for the statement's lines.
-func outsidePool(b string) string {
-	return "NOT EXISTS (SELECT 1 FROM cashflow_pool_spans() p WHERE " + poolSpanOn(b) + ")"
-}
-
-// planIncomeSQL sums the window's income lines by side of the pool,
-// class and account, the projected types aside, with an account's first
+// planIncomeSQL sums the window's income lines by side of the pool on
+// the line's own day (in_pool), operating-in class (income_line_class)
+// and account, the projected types aside, with an account's first
 // income line outside the pool ever, of any type (NULL for one that has
 // none).
 var planIncomeSQL = `
 WITH firsts AS (
     SELECT b.silver_source_id, b.account_external_id, MIN(b.occurred_at) AS first
       FROM income_lines_base(0, ?2) b
-     WHERE ` + outsidePool("b") + `
+     WHERE NOT b.in_pool
      GROUP BY ALL),
 lines AS (
-    SELECT w.*, ` + outsidePool("w") + ` AS outside
+    SELECT w.*, NOT w.in_pool AS outside
       FROM income_lines_outccy(?1, ?2, ?3) w
-     WHERE NOT list_contains(?4, COALESCE(w.income_detailed, '')))
-SELECT w.outside, ` + planIncomeClassSQL + ` AS class, w.silver_source_id, w.account_external_id,
+     WHERE income_line_class(w.income_detailed) IS NOT NULL)
+SELECT w.outside, income_line_class(w.income_detailed) AS class, w.silver_source_id, w.account_external_id,
        SUM(w.value_outccy)::DOUBLE, any_value(f.first)
   FROM lines w
   LEFT JOIN firsts f USING (silver_source_id, account_external_id)
@@ -311,7 +288,7 @@ func CashflowPlanIncome(ctx context.Context, db querier, from, to int64, outCcy 
 			pool[k] = value / float64(poolMonths)
 		}
 		return nil
-	}, from, to, outCcy, projectedIncomeDetailed)
+	}, from, to, outCcy)
 	if err != nil {
 		return nil, nil, fmt.Errorf("CashflowPlanIncome: %w", err)
 	}
@@ -519,6 +496,36 @@ func planQuality(tags map[string]bool) string {
 		}
 	}
 	return strings.Join(out, " ")
+}
+
+// PlanParams are a cash flow projection's: the forward window, a
+// look-back of Lookback months, and rows of Period months (1, 3, 12).
+type PlanParams struct {
+	ForwardParams
+	Lookback, Period int
+}
+
+// CashflowPlanRows is the cash flow projection: the income projection of
+// p.At for the window's months, split by the pool (PlanMonths), set
+// against the look-back's averages (CashflowPlanLookback), the
+// mortgages the book holds continued to their maturity. A window past
+// the projection is refused with PastProjection.
+func CashflowPlanRows(ctx context.Context, db querier, p PlanParams) ([]PlanRow, error) {
+	b, w, err := forwardBook(ctx, db, p.ForwardParams)
+	if err != nil {
+		return nil, err
+	}
+	pool, err := CashflowPool(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	months := PlanMonths(b, b.Amounts(nil, w, p.Assumptions), w, pool)
+	from, to := PlanWindow(time.Unix(p.At, 0), p.Lookback)
+	lb, err := CashflowPlanLookback(ctx, db, from, to, p.Ccy)
+	if err != nil {
+		return nil, err
+	}
+	return CashflowPlan(lb, PlanStanding(b), months, p.Period, p.Assumptions.Rule == yield.RuleRoll), nil
 }
 
 // PlanStanding are the mortgages a book holds, by source and account,

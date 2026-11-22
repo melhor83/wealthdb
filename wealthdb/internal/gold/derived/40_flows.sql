@@ -2,6 +2,119 @@
 -- populations through their categories to their reports.
 
 -- ============================================================
+-- The roles of the kinds and the values, as predicates.
+--
+-- Each is a scalar macro, so it expands in place to the test it holds
+-- and a caller's plan is the one the test would give. Go states
+-- every role once (internal/canonical: the kind tables and
+-- CategoryRoles), the derived set stamps it into txn_kind_roles and
+-- spend_categories, and a test holds each predicate here to it
+-- (TestFlowPredicatesHoldTheRoles). A macro that reads a role on a
+-- join it already has reads the stamped column instead.
+-- ============================================================
+
+-- kind_is_spending: a row of the kind is in the spending population
+-- (txn_kind_roles.spending_side). Interest is charged when negative.
+CREATE MACRO kind_is_spending(p_kind, p_amount) AS (
+    p_kind IN ('purchase', 'refund', 'withdrawal', 'fee', 'tax')
+    OR (p_kind = 'interest' AND p_amount < 0)
+);
+
+-- kind_is_income: a row of the kind is in the income population
+-- (txn_kind_roles.income_side). Interest is earned when positive.
+CREATE MACRO kind_is_income(p_kind, p_amount) AS (
+    p_kind IN ('dividend', 'coupon', 'staking', 'capital_gain',
+               'reward', 'distribution', 'deposit')
+    OR (p_kind = 'interest' AND p_amount > 0)
+);
+
+-- kind_in_matcher_pool: the internal-transfer matcher may pair a row of
+-- the kind (txn_kind_roles.matcher_pool).
+CREATE MACRO kind_in_matcher_pool(p_kind) AS (
+    p_kind IN ('deposit', 'withdrawal', 'card_payment', 'transfer_in', 'transfer_out')
+);
+
+-- kind_is_unsigned: gold pins the kind no sign, and cash flow excludes
+-- it for want of one (txn_kind_roles.unsigned).
+CREATE MACRO kind_is_unsigned(p_kind) AS (
+    p_kind IN ('fx', 'fx_forward', 'fx_swap', 'corporate_action', 'journal', 'other')
+);
+
+-- kind_is_trade: a trade, or private capital committed or returned by
+-- a sale (txn_kind_roles.trade).
+CREATE MACRO kind_is_trade(p_kind) AS (
+    p_kind IN ('buy', 'sell', 'contribution')
+);
+
+-- income_kind_floor: the income type a row of the kind reads where no
+-- tier placed it (txn_kind_roles.income_floor), on its income side.
+CREATE MACRO income_kind_floor(p_kind, p_amount) AS (
+    CASE p_kind
+        WHEN 'dividend'     THEN 'INCOME_DIVIDENDS'
+        WHEN 'coupon'       THEN 'INCOME_INTEREST_EARNED'
+        WHEN 'staking'      THEN 'INCOME_STAKING'
+        WHEN 'capital_gain' THEN 'INCOME_DISTRIBUTIONS'
+        WHEN 'reward'       THEN 'INCOME_REWARDS'
+        WHEN 'distribution' THEN 'capital_return'
+        WHEN 'interest'     THEN
+            CASE WHEN p_amount > 0
+                 THEN 'INCOME_INTEREST_EARNED' END
+    END
+);
+
+-- spend_kind_floor: the same for spending (txn_kind_roles.spend_floor).
+-- A fee's floor is the one that reads the account: a card's, and a
+-- `cash` account's in no portfolio, is a bank fee; every other is the
+-- cost of holding investments (spend_txn_categories says why).
+CREATE MACRO spend_kind_floor(p_kind, p_amount, p_account_kind, p_portfolio) AS (
+    CASE p_kind
+        WHEN 'fee' THEN
+            CASE WHEN p_account_kind = 'card'
+                      OR (p_account_kind = 'cash'
+                          AND p_portfolio IS NULL)
+                 THEN 'BANK_FEES_OTHER_BANK_FEES'
+                 ELSE 'BANK_FEES_INVESTMENT_FEES' END
+        WHEN 'tax' THEN 'GOVERNMENT_AND_NON_PROFIT_WITHHOLDING_TAX'
+        WHEN 'interest' THEN
+            CASE WHEN p_amount < 0
+                 THEN 'BANK_FEES_INTEREST_CHARGE' END
+    END
+);
+
+-- detailed_stays_in_spending: a line of the value stays in the
+-- spending base (NOT spend_categories.leaves_spending). The values that
+-- leave are an own-account move, capital deployed, a liability reduced
+-- and the crossings. A line with no value stays. One test per value
+-- rather than an IN-list, which the planner turns into a join.
+CREATE MACRO detailed_stays_in_spending(p_detailed) AS (
+    p_detailed IS DISTINCT FROM 'internal_transfer'
+    AND p_detailed IS DISTINCT FROM 'investment'
+    AND p_detailed IS DISTINCT FROM 'debt_repayment'
+    AND p_detailed IS DISTINCT FROM 'retirement_transfer'
+    AND p_detailed IS DISTINCT FROM 'education_transfer'
+    AND p_detailed IS DISTINCT FROM 'health_transfer'
+    AND p_detailed IS DISTINCT FROM 'trust_transfer'
+    AND p_detailed IS DISTINCT FROM 'deposit_transfer'
+    AND p_detailed IS DISTINCT FROM 'mortgage_transfer'
+);
+
+-- detailed_stays_in_income: the same for the income base (NOT
+-- spend_categories.leaves_income). The values that leave name money
+-- that arrived without being earned.
+CREATE MACRO detailed_stays_in_income(p_detailed) AS (
+    p_detailed IS DISTINCT FROM 'internal_transfer'
+    AND p_detailed IS DISTINCT FROM 'capital_return'
+    AND p_detailed IS DISTINCT FROM 'loan_proceeds'
+    AND p_detailed IS DISTINCT FROM 'reimbursement'
+    AND p_detailed IS DISTINCT FROM 'retirement_transfer'
+    AND p_detailed IS DISTINCT FROM 'education_transfer'
+    AND p_detailed IS DISTINCT FROM 'health_transfer'
+    AND p_detailed IS DISTINCT FROM 'trust_transfer'
+    AND p_detailed IS DISTINCT FROM 'deposit_transfer'
+    AND p_detailed IS DISTINCT FROM 'mortgage_transfer'
+);
+
+-- ============================================================
 -- Period bucketing and the valued line bases
 -- ============================================================
 
@@ -13,15 +126,28 @@
 -- passes a valid part INSIDE the call and nulls the result outside it.
 -- The timestamp comes from epoch_ms, not to_timestamp, which yields a
 -- TIMESTAMP WITH TIME ZONE and would truncate in the session's zone
--- rather than UTC. Any other part is passed through to date_trunc, so
--- an unrecognised one raises rather than bucketing wrongly; validating
--- the choice belongs to the caller.
+-- rather than UTC, and from a BIGINT, so a literal instant does not
+-- overflow an INTEGER. Any other part is passed through to date_trunc,
+-- so an unrecognised one raises rather than bucketing wrongly;
+-- validating the choice belongs to the caller.
 CREATE MACRO spend_period_bucket(p_period, p_at) AS (
     CASE WHEN p_period = 'total' THEN NULL
          ELSE CAST(epoch(date_trunc(
                   CASE WHEN p_period = 'total' THEN 'month' ELSE p_period END,
-                  epoch_ms(p_at * 1000))) AS BIGINT)
+                  epoch_ms(CAST(p_at AS BIGINT) * 1000))) AS BIGINT)
     END
+);
+
+-- spend_match_amount: the amount the transfer matcher compares for one
+-- transactions row. It is net_amount, but the quantity for a coin's leg
+-- in the coin itself (the instrument is the currency) whose amount
+-- net_amount's four places round to zero. A coin's dust then keeps its
+-- size and its sign, and pairs, while every other leg reads net_amount
+-- as stored. The quantity is kept to eight places. The pool and the
+-- matcher audit read it here.
+CREATE MACRO spend_match_amount(p_net, p_quantity, p_instrument, p_currency) AS (
+    CASE WHEN p_net = 0 AND p_quantity <> 0 AND p_instrument = p_currency
+         THEN p_quantity ELSE p_net END
 );
 
 -- spend_matcher_pool: the legs the internal-transfer matcher may pair,
@@ -53,17 +179,16 @@ CREATE MACRO spend_period_bucket(p_period, p_at) AS (
 --   * spend_scoped_accounts(), spend_enrichment_population() and
 --     spending_lines_base() keep their own scope. The pool adds
 --     candidates for PAIRING; it adds nothing to what a report charts.
---   * The eligible KIND set is `deposit`, `withdrawal`,
---     `card_payment`, `transfer_in`, `transfer_out`. Those are exactly
---     the kinds that mean "cash moved into or out of an account" AND
---     carry a pinned canonical sign (internal/canonical/sign.go), so
---     every leg can be oriented as debit or credit. `journal` and
---     `other` are catch-alls whose sign is whatever the source
---     supplied and whose meaning is "a bookkeeping entry"; `fx*` and
---     `corporate_action` are unsigned for the same reason;
---     `contribution` and `distribution` are booked from the funding
---     account's own perspective, so neither can ever be the RECEIVING
---     half of a movement out of it. Admitting any of them buys false
+--   * The eligible kinds are the matcher_pool role (txn_kind_roles,
+--     kind_in_matcher_pool): the kinds that mean "cash moved into or
+--     out of an account" AND carry a pinned canonical sign
+--     (internal/canonical/sign.go), so every leg can be oriented as
+--     debit or credit. `journal` and `other` are catch-alls whose sign
+--     is whatever the source supplied and whose meaning is "a
+--     bookkeeping entry"; `fx*` and `corporate_action` are unsigned for
+--     the same reason; `contribution` and `distribution` are booked
+--     from the funding account's own perspective, so neither can ever
+--     be the RECEIVING half of a movement out of it. Admitting any of them buys false
 --     pairs, and a false pair does not surface as a wrong category —
 --     it silently deletes a real spending line.
 --
@@ -71,14 +196,17 @@ CREATE MACRO spend_period_bucket(p_period, p_at) AS (
 -- spend_txn_categories() onto every transaction, so a paired leg on an
 -- out-of-scope account reads `internal_transfer` there instead of
 -- NULL. That is the label the pass has evidence for.
+--
+-- match_amount is the amount the matcher compares (spend_match_amount).
 CREATE MACRO spend_matcher_pool(p_from, p_to) AS TABLE (
     SELECT t.silver_source_id, t.transaction_external_id, t.occurred_at,
            t.account_external_id, t.kind, t.currency, t.net_amount,
-           t.description, t.counterparty
+           spend_match_amount(t.net_amount, t.quantity,
+                              t.instrument_external_id, t.currency) AS match_amount,
+           t.description, t.counterparty, t.provider_category
       FROM transactions t
      WHERE t.occurred_at BETWEEN p_from AND p_to
-       AND t.kind IN ('deposit', 'withdrawal', 'card_payment',
-                      'transfer_in', 'transfer_out')
+       AND kind_in_matcher_pool(t.kind)
 );
 
 -- txn_evidence: the evidence a source states in a transaction's payload
@@ -258,9 +386,7 @@ CREATE MACRO income_enrichment_population(p_from, p_to) AS TABLE (
              ON sa.silver_source_id    = t.silver_source_id
             AND sa.account_external_id = t.account_external_id
      WHERE t.occurred_at BETWEEN p_from AND p_to
-       AND (t.kind IN ('dividend', 'coupon', 'staking', 'capital_gain',
-                       'reward', 'distribution', 'deposit')
-            OR (t.kind = 'interest' AND t.net_amount > 0))
+       AND kind_is_income(t.kind, t.net_amount)
 );
 
 -- spend_enrichment_population: the rows the spending pass sees. The
@@ -293,8 +419,7 @@ CREATE MACRO spend_enrichment_population(p_from, p_to) AS TABLE (
              ON sa.silver_source_id    = t.silver_source_id
             AND sa.account_external_id = t.account_external_id
      WHERE t.occurred_at BETWEEN p_from AND p_to
-       AND (t.kind IN ('purchase', 'refund', 'withdrawal', 'fee', 'tax')
-            OR (t.kind = 'interest' AND t.net_amount < 0))
+       AND kind_is_spending(t.kind, t.net_amount)
 );
 
 -- ============================================================
@@ -435,17 +560,7 @@ CREATE MACRO income_txn_categories() AS TABLE (
     WITH floored AS (
         SELECT e.*,
                t.instrument_external_id,
-               CASE t.kind
-                   WHEN 'dividend'     THEN 'INCOME_DIVIDENDS'
-                   WHEN 'coupon'       THEN 'INCOME_INTEREST_EARNED'
-                   WHEN 'staking'      THEN 'INCOME_STAKING'
-                   WHEN 'capital_gain' THEN 'INCOME_DISTRIBUTIONS'
-                   WHEN 'reward'       THEN 'INCOME_REWARDS'
-                   WHEN 'distribution' THEN 'capital_return'
-                   WHEN 'interest'     THEN
-                       CASE WHEN t.net_amount > 0
-                            THEN 'INCOME_INTEREST_EARNED' END
-               END AS kind_floor
+               income_kind_floor(t.kind, t.net_amount) AS kind_floor
           FROM income_txn_enrichment e
           LEFT JOIN transactions t
                  ON t.silver_source_id        = e.silver_source_id
@@ -483,8 +598,11 @@ CREATE MACRO income_txn_categories() AS TABLE (
              ON pc.spend_detailed = e.provider_income_detailed
 );
 
--- cashflow_pool_accounts: the household's cash pool — every scoped
--- account whose tax wrapper is on the household side.
+-- cashflow_pool_spans: the household's cash pool, dated — every span
+-- of a scoped account's tax wrapper (account_wrapper_spans) whose
+-- wrapper is on the household side. A dated wrapper override applies
+-- from its day on, so an account can be in the pool on one day and out
+-- of it on another. This is the one statement of "in the pool".
 --
 -- An UNSET wrapper reads as household, which is the render-time
 -- default gold applies everywhere else and the safe direction: nothing
@@ -500,18 +618,30 @@ CREATE MACRO income_txn_categories() AS TABLE (
 -- wrapper, so an account carrying a wrapper the stamped table does not
 -- hold — a database migrated ahead of its binary — reads as household
 -- too, by the same rule and not by accident.
+CREATE MACRO cashflow_pool_spans() AS TABLE (
+    SELECT w.silver_source_id, w.account_external_id, w.from_at, w.until_at
+      FROM account_wrapper_spans() w
+      LEFT JOIN cashflow_account_scope s
+             ON s.silver_source_id    = w.silver_source_id
+            AND s.account_external_id = w.account_external_id
+      LEFT JOIN cashflow_wrapper_sides ws
+             ON ws.tax_wrapper = w.tax_wrapper
+     WHERE COALESCE(s.mode, 'include') = 'include'
+       AND COALESCE(ws.side, 'household') = 'household'
+);
+
+-- cashflow_pool_accounts: the pool today — every account whose span
+-- that is current, the one with no end, is in the pool. That span
+-- carries the account's own tax wrapper (account_wrapper_spans).
 CREATE MACRO cashflow_pool_accounts() AS TABLE (
     SELECT a.silver_source_id, a.account_external_id, a.account_kind,
            a.display_name, a.nickname, a.account_category,
            a.portfolio_external_id, a.tax_wrapper
       FROM accounts a
-      LEFT JOIN cashflow_account_scope s
-             ON s.silver_source_id    = a.silver_source_id
-            AND s.account_external_id = a.account_external_id
-      LEFT JOIN cashflow_wrapper_sides w
-             ON w.tax_wrapper = a.tax_wrapper
-     WHERE COALESCE(s.mode, 'include') = 'include'
-       AND COALESCE(w.side, 'household') = 'household'
+      JOIN cashflow_pool_spans() p
+        ON p.silver_source_id    = a.silver_source_id
+       AND p.account_external_id = a.account_external_id
+       AND p.until_at = CAST(9223372036854775807 AS BIGINT)
 );
 
 CREATE MACRO cashflow_section_rank(p_section) AS (
@@ -625,6 +755,9 @@ CREATE MACRO cashflow_period_end(p_period, p_start, p_to) AS (
     END
 );
 
+-- income_lines_base: the income lines. in_pool says whether the line's
+-- account is in the cash pool on the line's own day
+-- (cashflow_pool_spans).
 CREATE MACRO income_lines_base(p_from, p_to) AS TABLE (
     SELECT p.silver_source_id, p.transaction_external_id, p.occurred_at,
            p.account_external_id, p.account_kind, p.display_name,
@@ -635,21 +768,17 @@ CREATE MACRO income_lines_base(p_from, p_to) AS TABLE (
            c.income_primary, c.income_label, c.income_primary_label,
            c.provenance,
            c.provider_income_detailed, c.provider_income_primary,
-           c.provider_income_label, c.provider_income_primary_label
+           c.provider_income_label, c.provider_income_primary_label,
+           (ps.silver_source_id IS NOT NULL) AS in_pool
       FROM income_enrichment_population(p_from, p_to) p
       LEFT JOIN income_txn_categories() c
              ON c.silver_source_id        = p.silver_source_id
             AND c.transaction_external_id = p.transaction_external_id
-     WHERE c.income_detailed IS DISTINCT FROM 'internal_transfer'
-       AND c.income_detailed IS DISTINCT FROM 'capital_return'
-       AND c.income_detailed IS DISTINCT FROM 'loan_proceeds'
-       AND c.income_detailed IS DISTINCT FROM 'reimbursement'
-       AND c.income_detailed IS DISTINCT FROM 'retirement_transfer'
-       AND c.income_detailed IS DISTINCT FROM 'education_transfer'
-       AND c.income_detailed IS DISTINCT FROM 'health_transfer'
-       AND c.income_detailed IS DISTINCT FROM 'trust_transfer'
-       AND c.income_detailed IS DISTINCT FROM 'deposit_transfer'
-       AND c.income_detailed IS DISTINCT FROM 'mortgage_transfer'
+      LEFT JOIN cashflow_pool_spans() ps
+             ON ps.silver_source_id    = p.silver_source_id
+            AND ps.account_external_id = p.account_external_id
+            AND p.occurred_at >= ps.from_at AND p.occurred_at < ps.until_at
+     WHERE detailed_stays_in_income(c.income_detailed)
      ORDER BY p.occurred_at, p.silver_source_id, p.transaction_external_id
 );
 
@@ -897,18 +1026,8 @@ CREATE MACRO cashflow_class_rank(p_class) AS (
 CREATE MACRO spend_txn_categories() AS TABLE (
     WITH floored AS (
         SELECT e.*,
-               CASE t.kind
-                   WHEN 'fee' THEN
-                       CASE WHEN a.account_kind = 'card'
-                                 OR (a.account_kind = 'cash'
-                                     AND a.portfolio_external_id IS NULL)
-                            THEN 'BANK_FEES_OTHER_BANK_FEES'
-                            ELSE 'BANK_FEES_INVESTMENT_FEES' END
-                   WHEN 'tax' THEN 'GOVERNMENT_AND_NON_PROFIT_WITHHOLDING_TAX'
-                   WHEN 'interest' THEN
-                       CASE WHEN t.net_amount < 0
-                            THEN 'BANK_FEES_INTEREST_CHARGE' END
-               END AS kind_floor
+               spend_kind_floor(t.kind, t.net_amount, a.account_kind,
+                                a.portfolio_external_id) AS kind_floor
           FROM spend_txn_enrichment e
           LEFT JOIN transactions t
                  ON t.silver_source_id        = e.silver_source_id
@@ -990,6 +1109,33 @@ CREATE MACRO income_lines_multi(p_from, p_to) AS TABLE (
       ASOF LEFT JOIN fx_reporting_bridges fxb ON fxb.day <= (b.occurred_at // 86400)
 );
 
+-- income_projected_types: the projection's income types an income line
+-- of detailed type `detailed` can be (gold's incomeTypeSQL): interest a
+-- bond pays is a coupon, a dividend a fund pays a distribution. NULL for
+-- a type the projection does not project (canonical's ProjectedIncome).
+CREATE MACRO income_projected_types(detailed) AS
+    CASE detailed WHEN 'INCOME_INTEREST_EARNED' THEN ['interest', 'coupons']
+                  WHEN 'INCOME_DIVIDENDS' THEN ['dividends', 'distributions']
+                  WHEN 'INCOME_DISTRIBUTIONS' THEN ['distributions']
+                  WHEN 'INCOME_RENTAL' THEN ['rent']
+                  WHEN 'INCOME_RETIREMENT_PENSION' THEN ['pension'] END;
+
+-- income_line_class: the operating-in class of an income line of
+-- detailed type `detailed` that the projection does not project, as the
+-- cash flow statement classes a receipt (canonical's FlowClassIn, which
+-- cashflow_txn_nodes reads from spend_categories): a line of no type is
+-- the unresolved class, one of a type no class names other receipts.
+-- NULL for a projected type, whose lines are the holdings' income. The
+-- cash flow projection keeps its other income by it (gold.CashflowPlanIncome).
+CREATE MACRO income_line_class(detailed) AS
+    CASE WHEN detailed IS NULL THEN '(uncategorized)'
+         WHEN income_projected_types(detailed) IS NOT NULL THEN NULL
+         WHEN detailed IN ('INCOME_SALARY', 'INCOME_GIG_ECONOMY', 'INCOME_CONTRACTOR') THEN 'earnings'
+         WHEN detailed IN ('INCOME_STAKING', 'INCOME_ROYALTIES', 'INCOME_ENERGY_FEED_IN') THEN 'yield'
+         WHEN detailed IN ('INCOME_GOVERNMENT_BENEFITS', 'INCOME_UNEMPLOYMENT', 'INCOME_LONG_TERM_DISABILITY',
+                           'INCOME_MILITARY', 'INCOME_CHILD_SUPPORT', 'INCOME_ALIMONY') THEN 'benefits'
+         ELSE 'other_receipts' END;
+
 CREATE MACRO report_income_transactions_multi(p_from, p_to) AS TABLE (
     SELECT silver_source_id, transaction_external_id, occurred_at,
            account_external_id, account_kind, display_name, nickname, account_category,
@@ -1018,15 +1164,7 @@ CREATE MACRO spending_lines_own(p_from, p_to) AS TABLE (
       LEFT JOIN spend_txn_categories() c
              ON c.silver_source_id        = p.silver_source_id
             AND c.transaction_external_id = p.transaction_external_id
-     WHERE c.spend_detailed IS DISTINCT FROM 'internal_transfer'
-       AND c.spend_detailed IS DISTINCT FROM 'investment'
-       AND c.spend_detailed IS DISTINCT FROM 'debt_repayment'
-       AND c.spend_detailed IS DISTINCT FROM 'retirement_transfer'
-       AND c.spend_detailed IS DISTINCT FROM 'education_transfer'
-       AND c.spend_detailed IS DISTINCT FROM 'health_transfer'
-       AND c.spend_detailed IS DISTINCT FROM 'trust_transfer'
-       AND c.spend_detailed IS DISTINCT FROM 'deposit_transfer'
-       AND c.spend_detailed IS DISTINCT FROM 'mortgage_transfer'
+     WHERE detailed_stays_in_spending(c.spend_detailed)
      ORDER BY p.occurred_at, p.silver_source_id, p.transaction_external_id
 );
 
@@ -1086,10 +1224,7 @@ CREATE MACRO spend_reimbursements() AS TABLE (
         SELECT r.silver_source_id, r.transaction_external_id, m.spend_detailed
           FROM repaid r
           JOIN spend_merchant_categories m ON m.merchant_signature = r.payer_signature
-         WHERE m.spend_detailed NOT IN ('internal_transfer', 'investment', 'debt_repayment',
-                                        'retirement_transfer', 'education_transfer',
-                                        'health_transfer', 'trust_transfer',
-                                        'deposit_transfer', 'mortgage_transfer')
+         WHERE detailed_stays_in_spending(m.spend_detailed)
     )
     SELECT r.silver_source_id, r.transaction_external_id,
            COALESCE(p.out_silver_source_id, s.out_silver_source_id) AS out_silver_source_id,
@@ -1228,6 +1363,126 @@ CREATE MACRO report_spending_categories(p_from, p_to, p_ccy, p_period, p_level) 
      ORDER BY period_start, net_val DESC, category
 );
 
+-- ============================================================
+-- Spending against the year before (docs/SPENDING.md §7)
+--
+-- report_spending_categories_vs sets each bucket of a window beside
+-- the same bucket of the same window a year earlier. It is the one
+-- definition `spending categories --vs-last-year`, the MCP option and
+-- the Spending dashboard's tiles (serving_spending_vs_year) read.
+-- ============================================================
+
+-- spend_year_before: the epoch second one calendar year before p_at. A
+-- 29 February lands on the 28th. An instant past year 9999 stays
+-- itself, so an open end does not overflow.
+CREATE MACRO spend_year_before(p_at) AS (
+    CASE WHEN p_at >= 253402300800 THEN p_at
+         ELSE CAST(epoch(epoch_ms(CAST(p_at AS BIGINT) * 1000) - INTERVAL 1 YEAR) AS BIGINT)
+    END
+);
+
+-- spend_year_before_end: the window end a year before the window end
+-- p_to. The end maps as an exclusive bound, the second after it, so a
+-- window through 28 February reaches through the 29th a year earlier.
+-- An open end stays itself before the `+ 1` can overflow.
+CREATE MACRO spend_year_before_end(p_to) AS (
+    CASE WHEN p_to >= 253402300799 THEN p_to
+         ELSE spend_year_before(p_to + 1) - 1
+    END
+);
+
+-- change_pct: the change from p_before to p_now in percent of p_before's
+-- magnitude, so a rise reads positive whatever the sign of p_before.
+-- NULL where p_before is zero or either side is NULL.
+CREATE MACRO change_pct(p_now, p_before) AS
+    CAST(100 * (p_now - p_before) AS DOUBLE) / NULLIF(abs(p_before), 0)::DOUBLE;
+
+-- report_spending_categories_vs: report_spending_categories over the
+-- window, each row beside `year_before`, its category's net_spend in
+-- the same bucket of the window a year earlier, and `change_pct`. Each
+-- side converts at its own lines' historic rates. p_today is the last
+-- second of today.
+--
+-- A category only one side has reads 0 on the other side, and on this
+-- side its txn_count and share read 0 too. Both sides cover the same
+-- days of their buckets, so a window that cuts a bucket cuts the year
+-- before alike.
+--
+-- `quality` names what the comparison misses:
+--   * no_year_before: gold's first spending line falls on a day after
+--     the year before starts in this bucket, so that side covers part
+--     of it or none of it;
+--   * in_progress: the bucket's part of the window ends today or
+--     later, so this side is still accruing.
+-- p_period is 'month', 'quarter', 'year' or 'total'.
+CREATE MACRO report_spending_categories_vs(p_from, p_to, p_ccy, p_period, p_level, p_today) AS TABLE (
+    WITH cur AS (
+        SELECT * FROM report_spending_categories(p_from, p_to, p_ccy, p_period, p_level)),
+    prev AS (
+        SELECT CASE WHEN period_start IS NOT NULL
+                    THEN CAST(epoch(epoch_ms(period_start * 1000) + INTERVAL 1 YEAR) AS BIGINT)
+               END AS period_start,
+               category, category_label, CAST(net_spend AS DECIMAL(28,4)) AS net_val
+          FROM report_spending_categories(spend_year_before(p_from), spend_year_before_end(p_to),
+                                          p_ccy, p_period, p_level)),
+    first_line AS (
+        SELECT min(occurred_at) AS first_at FROM spend_enrichment_population(0, p_to)),
+    paired AS (
+        SELECT COALESCE(c.period_start, p.period_start) AS period_start,
+               COALESCE(c.category, p.category) AS category,
+               COALESCE(c.category_label, p.category_label) AS category_label,
+               COALESCE(c.txn_count, 0) AS txn_count,
+               c.category IS NULL AS absent,
+               c.spend, c.refunds, c.share,
+               CASE WHEN c.category IS NULL THEN 0 ELSE CAST(c.net_spend AS DECIMAL(28,4)) END AS net_val,
+               CASE WHEN p.category IS NULL THEN 0 ELSE p.net_val END AS before_val
+          FROM cur c
+          FULL OUTER JOIN prev p
+            ON p.period_start IS NOT DISTINCT FROM c.period_start AND p.category = c.category),
+    bounded AS (
+        SELECT *,
+               greatest(COALESCE(period_start, p_from), p_from) AS side_from,
+               cashflow_period_end(p_period, period_start, p_to) AS side_to
+          FROM paired)
+    SELECT b.period_start, b.category, b.category_label, b.txn_count,
+           CASE WHEN b.absent THEN '0.0000' ELSE b.spend END AS spend,
+           CASE WHEN b.absent THEN '0.0000' ELSE b.refunds END AS refunds,
+           CAST(b.net_val AS VARCHAR) AS net_spend,
+           CASE WHEN NOT b.absent THEN b.share
+                WHEN max(b.share) OVER (PARTITION BY b.period_start) IS NOT NULL THEN 0.0
+           END AS share,
+           CAST(b.before_val AS VARCHAR) AS year_before,
+           change_pct(b.net_val, b.before_val) AS change_pct,
+           concat_ws(' ',
+               CASE WHEN f.first_at IS NULL OR f.first_at // 86400 > spend_year_before(b.side_from) // 86400
+                    THEN 'no_year_before' END,
+               CASE WHEN b.side_to >= p_today THEN 'in_progress' END) AS quality
+      FROM bounded b, first_line f
+     ORDER BY b.period_start, b.net_val DESC, b.category
+);
+
+-- report_spending_vs_year_multi: report_spending_categories_vs by month
+-- and primary category, in every reporting currency, through the last
+-- whole month before p_today's (the last second of today), so no month
+-- compares part of itself with a whole one. The category is the
+-- primary label: the value the Spending dashboard's Category picker
+-- offers.
+CREATE MACRO report_spending_vs_year_multi(p_today) AS TABLE (
+    WITH v AS (
+        SELECT 'USD' AS currency, * FROM report_spending_categories_vs(0, spend_period_bucket('month', p_today) - 1, 'USD', 'month', 'primary', p_today)
+        UNION ALL
+        SELECT 'CHF', * FROM report_spending_categories_vs(0, spend_period_bucket('month', p_today) - 1, 'CHF', 'month', 'primary', p_today)
+        UNION ALL
+        SELECT 'EUR', * FROM report_spending_categories_vs(0, spend_period_bucket('month', p_today) - 1, 'EUR', 'month', 'primary', p_today)
+        UNION ALL
+        SELECT 'GBP', * FROM report_spending_categories_vs(0, spend_period_bucket('month', p_today) - 1, 'GBP', 'month', 'primary', p_today))
+    SELECT currency, period_start AS month, category_label AS category,
+           CAST(net_spend AS DECIMAL(28,4)) AS net_spend,
+           CAST(year_before AS DECIMAL(28,4)) AS net_spend_year_before,
+           quality
+      FROM v
+);
+
 -- The transaction reports carry both classifications, ours first.
 CREATE MACRO report_spending_transactions(p_from, p_to, p_ccy) AS TABLE (
     SELECT silver_source_id, transaction_external_id, occurred_at,
@@ -1266,18 +1521,6 @@ CREATE MACRO report_spending_transactions_multi(p_from, p_to) AS TABLE (
      ORDER BY occurred_at, silver_source_id, transaction_external_id
 );
 
-CREATE MACRO cashflow_pool_spans() AS TABLE (
-    SELECT w.silver_source_id, w.account_external_id, w.from_at, w.until_at
-      FROM account_wrapper_spans() w
-      LEFT JOIN cashflow_account_scope s
-             ON s.silver_source_id    = w.silver_source_id
-            AND s.account_external_id = w.account_external_id
-      LEFT JOIN cashflow_wrapper_sides ws
-             ON ws.tax_wrapper = w.tax_wrapper
-     WHERE COALESCE(s.mode, 'include') = 'include'
-       AND COALESCE(ws.side, 'household') = 'household'
-);
-
 CREATE MACRO cashflow_txn_nodes(p_from, p_to) AS TABLE (
     WITH joined AS (
         SELECT t.silver_source_id, t.transaction_external_id, t.occurred_at,
@@ -1295,12 +1538,13 @@ CREATE MACRO cashflow_txn_nodes(p_from, p_to) AS TABLE (
                COALESCE(i.name, i.symbol) AS instrument_name,
                sc.spend_detailed, sc.merchant_name, sc.provenance AS spend_provenance,
                ic.income_detailed, ic.payer_name, ic.provenance AS income_provenance,
-               e.far_silver_source_id, e.far_account_external_id, e.far_class,
+               -- Where the money went: the far account the pass linked.
+               fl.far_silver_source_id, fl.far_account_external_id,
                -- The holder's word for what the capital went INTO, one
-               -- column per family. Read off the raw overlay for
-               -- the reason the far account is: it describes a verdict
-               -- rather than belonging to either family's vocabulary,
-               -- and no report of theirs reads it. Safe against a
+               -- column per family. Read off the raw overlay, not its
+               -- resolution macro: it describes a verdict rather than
+               -- belonging to either family's vocabulary, and no
+               -- report of theirs reads it. Safe against a
                -- replaced verdict, because the store and the kind floor
                -- that `spend_txn_categories()` coalesces over only ever
                -- fill a NULL — where the overlay wrote a verdict, that
@@ -1314,7 +1558,7 @@ CREATE MACRO cashflow_txn_nodes(p_from, p_to) AS TABLE (
                -- A cash leg of a kind gold pins no sign for, where the
                -- row's source states it signed (cash_signed_kinds).
                (ck.kind IS NOT NULL
-                AND t.kind IN ('fx', 'fx_forward', 'fx_swap', 'corporate_action', 'journal', 'other')
+                AND kind_is_unsigned(t.kind)
                 AND COALESCE(t.quantity, 0) = 0
                 AND t.net_amount <> 0) AS cash_signed,
                (fa.silver_source_id IS NOT NULL)    AS far_known,
@@ -1332,12 +1576,14 @@ CREATE MACRO cashflow_txn_nodes(p_from, p_to) AS TABLE (
           LEFT JOIN income_txn_categories() ic
                  ON ic.silver_source_id        = t.silver_source_id
                 AND ic.transaction_external_id = t.transaction_external_id
-          -- The overlay itself, not its resolution macro: the far
-          -- account is a raw fact about a pairing rather than part of
-          -- the spending vocabulary.
           LEFT JOIN spend_txn_enrichment e
                  ON e.silver_source_id        = t.silver_source_id
                 AND e.transaction_external_id = t.transaction_external_id
+          -- The far side is a raw fact about a move rather than part of
+          -- either family's vocabulary.
+          LEFT JOIN transfer_links fl
+                 ON fl.silver_source_id        = t.silver_source_id
+                AND fl.transaction_external_id = t.transaction_external_id
           LEFT JOIN income_txn_enrichment ie
                  ON ie.silver_source_id        = t.silver_source_id
                 AND ie.transaction_external_id = t.transaction_external_id
@@ -1349,19 +1595,19 @@ CREATE MACRO cashflow_txn_nodes(p_from, p_to) AS TABLE (
                  ON rb.silver_source_id        = t.silver_source_id
                 AND rb.transaction_external_id = t.transaction_external_id
           LEFT JOIN accounts fa
-                 ON fa.silver_source_id    = e.far_silver_source_id
-                AND fa.account_external_id = e.far_account_external_id
+                 ON fa.silver_source_id    = fl.far_silver_source_id
+                AND fa.account_external_id = fl.far_account_external_id
           -- The far account's wrapper and pool membership as of the
           -- row's day: a dated wrapper override applies from its
           -- day on.
           LEFT JOIN account_wrapper_spans() fws
-                 ON fws.silver_source_id    = e.far_silver_source_id
-                AND fws.account_external_id = e.far_account_external_id
+                 ON fws.silver_source_id    = fl.far_silver_source_id
+                AND fws.account_external_id = fl.far_account_external_id
                 AND t.occurred_at >= fws.from_at AND t.occurred_at < fws.until_at
           LEFT JOIN cashflow_wrapper_sides fw ON fw.tax_wrapper = fws.tax_wrapper
           LEFT JOIN cashflow_pool_spans() fp
-                 ON fp.silver_source_id    = e.far_silver_source_id
-                AND fp.account_external_id = e.far_account_external_id
+                 ON fp.silver_source_id    = fl.far_silver_source_id
+                AND fp.account_external_id = fl.far_account_external_id
                 AND t.occurred_at >= fp.from_at AND t.occurred_at < fp.until_at
          WHERE t.occurred_at BETWEEN p_from AND p_to
     ),
@@ -1370,9 +1616,7 @@ CREATE MACRO cashflow_txn_nodes(p_from, p_to) AS TABLE (
                -- A linked repayment takes the category of the outflow it
                -- answers: it nets there, as a merchant's refund does.
                CASE WHEN j.reimbursed_detailed IS NOT NULL THEN j.reimbursed_detailed
-                    WHEN j.kind IN ('dividend', 'coupon', 'staking', 'capital_gain',
-                                    'reward', 'distribution', 'deposit')
-                      OR (j.kind = 'interest' AND j.net_amount > 0)
+                    WHEN kind_is_income(j.kind, j.net_amount)
                     THEN COALESCE(j.income_detailed, j.spend_detailed)
                     ELSE COALESCE(j.spend_detailed, j.income_detailed)
                END AS verdict,
@@ -1383,36 +1627,33 @@ CREATE MACRO cashflow_txn_nodes(p_from, p_to) AS TABLE (
                -- beside a verdict, so a NULL verdict implies a NULL
                -- exposure and the two CASEs select one family by
                -- construction.
-               CASE WHEN j.kind IN ('dividend', 'coupon', 'staking', 'capital_gain',
-                                    'reward', 'distribution', 'deposit')
-                      OR (j.kind = 'interest' AND j.net_amount > 0)
+               CASE WHEN kind_is_income(j.kind, j.net_amount)
                     THEN COALESCE(j.income_stated_class, j.spend_stated_class)
                     ELSE COALESCE(j.spend_stated_class, j.income_stated_class)
                END AS stated_asset_class
           FROM joined j
     ),
     -- THE ORDERED FAR-ACCOUNT TEST (docs/CASHFLOW.md §4). First match
-    -- wins, and
-    -- the WRAPPER is asked before the account KIND: any account kind can
-    -- sit inside any wrapper, and the wrapper is what says whose money
-    -- moved.
+    -- wins, and the WRAPPER is asked before the account KIND: any
+    -- account kind can sit inside any wrapper, and the wrapper is what
+    -- says whose money moved.
     --
-    -- A far account whose wrapper is unset falls past the first three
-    -- arms to the pool test, which admits it — the same render-time
-    -- default the pool macro applies, reached by the same rule rather
-    -- than by accident.
+    -- A far account whose wrapper is unset falls past the wrapper arms
+    -- and, unless it is a mortgage, reaches the pool test, which admits
+    -- it — the same render-time default the pool macro applies, reached
+    -- by the same rule rather than by accident.
     --
-    -- The last three arms are where a move lands that no wrapper and no
-    -- pool membership could place. The mortgage rule's own word first.
-    -- Then a far account gold HOLDS, on the household's side, that the
-    -- `cashflow.accounts` scope fenced out of the pool — a setting, and
-    -- named as one. Last, no far account at all: a rule or a pin placed
-    -- the verdict and nothing paired it, which under the closed world
-    -- the statement assumes is a finding — a counter-leg gold should
-    -- hold, or a declaration not yet written. Drawn as invisible that
-    -- money would vanish into the residual forever; drawn as a node it
-    -- is visible as what it is, and the remedy — collect the account,
-    -- declare it, or find the missing leg — is obvious.
+    -- The last two arms are where a move lands that no wrapper and no
+    -- pool membership could place. A far account gold HOLDS, on the
+    -- household's side, that the `cashflow.accounts` scope fenced out of
+    -- the pool — a setting, and named as one. Last, no far account at
+    -- all: a rule or a pin placed the verdict and nothing paired it,
+    -- which under the closed world the statement assumes is a finding —
+    -- a counter-leg gold should hold, or a declaration not yet written.
+    -- Drawn as invisible that money would vanish into the residual
+    -- forever; drawn as a node it is visible as what it is, and the
+    -- remedy — collect the account, declare it, or find the missing leg
+    -- — is obvious.
     far AS (
         SELECT v.*,
                CASE
@@ -1421,7 +1662,6 @@ CREATE MACRO cashflow_txn_nodes(p_from, p_to) AS TABLE (
                    WHEN v.far_side = 'giving'                       THEN 'giving_in'
                    WHEN v.far_account_kind = 'mortgage'             THEN 'mortgage'
                    WHEN v.far_pooled                                THEN 'internal'
-                   WHEN v.far_class = 'mortgage'                    THEN 'mortgage'
                    WHEN v.far_known                                 THEN 'out_of_pool'
                    ELSE 'unnamed'
                END AS far_place
@@ -1435,20 +1675,24 @@ CREATE MACRO cashflow_txn_nodes(p_from, p_to) AS TABLE (
     placed AS (
         SELECT f.*,
                -- The dimension row of the resolved verdict, read once:
-               -- its primary is what tells a fee from a tax from a
-               -- donation without restating the taxonomy here.
+               -- its primary and its roles say where it draws without
+               -- restating the taxonomy here.
                vc.spend_primary AS verdict_primary,
+               vc.flow_place AS verdict_place,
+               vc.flow_class_in AS verdict_class_in,
+               vc.flow_class_out AS verdict_class_out,
+               vc.flow_leaf_detailed AS verdict_leaf_detailed,
                CASE
                    -- THE KINDS NO VERDICT MAY PLACE, tested ahead of
                    -- every verdict arm. gold pins no canonical sign for
-                   -- these six — the adapter passes the source's
-                   -- through — so their direction is a per-source
-                   -- convention, and a section that reads direction
-                   -- cannot admit them. A pin or a rule may call such a
-                   -- row an own-account move; it still cannot make an
-                   -- unsigned amount readable. `fx` is cash becoming
-                   -- cash besides, and the two catch-alls are the
-                   -- exclusion both families already make.
+                   -- these kinds (txn_kind_roles.unsigned) — the adapter
+                   -- passes the source's through — so their direction is
+                   -- a per-source convention, and a section that reads
+                   -- direction cannot admit them. A pin or a rule may
+                   -- call such a row an own-account move; it still
+                   -- cannot make an unsigned amount readable. `fx` is
+                   -- cash becoming cash besides, and the two catch-alls
+                   -- are the exclusion both families already make.
                    --
                    -- The one exception is a cash leg its source states
                    -- signed (cash_signed_kinds): cash in lieu, a
@@ -1456,9 +1700,7 @@ CREATE MACRO cashflow_txn_nodes(p_from, p_to) AS TABLE (
                    -- investing, as the trade it settles is.
                    WHEN f.cash_signed THEN
                         CASE WHEN f.asset_class = 'cash' THEN 'internal' ELSE 'investing' END
-                   WHEN f.kind IN ('fx', 'fx_forward', 'fx_swap',
-                                   'corporate_action', 'journal', 'other')
-                        THEN 'excluded'
+                   WHEN kind_is_unsigned(f.kind) THEN 'excluded'
                    -- A repayment linked to its outflow is that outflow's
                    -- money coming back: operating out, netted inside the
                    -- outflow's class (spend_reimbursements).
@@ -1475,26 +1717,26 @@ CREATE MACRO cashflow_txn_nodes(p_from, p_to) AS TABLE (
                             WHEN 'internal'   THEN 'internal'
                             ELSE 'vehicle_unpaired'
                         END
-                   -- A mortgage servicer the product holds no account
-                   -- for. Ahead of the crossings and needing no far
-                   -- account: the two roads to `financing · Mortgage`
-                   -- both read the far side, and this verdict exists
-                   -- for the rows where there is none to read.
-                   WHEN f.verdict = 'mortgage_transfer' THEN 'mortgage'
-                   -- The four crossings whose far side the product does
-                   -- not hold. The direction is the ROW's: a withdrawal
-                   -- placed `retirement_transfer` is a contribution and a
-                   -- deposit placed the same is a distribution.
-                   WHEN f.verdict IN ('retirement_transfer', 'education_transfer',
-                                      'health_transfer', 'trust_transfer',
-                                      'deposit_transfer')
-                        THEN 'vehicle_delta'
-                   -- Debt at a lender the product does not track, in
-                   -- either direction.
-                   WHEN f.verdict IN ('loan_proceeds', 'debt_repayment') THEN 'loans'
-                   -- Capital deployed to, or returned from, a
-                   -- destination the product does not track.
-                   WHEN f.verdict IN ('investment', 'capital_return') THEN 'investing'
+                   -- A verdict whose value places it, needing no far
+                   -- account (spend_categories.flow_place):
+                   --   mortgage       a mortgage servicer the product
+                   --                  holds no account for. The two roads
+                   --                  to `financing · Mortgage` both read
+                   --                  the far side, and this verdict
+                   --                  exists for the rows where there is
+                   --                  none to read.
+                   --   vehicle_delta  a crossing whose far side the
+                   --                  product does not hold. The direction
+                   --                  is the ROW's: a withdrawal placed
+                   --                  `retirement_transfer` is a
+                   --                  contribution and a deposit placed
+                   --                  the same is a distribution.
+                   --   loans          debt at a lender the product does
+                   --                  not track, in either direction.
+                   --   investing      capital deployed to, or returned
+                   --                  from, a destination the product
+                   --                  does not track.
+                   WHEN vc.flow_place IS NOT NULL THEN vc.flow_place
                    -- A private fund's distribution is returned capital
                    -- until something proves otherwise — the income
                    -- floor says so — and a rule or a pin promoting it to
@@ -1510,18 +1752,15 @@ CREATE MACRO cashflow_txn_nodes(p_from, p_to) AS TABLE (
                    -- — is cash becoming cash, so the trade is
                    -- pool-internal rather than a movement anyone wants
                    -- drawn.
-                   WHEN f.kind IN ('buy', 'sell', 'contribution') THEN
+                   WHEN kind_is_trade(f.kind) THEN
                         CASE WHEN f.asset_class = 'cash' THEN 'internal' ELSE 'investing' END
-                   -- The inflow kinds.
-                   WHEN f.kind IN ('dividend', 'coupon', 'staking', 'capital_gain',
-                                   'reward', 'deposit')
-                     OR (f.kind = 'interest' AND f.net_amount > 0) THEN 'in'
+                   -- The inflow kinds, a distribution placed above.
+                   WHEN kind_is_income(f.kind, f.net_amount) THEN 'in'
                    -- The outflow kinds. `refund` is here with the rest:
                    -- a merchant credit nets inside its own category, and
                    -- the class's sign is what decides which side of the
                    -- diagram it is drawn on.
-                   WHEN f.kind IN ('purchase', 'refund', 'fee', 'tax', 'withdrawal')
-                     OR (f.kind = 'interest' AND f.net_amount < 0) THEN 'out'
+                   WHEN kind_is_spending(f.kind, f.net_amount) THEN 'out'
                    -- Everything left: the FX family and corporate
                    -- actions (but the cash legs a sign pin admits, above),
                    -- which gold pins no canonical sign for, so
@@ -1557,43 +1796,20 @@ CREATE MACRO cashflow_txn_nodes(p_from, p_to) AS TABLE (
                    WHEN 'in' THEN
                         CASE
                             WHEN p.verdict IS NULL THEN '(uncategorized)'
-                            -- Money from labour, whoever pays for it:
-                            -- an employer, a platform or a client.
-                            WHEN p.verdict IN ('INCOME_SALARY', 'INCOME_GIG_ECONOMY',
-                                               'INCOME_CONTRACTOR')
-                                 THEN 'earnings'
-                            -- Money the household's assets produce
-                            -- without its labour: rent and royalties
-                            -- belong here beside the dividends.
-                            WHEN p.verdict IN ('INCOME_DIVIDENDS', 'INCOME_INTEREST_EARNED',
-                                               'INCOME_DISTRIBUTIONS', 'INCOME_STAKING',
-                                               'INCOME_RENTAL', 'INCOME_ROYALTIES',
-                                               'INCOME_ENERGY_FEED_IN')
-                                 THEN 'yield'
-                            -- Entitlements: a pension, a benefit, and
-                            -- maintenance from a former partner or
-                            -- for a child.
-                            WHEN p.verdict IN ('INCOME_RETIREMENT_PENSION', 'INCOME_GOVERNMENT_BENEFITS',
-                                               'INCOME_UNEMPLOYMENT', 'INCOME_LONG_TERM_DISABILITY',
-                                               'INCOME_MILITARY', 'INCOME_CHILD_SUPPORT',
-                                               'INCOME_ALIMONY')
-                                 THEN 'benefits'
-                            -- A card credit or a referral bonus sits
-                            -- with the receipts rather than the yield:
-                            -- it is not income from wealth.
-                            ELSE 'other_receipts'
+                            -- Earnings, yield or benefits by the value
+                            -- (spend_categories.flow_class_in). A card
+                            -- credit or a referral bonus sits with the
+                            -- receipts rather than the yield: it is not
+                            -- income from wealth.
+                            ELSE COALESCE(p.verdict_class_in, 'other_receipts')
                         END
                    WHEN 'giving_in' THEN 'other_receipts'
                    WHEN 'out' THEN
                         CASE
                             WHEN p.verdict IS NULL THEN '(uncategorized)'
-                            WHEN p.verdict_primary = 'BANK_FEES' THEN 'fees'
-                            WHEN p.verdict IN ('GOVERNMENT_AND_NON_PROFIT_TAX_PAYMENT',
-                                               'GOVERNMENT_AND_NON_PROFIT_WITHHOLDING_TAX')
-                                 THEN 'taxes'
-                            WHEN p.verdict IN ('GOVERNMENT_AND_NON_PROFIT_DONATIONS', 'gift')
-                                 THEN 'giving'
-                            ELSE 'consumption'
+                            -- Fees, taxes or giving by the value
+                            -- (spend_categories.flow_class_out).
+                            ELSE COALESCE(p.verdict_class_out, 'consumption')
                         END
                    WHEN 'giving_out' THEN 'giving'
                    -- `elsewhere` is Untracked investments: capital
@@ -1636,14 +1852,8 @@ CREATE MACRO cashflow_txn_nodes(p_from, p_to) AS TABLE (
                    WHEN 'mortgage' THEN 'mortgage'
                    WHEN 'loans'    THEN 'loans'
                    WHEN 'vehicle_far' THEN p.far_wrapper_class
-                   WHEN 'vehicle_delta' THEN
-                        CASE p.verdict
-                            WHEN 'retirement_transfer' THEN 'retirement'
-                            WHEN 'education_transfer'  THEN 'education'
-                            WHEN 'health_transfer'     THEN 'health'
-                            WHEN 'trust_transfer'      THEN 'trusts'
-                            WHEN 'deposit_transfer'    THEN 'deposits'
-                        END
+                   -- The pool a crossing's value names.
+                   WHEN 'vehicle_delta' THEN p.verdict_class_out
                    WHEN 'vehicle_unpaired'  THEN 'unpaired'
                END AS class
           FROM placed p
@@ -1688,8 +1898,7 @@ CREATE MACRO cashflow_txn_nodes(p_from, p_to) AS TABLE (
                    WHEN 'out' THEN
                         CASE WHEN n.verdict IS NULL THEN '(uncategorized)'
                              WHEN n.class IN ('taxes', 'fees', 'giving') THEN n.verdict
-                             WHEN n.verdict IN ('GENERAL_SERVICES_EDUCATION')
-                                  THEN n.verdict
+                             WHEN n.verdict_leaf_detailed THEN n.verdict
                              ELSE COALESCE(n.verdict_primary, n.verdict) END
                    -- A crossing to or from a giving vehicle has no
                    -- family value behind it: the row's verdict is
@@ -1707,20 +1916,20 @@ CREATE MACRO cashflow_txn_nodes(p_from, p_to) AS TABLE (
                    -- `n.class = 'elsewhere'` would fall to the ELSE the
                    -- moment a stated exposure moved a row off
                    -- `elsewhere`, and a house purchase would read
-                   -- `Real estate · Private capital`. No row reaches
-                   -- `investing` on a kind other than
-                   -- buy/sell/contribution/distribution except through
-                   -- those two verdicts, so the first arm covers it.
+                   -- `Real estate · Private capital`. A row reaches
+                   -- `investing` on another kind only through a value
+                   -- that places it there, or as a cash leg its source
+                   -- signs (cash_signed). A corporate action's is its
+                   -- own group; every other is private capital.
                    --
                    -- The class is what the money went INTO; the group is
                    -- what the money DID. A house bought and a REIT traded
                    -- share a class node and differ at group grain.
                    WHEN 'investing' THEN
-                        CASE WHEN n.verdict IN ('investment', 'capital_return')
+                        CASE WHEN n.verdict_place = 'investing'
                                   THEN n.verdict
                              WHEN n.kind IN ('buy', 'sell') THEN 'trades'
                              WHEN n.kind = 'corporate_action' THEN 'corporate_actions'
-                             WHEN n.kind IN ('contribution', 'distribution') THEN 'private_capital'
                              ELSE 'private_capital' END
                    WHEN 'loans' THEN n.verdict
                    -- The unpaired transfers split by what is missing:
@@ -1779,6 +1988,19 @@ CREATE MACRO cashflow_txn_nodes(p_from, p_to) AS TABLE (
       LEFT JOIN spend_categories gc ON gc.spend_detailed = g.grp
       LEFT JOIN (SELECT DISTINCT spend_primary, primary_label FROM spend_categories) gp
              ON gp.spend_primary = g.grp
+);
+
+-- cashflow_pool_nodes: the nodes of the rows whose own account is in
+-- the pool on the row's own day (cashflow_pool_spans), so a row on a
+-- dated wrapper override's day reads the override's wrapper. What the
+-- statement's lines, the projection's look-back and `status` count.
+CREATE MACRO cashflow_pool_nodes(p_from, p_to) AS TABLE (
+    SELECT n.*
+      FROM cashflow_txn_nodes(p_from, p_to) n
+      JOIN cashflow_pool_spans() p
+             ON p.silver_source_id    = n.silver_source_id
+            AND p.account_external_id = n.account_external_id
+            AND n.occurred_at >= p.from_at AND n.occurred_at < p.until_at
 );
 
 -- ============================================================
@@ -1923,12 +2145,7 @@ CREATE MACRO cashflow_lines_base(p_from, p_to) AS TABLE (
                -- draws no edge either way, and naming it here costs
                -- nothing and keeps the leaf rule structural.
                (n.class = 'mortgage' AND n.net_amount >= 0) AS borrowed
-          FROM cashflow_txn_nodes(p_from, p_to) n
-          -- In the pool on the row's own day.
-          JOIN cashflow_pool_spans() p
-                 ON p.silver_source_id    = n.silver_source_id
-                AND p.account_external_id = n.account_external_id
-                AND n.occurred_at >= p.from_at AND n.occurred_at < p.until_at
+          FROM cashflow_pool_nodes(p_from, p_to) n
           LEFT JOIN alloc a
                  ON a.silver_source_id        = n.silver_source_id
                 AND a.transaction_external_id = n.transaction_external_id
@@ -2598,7 +2815,7 @@ CREATE MACRO report_cashflow_coverage(p_from, p_to, p_period) AS TABLE (
     -- (cash_signed_kinds) moves cash and is in the ledger.
     unsigned AS (
         SELECT t.*,
-               (t.kind IN ('fx','fx_forward','fx_swap','corporate_action','journal','other')
+               (kind_is_unsigned(t.kind)
                 AND NOT (ck.kind IS NOT NULL AND COALESCE(t.quantity, 0) = 0
                          AND t.net_amount <> 0))
                OR (t.kind IN ('transfer_in','transfer_out')

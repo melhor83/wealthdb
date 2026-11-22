@@ -39,71 +39,113 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import csv
 import hashlib
 import json
 import logging
 import os
-import re
+import shutil
 import sqlite3
 import sys
-from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
-from collectorkit import bronze, cli, compress, silver, srcfp
+from collectorkit import (
+    bronze, cli, derivations, extract, parsecache, rebuild, silver, srcfp,
+)
+from collectorkit.parsecache import ParseCache, ParsePool
 from collectorkit.parse import iso_date_to_epoch
 
-import lot_parsers
 import pdf_parsers
 import pdf_parsers_1099
 import pdf_parsers_daf
 import pdf_parsers_supplied
+import pdf_readers
+
+# Each family of silver rows has a module of its own: silver_retail
+# (master, positions, activity, documents), silver_lots, silver_daf,
+# silver_statements and silver_1099. This module holds the load frame
+# and the document passes, the code that knows a parser's generation.
+from silver_1099 import (
+    _consolidated_1099_candidates, _file_1099_documents, _held_1099_forms,
+    _latest_1099_copies, _replace_1099_lots,
+)
+from silver_daf import (
+    _daf_account_for_statement, _daf_statement_pdf_candidates, _load_daf,
+    _positions_completeness_gate,
+)
+from silver_lots import (
+    _drop_supplied_closed_lots, _insert_supplied_closed_lots,
+    _load_closed_positions, _load_open_lots, _read_lot_step,
+)
+from silver_retail import (
+    _fill_instrument_keys, _load_documents, _load_master, _load_positions,
+    _load_transactions, _parse_positions,
+)
+from silver_statements import (
+    _drop_document_holdings, _drop_supplied_activity, _feed_legs,
+    _insert_daf_historical_rows, _insert_historical_rows,
+    _insert_supplied_activity_rows, _insert_supplied_historical_rows,
+    _read_signature_sidecar, _statement_pdf_candidates,
+    _supplied_pdf_candidates, _synthesize_missing_account_masters,
+)
 
 log = logging.getLogger("fidelity-web.load")
 
 
-# A parse-cache entry must be invalidated whenever the logic that
-# produced it changes. srcfp.parser_fingerprint captures that logic
-# precisely: the normalised source (comment-, format- and
-# docstring-invariant) of the parser's whole first-party import
-# closure — pdf_parsers itself plus the collectorkit.pdf extractor and
-# the pdf_common helpers it imports, an edit to any of which shifts the
-# parsed rows — together with the installed versions of the third-party
-# extraction stack (pdfplumber on pdfminer.six, whose >=0.11,<1 pin
-# allows a text-shifting minor bump) and the running Python version. It
-# returns hex, so it drops straight into a sidecar filename.
-_EXTRACTOR_DISTS = ("pdfplumber", "pdfminer.six")
-
-# Parse-cache namespace for the 529 statement parser: a coarse manual
-# PARSER_VERSION (a deliberate epoch lever) plus the automatic logic
-# fingerprint. The supplied-statement parser's namespace additionally
-# folds in the signature guard (see _supplied_parser_version) because
-# that guard changes the parsed rows.
+# A parse-cache entry must be invalidated whenever anything that
+# produced it changes, and a parsed document depends on two things:
+#
+#   * the parser's code. srcfp.parser_fingerprint is the normalised source
+#     (comment-, format- and docstring-invariant) of the parser's whole
+#     first-party import closure — the parser module and the pdf_common and
+#     collectorkit helpers it imports, an edit to any of which shifts the
+#     parsed rows. The parser reads an extracted document, so nothing else
+#     belongs in it (python=False);
+#   * the extraction. collectorkit.extract.extraction_key names the engine,
+#     its arguments and versions (pdfplumber on pdfminer.six, whose
+#     >=0.11,<1 pin allows a text-shifting minor bump) and the Python minor
+#     version.
+#
+# Both are hex, so the namespace drops straight into a sidecar filename. The
+# supplied-statement parser's namespace additionally folds in the signature
+# guard (see _supplied_parser_version) because that guard changes the parsed
+# rows.
 _STATEMENT_PARSER_VERSION = (
-    f"stmt529.v{pdf_parsers.PARSER_VERSION}."
-    + srcfp.parser_fingerprint([pdf_parsers], _EXTRACTOR_DISTS)
+    "stmt529." + srcfp.parser_fingerprint([pdf_parsers], python=False)
+    + "." + extract.extraction_key(pdf_readers.STATEMENT_TEXT)
 )
 _SUPPLIED_PARSER_FINGERPRINT = (
-    f"supplied.v{pdf_parsers_supplied.PARSER_VERSION}."
-    + srcfp.parser_fingerprint([pdf_parsers_supplied], _EXTRACTOR_DISTS)
+    "supplied."
+    + srcfp.parser_fingerprint([pdf_parsers_supplied], python=False)
+    + "." + extract.extraction_key(pdf_readers.STATEMENT_TEXT)
 )
 _DAF_STATEMENT_PARSER_VERSION = (
-    f"dafstmt.v{pdf_parsers_daf.PARSER_VERSION}."
-    + srcfp.parser_fingerprint([pdf_parsers_daf], _EXTRACTOR_DISTS)
+    "dafstmt." + srcfp.parser_fingerprint([pdf_parsers_daf], python=False)
+    + "." + extract.extraction_key(pdf_readers.STATEMENT_TEXT)
 )
 # The Consolidated 1099 pass reads each PDF twice under two namespaces:
 # first only which form it is, then the lots of the copy it keeps.
 _CONSOLIDATED_1099_PARSER_VERSION = (
-    f"1099.v{pdf_parsers_1099.PARSER_VERSION}."
-    + srcfp.parser_fingerprint([pdf_parsers_1099], _EXTRACTOR_DISTS)
+    "1099." + srcfp.parser_fingerprint([pdf_parsers_1099], python=False)
+    + "." + extract.extraction_key(pdf_readers.FORM_1099_WORDS)
 )
 _CONSOLIDATED_1099_IDENTITY_VERSION = (
     _CONSOLIDATED_1099_PARSER_VERSION + ".identity")
 
-# Those values are also the PARSER GENERATIONS stamped into
-# `parser_generations` (migration 0008) once a pass has run, so silver can be
-# asked in plain SQL which parser produced the rows it is holding.
+# Those values are also the PARSER GENERATIONS a pass records per document
+# it reads (`document_derivations`, collectorkit.derivations, migration
+# 0016), so silver can be asked in plain SQL which parser produced the rows
+# it is holding. A scope holding a document recorded under another
+# generation has a moved parser, and its pass re-derives. A parse that
+# fails leaves the document's rows as they are. The supplied pass records
+# nothing for it and reads every PDF at each load, so it tries such a
+# document again then. A dump pass records it with no rows, so it tries it
+# again once its parser moves. A re-derivation in which nothing parses
+# records no failure: the older records stay, and the next load tries
+# again. Once a pass has re-derived every document it can still read, it
+# drops the records its scope holds under another generation. They are
+# documents gone from bronze, whose rows stay, and the supplied
+# statements that did not parse.
 #
 # The three statement passes key their rows on text read off the page — a
 # holding's description is part of the `historical_position_snapshots`
@@ -117,9 +159,9 @@ _CONSOLIDATED_1099_IDENTITY_VERSION = (
 # can actually be addressed at:
 #
 #   * activity rows — scope-wide (`_drop_supplied_activity`), gated on the
-#     stamp and held until a statement has actually parsed. The `stmt_`
-#     prefix names exactly the supplied pass's rows, so nothing escapes the
-#     purge.
+#     moved generation and held until a statement has actually parsed. The
+#     `stmt_` prefix names exactly the supplied pass's rows, so nothing
+#     escapes the purge.
 #   * holdings rows — per document (`_drop_document_holdings`), every time
 #     the document is re-parsed. Three passes share that table and only
 #     `source_sha256` says which PDF a row came from, so the document is the
@@ -155,39 +197,6 @@ CASH_ONLY_ACTIONS = {
     # with an instrument_key; the cash-contribution case is exempt here.
     "GRANT", "GIFT", "EXCHANGE",
 }
-
-# Fidelity selector group labels the loader classifies. Anything
-# else falls through to 'other' so the loader doesn't fail on a
-# future label change.
-PORTFOLIO_KIND = {
-    "Education": "529",
-    "Authorized": "trust_managed",
-}
-
-# Per-portfolio-kind default management style. Fidelity does not
-# emit a per-account style indicator (see DESIGN.md §11.6), but
-# kind alone pins the style for the categories silver models:
-#   529            → automated (the plan offers only percentage-wise
-#                    allocation across a small menu of funds and
-#                    age-based strategies — a model portfolio, not
-#                    free security selection).
-#   trust_managed  → discretionary (a third-party manager places
-#                    trades; custodian executes).
-# 'other' / unknown labels stay NULL — gold handles them.
-MANAGEMENT_STYLE_BY_KIND = {
-    "529": "automated",
-    "trust_managed": "discretionary",
-    # A Fidelity DAF invests in model pools (§12.3) — automated, like
-    # the 529.
-    "daf": "automated",
-}
-
-# The portfolio grouping the DAF phase lands under. The retail
-# portfolios key on the account-selector group label; the DAF bronze
-# comes from the charitable API, not the selector, so the loader stamps
-# this stable label (matching the selector's 'Fidelity Charitable®
-# Giving' section) with kind='daf'.
-DAF_PORTFOLIO_LABEL = "Fidelity Charitable® Giving"
 
 
 # ============================================================
@@ -248,11 +257,15 @@ def parse_args(argv):
               "every parsed statement and Consolidated 1099, keyed by "
               "content hash + parser version, so a `--force` rebuild or "
               "nightly reload replays unchanged PDFs instead of "
-              "re-extracting them. "
-              "DEFAULT: `$XDG_CACHE_HOME/wealthdb/fidelity-web/"
-              "parse-cache` (falls back to `~/.cache/...`). A derived "
-              "cache, kept outside the bronze tree and outside "
-              "`~/.secrets`; safe to delete — it is rebuilt on demand."),
+              "re-parsing them. The `extract/` directory beside it "
+              "keeps each PDF's extracted text and words, so a parser "
+              "edit re-parses without opening a PDF. "
+              "DEFAULT: `parse-cache` under the cache root, which is "
+              "`$WEALTHDB_CACHE_DIR` when set, else "
+              "`$XDG_CACHE_HOME/wealthdb/fidelity-web` (or "
+              "`~/.cache/wealthdb/fidelity-web`). A derived cache, kept "
+              "outside the bronze tree and outside `~/.secrets`; safe to "
+              "delete — it is rebuilt on demand."),
     )
     cli.add_standard_args(p, verb="load")
     return p.parse_args(argv)
@@ -263,6 +276,7 @@ def main(argv=None):
     cli.configure_logging(args.verbose)
     args.silver_db.parent.mkdir(parents=True, exist_ok=True)
     if args.force:
+        rebuild.runs_without_bronze(args.silver_db, args.bronze_dir)
         silver.reset(args.silver_db)
     conn = sqlite3.connect(str(args.silver_db))
     silver.own_only(args.silver_db)
@@ -290,12 +304,27 @@ def main(argv=None):
         if signature is None and supplied_dir.is_dir():
             signature = _read_signature_sidecar(supplied_dir)
 
-        pending = [d for d in dumps if not already_loaded(conn, d)]
-        dumps_1099, rederive_1099s = _dumps_for_1099s(conn, dumps, pending)
+        loaded_at = silver.loaded_snapshots(conn)
+        pending = [d for d in dumps if ts_from_dir(d.name) not in loaded_at]
+        dumps_1099, rederive_1099s = _dumps_to_derive(
+            conn, CONSOLIDATED_1099_GENERATION_SCOPE,
+            _CONSOLIDATED_1099_PARSER_VERSION, dumps, pending)
+        dumps_529, rederive_529 = _dumps_to_derive(
+            conn, STATEMENT_GENERATION_SCOPE, _STATEMENT_PARSER_VERSION,
+            dumps, pending)
+        dumps_daf, rederive_daf = _dumps_to_derive(
+            conn, DAF_GENERATION_SCOPE, _DAF_STATEMENT_PARSER_VERSION,
+            dumps, pending)
 
-        cache = ParseCache(
-            args.parse_cache_dir or _default_parse_cache_dir())
-        with PdfParseCoordinator(cache, os.cpu_count() or 1) as coord:
+        cache_dir = (args.parse_cache_dir
+                     or parsecache.default_dir("fidelity-web"))
+        cache = ParseCache(cache_dir)
+        # The extracted text and words, kept apart from the parsed
+        # results, so a parser edit re-parses without opening a PDF.
+        extract_dir = cache_dir.parent / EXTRACT_CACHE_DIR
+        _move_nested_extract_cache(cache_dir / EXTRACT_CACHE_DIR,
+                                   extract_dir)
+        with ParsePool(cache, os.cpu_count() or 1) as coord:
             # Enqueue every pending dump's statement PDFs and the
             # supplied PDFs, deduplicated by content, then dispatch once so all
             # unique parses run across a single pool (workers import
@@ -310,28 +339,44 @@ def main(argv=None):
                         coord.sha_for(path),
                         _CONSOLIDATED_1099_IDENTITY_VERSION,
                         _read_1099_identity_worker, str(path))
-            for dump in pending:
+            for dump in dumps_529:
                 for path in _statement_pdf_candidates(dump):
+                    sha = coord.sha_for(path)
                     coord.enqueue(
-                        coord.sha_for(path), _STATEMENT_PARSER_VERSION,
-                        _parse_statement_pdf_worker, str(path))
+                        sha, _STATEMENT_PARSER_VERSION,
+                        _parse_statement_pdf_worker,
+                        _job(path, sha, extract_dir))
+            for dump in dumps_daf:
                 for path in _daf_statement_pdf_candidates(dump):
+                    sha = coord.sha_for(path)
                     coord.enqueue(
-                        coord.sha_for(path), _DAF_STATEMENT_PARSER_VERSION,
-                        _parse_daf_statement_pdf_worker, str(path))
+                        sha, _DAF_STATEMENT_PARSER_VERSION,
+                        _parse_daf_statement_pdf_worker,
+                        _job(path, sha, extract_dir))
             supplied_version = _supplied_parser_version(signature)
             for path in _supplied_pdf_candidates(supplied_dir):
+                sha = coord.sha_for(path)
                 coord.enqueue(
-                    coord.sha_for(path), supplied_version,
+                    sha, supplied_version,
                     _parse_supplied_statement_pdf_worker,
-                    (str(path), signature))
+                    (*_job(path, sha, extract_dir), signature))
             coord.dispatch()
+
+            # The dumps loaded before keep their statement rows until the
+            # parser that wrote them changes; then they are re-derived
+            # here, oldest first, ahead of the dumps this run loads.
+            loaded_before = [d for d in dumps if d not in pending]
+            _rederive_statements(
+                conn, loaded_before if rederive_529 else None,
+                loaded_before if rederive_daf else None, coord,
+                extract_dir=extract_dir)
 
             loaded = 0
             for dump in pending:
                 try:
                     conn.execute("BEGIN")
-                    load_dump(conn, dump, schema_version, coord)
+                    load_dump(conn, dump, schema_version, coord,
+                              extract_dir=extract_dir)
                     conn.commit()
                     loaded += 1
                 except Exception:
@@ -344,12 +389,24 @@ def main(argv=None):
             if filled:
                 log.info("activity: %d row(s) took their instrument from "
                          "the CUSIP in their action text", filled)
-            if dumps_1099:
+            if dumps_1099 or rederive_1099s:
                 _load_consolidated_1099s(
-                    conn, dumps_1099, rederive=rederive_1099s, coord=coord)
+                    conn, dumps_1099, rederive=rederive_1099s, coord=coord,
+                    extract_dir=extract_dir)
             _load_supplied_statements_oneshot(
                 conn, supplied_dir, signature=signature, coord=coord,
+                extract_dir=extract_dir,
             )
+        # A parser edit or an engine upgrade moves a namespace or an
+        # extraction key; the entries under the old one are never read
+        # again.
+        cache.sweep({
+            _STATEMENT_PARSER_VERSION, _DAF_STATEMENT_PARSER_VERSION,
+            supplied_version, _CONSOLIDATED_1099_PARSER_VERSION,
+            _CONSOLIDATED_1099_IDENTITY_VERSION})
+        extract.sweep(extract_dir, {
+            extract.extraction_key(pdf_readers.STATEMENT_TEXT),
+            extract.extraction_key(pdf_readers.FORM_1099_WORDS)})
         validate(conn)
     finally:
         conn.close()
@@ -387,7 +444,7 @@ def txn_staleness_days(latest_act_dump, latest_txn):
 
 def scan_bronze(bronze_dir):
     """The dumps worth loading: every run dir with a manifest that does
-    not say it is unfinished (`bronze.run_is_loadable`).
+    not say it is unfinished (`bronze.run_skip_reason`).
 
     A status other than `complete` marks a crashed or still-running
     dump whose partial artefacts must not be ingested. A manifest with
@@ -402,21 +459,12 @@ def scan_bronze(bronze_dir):
         raise SystemExit(f"--bronze-dir does not exist: {bronze_dir}")
     keep = []
     for run_dir in bronze.iter_run_dirs(bronze_dir):
-        if not bronze.run_is_loadable(run_dir):
-            run_json = run_dir / "run.json"
-            if run_json.is_file():
-                log.info("skipping %s: status=%s", run_dir.name,
-                         bronze.run_status(run_json))
-            else:
-                log.info("skipping %s: no run.json (still writing?)",
-                         run_dir.name)
+        reason = bronze.run_skip_reason(run_dir)
+        if reason is not None:
+            log.info("skipping %s: %s", run_dir.name, reason)
             continue
         keep.append(run_dir)
     return keep
-
-
-def already_loaded(conn, dump_dir):
-    return silver.snapshot_loaded(conn, ts_from_dir(dump_dir.name))
 
 
 # ============================================================
@@ -427,89 +475,12 @@ def ts_from_dir(name):
     return bronze.parse_run_ts(name)
 
 
-def ts_from_mdy(s):
-    """Fidelity's CSV dates are MM/DD/YYYY (US) at midnight UTC."""
-    if not s or s == "--" or s.strip() == "":
-        return None
-    try:
-        dt = datetime.strptime(s.strip(), "%m/%d/%Y").replace(tzinfo=timezone.utc)
-        return int(dt.timestamp())
-    except (TypeError, ValueError):
-        return None
-
-
-_NUMERIC_CLEAN_RE = re.compile(r"[\s,$]+")
-
-
-def parse_decimal(s):
-    """Parse a Fidelity-emitted dollar / percent / count cell.
-
-    Strips '$', commas, and whitespace. Returns None for empty,
-    '--', or unparseable strings. '+12.34' is fine; '+12.34%' is
-    converted to 0.1234 (fraction)."""
-    if s is None:
-        return None
-    raw = s.strip() if isinstance(s, str) else str(s)
-    if not raw or raw == "--":
-        return None
-    is_pct = raw.endswith("%")
-    if is_pct:
-        raw = raw[:-1]
-    cleaned = _NUMERIC_CLEAN_RE.sub("", raw)
-    if not cleaned or cleaned in ("+", "-"):
-        return None
-    try:
-        v = float(cleaned)
-    except ValueError:
-        return None
-    return v / 100.0 if is_pct else v
-
-
-def _row_ci(row):
-    """Case-insensitive view of a CSV row, keyed on casefolded header
-    names. Fidelity's exports have shipped the same headers in more
-    than one casing ('Account Number' / 'Account number', 'Last Price'
-    / 'Last price', …), and an exact-case lookup reads a re-cased file
-    as empty; casefolded lookups read every casing identically. The
-    original row (source-cased keys) still lands in payload."""
-    return {(k or "").strip().casefold(): v for k, v in row.items()
-            if k is not None}
-
-
-def _ci_get(ci_row, *names):
-    """First present value among casefolded column ``names`` — for
-    columns Fidelity has renamed outright (e.g. the dividend view's
-    'Dist. yield' → 'Dist. rate')."""
-    for name in names:
-        v = ci_row.get(name)
-        if v is not None:
-            return v
-    return None
-
-
-def normalize_payload(data):
-    # csv.DictReader bundles extra columns (trailing commas) under
-    # a None key. Drop those — they're not safely sortable in JSON.
-    return json.dumps(
-        _strip_none_keys(data),
-        ensure_ascii=False, sort_keys=True, default=str,
-    )
-
-
-def _strip_none_keys(data):
-    if isinstance(data, dict):
-        return {k: _strip_none_keys(v) for k, v in data.items()
-                if k is not None}
-    if isinstance(data, list):
-        return [_strip_none_keys(v) for v in data]
-    return data
-
-
 # ============================================================
 # Loaders
 # ============================================================
 
-def load_dump(conn, dump_dir, schema_version, coord=None):
+def load_dump(conn, dump_dir, schema_version, coord=None, *,
+              extract_dir=None):
     snapshot_at = ts_from_dir(dump_dir.name)
     log.info("loading %s (snapshot_at=%d)", dump_dir.name, snapshot_at)
 
@@ -545,12 +516,14 @@ def load_dump(conn, dump_dir, schema_version, coord=None):
                         if lot_step else 0)
     txn_count = _load_transactions(conn, dump_dir)
     doc_count = _load_documents(conn, snapshot_at, dump_dir)
-    hist_pos_count = _load_historical_from_pdfs(conn, dump_dir, coord)
+    hist_pos_count = _load_historical_from_pdfs(
+        conn, dump_dir, coord, extract_dir=extract_dir)
 
     # Donor-Advised Fund phase.
     daf = _load_daf(conn, snapshot_at, dump_dir,
                     skip_positions=skip_positions)
-    daf_hist_count = _load_daf_historical(conn, dump_dir, coord)
+    daf_hist_count = _load_daf_historical(
+        conn, dump_dir, coord, extract_dir=extract_dir)
 
     log.info(
         "loaded %s: portfolios=%d accounts=%d positions=%d open_lots=%d "
@@ -621,1175 +594,6 @@ def _insert_dump_run(conn, snapshot_at, schema_version, dump_dir, run_meta,
 
 
 # ------------------------------------------------------------
-# Master data: portfolios + accounts (from run.json's
-# account_dimensions, which captures the account-selector groups
-# and per-account nicknames the bronze fetch read at walk-start).
-# ------------------------------------------------------------
-
-def _load_master(conn, snapshot_at, run_meta):
-    # A dump only vouches for the accounts its phases covered. A
-    # mode='daf' dump ran no retail phase — its account_dimensions is
-    # an enumeration-only capture of the account selector — so writing
-    # retail master rows at that snapshot would pair accounts with no
-    # value rows, which latest-snapshot-wins consumers read as the
-    # accounts having emptied. Partial coverage must never masquerade
-    # as observation (the DAF master rows come from _load_daf, whose
-    # phase did run).
-    mode = (run_meta.get("cli_config") or {}).get("mode")
-    if mode == "daf":
-        log.debug("mode=daf dump: retail master load skipped "
-                  "(enumeration-only capture)")
-        return 0, 0
-    dims = run_meta.get("account_dimensions") or {}
-    if not dims:
-        log.debug("no account_dimensions in run.json; skipping master load")
-        return 0, 0
-    # account_dimensions is keyed by sha256-prefix; the raw 9-digit
-    # id lives in accounts_in_scope + accounts_enumerated.
-    enumerated = set(run_meta.get("accounts_enumerated") or [])
-    in_scope = set(run_meta.get("accounts_in_scope") or [])
-    # Build hash → raw-id map.
-    hash_to_id = {account_key(aid): aid for aid in enumerated}
-
-    portfolios_inserted = 0
-    accounts_inserted = 0
-    seen_portfolios = set()
-    for hashed, entry in dims.items():
-        aid = hash_to_id.get(hashed)
-        if not aid:
-            log.debug("account_dimensions key %s not in enumerated set", hashed)
-            continue
-        if aid not in in_scope:
-            # DAF / auto-excluded — don't pollute silver.
-            continue
-        portfolio_ext = entry.get("portfolio")
-        nickname = entry.get("nickname")
-        kind = PORTFOLIO_KIND.get(portfolio_ext, "other") if portfolio_ext else None
-        management_style = MANAGEMENT_STYLE_BY_KIND.get(kind) if kind else None
-        if portfolio_ext and portfolio_ext not in seen_portfolios:
-            seen_portfolios.add(portfolio_ext)
-            conn.execute(
-                "INSERT OR REPLACE INTO portfolios ("
-                "snapshot_at, portfolio_external_id, kind, payload"
-                ") VALUES (?, ?, ?, ?)",
-                (snapshot_at, portfolio_ext, kind,
-                 normalize_payload({"source": "run.json/account_dimensions"})),
-            )
-            portfolios_inserted += 1
-        conn.execute(
-            "INSERT OR REPLACE INTO accounts ("
-            "snapshot_at, account_external_id, portfolio_external_id, "
-            "nickname, payload, management_style"
-            ") VALUES (?, ?, ?, ?, ?, ?)",
-            (snapshot_at, aid, portfolio_ext, nickname,
-             normalize_payload({"source": "run.json/account_dimensions",
-                                "hash": hashed}),
-             management_style),
-        )
-        accounts_inserted += 1
-    return portfolios_inserted, accounts_inserted
-
-
-def account_key(account_external_id):
-    """Mirrors download.account_key() — first 16 hex of sha256."""
-    return bronze.short_token(account_external_id)
-
-
-# ------------------------------------------------------------
-# Positions
-# ------------------------------------------------------------
-
-POSITIONS_FILES = {
-    "summary": "positions_summary.csv",
-    "dividend": "positions_dividend.csv",
-}
-
-
-def _parse_positions(dump_dir):
-    """Parse both positions views into a (account, instrument) →
-    {view: row} map without touching silver — so `load_dump` can judge
-    the dump's positions completeness BEFORE anything is inserted (the
-    all-or-nothing guard)."""
-    pos_dir = dump_dir / "positions"
-    merged = {}
-    if not pos_dir.is_dir():
-        return merged
-    for view, fname in POSITIONS_FILES.items():
-        # download / recompress may have written positions_<view>.csv
-        # as .csv.zst; resolve whichever variant is on disk (plain wins).
-        path = compress.resolve_variant(pos_dir / fname)
-        if path is None:
-            continue
-        for row in _iter_positions_rows(path):
-            ci = _row_ci(row)
-            account_ext = (ci.get("account number") or "").strip()
-            instr = (ci.get("symbol") or "").strip()
-            if not account_ext or not instr:
-                continue
-            key = (account_ext, instr)
-            entry = merged.setdefault(key, {})
-            entry[view] = row
-    return merged
-
-
-def _load_positions(conn, snapshot_at, merged):
-    # The summary view's columns land first; dividend-view columns
-    # merge over (``merged`` comes from _parse_positions).
-    inserted = 0
-    for (account_ext, raw_instr), views in merged.items():
-        # Strip trailing '*' chars Fidelity appends to money-market
-        # core-position symbols (e.g. 'CORE_X**' → 'CORE_X'). The
-        # asterisks are a channel signal promoted to the
-        # is_core_position flag; the silver instrument_key joins
-        # cleanly against transactions where the same fund appears
-        # without the suffix.
-        is_core = 1 if raw_instr.endswith("*") else 0
-        instr = raw_instr.rstrip("*")
-        summary = views.get("summary", {})
-        dividend = views.get("dividend", {})
-        # Case-insensitive views for lookups (payload keeps the
-        # source-cased rows). The distribution column appears as both
-        # 'Dist. yield' and 'Dist. rate' (_ci_get takes either).
-        ci_sum = _row_ci(summary)
-        ci_div = _row_ci(dividend)
-        ci_pri = ci_sum or ci_div
-        # Prefer summary's quantity/value/cost; fall back to dividend.
-        description = ci_pri.get("description") or None
-        asset_class = _classify_asset_class(instr, description, is_core)
-        conn.execute(
-            "INSERT OR REPLACE INTO positions ("
-            "snapshot_at, account_external_id, instrument_key, "
-            "description, quantity, last_price, current_value, "
-            "cost_basis_total, average_cost_basis, type, "
-            "ex_date, amount_per_share, pay_date, "
-            "distribution_yield, sec_yield, est_annual_income, "
-            "payload, currency, asset_class, is_core_position"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                snapshot_at, account_ext, instr,
-                description,
-                parse_decimal(ci_pri.get("quantity")),
-                parse_decimal(ci_pri.get("last price")),
-                parse_decimal(ci_pri.get("current value")),
-                parse_decimal(ci_sum.get("cost basis total")),
-                parse_decimal(ci_sum.get("average cost basis")),
-                ci_pri.get("type") or None,
-                ts_from_mdy(ci_div.get("ex-date")),
-                parse_decimal(ci_div.get("amount per share")),
-                ts_from_mdy(ci_div.get("pay date")),
-                parse_decimal(_ci_get(ci_div, "dist. yield", "dist. rate")),
-                parse_decimal(ci_div.get("sec yield")),
-                parse_decimal(ci_div.get("est. annual income")),
-                normalize_payload({"summary": summary, "dividend": dividend}),
-                "USD",
-                asset_class,
-                is_core,
-            ),
-        )
-        inserted += 1
-    return inserted
-
-
-# ------------------------------------------------------------
-# Open lots (migration 0011)
-# ------------------------------------------------------------
-
-# How far a position's lots may sum from the figures the page states for
-# the position before the load says so: (index field, lot column,
-# tolerance). The lot tables print cents and thousandths, so honest
-# rounding stays well inside these.
-_LOT_QUANTITY_TOLERANCE = 0.0005
-_LOT_COST_TOLERANCE = 0.01
-_OPEN_LOT_SUMS = (
-    ("quantity", "quantity", _LOT_QUANTITY_TOLERANCE),
-    ("cost_basis_total", "cost_basis", _LOT_COST_TOLERANCE),
-)
-_CLOSED_LOT_SUMS = (
-    ("proceeds", "proceeds", _LOT_COST_TOLERANCE),
-    ("cost_basis", "cost_basis", _LOT_COST_TOLERANCE),
-)
-
-
-def _read_lot_step(dump_dir, run_meta):
-    """This dump's lot step as ``(index, records, hash_to_id)``, or None
-    when it has none.
-
-    ``records`` maps each record id in the bundle (`lots/lots.jsonl`,
-    compressed or not) to its line. A line that does not parse, the tail
-    of a run killed mid-write, is skipped with a warning; an index entry
-    that points at it then fails to load on its own."""
-    lots_dir = dump_dir / "lots"
-    index = lot_parsers.read_lot_index(lots_dir)
-    if not index:
-        return None
-    records = {}
-    path = compress.resolve_variant(lots_dir / lot_parsers.LOTS_BUNDLE)
-    if path is not None:
-        with compress.open_text(path) as fh:
-            for line_no, line in enumerate(fh, 1):
-                try:
-                    rec = json.loads(line)
-                    records[rec["id"]] = rec
-                except (ValueError, KeyError, TypeError):
-                    log.warning("%s: lots.jsonl line %d does not parse; "
-                                "skipped", dump_dir.name, line_no)
-    hash_to_id = {account_key(aid): aid
-                  for aid in run_meta.get("accounts_enumerated") or []}
-    return index, records, hash_to_id
-
-
-def _lot_bodies(records, item):
-    """The response bodies an index entry points at, in order. Raises
-    ValueError when one is missing from the bundle."""
-    bodies = []
-    for rid in item.get("records") or []:
-        rec = records.get(rid)
-        if rec is None or not isinstance(rec.get("body"), str):
-            raise ValueError(f"record {rid} is missing")
-        bodies.append(rec["body"])
-    return bodies
-
-
-def _load_open_lots(conn, snapshot_at, dump_name, lot_step):
-    """Load the open lots this dump fetched.
-
-    Only the positions whose `fetched_in` is this dump are read; an
-    unchanged position points at the earlier dump that fetched its
-    lots, which loaded them then. Each fetched position is checked
-    against the figures the positions query reported for it: a lot
-    table whose quantities or costs do not add up to the position is
-    loaded as printed, and the load warns."""
-    index, records, hash_to_id = lot_step
-    inserted = 0
-    for item in index.get("open") or []:
-        if item.get("fetched_in") != dump_name:
-            continue
-        aid = hash_to_id.get(item.get("account"))
-        instr = (item.get("symbol") or item.get("position") or "").rstrip("*")
-        if not aid or not instr:
-            log.warning("%s: lot index entry for account %s names no "
-                        "known account or symbol; skipped",
-                        dump_name, item.get("account"))
-            continue
-        lots = []
-        try:
-            for page_num, html in enumerate(_lot_bodies(records, item), 1):
-                sha = hashlib.sha256(html.encode("utf-8")).hexdigest()
-                lots += [(lot, page_num, sha)
-                         for lot in lot_parsers.parse_open_lots(html)]
-        except ValueError as e:
-            log.warning("%s: open lots of %s not loaded: %s",
-                        dump_name, instr, e)
-            continue
-        conn.execute(
-            "DELETE FROM open_lots WHERE snapshot_at = ? "
-            "AND account_external_id = ? AND instrument_key = ?",
-            (snapshot_at, aid, instr))
-        for lot_index, (lot, page_num, sha) in enumerate(lots):
-            conn.execute(
-                "INSERT INTO open_lots ("
-                "snapshot_at, account_external_id, instrument_key, "
-                "lot_index, cusip, quantity, unit_cost, cost_basis, "
-                "acquired_date, unrealized_gain_loss, current_value, term, "
-                "source_sha256, payload"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (snapshot_at, aid, instr, lot_index, item.get("cusip"),
-                 lot.get("quantity"), lot.get("unit_cost"),
-                 lot.get("cost_basis"), lot.get("acquired_date"),
-                 lot.get("unrealized_gain_loss"), lot.get("current_value"),
-                 lot.get("term"), sha,
-                 normalize_payload({"cells": lot["cells"],
-                                    "page": page_num})),
-            )
-        inserted += len(lots)
-        _check_lot_sums(dump_name, "open", instr, item,
-                        [lot for lot, _, _ in lots], _OPEN_LOT_SUMS)
-    return inserted
-
-
-def _check_lot_sums(dump_name, kind, instr, item, lots, checks):
-    """Warn when a position's ``kind`` ('open' or 'closed') lots miss a
-    figure the page stated for the position, per ``(field, column,
-    tolerance)`` of ``checks``. Each check runs only when the position
-    states its figure."""
-    for field, column, tolerance in checks:
-        stated = item.get(field)
-        if not isinstance(stated, (int, float)):
-            continue
-        total = sum(lot.get(column) or 0.0 for lot in lots)
-        if abs(total - stated) > tolerance:
-            log.warning("%s: the %s lots of %s sum to %s %.4f, the "
-                        "position states %.4f", dump_name, kind, instr,
-                        column, total, stated)
-
-
-# Regexes for the instrument-shape rules in _classify_asset_class.
-# CUSIP-9: 9 alphanumeric chars with a trailing check digit.
-_CUSIP9_RE = re.compile(r"^[A-Z0-9]{8}[0-9]$")
-# Fidelity's 529-plan investment-option codes: 3 letters + 6 digits
-# (an internal Fidelity scheme for target-date / risk-bucket
-# sleeves inside a state 529 plan). The strictness matters — some
-# ADRs share the first three letters of a state's plan prefix, so
-# the regex pins the trailing 6 characters to digits.
-_PLAN_FUND_RE = re.compile(r"^[A-Z]{3}[0-9]{6}$")
-# Industry mutual-fund convention: 5-char ticker ending in 'X'.
-_MUTUAL_FUND_RE = re.compile(r"^[A-Z]{4}X$")
-# Word-boundary "ETF" in the Description field. Fidelity groups
-# ETFs with stocks (no structured signal), but the fund sponsors
-# put "ETF" in the security name itself. The word boundary
-# matters: a substring match would also catch N-ETF-LIX.
-_ETF_DESC_RE = re.compile(r"\bETF\b", re.IGNORECASE)
-
-
-def _classify_asset_class(instrument_key, description, is_core_position):
-    """Heuristic asset-class derivation from the Fidelity Symbol +
-    Description fields. Order matters — first match wins. Returns
-    one of 'money_market' / 'bond' / 'plan_fund' / 'mutual_fund' /
-    'etf' / 'equity'. Gold can override via the config's
-    instrument_overrides; this populates the column for the common
-    cases."""
-    if is_core_position:
-        return "money_market"
-    if not instrument_key:
-        return "equity"
-    # plan_fund BEFORE the broader CUSIP-9 check because the
-    # plan-fund shape ([A-Z]{3}[0-9]{6}) is a stricter subset of
-    # CUSIP-9 (any alphanumeric ending in a digit). Real CUSIPs
-    # almost never fit the strict 3-letters-then-6-digits pattern.
-    if _PLAN_FUND_RE.match(instrument_key):
-        return "plan_fund"
-    if _CUSIP9_RE.match(instrument_key):
-        # 9-char alphanumeric with trailing check digit → CUSIP.
-        # Fidelity exposes the CUSIP in the Symbol column for
-        # bonds when no ticker exists.
-        return "bond"
-    if _MUTUAL_FUND_RE.match(instrument_key):
-        return "mutual_fund"
-    if description and _ETF_DESC_RE.search(description):
-        # Exchange-traded funds trade like stocks and Fidelity
-        # groups them with equities; the security name is the only
-        # signal. Misses name-shy exchange-traded products (e.g. a
-        # commodity trust whose name says "SHS") — those are what
-        # the gold config's instrument_overrides are for.
-        return "etf"
-    return "equity"
-
-
-def _iter_positions_rows(csv_path):
-    """Yield meaningful holding rows from a Fidelity positions
-    export CSV. Stops at the first 'Brokerage services...'
-    disclaimer line (Fidelity glues legalese onto the end with
-    rows that pollute the data otherwise).
-
-    Some rows have a literal 'Pending Activity' or 'Account Total'
-    in the Symbol column — skip those too."""
-    SKIP_INSTRUMENTS = {"Pending Activity", "Account Total"}
-    # csv_path may be plain .csv or a .csv.zst variant — open_text
-    # decompresses by suffix in memory. Keep utf-8-sig (BOM strip) +
-    # newline="" so a compressed load reads byte-identical rows.
-    with compress.open_text(csv_path, encoding="utf-8-sig", newline="") as f:
-        # Read raw lines first so the parse can stop at the disclaimer.
-        text = f.read()
-    # Disclaimers start with 'Brokerage services' or '"The data...'.
-    cutoff = len(text)
-    for marker in ('\n"The data ',
-                   '\nBrokerage services',
-                   '\nDate downloaded'):
-        i = text.find(marker)
-        if i != -1 and i < cutoff:
-            cutoff = i
-    text = text[:cutoff]
-    reader = csv.DictReader(text.splitlines())
-    for row in reader:
-        ci = _row_ci(row)
-        sym = (ci.get("symbol") or "").strip()
-        acct = (ci.get("account number") or "").strip()
-        if not acct:
-            continue
-        if not sym or sym in SKIP_INSTRUMENTS:
-            continue
-        yield row
-
-
-# ------------------------------------------------------------
-# Transactions
-# ------------------------------------------------------------
-
-ACTIVITY_FILE_RE = re.compile(r"^activity_.*\.csv$")
-
-
-def _resolved_bronze_files(directory, matches):
-    """The on-disk file of each LOGICAL name (any .zst/.gz stripped) in
-    `directory` that `matches(logical_path)` accepts, sorted by name.
-    A plain + .zst twin that coexist (a recompress interrupted between
-    verify and unlink) resolve to one file, the plain original."""
-    logical_names = set()
-    for path in directory.iterdir():
-        if not path.is_file():
-            continue
-        logical = compress.logical_bronze_path(path)
-        if matches(logical):
-            logical_names.add(logical.name)
-    resolved = (compress.resolve_variant(directory / name)
-                for name in sorted(logical_names))
-    return [p for p in resolved if p is not None]
-
-
-def _load_transactions(conn, dump_dir):
-    act_dir = dump_dir / "activity"
-    if not act_dir.is_dir():
-        return 0
-    # ACTIVITY_FILE_RE matches the logical `activity_*.csv` name.
-    return sum(_ingest_activity_csv(conn, path)
-               for path in _resolved_bronze_files(
-                   act_dir, lambda p: ACTIVITY_FILE_RE.match(p.name)))
-
-
-def _ingest_activity_csv(conn, csv_path):
-    # source_sha256 is the DECOMPRESSED content hash, not the on-disk
-    # file's hash: a .csv.zst and its plain twin must produce identical
-    # transactions rows (the convergence invariant), and source_sha256
-    # is a stored column. read_text_and_sha hashes those decompressed
-    # bytes while reading them, so pre-compression dumps are unaffected
-    # and the file is decompressed once.
-    text, src_sha, _ = compress.read_text_and_sha(csv_path, encoding="utf-8-sig")
-    inserted = 0
-    # Fidelity prefixes a BOM + blank line before the header on
-    # every activity export. Skip everything up to the line that
-    # starts with "Run Date,".
-    lines = text.splitlines()
-    header_idx = next(
-        (i for i, ln in enumerate(lines) if ln.startswith("Run Date,")),
-        None,
-    )
-    if header_idx is None:
-        log.warning("no 'Run Date,' header in %s; skipping", csv_path.name)
-        return 0
-    body = "\n".join(lines[header_idx:])
-    reader = csv.DictReader(body.splitlines())
-    if not reader.fieldnames or "Run Date" not in reader.fieldnames:
-        log.warning("unexpected activity CSV header in %s; skipping",
-                    csv_path.name)
-        return 0
-    # Per-file occurrence counter, keyed by the row's structural
-    # identity. See _synthesise_activity_id for why this — rather
-    # than the file sha256 + global CSV row index — is the dedup key.
-    occ_counter: dict[str, int] = {}
-    for row in reader:
-            # Case-insensitive lookups (_row_ci): a re-cased header
-            # must not read as an empty column (the positions export
-            # can change header casing).
-            # Values (which the activity identity hashes) are
-            # untouched, so ids are stable across header re-casings.
-            ci = _row_ci(row)
-            run_date = (ci.get("run date") or "").strip()
-            # Footer "Date downloaded..." rows surface as a single
-            # field that doesn't match Fidelity's data shape.
-            if not run_date or not re.match(r"^\d{2}/\d{2}/\d{4}$", run_date):
-                continue
-            account_ext = (ci.get("account number") or "").strip()
-            if not account_ext:
-                continue
-            ts = ts_from_mdy(run_date)
-            if ts is None:
-                continue
-            action = (ci.get("action") or "").strip()
-            kind = _classify_action(action)
-            symbol = (ci.get("symbol") or "").strip() or None
-            instrument_key = symbol or instrument_from_action(action)
-            quantity = parse_decimal(ci.get("quantity"))
-            price = parse_decimal(ci.get("price ($)"))
-            amount = parse_decimal(ci.get("amount ($)"))
-            settlement = ts_from_mdy(ci.get("settlement date"))
-            payload = normalize_payload(dict(row))
-            identity = _activity_identity(
-                account_ext, ts, kind, quantity, price, amount, settlement)
-            occ = occ_counter.get(identity, 0)
-            occ_counter[identity] = occ + 1
-            activity_id = _synthesise_activity_id(identity, occ)
-            if symbol is None and _stored_symbol(conn, activity_id):
-                # Another export printed this transaction's Symbol; that
-                # copy names the security the way the positions do, so it
-                # stays whatever order the exports load in.
-                #
-                # Limitation: the identity names no security, so two
-                # transactions with the same economics in one account on
-                # one day (say, two securities bought for the same
-                # quantity, price and amount) differ only by occurrence
-                # index, which follows print order. When export A prints
-                # them X, Y and a later export B prints Y, X with Y's
-                # Symbol blank, B's Y lands on X's id and is skipped
-                # here, and B's X then replaces A's Y under the other id.
-                # Silver keeps X twice and loses Y until an export that
-                # prints both Symbols loads after B.
-                continue
-            conn.execute(
-                "INSERT OR REPLACE INTO transactions ("
-                "activity_id, timestamp, account_external_id, kind, "
-                "instrument_key, quantity, price, amount, "
-                "settlement_date, source_sha256, payload, currency"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    activity_id, ts, account_ext, kind, instrument_key,
-                    quantity, price, amount, settlement,
-                    src_sha,
-                    payload,
-                    "USD",
-                ),
-            )
-            inserted += 1
-    return inserted
-
-
-# Some activity exports leave the Symbol column blank for a security
-# and name it only in the action text, by CUSIP: in parentheses after
-# the name (`YOU BOUGHT <name> (<CUSIP>) (Cash)`), or bare right after
-# the verb when no name is printed (`YOU BOUGHT <CUSIP> (Cash)`). The
-# bare form is read only behind a trade or income verb, so a check or
-# journal number elsewhere in the text is never taken for a CUSIP.
-_ACTION_CUSIP_RE = re.compile(r"\(([0-9A-Z]{8}[0-9])\)")
-_ACTION_BARE_CUSIP_RE = re.compile(
-    r"^(?:YOU BOUGHT|YOU SOLD|DIVIDEND RECEIVED|REINVESTMENT|"
-    r"REVERSE SPLIT R/S TO)\s+([0-9A-Z]{8}[0-9])(?![0-9A-Z])",
-    re.IGNORECASE)
-
-
-def _cusip_check_digit_ok(cusip):
-    """Whether a 9-character CUSIP's last digit is its check digit
-    (the modulus-10 double-add-double over the first eight)."""
-    total = 0
-    for i, ch in enumerate(cusip[:8]):
-        value = int(ch) if ch.isdigit() else ord(ch) - ord("A") + 10
-        if i % 2:
-            value *= 2
-        total += value // 10 + value % 10
-    return (10 - total % 10) % 10 == int(cusip[8])
-
-
-def instrument_from_action(action):
-    """The CUSIP an activity row's action text names, or None. In
-    parentheses, the last valid one wins, since the security's CUSIP
-    follows its name; otherwise a bare CUSIP right after the verb. A
-    token whose check digit fails is not a CUSIP."""
-    for token in reversed(_ACTION_CUSIP_RE.findall(action or "")):
-        if _cusip_check_digit_ok(token):
-            return token
-    m = _ACTION_BARE_CUSIP_RE.match((action or "").strip())
-    if m and _cusip_check_digit_ok(m.group(1).upper()):
-        return m.group(1).upper()
-    return None
-
-
-def _fill_instrument_keys(conn):
-    """Give an activity row loaded with a blank Symbol the CUSIP its
-    action text names, the way ingest does for new rows. Idempotent;
-    rows of the supplied statements (`stmt_`) and rows with no Action
-    are left alone. Returns the number of rows filled."""
-    filled = 0
-    rows = conn.execute(
-        "SELECT activity_id, json_extract(payload, '$.Action') "
-        "FROM transactions WHERE instrument_key IS NULL "
-        "AND activity_id NOT LIKE 'stmt\\_%' ESCAPE '\\' "
-        "AND json_extract(payload, '$.Action') IS NOT NULL").fetchall()
-    for activity_id, action in rows:
-        cusip = instrument_from_action(action)
-        if cusip:
-            conn.execute(
-                "UPDATE transactions SET instrument_key = ? "
-                "WHERE activity_id = ?", (cusip, activity_id))
-            filled += 1
-    return filled
-
-
-# Fidelity's Action column is free-text. Pull out the user-
-# meaningful action verb so silver can filter by `kind` directly.
-# Order matters — most specific first; the catch-all is the first
-# whitespace-delimited token, uppercased.
-_ACTION_PATTERNS = (
-    (re.compile(r"^YOU\s+BOUGHT\b", re.I), "BUY"),
-    (re.compile(r"^YOU\s+SOLD\b", re.I), "SELL"),
-    (re.compile(r"^REINVESTMENT\b", re.I), "REINVESTMENT"),
-    (re.compile(r"^DIVIDEND\s+RECEIVED\b", re.I), "DIVIDEND"),
-    (re.compile(r"^DISTRIBUTION\b", re.I), "DISTRIBUTION"),
-    (re.compile(r"^MUNI\s+EXEMPT\s+INT\b", re.I), "INTEREST"),
-    (re.compile(r"^INTEREST\b", re.I), "INTEREST"),
-    (re.compile(r"^FOREIGN\s+TAX\b", re.I), "TAX"),
-    (re.compile(r"^FEE\b", re.I), "FEE"),
-    (re.compile(r"^PURCHASE\s+INTO\s+CORE", re.I), "CASH_SWEEP_IN"),
-    (re.compile(r"^REDEMPTION\s+FROM\s+CORE", re.I), "CASH_SWEEP_OUT"),
-    (re.compile(r"^TRANSFERRED\b", re.I), "TRANSFER"),
-    (re.compile(r"^JOURNALED\b", re.I), "JOURNAL"),
-    (re.compile(r"^IN\s+LIEU\s+OF", re.I), "CASH_IN_LIEU"),
-    (re.compile(r"^NAME\s+CHANGE", re.I), "NAME_CHANGE"),
-    (re.compile(r"^MERGER\b", re.I), "MERGER"),
-    (re.compile(r"^REVERSE\s+SPLIT", re.I), "REVERSE_SPLIT"),
-    (re.compile(r"^RETURN\s+OF\s+CAPITAL", re.I), "RETURN_OF_CAPITAL"),
-    (re.compile(r"^TENDERED\b", re.I), "TENDER"),
-    (re.compile(r"^ADJUST(?:MENT)?\b", re.I), "ADJUSTMENT"),
-    (re.compile(r"^ADJ\b", re.I), "ADJUSTMENT"),
-    (re.compile(r"^(?:SHORT|LONG)-TERM\s+CAP\b", re.I), "DISTRIBUTION"),
-    (re.compile(r"^EXPIRED\b", re.I), "EXPIRATION"),
-    (re.compile(r"^REDEMPTION\b", re.I), "REDEMPTION"),
-)
-
-
-def _classify_action(action):
-    if not action:
-        return "UNKNOWN"
-    for pat, kind in _ACTION_PATTERNS:
-        if pat.search(action):
-            return kind
-    return action.split()[0].upper()
-
-
-def _stored_symbol(conn, activity_id):
-    """The Symbol cell of the stored copy of an activity row, or ''."""
-    row = conn.execute(
-        "SELECT payload FROM transactions WHERE activity_id = ?",
-        (activity_id,)).fetchone()
-    if row is None:
-        return ""
-    return (_row_ci(json.loads(row[0])).get("symbol") or "").strip()
-
-
-def _activity_identity(account_ext, ts, kind, quantity, price, amount,
-                       settlement_ts):
-    """Structural fingerprint of one activity row: the parsed
-    economic columns, none of the text ones.
-
-    Fidelity re-labels securities between exports — the same
-    transaction's Action/Description text drifts (e.g. "SPONSORED
-    ADR" one month, an abbreviated form the next) — and fills the
-    Symbol cell in one export and leaves it blank in another, the
-    security then named only inside the Action text. Any of those
-    columns in the identity splits one transaction into two rows. The
-    economics (who, when, what verb, how many, at what price, for how
-    much, settling when) do not drift, so only they participate.
-    Numbers enter parsed (not as raw CSV strings) so formatting changes
-    ("1,250.00" vs "1250.00") can't split the key either.
-
-    Two distinct transactions with the same economics on the same day
-    in one account still get two rows: the occurrence index of
-    _synthesise_activity_id tells them apart, and every export that
-    covers the day carries both.
-    """
-    return json.dumps(
-        [account_ext, ts, kind, quantity, price, amount, settlement_ts],
-        separators=(",", ":"))
-
-
-def _drop_document_holdings(conn, sha):
-    """Drop the `historical_position_snapshots` rows one source PDF
-    materialised, so re-parsing that PDF REPLACES them instead of leaving
-    the old ones beside them.
-
-    A holding's DESCRIPTION — read off the page — is part of that table's
-    primary key, so a parser edit re-keys the row and `INSERT OR REPLACE`
-    has nothing to replace. Scoped by the document rather than by the pass
-    because three passes share the table and nothing on a row says which of
-    them wrote it, while `source_sha256` says exactly which PDF did. The
-    document is also the only unit any of them can re-derive.
-
-    Called only once a parse has SUCCEEDED. A statement that fails to parse,
-    fails its signature guard or fails reconciliation is never dropped:
-    stale rows beat no rows when nothing can re-derive them.
-
-    The one case this grain cannot reach: a row whose last writer was a
-    statement since removed from bronze carries THAT statement's sha, so the
-    statement still present does not delete it and a re-key would leave both.
-    Removing a supplied statement is a deliberate act; `load --force` is the
-    repair.
-    """
-    conn.execute(
-        "DELETE FROM historical_position_snapshots WHERE source_sha256 = ?",
-        (sha,))
-
-
-def _drop_supplied_activity(conn):
-    """Drop every statement-derived activity row, for a re-derivation of all
-    of them.
-
-    Scope-wide rather than per-document, because it can be: the `stmt_`
-    prefix names exactly the rows the supplied pass writes into
-    `transactions`, so unlike the holdings above there is no row this cannot
-    reach — including one whose statement has since left the tree. Rows of
-    the scraped feed carry structural ids and are untouched.
-    """
-    return conn.execute(
-        r"DELETE FROM transactions WHERE activity_id LIKE 'stmt\_%' "
-        r"ESCAPE '\'").rowcount
-
-
-def _synthesise_activity_id(identity, occurrence):
-    """Stable, file-independent dedup key for one activity row.
-
-    Fidelity's Activity export is consolidated across all accounts
-    and the backfill downloads it window by window
-    (`download.MAX_ACTIVITY_WINDOW_DAYS`-day chunks)
-    on every run. The SAME real-world transaction therefore lands
-    in many distinct CSV files — different windows, different runs.
-    The dedup key must depend only on the transaction's intrinsic
-    content so those copies collapse onto one row.
-
-    The fingerprint is the row's structural identity (see
-    _activity_identity) plus a per-file ``occurrence`` index. The
-    occurrence index disambiguates genuinely-repeated identical
-    rows within a single export (e.g. two same-day, same-amount
-    fills) without breaking cross-file convergence: every file that
-    covers a given day sees that day's complete set of rows, so the
-    Nth identical copy is assigned the same occurrence index N in
-    every file.
-
-    Neither the source file nor the description text enters the key:
-    both vary between copies of one transaction. source_sha256 is
-    stored as a column for provenance only.
-    """
-    h = hashlib.sha256()
-    h.update(identity.encode("utf-8"))
-    h.update(b"|")
-    h.update(str(occurrence).encode("ascii"))
-    return h.hexdigest()[:32]
-
-
-# ------------------------------------------------------------
-# Documents
-# ------------------------------------------------------------
-
-TAX_FORM_YEAR_RE = re.compile(r"^(\d{4})-")
-
-
-def _load_documents(conn, snapshot_at, dump_dir):
-    """Index every PDF / HTML capture in the dump dir into the
-    documents table. Dedups on content_sha256; the first dump that
-    surfaced a given file's bytes wins the snapshot_at column."""
-    inserted = 0
-    # Statements + tax forms.
-    docs_dir = dump_dir / "documents"
-    if docs_dir.is_dir():
-        # PDFs are never compressed (already internally compressed) —
-        # hashed + sized by their raw bytes, unchanged.
-        for pdf in sorted(docs_dir.glob("*.pdf")):
-            inserted += _ingest_document(
-                conn, snapshot_at, pdf,
-                _classify_documents_pdf(pdf.name),
-            )
-        # Statement CSV companions ARE compressible: a `.csv.zst` has
-        # suffix `.zst`, so match on the LOGICAL name and resolve the
-        # on-disk variant (plain wins). The decompressed-hash path keeps
-        # the documents row identical to a plain-CSV load.
-        for resolved in _resolved_bronze_files(
-                docs_dir, lambda p: p.suffix.lower() == ".csv"):
-            inserted += _ingest_document(
-                conn, snapshot_at, resolved,
-                {"doc_kind": "statement", "file_format": "csv"},
-                compressible=True,
-            )
-    # Balances HTML (compressible: balances.html or balances.html.zst).
-    bal = compress.resolve_variant(dump_dir / "balances" / "balances.html")
-    if bal is not None:
-        inserted += _ingest_document(
-            conn, snapshot_at, bal,
-            {"doc_kind": "balances_html", "file_format": "html"},
-            compressible=True,
-        )
-    # Performance HTML (compressible).
-    perf = compress.resolve_variant(
-        dump_dir / "performance" / "performance.html")
-    if perf is not None:
-        inserted += _ingest_document(
-            conn, snapshot_at, perf,
-            {"doc_kind": "performance_html", "file_format": "html"},
-            compressible=True,
-        )
-    return inserted
-
-
-def _classify_documents_pdf(filename):
-    """Heuristic kind + tax_year for documents/*.pdf
-    based on Fidelity's filename conventions:
-
-      Statement<MMDDYYYY>.pdf
-          → statement
-      <YYYY>-<Nickname>-<NNNN>-Consolidated-Form-1099.pdf
-      <YYYY>-<Nickname>-<NNNN>-CORRECTED-Consolidated-Form-1099.pdf
-      <YYYY>-<Nickname>-<NNNN>-Form-1099-Q-Instructions.pdf
-          → tax_form, tax_year=<YYYY>
-      Consolidated_Form_1099.pdf, CORRECTED_Consolidated_Form_1099__1.pdf,
-      Form_1099_Q_….pdf
-          → tax_form; the name states no year (the form itself does)
-    """
-    info = {"file_format": "pdf"}
-    if filename.lower().startswith("statement"):
-        info["doc_kind"] = "statement"
-        return info
-    m = TAX_FORM_YEAR_RE.match(filename)
-    if m:
-        info["doc_kind"] = "tax_form"
-        info["tax_year"] = int(m.group(1))
-    elif "1099" in filename:
-        info["doc_kind"] = "tax_form"
-    else:
-        info["doc_kind"] = "statement"  # fallback
-    return info
-
-
-def _ingest_document(conn, snapshot_at, path, classification, *,
-                     compressible=False):
-    """Index one bronze artefact into the documents table.
-
-    PDFs (``compressible=False``, the default — PDFs are never
-    compressed) are hashed and sized by their raw on-disk bytes.
-
-    Compressible artefacts (HTML / CSV, which download + recompress may
-    have written as ``<name>.zst``) are keyed on their DECOMPRESSED
-    content: content_sha256 + size_bytes are of the logical uncompressed
-    bytes, and file_path / file_name drop the compression suffix. That
-    makes a documents row byte-identical whether the file on disk is
-    ``balances.html`` or ``balances.html.zst`` — the convergence
-    invariant a ``load --force`` on a compressed vs plain bronze tree
-    relies on, and the reason the content_sha256 dedup still collapses
-    the same artefact across runs regardless of compression state."""
-    if compressible:
-        sha, size = compress.decompressed_sha256(path)
-        logical = compress.logical_bronze_path(path)
-    else:
-        sha = bronze.sha256_file(path)[0]
-        size = path.stat().st_size
-        logical = path
-    info = dict(classification)
-    info.setdefault("file_format", logical.suffix.lstrip(".").lower() or "bin")
-    info.setdefault("doc_kind", "statement")
-    try:
-        conn.execute(
-            "INSERT INTO documents ("
-            "content_sha256, snapshot_at, file_path, file_name, "
-            "size_bytes, doc_kind, file_format, tax_year, "
-            "account_external_id, payload"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                sha, snapshot_at, str(logical.resolve()), logical.name,
-                size, info["doc_kind"], info["file_format"],
-                info.get("tax_year"),
-                info.get("account_external_id"),
-                normalize_payload({"filename": logical.name, **info}),
-            ),
-        )
-        return 1
-    except sqlite3.IntegrityError:
-        # Same bytes already loaded from an earlier dump.
-        return 0
-
-
-# ============================================================
-# Donor-Advised Fund (Fidelity Charitable) — §12
-# ============================================================
-#
-# The DAF bronze under <dump>/daf/ is the charitable API's own JSON,
-# not the retail CSV/HTML exports. It lands in the SAME silver tables
-# as the retail data so the gold adapter composes uniformly:
-#   * one portfolio row  (kind='daf')            per dump
-#   * one accounts row   (management_style='automated')  per giving account
-#   * positions rows      from the investment pools (instrument = poolId)
-#   * transactions rows   from grants / contributions / gifts / pool
-#                         exchanges / adjustments (stable id per source id)
-#   * documents rows      from the statement / confirmation / tax-form PDFs
-# The rich per-event fields the retail columns don't model live in the
-# JSON `payload`. See DESIGN.md §12.
-
-
-def _read_json_file(path):
-    """Read + parse a JSON bronze file, or None if absent/unreadable."""
-    if not path.is_file():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (ValueError, OSError) as e:
-        log.warning("DAF: could not read %s: %s", path.name, e)
-        return None
-
-
-def _daf_ts(value):
-    """Parse a DAF date (ISO 'YYYY-MM-DD', ISO datetime, or US
-    'MM/DD/YYYY') to Unix seconds UTC, or None."""
-    if not value or not isinstance(value, str):
-        return None
-    return iso_date_to_epoch(value) or ts_from_mdy(value)
-
-
-def _daf_first(rec, keys):
-    """First present, non-empty value among ``keys`` in ``rec``."""
-    for k in keys:
-        v = rec.get(k)
-        if v not in (None, "", "--"):
-            return v
-    return None
-
-
-def _daf_activity_id(kind, account_ext, source_id, payload):
-    """Deterministic transactions PK for a DAF event. Keyed on the
-    source's own stable id (grantId, contributionId, …) when present so
-    a re-download collapses onto one row; falls back to a hash of the
-    account + normalized payload when the source offers no id."""
-    basis = (f"{kind}:{account_ext}:{source_id}" if source_id
-             else f"{kind}:{account_ext}:{normalize_payload(payload)}")
-    return "daf-" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:28]
-
-
-# One spec per DAF event file. ``unwrap`` names a nested object the row
-# fields live under (grants wrap them in "grant"); ``sign`` fixes the
-# amount direction (grants/gifts out = -1, contributions in = +1,
-# exchanges/adjustments kept as-is = 0). Candidate key lists absorb
-# field-name variation across the endpoints without over-fitting a
-# single observed shape.
-_DAF_EVENT_SPECS = (
-    dict(file="grants.json", kind="GRANT", unwrap="grant", sign=-1,
-         id_keys=("grantId",), amount_keys=("amount",),
-         date_keys=("approvalDate", "settlementDate", "submitDate",
-                    "creationDate", "updateDate"),
-         instrument_keys=()),
-    dict(file="contributions.json", kind="CONTRIBUTION", unwrap=None, sign=1,
-         id_keys=("contributionId", "id"),
-         amount_keys=("estimatedAmount", "fmv", "FMV", "netProceeds",
-                      "amount"),
-         date_keys=("receivedDate", "tradeDate", "settlementDate",
-                    "submittedDate", "submitDate"),
-         instrument_keys=("cusip", "CUSIP", "symbol", "Symbol")),
-    dict(file="gifts.json", kind="GIFT", unwrap=None, sign=-1,
-         id_keys=("id", "giftId"), amount_keys=("giftAmount", "amount"),
-         date_keys=("processed", "processedDate", "date"),
-         instrument_keys=()),
-    dict(file="pool_exchanges.json", kind="EXCHANGE", unwrap=None, sign=0,
-         id_keys=("id", "exchangeId"), amount_keys=("amount",),
-         date_keys=("processDate", "submitDate", "date"),
-         instrument_keys=()),
-    dict(file="adjustments.json", kind="ADJUSTMENT", unwrap=None, sign=0,
-         id_keys=("id", "adjustmentId"), amount_keys=("amount",),
-         date_keys=("processed", "processedDate", "date"),
-         instrument_keys=()),
-)
-
-
-def _daf_pool_count(dump_dir):
-    """Count parseable pool entries across the dump's DAF account
-    dirs, without touching silver — the completeness gate's DAF-side
-    signal."""
-    daf_dir = dump_dir / "daf"
-    if not daf_dir.is_dir():
-        return 0
-    n = 0
-    for acct_dir in daf_dir.iterdir():
-        if not acct_dir.is_dir():
-            continue
-        pb = _read_json_file(acct_dir / "pool_balances.json")
-        if isinstance(pb, list) and pb:
-            n += len((pb[0] or {}).get("poolInfoList") or [])
-    return n
-
-
-def _positions_completeness_gate(dump_dir, run_meta, merged):
-    """Decide whether this dump's positions may enter silver at all.
-    Returns (skip, reason); (False, None) means the observation is
-    complete and both retail and DAF pool rows load.
-
-    A positions-bearing snapshot is read downstream (gold's per-source
-    latest-snapshot anchor) as a COMPLETE holdings observation, so a
-    dump that observed only one channel must contribute NO positions:
-    stale beats partial, and the anchor stays on the last complete
-    dump. Events, documents, and master data are unaffected (keyed
-    rows, not snapshots). See DESIGN.md §12.3.
-
-    Partiality signals:
-      * mode='daf' — the retired DAF-only mode; such a legacy dump
-        runs no retail phase, so it is partial by construction.
-      * daf_results.status='error', or an error in its per_account
-        map — the walk expected a DAF (the account selector
-        enumerated one) but the charitable phase, or one giving
-        account of it, failed; loading the rest alone would zero the
-        missing pools.
-      * retail rows parse to zero while the dump carries DAF pool
-        rows and the roster says retail accounts were in scope — the
-        retail export failed (or its format drifted); loading the
-        pool alone would zero the retail holdings.
-    """
-    mode = (run_meta.get("cli_config") or {}).get("mode")
-    if mode == "daf":
-        return True, "legacy mode=daf dump covers only the DAF"
-    daf_res = run_meta.get("daf_results")
-    pool_rows = _daf_pool_count(dump_dir)
-    if isinstance(daf_res, dict) and (merged or pool_rows) and (
-            daf_res.get("status") == "error"
-            or any(isinstance(r, dict) and r.get("status") == "error"
-                   for r in (daf_res.get("per_account") or {}).values())):
-        return True, "the DAF phase failed while other positions landed"
-    if not merged and pool_rows and (run_meta.get("accounts_in_scope")
-                                     or []):
-        return True, ("retail positions parsed to zero rows while the "
-                      "DAF pool landed")
-    return False, None
-
-
-def _load_daf(conn, snapshot_at, dump_dir, *, skip_positions=False):
-    """Load the Donor-Advised Fund bronze (<dump>/daf/) into silver.
-    Returns a per-table count dict (empty if the dump has no DAF).
-    ``skip_positions`` (the completeness gate) suppresses the pool
-    position rows while master / events / documents still load."""
-    daf_dir = dump_dir / "daf"
-    if not daf_dir.is_dir():
-        return {}
-    counts = {"portfolios": 0, "accounts": 0, "positions": 0,
-              "transactions": 0, "documents": 0}
-    portfolio_written = False
-    for acct_dir in sorted(p for p in daf_dir.iterdir() if p.is_dir()):
-        master = _read_json_file(acct_dir / "account.json")
-        if not isinstance(master, dict):
-            continue
-        account_ext = str(master.get("accountNbr")
-                          or master.get("accountNumber") or "").strip()
-        if not account_ext:
-            continue
-        if not portfolio_written:
-            conn.execute(
-                "INSERT OR REPLACE INTO portfolios ("
-                "snapshot_at, portfolio_external_id, kind, payload"
-                ") VALUES (?, ?, 'daf', ?)",
-                (snapshot_at, DAF_PORTFOLIO_LABEL,
-                 normalize_payload({"source": "daf/accounts.json"})),
-            )
-            portfolio_written = True
-            counts["portfolios"] = 1
-        conn.execute(
-            "INSERT OR REPLACE INTO accounts ("
-            "snapshot_at, account_external_id, portfolio_external_id, "
-            "nickname, payload, management_style"
-            ") VALUES (?, ?, ?, ?, ?, 'automated')",
-            (snapshot_at, account_ext, DAF_PORTFOLIO_LABEL,
-             master.get("gaName"),
-             normalize_payload({"source": "daf/account.json", **master})),
-        )
-        counts["accounts"] += 1
-        if not skip_positions:
-            counts["positions"] += _load_daf_pools(
-                conn, snapshot_at, account_ext, acct_dir)
-        counts["transactions"] += _load_daf_events(
-            conn, snapshot_at, account_ext, acct_dir)
-        counts["documents"] += _load_daf_documents(
-            conn, snapshot_at, account_ext, acct_dir)
-    return counts
-
-
-def _load_daf_pools(conn, snapshot_at, account_ext, acct_dir):
-    """Load the investment-pool positions from pool_balances.json. The
-    latest date bucket's poolInfoList is the current holding snapshot;
-    each pool is one positions row keyed on poolId."""
-    pb = _read_json_file(acct_dir / "pool_balances.json")
-    if not isinstance(pb, list) or not pb:
-        return 0
-    bucket = pb[0] or {}
-    price_date = bucket.get("poolPriceDate")
-    inserted = 0
-    for pool in bucket.get("poolInfoList") or []:
-        instrument_key = str(pool.get("poolId")
-                             or pool.get("poolName") or "").strip()
-        if not instrument_key:
-            continue
-        conn.execute(
-            "INSERT OR REPLACE INTO positions ("
-            "snapshot_at, account_external_id, instrument_key, "
-            "description, quantity, last_price, current_value, "
-            "type, currency, asset_class, is_core_position, payload"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'USD', 'daf_pool', 0, ?)",
-            (snapshot_at, account_ext, instrument_key,
-             pool.get("poolName"),
-             parse_decimal(pool.get("unitQuantity")),
-             parse_decimal(pool.get("poolUnitPrice")),
-             parse_decimal(pool.get("marketValue")),
-             pool.get("poolCategory"),
-             normalize_payload({"pool_price_date": price_date, **pool})),
-        )
-        inserted += 1
-    return inserted
-
-
-def _load_daf_events(conn, snapshot_at, account_ext, acct_dir):
-    """Load grants / contributions / gifts / pool-exchanges / adjustments
-    into the transactions table, one row per event, keyed on a stable
-    per-source id (see _daf_activity_id)."""
-    inserted = 0
-    for spec in _DAF_EVENT_SPECS:
-        path = acct_dir / spec["file"]
-        items = _read_json_file(path)
-        if not isinstance(items, list) or not items:
-            continue
-        source_sha = bronze.sha256_file(path)[0]
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            rec = item.get(spec["unwrap"]) if spec["unwrap"] else item
-            if not isinstance(rec, dict):
-                rec = item
-            amount = parse_decimal(_daf_first(rec, spec["amount_keys"]))
-            if amount is not None and spec["sign"]:
-                amount = spec["sign"] * abs(amount)
-            ts = _daf_ts(_daf_first(rec, spec["date_keys"])) or snapshot_at
-            instr = _daf_first(rec, spec["instrument_keys"])
-            source_id = _daf_first(rec, spec["id_keys"])
-            activity_id = _daf_activity_id(
-                spec["kind"], account_ext, source_id, item)
-            conn.execute(
-                "INSERT OR REPLACE INTO transactions ("
-                "activity_id, timestamp, account_external_id, kind, "
-                "instrument_key, amount, currency, source_sha256, payload"
-                ") VALUES (?, ?, ?, ?, ?, ?, 'USD', ?, ?)",
-                (activity_id, ts, account_ext, spec["kind"],
-                 (str(instr).strip() or None) if instr else None,
-                 amount, source_sha, normalize_payload(item)),
-            )
-            inserted += 1
-    return inserted
-
-
-# DAF document filename stems (download._daf_doc_stem): '<TYPE>_<date>',
-# TYPE ∈ {STATEMENT, GRANT, CONTRIBUTION, FORM_8283}. The kind is
-# namespaced 'daf_*' so DAF documents never mix with the retail
-# statement / tax-form rows.
-_DAF_DOC_KINDS = {
-    "STATEMENT": "daf_statement",
-    "FORM_8283": "daf_tax_form",
-    "GRANT": "daf_grant_confirmation",
-    "CONTRIBUTION": "daf_contribution_confirmation",
-}
-_DAF_DOC_STEM_RE = re.compile(
-    r"^(STATEMENT|FORM_8283|GRANT|CONTRIBUTION)_(\d{4})")
-
-
-def _classify_daf_pdf(filename, account_ext):
-    """Kind + tax_year + account for a DAF documents/*.pdf, from the
-    '<TYPE>_<YYYY>_...' stem download.py writes."""
-    info = {"file_format": "pdf", "doc_kind": "daf_statement",
-            "account_external_id": account_ext}
-    m = _DAF_DOC_STEM_RE.match(filename)
-    if m:
-        info["doc_kind"] = _DAF_DOC_KINDS.get(m.group(1), "daf_statement")
-        if info["doc_kind"] == "daf_tax_form":
-            info["tax_year"] = int(m.group(2))
-    return info
-
-
-def _load_daf_documents(conn, snapshot_at, account_ext, acct_dir):
-    """Index the DAF PDF archive into the documents table (deduped on
-    content_sha256 like every other document)."""
-    docs_dir = acct_dir / "documents"
-    if not docs_dir.is_dir():
-        return 0
-    inserted = 0
-    for pdf in sorted(docs_dir.glob("*.pdf")):
-        inserted += _ingest_document(
-            conn, snapshot_at, pdf,
-            _classify_daf_pdf(pdf.name, account_ext))
-    return inserted
-
-
-# ------------------------------------------------------------
 # DAF historical position snapshots (statement-PDF parsing)
 # ------------------------------------------------------------
 #
@@ -1801,43 +605,34 @@ def _load_daf_documents(conn, snapshot_at, account_ext, acct_dir):
 # (`pdf_parsers_daf`) and reconciliation gate.
 
 
-def _parse_daf_statement_pdf_worker(path):
+def _parse_daf_statement_pdf_worker(job):
     """ProcessPoolExecutor target — module-level so it pickles
     cleanly under spawn (macOS); errors return a dict rather than
-    crashing the pool."""
+    crashing the pool. ``job`` is `_job`'s."""
+    path, sha, extract_dir = job
     try:
-        return pdf_parsers_daf.parse_daf_statement_pdf(path)
+        return pdf_readers.parse_daf_statement_pdf(
+            path, sha=sha, cache_dir=extract_dir)
     except Exception as e:
         return {"_error": repr(e), "path": str(path)}
 
 
-def _daf_statement_pdf_candidates(dump_dir):
-    """The DAF statement PDFs across a dump's giving-account dirs
-    (``daf/<account_key>/documents/STATEMENT_*.pdf``), sorted for
-    deterministic INSERT OR REPLACE ordering."""
-    daf_dir = dump_dir / "daf"
-    if not daf_dir.is_dir():
-        return []
-    return sorted(daf_dir.glob("*/documents/STATEMENT_*.pdf"))
-
-
-def _daf_account_for_statement(path):
-    """The giving-account id owning a statement PDF, from the
-    ``account.json`` beside its documents dir; None when absent."""
-    master = _read_json_file(path.parents[1] / "account.json")
-    if not isinstance(master, dict):
-        return None
-    aid = str(master.get("accountNbr") or master.get("accountNumber")
-              or "").strip()
-    return aid or None
-
-
-def _load_daf_historical(conn, dump_dir, coord=None):
+def _load_daf_historical(conn, dump_dir, coord=None, *, extract_dir=None,
+                         parsed_shas=None, failed_shas=None):
     """Parse every DAF statement PDF in this dump and insert the
     period-end pool rows into ``historical_position_snapshots``. The
     reconciliation gate is enforced here: a statement whose pool sum
     doesn't tie out to its own stated ending value is skipped and
-    logged, never imported."""
+    logged, never imported.
+
+    Each statement that parsed is recorded under the generation, whether
+    or not it wrote a row: a re-parse under the same parser reads it the
+    same way, and a statement that fails reconciliation keeps the rows
+    an earlier parse wrote, by design. Its sha256 joins `parsed_shas`
+    when given. A statement whose parse fails keeps its rows too and is
+    recorded with none, so the pass reads it again once its parser
+    moves. With `failed_shas` it joins that set instead, and the caller
+    records it."""
     candidates = _daf_statement_pdf_candidates(dump_dir)
     if not candidates:
         return 0
@@ -1849,47 +644,36 @@ def _load_daf_historical(conn, dump_dir, coord=None):
         sha = coord.sha_for(path)
         parsed = coord.resolve(
             sha, _DAF_STATEMENT_PARSER_VERSION,
-            _parse_daf_statement_pdf_worker, str(path),
+            _parse_daf_statement_pdf_worker, _job(path, sha, extract_dir),
         )
         if "_error" in parsed:
             log.warning("daf historical: parse failed for %s: %s",
                         path.name, parsed["_error"])
+            if failed_shas is None:
+                _record_unread(conn, DAF_GENERATION_SCOPE,
+                               _DAF_STATEMENT_PARSER_VERSION, [sha])
+            else:
+                failed_shas.add(sha)
             continue
+        rows = 0
+        as_of = iso_date_to_epoch(parsed.get("as_of_date"))
+        aid = _daf_account_for_statement(path)
         if not parsed.get("reconciled"):
             log.warning(
                 "daf historical: %s failed reconciliation (%s); skipped",
                 path.name, parsed.get("reconcile_error"))
-            continue
-        as_of = iso_date_to_epoch(parsed.get("as_of_date"))
-        aid = _daf_account_for_statement(path)
-        if as_of is None or not aid:
+        elif as_of is None or not aid:
             log.warning("daf historical: %s missing as-of date or "
                         "account master; skipped", path.name)
-            continue
-        _drop_document_holdings(conn, sha)
-        for pool in parsed.get("pools", []):
-            desc = (pool.get("description") or "").strip()
-            if not desc:
-                continue
-            instrument_key = _crosswalk_description_to_instrument(
-                conn, aid, desc)
-            conn.execute(
-                "INSERT OR REPLACE INTO historical_position_snapshots ("
-                "as_of_date, account_external_id, description, "
-                "instrument_key, quantity, price, market_value, "
-                "percent_of_total, currency, source_sha256, payload"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'USD', ?, ?)",
-                (
-                    as_of, aid, desc, instrument_key,
-                    pool.get("quantity"), pool.get("price"),
-                    pool.get("market_value"),
-                    sha, normalize_payload(pool),
-                ),
-            )
-            inserted += 1
-    if inserted:
-        silver.stamp_generation(conn, DAF_GENERATION_SCOPE,
-                                _DAF_STATEMENT_PARSER_VERSION)
+        else:
+            _drop_document_holdings(conn, sha)
+            rows = _insert_daf_historical_rows(
+                conn, aid, as_of, parsed, sha, ts_from_dir(dump_dir.name))
+            inserted += rows
+        derivations.record_derivation(conn, sha, DAF_GENERATION_SCOPE,
+                                      _DAF_STATEMENT_PARSER_VERSION, rows)
+        if parsed_shas is not None:
+            parsed_shas.add(sha)
     return inserted
 
 
@@ -1902,11 +686,12 @@ def _load_daf_historical(conn, dump_dir, coord=None):
 # archive. Three distinct PDF layouts feed three loader paths into
 # the same `historical_position_snapshots` table — the two below,
 # plus the DAF Giving Account statements (`_load_daf_historical`,
-# beside the other DAF loaders):
+# above):
 #
 #   1. 529 statements — quarterly + year-end PDFs that download.py
 #      scrapes into `<dump>/documents/Statement<MMDDYYYY>.pdf`.
-#      Text-level parsing in `pdf_parsers.py`. Runs once per dump.
+#      Text-level parsing in `pdf_parsers.py`. Runs once per dump,
+#      and again over every loaded dump when its parser changes.
 #
 #   2. Supplied statements — monthly PDFs obtained out-of-band
 #      (the web scraper doesn't surface them; see DESIGN.md §4.5).
@@ -1925,205 +710,78 @@ def _load_daf_historical(conn, dump_dir, coord=None):
 #      flag, no orchestration change.
 #
 # PDF text extraction is CPU-bound, so both paths route their PDFs
-# through the run's shared PdfParseCoordinator (one ProcessPool + a
+# through the run's shared ParsePool (one process pool + a
 # content-addressed parse cache) and insert the resulting rows
-# serially. See the coordinator section below.
+# serially. See the parse cache section below.
 
-def _parse_statement_pdf_worker(path):
+def _parse_statement_pdf_worker(job):
     """ProcessPoolExecutor target: parse one PDF and return its
     parsed dict (or ``{"_error": "<repr>"}`` so the parent can
     log and continue rather than crashing the whole pool).
-    Module-level so it pickles cleanly under spawn (macOS)."""
+    Module-level so it pickles cleanly under spawn (macOS).
+    ``job`` is `_job`'s."""
+    path, sha, extract_dir = job
     try:
-        return pdf_parsers.parse_statement_pdf(path)
+        return pdf_readers.parse_statement_pdf(
+            path, sha=sha, cache_dir=extract_dir)
     except Exception as e:
         return {"_error": repr(e), "path": str(path)}
 
 
 # ------------------------------------------------------------
-# Content-addressed parse cache + shared parse pool
+# The parse cache and the parse pool
 # ------------------------------------------------------------
 #
-# PDF text extraction is the load's dominant cost. Two mechanisms
-# cut it without changing what silver contains:
+# PDF text extraction is the load's dominant cost. The kit's
+# `collectorkit.parsecache` cuts it without changing what silver holds:
+# a ParseCache keyed on (content_sha256, parser_version), whose JSON
+# sidecar replays a parsed dict on every later sighting of the same
+# bytes (within one run, across runs, and across a `--force` rebuild),
+# and one ParsePool per load run that parses every unique miss once
+# across all cores. The sidecar is `<sha>.<version>.json`, so a cache
+# stays warm across a change of the code around it. An error result is
+# never cached.
 #
-#   * A parse cache keyed on (content_sha256, parser_version).
-#     Each unique PDF content is parsed once and its parsed dict
-#     replayed on every later sighting — across dumps within one
-#     `--force` rebuild (in-process) and across separate load runs
-#     (a JSON sidecar), so a nightly reload never re-extracts an
-#     unchanged supplied statement. The cache stores exactly the
-#     parser's output, so a replayed insert is byte-identical to a
-#     fresh parse.
-#
-#   * One ProcessPoolExecutor per load run. Every unique PDF is
-#     submitted once as the dumps are scanned and resolved at each
-#     dump's insertion point, so workers import pdfplumber once and
-#     all cores stay busy — versus a fresh pool per dump (and
-#     single-PDF dumps parsed serially in the parent) before.
+# Beneath it, `collectorkit.extract` caches each document's extracted text
+# and words, keyed on the content hash and the extraction key, in the
+# EXTRACT_CACHE_DIR beside the parse cache (with the default parse cache,
+# that is `extract.default_dir`, where the other loaders keep it). A parser
+# edit moves the parse namespace and re-parses from there. After the load,
+# `main` sweeps the entries of both caches that no namespace or extraction
+# key in use names.
 
-def _default_parse_cache_dir():
-    """Persistent parse-cache location: ``$XDG_CACHE_HOME`` (or
-    ``~/.cache``)``/wealthdb/fidelity-web/parse-cache``. A derived
-    cache — not source data — so it sits outside the bronze tree
-    and outside ``~/.secrets``; content-addressed, so a stale entry
-    is never mistaken for a different PDF."""
-    base = os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")
-    return Path(base) / "wealthdb" / "fidelity-web" / "parse-cache"
+EXTRACT_CACHE_DIR = "extract"
 
 
-class ParseCache:
-    """Maps ``(content_sha256, parser_version)`` to a parsed dict via
-    an in-process map plus an optional JSON sidecar directory
-    (``<dir>/<sha>.<version>.json``).
-
-    ``get`` checks memory then the sidecar; ``put`` writes both.
-    Sidecar I/O failures degrade to memory-only (logged at debug),
-    so a missing or read-only cache directory never fails a load.
-    Bumping a parser's version changes the key, leaving older
-    entries unreachable (harmless — they are simply never read)."""
-
-    def __init__(self, sidecar_dir=None):
-        self._mem = {}
-        self._dir = Path(sidecar_dir) if sidecar_dir is not None else None
-        self._dir_ready = None
-
-    def _sidecar_path(self, sha, version):
-        if self._dir is None:
-            return None
-        return self._dir / f"{sha}.{version}.json"
-
-    def get(self, sha, version):
-        key = (sha, version)
-        cached = self._mem.get(key)
-        if cached is not None:
-            return cached
-        path = self._sidecar_path(sha, version)
-        if path is None or not path.is_file():
-            return None
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as e:
-            log.debug("parse-cache: unreadable %s: %s", path, e)
-            return None
-        self._mem[key] = data
-        return data
-
-    def put(self, sha, version, parsed):
-        self._mem[(sha, version)] = parsed
-        path = self._sidecar_path(sha, version)
-        if path is None or not self._ensure_dir():
-            return
-        tmp = path.with_name(path.name + ".tmp")
-        try:
-            tmp.write_text(json.dumps(parsed, ensure_ascii=False),
-                           encoding="utf-8")
-            tmp.replace(path)
-        except OSError as e:
-            log.debug("parse-cache: could not write %s: %s", path, e)
-            tmp.unlink(missing_ok=True)
-
-    def _ensure_dir(self):
-        if self._dir_ready is None:
-            try:
-                self._dir.mkdir(parents=True, exist_ok=True)
-                self._dir_ready = True
-            except OSError as e:
-                log.debug("parse-cache: disabled (cannot create %s): %s",
-                          self._dir, e)
-                self._dir_ready = False
-        return self._dir_ready
+def _move_nested_extract_cache(nested, beside):
+    """Move an extraction cache found inside the parse cache (`nested`)
+    to its place beside it, so its entries are read rather than
+    extracted again. With a cache already beside it, the nested one is
+    removed: the parse cache's sweep reads no directory."""
+    if not nested.is_dir():
+        return
+    if beside.exists():
+        shutil.rmtree(nested, ignore_errors=True)
+    else:
+        os.replace(nested, beside)
 
 
-class PdfParseCoordinator:
-    """One ProcessPool + one ParseCache shared across a whole load run.
-
-    Lifecycle: ``enqueue`` every PDF as the dumps are scanned, call
-    ``dispatch`` once, then ``resolve`` each PDF at its insertion
-    point. Cache hits are never enqueued; work is deduplicated by
-    (sha, version); with fewer than two misses no pool is created —
-    a tiny corpus or a fully-warm cache parses inline. Used as a
-    context manager so the pool is always shut down.
-
-    Direct callers (unit tests) may skip enqueue/dispatch and call
-    ``resolve`` straight away — it parses inline when a content has
-    neither a cache entry nor a submitted future."""
-
-    def __init__(self, cache, max_workers):
-        self._cache = cache
-        self._max_workers = max(1, max_workers)
-        self._work = {}       # (sha, version) -> (worker, arg)
-        self._futures = {}    # (sha, version) -> Future
-        self._sha_by_path = {}
-        self._pool = None
-
-    def sha_for(self, path):
-        """sha256 of a PDF, memoized by path so the same file is
-        hashed once across enqueue, resolve and the row insert."""
-        key = str(path)
-        sha = self._sha_by_path.get(key)
-        if sha is None:
-            sha = bronze.sha256_file(path)[0]
-            self._sha_by_path[key] = sha
-        return sha
-
-    def enqueue(self, sha, version, worker, arg):
-        if self._cache.get(sha, version) is not None:
-            return
-        self._work.setdefault((sha, version), (worker, arg))
-
-    def dispatch(self):
-        if len(self._work) < 2:
-            return  # serial fallback: resolve() parses inline
-        workers = min(len(self._work), self._max_workers)
-        self._pool = ProcessPoolExecutor(max_workers=workers)
-        for key, (worker, arg) in self._work.items():
-            self._futures[key] = self._pool.submit(worker, arg)
-
-    def resolve(self, sha, version, worker, arg):
-        cached = self._cache.get(sha, version)
-        if cached is not None:
-            return cached
-        future = self._futures.get((sha, version))
-        result = future.result() if future is not None else worker(arg)
-        # Never cache an error dict — a parse failure or signature
-        # mismatch must be re-evaluated on the next run, not pinned.
-        if not (isinstance(result, dict) and "_error" in result):
-            self._cache.put(sha, version, result)
-        return result
-
-    def close(self):
-        if self._pool is not None:
-            self._pool.shutdown()
-            self._pool = None
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.close()
-        return False
+def _job(path, sha, extract_dir):
+    """A worker's argument: the document, its sha256, and the extraction
+    cache directory (None for none). Strings only, so it pickles."""
+    return (str(path), sha, None if extract_dir is None else str(extract_dir))
 
 
 def _transient_coordinator():
-    """A pool-less, sidecar-less coordinator for direct callers of
-    the loader functions (unit tests): ``resolve`` parses inline and
-    nothing persists to disk."""
-    return PdfParseCoordinator(ParseCache(sidecar_dir=None), max_workers=1)
+    """A pool-less, sidecar-less parse pool for direct callers of the
+    loader functions (unit tests): ``resolve`` parses inline and nothing
+    persists to disk."""
+    return ParsePool(ParseCache(), 1)
 
 
-def _statement_pdf_candidates(dump_dir):
-    """The 529 statement PDFs in a dump's ``documents/`` — files
-    matching ``Statement<MMDDYYYY>.pdf`` (the CSV companions carry
-    only cash-flow lines, tax forms use a ``<YYYY>-…`` prefix), in
-    the sorted order the rows are inserted."""
-    docs_dir = dump_dir / "documents"
-    if not docs_dir.is_dir():
-        return []
-    return sorted(docs_dir.glob("Statement*.pdf"))
-
-
-def _load_historical_from_pdfs(conn, dump_dir, coord=None):
+def _load_historical_from_pdfs(conn, dump_dir, coord=None, *,
+                               extract_dir=None, parsed_shas=None,
+                               failed_shas=None):
     """Parse every 529 statement PDF in this dump's ``documents/``
     and insert the holdings rows into ``historical_position_snapshots``
     keyed by ``(as_of_date, account_external_id, description)``.
@@ -2132,7 +790,15 @@ def _load_historical_from_pdfs(conn, dump_dir, coord=None):
     called without one (direct test callers), a transient inline
     coordinator is used. Rows are inserted in the sorted candidate
     order so the ``INSERT OR REPLACE`` keeping the last writer per
-    key is deterministic."""
+    key is deterministic.
+
+    Each statement that parsed is recorded under the generation, whether
+    or not it wrote a row: a statement with no Holdings block reads the
+    same way under the same parser, so a re-derivation would change
+    nothing. Its sha256 joins `parsed_shas` when given. A statement whose
+    parse fails keeps its rows and is recorded with none, so the pass
+    reads it again once its parser moves. With `failed_shas` it joins
+    that set instead, and the caller records it."""
     candidates = _statement_pdf_candidates(dump_dir)
     if not candidates:
         return 0
@@ -2144,134 +810,122 @@ def _load_historical_from_pdfs(conn, dump_dir, coord=None):
         sha = coord.sha_for(path)
         result = coord.resolve(
             sha, _STATEMENT_PARSER_VERSION,
-            _parse_statement_pdf_worker, str(path),
+            _parse_statement_pdf_worker, _job(path, sha, extract_dir),
         )
         if "_error" in result:
             log.warning(
                 "historical: PDF parse failed for %s: %s",
                 path.name, result["_error"],
             )
+            if failed_shas is None:
+                _record_unread(conn, STATEMENT_GENERATION_SCOPE,
+                               _STATEMENT_PARSER_VERSION, [sha])
+            else:
+                failed_shas.add(sha)
             continue
         _drop_document_holdings(conn, sha)
-        inserted += _insert_historical_rows(conn, path, result, sha)
-    if inserted:
-        silver.stamp_generation(conn, STATEMENT_GENERATION_SCOPE,
-                                _STATEMENT_PARSER_VERSION)
+        rows = _insert_historical_rows(
+            conn, path, result, sha, ts_from_dir(dump_dir.name))
+        inserted += rows
+        derivations.record_derivation(conn, sha, STATEMENT_GENERATION_SCOPE,
+                                      _STATEMENT_PARSER_VERSION, rows)
+        if parsed_shas is not None:
+            parsed_shas.add(sha)
     return inserted
 
 
-def _insert_historical_rows(conn, pdf_path, parsed, sha):
-    """Insert one ``historical_position_snapshots`` row per
-    holding in the parsed statement. Cross-walks the human-
-    readable fund description to an `instrument_key` when a
-    matching `positions.description` exists in silver; leaves
-    `instrument_key` NULL otherwise (gold can resolve)."""
-    period_end = parsed.get("period_end")
-    if not period_end:
-        log.debug(
-            "historical: no period in %s; skipping", pdf_path.name,
-        )
-        return 0
-    as_of = iso_date_to_epoch(period_end)
-    if as_of is None:
-        return 0
-    inserted = 0
-    for account in parsed.get("accounts", []):
-        aid = account.get("account_external_id")
-        if not aid:
-            continue
-        for holding in account.get("holdings", []):
-            desc = (holding.get("description") or "").strip()
-            if not desc:
-                continue
-            instrument_key = _crosswalk_description_to_instrument(
-                conn, aid, desc,
-            )
-            try:
-                conn.execute(
-                    "INSERT OR REPLACE INTO historical_position_snapshots ("
-                    "as_of_date, account_external_id, description, "
-                    "instrument_key, quantity, price, market_value, "
-                    "percent_of_total, currency, source_sha256, payload"
-                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        as_of, aid, desc, instrument_key,
-                        holding.get("quantity"),
-                        holding.get("price"),
-                        holding.get("market_value"),
-                        holding.get("percent_of_total"),
-                        "USD", sha,
-                        normalize_payload(holding),
-                    ),
-                )
-                inserted += 1
-            except sqlite3.IntegrityError as e:
-                log.debug(
-                    "historical: insert skipped for %s @ %s: %s",
-                    aid, period_end, e,
-                )
-    return inserted
+def _rederive_statements(conn, statement_dumps, daf_dumps, coord=None, *,
+                         extract_dir=None):
+    """Re-derive the 529 statements of ``statement_dumps`` and the DAF
+    statements of ``daf_dumps``: dumps loaded before, whose rows the
+    parser now in use did not write. ``None`` for a scope that does not
+    re-derive. Each document's rows are replaced by the passes
+    `load_dump` runs (`_load_historical_from_pdfs`,
+    `_load_daf_historical`), dump by dump in the order given, so the
+    last writer of a row is the one a `load --force` has, and each pass
+    records the statements it parsed.
 
-
-def _crosswalk_description_to_instrument(conn, account_external_id,
-                                          description):
-    """Look the description up against any live ``positions.description``
-    for the same account; return the matching ``instrument_key``
-    when there's exactly one. NULL when the description never
-    appears (e.g. fund was sold before any live snapshot ran) or
-    when it's ambiguous."""
-    cur = conn.execute(
-        "SELECT DISTINCT instrument_key FROM positions "
-        " WHERE account_external_id = ? AND description = ? "
-        "   AND instrument_key IS NOT NULL "
-        " LIMIT 2",
-        (account_external_id, description),
-    )
-    hits = [r[0] for r in cur.fetchall()]
-    if len(hits) == 1:
-        return hits[0]
-    return None
-
-
-# ------------------------------------------------------------
-# Supplied statements (legacy monthly statements)
-# ------------------------------------------------------------
-
-# Monthly supplied statements follow Fidelity's legacy naming
-# convention: ``<Registration> <M>.<YY> Statement.PDF`` (e.g.
-# ``Example 1.24 Statement.PDF`` for January 2024). Year-end
-# statements in the same directory carry ``Year End`` between the
-# registration and ``Statement.PDF`` (e.g. ``Example 2024 Year End
-# Statement.PDF``) — those use a different per-asset-class layout
-# the parser doesn't handle yet and are excluded here (the
-# December monthly statement covers the same period end).
-_SUPPLIED_STATEMENT_FILENAME_RE = re.compile(
-    r"^[A-Za-z][A-Za-z\s]*?\s+\d{1,2}\.\d{2}\s+Statement\.pdf$",
-    re.IGNORECASE,
-)
-
-
-_SIGNATURE_SIDECAR = "signature.txt"
-
-
-def _read_signature_sidecar(supplied_dir):
-    """Resolve the supplied-statement signature from
-    ``<supplied_dir>/signature.txt`` (first non-empty, non-``#``-comment
-    line). This keeps the account registration — which is PII — in the
-    local data directory next to the PDFs, rather than in argv / shell
-    history or a committed orchestration script. Returns None when
-    the file is absent or carries no usable line."""
-    sidecar = supplied_dir / _SIGNATURE_SIDECAR
-    if not sidecar.is_file():
-        return None
+    Only dumps that hold such a statement are read, so a silver with
+    none re-derives nothing. A scope that parsed at least one statement
+    then records the statements whose parse failed, with no rows, and
+    drops its records under other generations (`_drop_older_records`).
+    A scope in which nothing parsed does neither: its older records
+    stay, so the next load tries again. A scope that re-derives and
+    finds no statement in its dumps drops its older records: nothing is
+    left to re-derive. In its own transaction: a failure rolls back and
+    leaves the rows and the records in place, so the next load tries
+    again."""
+    nothing_left = []
+    if statement_dumps is not None:
+        statement_dumps = [d for d in statement_dumps
+                           if _statement_pdf_candidates(d)]
+        if not statement_dumps:
+            nothing_left.append((STATEMENT_GENERATION_SCOPE,
+                                 _STATEMENT_PARSER_VERSION))
+    if daf_dumps is not None:
+        daf_dumps = [d for d in daf_dumps if _daf_statement_pdf_candidates(d)]
+        if not daf_dumps:
+            nothing_left.append((DAF_GENERATION_SCOPE,
+                                 _DAF_STATEMENT_PARSER_VERSION))
+    if not statement_dumps and not daf_dumps and not nothing_left:
+        return
+    coord = coord or _transient_coordinator()
     try:
-        for line in sidecar.read_text(encoding="utf-8").splitlines():
-            s = line.strip()
-            if s and not s.startswith("#"):
-                return s
-    except OSError as e:
-        log.warning("supplied-statements: could not read %s: %s", sidecar, e)
-    return None
+        conn.execute("BEGIN")
+        for scope, generation in nothing_left:
+            _drop_older_records(conn, scope, generation)
+        parsed_529, parsed_daf = set(), set()
+        failed_529, failed_daf = set(), set()
+        if statement_dumps:
+            log.info("historical: re-deriving the statements of %d dump(s) "
+                     "for this parser generation", len(statement_dumps))
+        for dump in statement_dumps or ():
+            _load_historical_from_pdfs(conn, dump, coord,
+                                       extract_dir=extract_dir,
+                                       parsed_shas=parsed_529,
+                                       failed_shas=failed_529)
+        if daf_dumps:
+            log.info("daf historical: re-deriving the statements of %d "
+                     "dump(s) for this parser generation", len(daf_dumps))
+        for dump in daf_dumps or ():
+            _load_daf_historical(conn, dump, coord, extract_dir=extract_dir,
+                                 parsed_shas=parsed_daf,
+                                 failed_shas=failed_daf)
+        for scope, generation, parsed, failed in (
+                (STATEMENT_GENERATION_SCOPE, _STATEMENT_PARSER_VERSION,
+                 parsed_529, failed_529),
+                (DAF_GENERATION_SCOPE, _DAF_STATEMENT_PARSER_VERSION,
+                 parsed_daf, failed_daf)):
+            if parsed:
+                _record_unread(conn, scope, generation, failed)
+                _drop_older_records(conn, scope, generation)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        log.exception("statement re-derivation failed; rolled back")
+
+
+def _record_unread(conn, scope, generation, shas):
+    """Record each document of ``shas`` with no rows under
+    ``generation``: its pass read it and could not use it, so only a
+    moved parser reads it again. Its rows stay as they are."""
+    for sha in shas:
+        derivations.record_derivation(conn, sha, scope, generation, 0)
+
+
+def _drop_older_records(conn, scope, generation):
+    """Drop the records ``scope`` holds under a generation other than
+    ``generation``, once its pass has re-derived every document it could
+    read. What is left are the documents it did not read again, such as
+    those gone from bronze, and the supplied statements whose parse
+    failed. Their rows stay. Without this the scope would read as moved
+    at every load."""
+    dropped = conn.execute(
+        "DELETE FROM document_derivations WHERE scope = ? "
+        "AND generation != ?", (scope, generation)).rowcount
+    if dropped:
+        log.info("%s: %d document(s) not read again under this parser "
+                 "generation keep their rows", scope, dropped)
 
 
 def _parse_supplied_statement_pdf_worker(args):
@@ -2279,12 +933,13 @@ def _parse_supplied_statement_pdf_worker(args):
     its parsed dict, or ``{"_error": "<repr>"}`` so the parent can
     log and continue. Module-level so it pickles under spawn.
 
-    ``args`` is a ``(path, expected_signature)`` tuple — the pool
+    ``args`` is `_job`'s tuple plus the expected signature — the pool
     only takes a single argument per call."""
-    path, expected_signature = args
+    path, sha, extract_dir, expected_signature = args
     try:
-        return pdf_parsers_supplied.parse_supplied_statement_pdf(
+        return pdf_readers.parse_supplied_statement_pdf(
             path, expected_signature=expected_signature,
+            sha=sha, cache_dir=extract_dir,
         )
     except Exception as e:
         return {"_error": repr(e), "path": str(path)}
@@ -2301,20 +956,9 @@ def _supplied_parser_version(signature):
     return f"{_SUPPLIED_PARSER_FINGERPRINT}.{sig}"
 
 
-def _supplied_pdf_candidates(supplied_dir):
-    """Monthly supplied statement PDFs in ``supplied_dir`` (matching the
-    ``<name> <M>.<YY> Statement.pdf`` convention), in the sorted
-    order the rows are inserted. Empty when the dir is None/absent."""
-    if supplied_dir is None or not supplied_dir.is_dir():
-        return []
-    return [
-        p for p in sorted(supplied_dir.iterdir())
-        if p.is_file() and _SUPPLIED_STATEMENT_FILENAME_RE.match(p.name)
-    ]
-
-
 def _load_supplied_statements_oneshot(conn, supplied_dir, *,
-                                      signature=None, coord=None):
+                                      signature=None, coord=None,
+                                      extract_dir=None):
     """Load every monthly supplied statement from ``supplied_dir``:
     its holdings into ``historical_position_snapshots`` and its
     account-level activity into ``transactions``. No-op when
@@ -2369,19 +1013,22 @@ def _load_supplied_statements_oneshot(conn, supplied_dir, *,
         # Held until the FIRST statement parses, never spent before: a purge
         # ahead of the walk would delete the whole statement-derived ledger
         # on the run where poppler broke or the PDFs became unreadable, and
-        # then re-derive nothing. Unspent, it also leaves the generation
-        # unstamped, so the next load tries the whole thing again.
-        owed_a_purge = silver.stale_generation(
+        # then re-derive nothing. Unspent, it also leaves the older records
+        # in place, so the next load tries the whole thing again.
+        owed_a_purge = derivations.generation_moved(
             conn, SUPPLIED_GENERATION_SCOPE, version)
         inserted = skipped = activity = activity_dup = sales = 0
         # One ledger for the whole walk: a feed row absorbed by one
-        # statement must not be absorbed again by the next.
-        claims = _FeedClaims()
+        # statement must not be absorbed again by the next. The walk
+        # writes only statement rows, which the feed leaves out, so the
+        # feed is read once.
+        claims = {}
+        feed = _feed_legs(conn)
         for path in candidates:
             sha = coord.sha_for(path)
             result = coord.resolve(
                 sha, version, _parse_supplied_statement_pdf_worker,
-                (str(path), signature),
+                (*_job(path, sha, extract_dir), signature),
             )
             err = result.get("_error")
             if err == "signature-mismatch":
@@ -2391,6 +1038,8 @@ def _load_supplied_statements_oneshot(conn, supplied_dir, *,
                     result.get("expected_signature"), path.name,
                 )
                 skipped += 1
+                derivations.record_derivation(
+                    conn, sha, SUPPLIED_GENERATION_SCOPE, version, 0)
                 continue
             if err:
                 log.warning(
@@ -2409,19 +1058,24 @@ def _load_supplied_statements_oneshot(conn, supplied_dir, *,
                 )
                 owed_a_purge = False
             _drop_document_holdings(conn, sha)
-            inserted += _insert_supplied_historical_rows(conn, path, result, sha)
+            held = _insert_supplied_historical_rows(conn, path, result, sha)
             act_in, act_dup = _insert_supplied_activity_rows(
-                conn, path, result, sha, claims=claims)
+                conn, path, result, sha, claims=claims, feed=feed)
+            sold = _insert_supplied_closed_lots(conn, path, result, sha)
+            derivations.record_derivation(
+                conn, sha, SUPPLIED_GENERATION_SCOPE, version,
+                held + act_in + sold)
+            inserted += held
             activity += act_in
             activity_dup += act_dup
-            sales += _insert_supplied_closed_lots(conn, path, result, sha)
+            sales += sold
         synth = _synthesize_missing_account_masters(conn)
         if not owed_a_purge:
             # Either the generation had not moved, or it had and the
             # re-derivation ran. A purge still owed means nothing parsed, so
             # the rows in hand are the older parser's and still the best
             # record there is.
-            silver.stamp_generation(conn, SUPPLIED_GENERATION_SCOPE, version)
+            _drop_older_records(conn, SUPPLIED_GENERATION_SCOPE, version)
         conn.commit()
         log.info(
             "supplied-statements: %d holdings rows inserted, %d activity "
@@ -2435,435 +1089,24 @@ def _load_supplied_statements_oneshot(conn, supplied_dir, *,
         log.exception("supplied-statements load failed; rolled back")
 
 
-# How far a statement row's date may sit from a scraped row's and
-# still be the same event. The two describe one payment from either
-# side of the settlement, so a day or two of drift is ordinary; three
-# is generous without being loose enough for two genuinely different
-# payments of the same amount on one account to collide.
-_ACTIVITY_MATCH_WINDOW = 3 * 86400
-
-# A fee is the exception. The statement dates it when it is assessed and the
-# feed when the cash is debited, so the two can sit further apart than other
-# payments, and the window is wider for that reason. Two different fees of one
-# signed amount, to the cent, on one account inside the window are left to the
-# one-to-one claim to settle.
-_FEE_MATCH_WINDOW = 14 * 86400
-
-
-class _FeedClaims:
-    """One-to-one bookkeeping for the statement-to-feed match, held for
-    the whole supplied pass.
-
-    Without it the match is many-to-one: two statement rows sharing an
-    account, an amount and the window both resolve to the single feed
-    row that carries one of them, and the other payment is dropped with
-    nothing in the log to say so. Two payments can share an account, a
-    day and an amount and still be different payments, telling apart
-    only by a reference and a payee the scraped feed does not carry.
-
-    Only rows the feed ABSORBED are recorded. A row that found no feed
-    match is simply inserted, and its id converges on a re-sighting
-    through INSERT OR REPLACE, so the ledger can never
-    suppress an insert.
-    """
-
-    def __init__(self):
-        self._by_statement = {}   # statement activity_id -> feed activity_id
-        self._taken = set()       # feed activity_ids already absorbed
-
-    def claimed_for(self, statement_id):
-        return self._by_statement.get(statement_id)
-
-    def claim(self, statement_id, feed_id):
-        self._by_statement[statement_id] = feed_id
-        self._taken.add(feed_id)
-
-    def is_taken(self, feed_id):
-        return feed_id in self._taken
-
-
-def _unclaimed_feed_match(conn, account_external_id, amount, ts, claims,
-                          window=_ACTIVITY_MATCH_WINDOW):
-    """The SCRAPED feed row that already carries this payment, or None.
-
-    The statement and the feed number their rows differently and
-    cannot be joined on an id, so the match is the only thing both
-    agree on: one account, the same signed amount to the cent, within
-    `window` (`_ACTIVITY_MATCH_WINDOW`, or `_FEE_MATCH_WINDOW` for a fee). Signed, not absolute — a core
-    redemption of +450.00 raises the cash that the -450.00 fee then
-    spends, and those two must not cancel each other out.
-
-    Statement-derived rows are excluded from the comparison. They
-    converge on their own content-derived id instead, which is what
-    lets the monthly and year-end statements both carry a row (the
-    year-end repeats the whole year) without inserting it twice.
-
-    Only a feed row nothing has claimed yet counts. The match is a
-    resemblance rather than an identity, so unclaimed, the one feed row
-    carrying one of a same-day same-amount pair would absorb both and
-    the payment the feed never carried would vanish.
-
-    Candidates come back closest-in-time first, then by id, because
-    with claiming the pick is not arbitrary: which row is taken
-    decides what the next statement row can still find.
-    """
-    for (feed_id,) in conn.execute(
-        "SELECT activity_id FROM transactions "
-        "WHERE account_external_id = ? "
-        "  AND activity_id NOT LIKE 'stmt\\_%' ESCAPE '\\' "
-        "  AND ABS(amount - ?) < 0.005 "
-        "  AND ABS(timestamp - ?) <= ? "
-        "ORDER BY ABS(timestamp - ?), activity_id",
-        (account_external_id, amount, ts, window, ts),
-    ):
-        if claims.is_taken(feed_id):
-            log.info(
-                "supplied-statements: feed row %s already absorbed another "
-                "statement row; %s %+.2f keeps looking",
-                feed_id, bronze.log_id(account_external_id), amount,
-            )
-            continue
-        return feed_id
-    return None
-
-
-def _occurrence_id(prefix, identity, occurrence):
-    """A row id derived from the row's own content, ``identity``, plus
-    its occurrence index among the rows of one document that share it,
-    counted in ``occurrence``. The same row read again converges on its
-    id, while two identical rows in one document keep two."""
-    occ = occurrence.get(identity, 0)
-    occurrence[identity] = occ + 1
-    return prefix + hashlib.sha256(
-        f"{identity}|#{occ}".encode()).hexdigest()[:28]
-
-
-def _insert_supplied_activity_rows(conn, pdf_path, parsed, sha, *, claims=None):
-    """Insert the statement's ACCOUNT-LEVEL activity into
-    ``transactions`` — the money in and out, and the account fees.
-
-    Returns ``(inserted, skipped)``. Skipped rows are the ones the
-    scraped feed already carries; see `_unclaimed_feed_match`. `claims`
-    is the pass-wide one-to-one ledger; a caller that omits it gets a
-    private one, which is right for a single statement read in
-    isolation and wrong for a walk (the walk threads its own).
-
-    The id is derived from the row's own content plus an occurrence
-    index within the PDF, on the same reasoning as
-    `_synthesise_activity_id`: one real payment printed on both the
-    monthly and the year-end statement hashes the same and converges,
-    while two genuinely distinct payments that share a day and an
-    amount differ in their reference and payee, and so keep separate
-    rows.
-    """
-    inserted = skipped = 0
-    claims = _FeedClaims() if claims is None else claims
-    occurrence: dict[str, int] = {}
-    for account in parsed.get("accounts", []):
-        aid = account.get("account_external_id")
-        if not aid:
-            continue
-        for row in account.get("activity", []):
-            ts = iso_date_to_epoch(row.get("date"))
-            amount = row.get("amount")
-            if ts is None or amount is None:
-                continue
-            amount = float(amount)
-            desc = (row.get("description") or "").strip()
-            identity = "|".join(
-                (aid, row["date"], row.get("section") or "", f"{amount:.2f}", desc))
-            activity_id = _occurrence_id("stmt_", identity, occurrence)
-            # Keyed on the STATEMENT row's own id, not the feed row's:
-            # the year-end statement repeats the whole year, so this
-            # payment may be offered again later in the pass and hashes
-            # the same both times. The second sighting re-uses the claim
-            # the first made rather than reaching for a second feed row.
-            absorbed_by = claims.claimed_for(activity_id)
-            if absorbed_by is None:
-                window = (_FEE_MATCH_WINDOW if row.get("section") == "FEE"
-                          else _ACTIVITY_MATCH_WINDOW)
-                absorbed_by = _unclaimed_feed_match(
-                    conn, aid, amount, ts, claims, window)
-                if absorbed_by is not None:
-                    claims.claim(activity_id, absorbed_by)
-                    # The description stays out of the line: on a wire it
-                    # names the beneficiary. The account, date, section,
-                    # signed amount and feed id locate the row.
-                    log.info(
-                        "supplied-statements: %s %s %s %+.2f is already in "
-                        "the scraped feed as %s; not deriving it from %s",
-                        aid, row["date"], row.get("section") or "other",
-                        amount, absorbed_by, pdf_path.name,
-                    )
-            if absorbed_by is not None:
-                # A run before the feed reached this date derived the row;
-                # the feed carries it now, so that derivation goes.
-                conn.execute("DELETE FROM transactions WHERE activity_id = ?",
-                             (activity_id,))
-                skipped += 1
-                continue
-            conn.execute(
-                "INSERT OR REPLACE INTO transactions ("
-                "activity_id, timestamp, account_external_id, kind, "
-                "instrument_key, amount, currency, source_sha256, payload"
-                ") VALUES (?, ?, ?, ?, NULL, ?, 'USD', ?, ?)",
-                (
-                    activity_id, ts, aid, row.get("section") or "other",
-                    amount, sha,
-                    # `Action` is the key gold's payloadNarrative
-                    # reads, and the statement's own words are the
-                    # action: "Wire Tfr To Bank <ref> <beneficiary>".
-                    normalize_payload({
-                        "Action": desc,
-                        "section": row.get("section"),
-                        "basis": "supplied_statement",
-                        "statement": pdf_path.name,
-                    }),
-                ),
-            )
-            inserted += 1
-    return inserted, skipped
-
-
-def _insert_supplied_historical_rows(conn, pdf_path, parsed, sha):
-    """Insert one ``historical_position_snapshots`` row per holding
-    in the parsed supplied statement. That parser surfaces the
-    ticker (or CUSIP) directly as ``instrument_key`` so no
-    cross-walk against live ``positions`` is needed. ``sha`` is the
-    source PDF's content hash, stored in ``source_sha256``."""
-    period_end = parsed.get("period_end")
-    if not period_end:
-        log.debug(
-            "supplied-statements: no period in %s; skipping", pdf_path.name,
-        )
-        return 0
-    as_of = iso_date_to_epoch(period_end)
-    if as_of is None:
-        return 0
-    inserted = 0
-    for account in parsed.get("accounts", []):
-        aid = account.get("account_external_id")
-        if not aid:
-            continue
-        for holding in account.get("holdings", []):
-            desc = (holding.get("description") or "").strip()
-            if not desc:
-                continue
-            mv = holding.get("market_value")
-            # The supplied statements print no portfolio total, so the
-            # holding's share of it stays NULL.
-            try:
-                conn.execute(
-                    "INSERT OR REPLACE INTO historical_position_snapshots ("
-                    "as_of_date, account_external_id, description, "
-                    "instrument_key, quantity, price, market_value, "
-                    "percent_of_total, cost_basis, unrealized_gain_loss, "
-                    "currency, source_sha256, payload"
-                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        as_of, aid, desc,
-                        holding.get("instrument_key"),
-                        holding.get("quantity"),
-                        holding.get("price"),
-                        mv, None,
-                        holding.get("cost_basis"),
-                        holding.get("unrealized_gain"),
-                        "USD", sha,
-                        normalize_payload(holding),
-                    ),
-                )
-                inserted += 1
-            except sqlite3.IntegrityError as e:
-                log.debug(
-                    "supplied-statements: insert skipped for %s @ %s: %s",
-                    aid, period_end, e,
-                )
-    return inserted
-
-
-# ============================================================
-# Closed lots (migrations 0010, 0012)
-# ============================================================
-#
-# Three sources state realized lots: the Form 1099-B pages of a
-# Consolidated 1099 (`document_kind = 'form_1099b'`), the sales in a
-# supplied statement's Securities Bought & Sold section
-# (`document_kind = 'statement'`), and the positions page's closed lots
-# (`document_kind = 'closed_positions'`). All land in `closed_lots` as
-# printed; the same sale in two of them stays twice, for gold to
-# reconcile.
-
-_CLOSED_LOT_COLUMNS = (
-    "lot_id", "document_kind", "account_external_id", "tax_year",
-    "form_prepared", "security_name", "instrument_key", "cusip", "action",
-    "quantity", "acquired_date", "disposed_date", "settlement_date", "proceeds",
-    "cost_basis", "accrued_market_discount",
-    "wash_sale_disallowed", "realized_gain_loss", "fees", "federal_tax_withheld",
-    "term", "covered", "form_8949_box", "specific_share_id", "corrected",
-    "source_sha256", "payload",
-)
-_INSERT_CLOSED_LOT = (
-    f"INSERT OR REPLACE INTO closed_lots ({', '.join(_CLOSED_LOT_COLUMNS)}) "
-    f"VALUES ({', '.join('?' * len(_CLOSED_LOT_COLUMNS))})")
-
-
-def _insert_closed_lot(conn, prefix, identity, occurrence, row):
-    """Insert one `closed_lots` row under the id `_occurrence_id` derives
-    from the lot's own content. ``row`` maps column names to values; the
-    rest default to NULL."""
-    row = dict(row, lot_id=_occurrence_id(prefix, identity, occurrence))
-    conn.execute(_INSERT_CLOSED_LOT,
-                 tuple(row.get(c) for c in _CLOSED_LOT_COLUMNS))
-
-
-def _closed_lot_term(term):
-    """A parser's 'short' / 'long' as the column's 'SHORT' / 'LONG'."""
-    return term.upper() if term else None
-
-
-def _bool_column(value):
-    return None if value is None else int(bool(value))
-
-
-def _insert_supplied_closed_lots(conn, pdf_path, parsed, sha):
-    """Insert one `closed_lots` row per sale the parsed supplied statement
-    lists under Securities Bought & Sold. Returns the count.
-
-    The statement prints a sale, not its lots: one row carries the sale's
-    basis, its realized gain and, when every lot shares one, its term. It
-    prints the settlement date only, so `settlement_date` is set and the
-    acquired and sold dates stay NULL."""
-    inserted = 0
-    occurrence: dict[str, int] = {}
-    for account in parsed.get("accounts", []):
-        aid = account.get("account_external_id")
-        if not aid:
-            continue
-        for sale in account.get("sales", []):
-            identity = "|".join(str(sale.get(k)) for k in (
-                "settlement_date", "symbol", "action", "quantity", "amount",
-                "cost_basis"))
-            _insert_closed_lot(conn, "stmt_", f"{aid}|{identity}", occurrence, {
-                "document_kind": "statement",
-                "account_external_id": aid,
-                "security_name": sale.get("description"),
-                "instrument_key": sale.get("symbol"),
-                "action": sale.get("action"),
-                "quantity": sale.get("quantity"),
-                "settlement_date": sale.get("settlement_date"),
-                "proceeds": sale.get("amount"),
-                "cost_basis": sale.get("cost_basis"),
-                "realized_gain_loss": sale.get("gain_loss"),
-                "fees": sale.get("transaction_cost"),
-                "term": _closed_lot_term(sale.get("term")),
-                "specific_share_id": _bool_column(sale.get("specific_share_id")),
-                "source_sha256": sha,
-                "payload": normalize_payload(
-                    {**sale, "statement": pdf_path.name}),
-            })
-            inserted += 1
-    return inserted
-
-
-def _drop_supplied_closed_lots(conn):
-    """Drop every statement-derived closed lot, for a re-derivation of all
-    of them — the closed-lot counterpart of `_drop_supplied_activity`, and
-    spent at the same moment. `document_kind` names exactly the rows the
-    supplied pass writes."""
-    return conn.execute(
-        "DELETE FROM closed_lots WHERE document_kind = 'statement'").rowcount
-
-
-def _load_closed_positions(conn, dump_name, lot_step):
-    """Load the closed-position lots this dump fetched into
-    `closed_lots` as 'closed_positions'.
-
-    Each fetch is the page's whole lot list for one closed position in
-    one tax year, so it replaces the rows an earlier fetch wrote for
-    that position and year. A closed position whose lots do not sum to
-    the proceeds or cost basis the page stated for it loads as
-    printed, and the load warns."""
-    index, records, hash_to_id = lot_step
-    inserted = 0
-    for item in index.get("closed") or []:
-        if item.get("fetched_in") != dump_name:
-            continue
-        aid = hash_to_id.get(item.get("account"))
-        instr = item.get("symbol") or item.get("position")
-        year = item.get("tax_year")
-        try:
-            [body] = _lot_bodies(records, item)
-            lots = json.loads(body)
-        except ValueError:
-            lots = None
-        if not aid or not instr or not isinstance(lots, list):
-            log.warning("%s: closed lots of a position in account %s not "
-                        "loaded", dump_name, item.get("account"))
-            continue
-        sha = hashlib.sha256(body.encode("utf-8")).hexdigest()
-        conn.execute(
-            "DELETE FROM closed_lots WHERE document_kind = 'closed_positions' "
-            "AND account_external_id = ? AND tax_year = ? "
-            "AND instrument_key = ?", (aid, year, instr))
-        occurrence: dict[str, int] = {}
-        rows = [lot_parsers.closed_lot_row(lot) for lot in lots]
-        for lot, row in zip(lots, rows, strict=True):
-            identity = "|".join(str(row.get(k)) for k in (
-                "acquired_date", "disposed_date", "quantity", "proceeds",
-                "cost_basis"))
-            _insert_closed_lot(
-                conn, "web_", f"{aid}|{year}|{instr}|{identity}", occurrence,
-                dict(row, document_kind="closed_positions",
-                     account_external_id=aid, tax_year=year,
-                     instrument_key=instr, cusip=item.get("cusip"),
-                     source_sha256=sha, payload=normalize_payload(lot)))
-        inserted += len(rows)
-        _check_lot_sums(dump_name, "closed", instr, item, rows,
-                        _CLOSED_LOT_SUMS)
-    return inserted
-
-
-# A Consolidated 1099 under either naming Fidelity uses:
-# `<YYYY>-<nickname>-<NNNN>-Consolidated-Form-1099.pdf` and
-# `[CORRECTED_]Consolidated_Form_1099[__<n>].pdf`.
-_CONSOLIDATED_1099_RE = re.compile(r"Consolidated[-_]Form[-_]1099",
-                                   re.IGNORECASE)
-
-
-def _consolidated_1099_candidates(dump_dir):
-    """The Consolidated Form 1099 PDFs in a dump's ``documents/``,
-    corrected forms included, in sorted order."""
-    docs_dir = dump_dir / "documents"
-    if not docs_dir.is_dir():
-        return []
-    return [p for p in sorted(docs_dir.glob("*.pdf"))
-            if _CONSOLIDATED_1099_RE.search(p.name)]
-
-
 def _read_1099_identity_worker(path):
     """ProcessPoolExecutor target: which form one Consolidated 1099 is,
     or ``{"_error": "<repr>"}``."""
     try:
-        return pdf_parsers_1099.read_consolidated_1099_identity(path)
+        return pdf_readers.read_consolidated_1099_identity(path)
     except Exception as e:
         return {"_error": repr(e), "path": str(path)}
 
 
-def _parse_1099_worker(path):
-    """Parse one Consolidated 1099 in full, or ``{"_error": "<repr>"}``."""
+def _parse_1099_worker(job):
+    """Parse one Consolidated 1099 in full, or ``{"_error": "<repr>"}``.
+    ``job`` is `_job`'s."""
+    path, sha, extract_dir = job
     try:
-        return pdf_parsers_1099.parse_consolidated_1099_pdf(path)
+        return pdf_readers.parse_consolidated_1099_pdf(
+            path, sha=sha, cache_dir=extract_dir)
     except Exception as e:
         return {"_error": repr(e), "path": str(path)}
-
-
-def _held_1099_forms(conn):
-    """``(account, tax_year) -> form_prepared`` of the 1099-B lots silver
-    holds."""
-    return {(aid, year): prepared for aid, year, prepared in conn.execute(
-        "SELECT account_external_id, tax_year, MAX(form_prepared) "
-        "FROM closed_lots WHERE document_kind = 'form_1099b' "
-        "GROUP BY account_external_id, tax_year")}
 
 
 def _1099_copies(dumps, coord):
@@ -2879,111 +1122,19 @@ def _1099_copies(dumps, coord):
     return copies
 
 
-def _latest_1099_copies(copies):
-    """The copy to keep of each form among ``copies``:
-    ``(account, tax_year) -> (prepared, path, sha)``.
-
-    Fidelity re-renders a Consolidated 1099 on every download, so one
-    form arrives in every dump with new bytes. A form is its account and
-    tax year; the copy prepared latest wins, which puts a corrected form
-    over the original, and between copies of one form the later dump's.
-    Only the identities are read by then; the lots are parsed for the
-    copies kept."""
-    chosen = {}
-    for dump, path, sha, ident in copies:
-        key = (ident.get("account_external_id"), ident.get("tax_year"))
-        if "_error" in ident or None in key or not ident.get("prepared"):
-            log.warning(
-                "1099: %s/%s states no account, tax year or prepared "
-                "date; skipping (%s)", dump.name, path.name,
-                ident.get("_error", "unrecognised layout"))
-            continue
-        best = chosen.get(key)
-        if best is None or ident["prepared"] >= best[0]:
-            chosen[key] = (ident["prepared"], path, sha)
-    return chosen
-
-
-def _file_1099_documents(conn, copies):
-    """Give each copy's `documents` row the account and tax year its form
-    states. Returns the number of rows changed.
-
-    The newer file name, ``Consolidated_Form_1099.pdf``, states neither,
-    and the ``<YYYY>-…`` one states only the year, so the classifier
-    leaves the rest NULL. Only a NULL column is filled: a column the
-    form does not state stays NULL, and a year the name stated stays."""
-    changed = 0
-    for _, _, sha, ident in copies:
-        if "_error" in ident:
-            continue
-        aid, year = ident.get("account_external_id"), ident.get("tax_year")
-        changed += conn.execute(
-            "UPDATE documents"
-            "   SET account_external_id = COALESCE(account_external_id, ?),"
-            "       tax_year = COALESCE(tax_year, ?)"
-            " WHERE content_sha256 = ?"
-            "   AND ((account_external_id IS NULL AND ? IS NOT NULL)"
-            "     OR (tax_year IS NULL AND ? IS NOT NULL))",
-            (aid, year, sha, aid, year)).rowcount
-    return changed
-
-
-def _replace_1099_lots(conn, parsed, sha):
-    """Replace the 1099-B lots of the form ``parsed`` is a copy of with
-    its own. Returns the number of lots written."""
-    aid = parsed["account_external_id"]
-    year = parsed["tax_year"]
-    conn.execute(
-        "DELETE FROM closed_lots WHERE document_kind = 'form_1099b' "
-        "AND account_external_id = ? AND tax_year = ?", (aid, year))
-    occurrence: dict[str, int] = {}
-    for lot in parsed.get("lots", []):
-        identity = "|".join(str(lot.get(k)) for k in (
-            "form_8949_box", "term", "covered", "cusip", "description",
-            "action", "quantity", "acquired_date", "date_sold", "proceeds",
-            "cost_basis"))
-        _insert_closed_lot(conn, "1099b_", f"{aid}|{year}|{identity}",
-                           occurrence, {
-            "document_kind": "form_1099b",
-            "account_external_id": aid,
-            "tax_year": year,
-            "form_prepared": parsed.get("prepared"),
-            "security_name": lot.get("description"),
-            "instrument_key": lot.get("symbol") or lot.get("cusip"),
-            "cusip": lot.get("cusip"),
-            "action": lot.get("action"),
-            "quantity": lot.get("quantity"),
-            "acquired_date": lot.get("acquired_date"),
-            "disposed_date": lot.get("date_sold"),
-            "proceeds": lot.get("proceeds"),
-            "cost_basis": lot.get("cost_basis"),
-            "accrued_market_discount": lot.get("accrued_market_discount"),
-            "wash_sale_disallowed": lot.get("wash_sale_disallowed"),
-            "realized_gain_loss": lot.get("gain_loss"),
-            "federal_tax_withheld": lot.get("federal_tax_withheld"),
-            "term": _closed_lot_term(lot.get("term")),
-            "covered": _bool_column(lot.get("covered")),
-            "form_8949_box": lot.get("form_8949_box"),
-            "corrected": _bool_column(lot.get("corrected")),
-            "source_sha256": sha,
-            "payload": normalize_payload(lot),
-        })
-    return len(parsed.get("lots", []))
-
-
-def _dumps_for_1099s(conn, dumps, pending):
-    """Which dumps the 1099 pass reads, and whether it re-derives:
+def _dumps_to_derive(conn, scope, generation, dumps, pending):
+    """Which dumps a document pass reads, and whether it re-derives:
     ``(dumps, rederive)``. It reads the dumps this run loads, or every
-    dump in bronze when its generation is stale: its parser has changed
-    since the lots silver holds were written, or no generation is
-    stamped (none was yet, or migration 0013 dropped it)."""
-    if silver.stale_generation(conn, CONSOLIDATED_1099_GENERATION_SCOPE,
-                               _CONSOLIDATED_1099_PARSER_VERSION):
+    dump in bronze when its generation has moved: a document of the
+    scope is recorded under another generation, so its parser has
+    changed since the rows silver holds were written."""
+    if derivations.generation_moved(conn, scope, generation):
         return list(dumps), True
     return list(pending), False
 
 
-def _load_consolidated_1099s(conn, dumps, *, rederive=False, coord=None):
+def _load_consolidated_1099s(conn, dumps, *, rederive=False, coord=None,
+                             extract_dir=None):
     """Load the Form 1099-B lots of every Consolidated 1099 in ``dumps``
     into `closed_lots`, one form at a time, and file each copy's account
     and tax year into `documents` (`_file_1099_documents`).
@@ -2995,11 +1146,17 @@ def _load_consolidated_1099s(conn, dumps, *, rederive=False, coord=None):
     held rows are all dropped before the first form is written, so every
     form is re-derived. The drop waits for a form that parsed, for the
     same reason the supplied pass holds its purge: a run on which no PDF
-    parses keeps the rows it has and leaves the generation unstamped."""
+    parses keeps the rows it has and the older records. A re-derivation
+    that finds no form at all keeps the rows and drops the older
+    records, since nothing is left to re-derive. Each copy that parsed
+    is recorded under the generation. Each copy whose identity or lots
+    do not read is recorded with no rows, so the pass reads it again
+    once its parser moves. A re-derivation in which no form parses
+    records no such copy, so the older records stay."""
     coord = coord or _transient_coordinator()
     try:
         copies = _1099_copies(dumps, coord)
-        chosen = _latest_1099_copies(copies)
+        chosen, unread = _latest_1099_copies(copies)
         conn.execute("BEGIN")
         filed = _file_1099_documents(conn, copies)
         held = {} if rederive else _held_1099_forms(conn)
@@ -3009,10 +1166,12 @@ def _load_consolidated_1099s(conn, dumps, *, rederive=False, coord=None):
             if held.get(key) is not None and held[key] >= prepared:
                 continue
             parsed = coord.resolve(sha, _CONSOLIDATED_1099_PARSER_VERSION,
-                                   _parse_1099_worker, str(path))
+                                   _parse_1099_worker,
+                                   _job(path, sha, extract_dir))
             if "_error" in parsed:
                 log.warning("1099: parse failed for %s: %s",
                             path.name, parsed["_error"])
+                unread.append(sha)
                 continue
             if owed_a_purge:
                 dropped = conn.execute(
@@ -3021,94 +1180,23 @@ def _load_consolidated_1099s(conn, dumps, *, rederive=False, coord=None):
                 log.info("1099: re-deriving every form for this parser "
                          "generation; dropped %d lot(s)", dropped)
                 owed_a_purge = False
-            lots += _replace_1099_lots(conn, parsed, sha)
+            written = _replace_1099_lots(conn, parsed, sha)
+            derivations.record_derivation(
+                conn, sha, CONSOLIDATED_1099_GENERATION_SCOPE,
+                _CONSOLIDATED_1099_PARSER_VERSION, written)
+            lots += written
             forms += 1
-        if not owed_a_purge:
-            silver.stamp_generation(conn, CONSOLIDATED_1099_GENERATION_SCOPE,
-                                    _CONSOLIDATED_1099_PARSER_VERSION)
+        if not owed_a_purge or not chosen:
+            _record_unread(conn, CONSOLIDATED_1099_GENERATION_SCOPE,
+                           _CONSOLIDATED_1099_PARSER_VERSION, unread)
+            _drop_older_records(conn, CONSOLIDATED_1099_GENERATION_SCOPE,
+                                _CONSOLIDATED_1099_PARSER_VERSION)
         conn.commit()
         log.info("1099: %d form(s) read, %d lot(s) written, %d document(s) "
                  "filed", forms, lots, filed)
     except Exception:
         conn.rollback()
         log.exception("1099 load failed; rolled back")
-
-
-# Default portfolio + management classification for an account
-# synthesised from supplied historical statements. Supplied
-# statements stand in for the web document center, which may serve
-# no statement PDFs for the `Authorized` group (DESIGN.md §4.5), so
-# the defaults are that group's: `_load_master` maps the selector
-# label to portfolios.kind = 'trust_managed', and the gold adapter
-# maps the kind to its wrapper and management style. The synthesised
-# row pre-fills the same shape, so the account rolls up under that
-# portfolio. Groups the web document center serves statements for
-# need no synthesis.
-_SUPPLIED_SYNTHETIC_PORTFOLIO = "Authorized"
-_SUPPLIED_SYNTHETIC_KIND = "trust_managed"
-_SUPPLIED_SYNTHETIC_MANAGEMENT = "discretionary"
-
-
-def _synthesize_missing_account_masters(conn):
-    """For every ``account_external_id`` mentioned in
-    ``historical_position_snapshots`` but absent from
-    ``accounts``, insert one synthetic accounts row at the
-    account's latest historical ``as_of_date``. Gold's
-    `appendHistoricalAccounts` joins on account_external_id alone
-    (taking MAX(snapshot_at) per id), so a single row is enough
-    for the master projection to fire.
-
-    Returns the number of synthetic rows inserted. Idempotent —
-    INSERT OR IGNORE means a re-run after the live download
-    finally observes the account is a no-op (the live row's
-    snapshot_at outranks the synthetic one, and gold uses MAX)."""
-    cur = conn.execute("""
-SELECT h.account_external_id, MAX(h.as_of_date)
-  FROM historical_position_snapshots h
- WHERE NOT EXISTS (
-       SELECT 1 FROM accounts a
-        WHERE a.account_external_id = h.account_external_id
- )
- GROUP BY h.account_external_id
-""")
-    missing = cur.fetchall()
-    if not missing:
-        return 0
-    payload = normalize_payload({"source": "supplied-statement-synthetic"})
-    inserted = 0
-    for aid, latest_as_of in missing:
-        # Portfolio master too: the historical projection joins
-        # accounts → portfolios on (snapshot_at, portfolio_external_id),
-        # so the synthetic accounts row needs a same-snapshot_at
-        # portfolio companion. INSERT OR IGNORE so it never tramples
-        # a real portfolio row that the live loader already wrote.
-        try:
-            conn.execute(
-                "INSERT OR IGNORE INTO portfolios ("
-                "snapshot_at, portfolio_external_id, kind, payload"
-                ") VALUES (?, ?, ?, ?)",
-                (latest_as_of, _SUPPLIED_SYNTHETIC_PORTFOLIO,
-                 _SUPPLIED_SYNTHETIC_KIND, payload),
-            )
-            conn.execute(
-                "INSERT OR IGNORE INTO accounts ("
-                "snapshot_at, account_external_id, portfolio_external_id, "
-                "nickname, payload, management_style"
-                ") VALUES (?, ?, ?, ?, ?, ?)",
-                (latest_as_of, aid, _SUPPLIED_SYNTHETIC_PORTFOLIO,
-                 None, payload, _SUPPLIED_SYNTHETIC_MANAGEMENT),
-            )
-            inserted += 1
-            log.info(
-                "supplied-statements: synthesised accounts master for "
-                "%s @ %s (absent from every live download)",
-                aid, latest_as_of,
-            )
-        except sqlite3.IntegrityError as e:
-            log.debug(
-                "supplied-statements: synthesise skipped for %s: %s", aid, e,
-            )
-    return inserted
 
 
 # ============================================================

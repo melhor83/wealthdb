@@ -34,17 +34,13 @@ tree under `/data` stays clean.
 from __future__ import annotations
 
 import argparse
-import contextlib
-import logging
 import re
 import sys
 from pathlib import Path
 
-from collectorkit import cli, debugcap, explore
+from collectorkit import explore
 
 import elba_client as elba
-
-log = logging.getLogger("raiffeisen_at.explore")
 
 DEFAULT_PROFILE_DIR = Path("/secrets/raiffeisen_at-profile")
 DEFAULT_ENV_FILE = Path("/secrets/raiffeisen_at.env")
@@ -103,30 +99,6 @@ CLICK_RECORDER_JS = explore.click_recorder_js(
     password_selector=PWD_SELECTOR, otp_selector=OTP_SELECTOR)
 
 
-def parse_args(argv: list[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description=__doc__.strip(),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    explore.add_args(p, url=elba.START_URL, env_file=DEFAULT_ENV_FILE,
-                     profile_dir=DEFAULT_PROFILE_DIR, dom_snapshots=True)
-    return p.parse_args(argv)
-
-
-def _prefill(page, username: str, password: str, filled: set) -> bool:
-    """Pre-fill the Mein ELBA login form, each field at most once per page.
-
-    Frame-aware: the form may sit in the main frame or in a same-brand
-    iframe. Both fields must co-exist in one frame, so a TWO-STEP login
-    (identifier first, password later) leaves the pre-fill idle; the
-    credentials are then typed by hand. Never submits: sign-in and 2FA are
-    driven by hand in the VNC session.
-    """
-    return explore.prefill_login(
-        page, username, password, filled, host_re=HOST_RE,
-        user_selector=USER_SELECTOR, password_selector=PWD_SELECTOR, log=log)
-
-
 # What the person at the VNC session is asked to walk (DESIGN.md §3).
 WALK = ("walk the three discovery flows (DESIGN.md §3): 1) log in via VNC, "
         "noting the pushTAN screen and its completion; 2) open the document "
@@ -135,30 +107,27 @@ WALK = ("walk the three discovery flows (DESIGN.md §3): 1) log in via VNC, "
         "the CSV export may be run once for comparison.")
 
 
-def main(argv: list[str]) -> int:
-    args = parse_args(argv)
-    cli.configure_logging(args.verbose)
-    explore.prepare_profile(args.profile_dir, fresh=args.fresh, log=log,
-                            note="the full pushTAN challenge will fire on "
-                                 "next login")
-    username, password, prefill = explore.load_credentials(
-        args.env_file, (USER_ENV,), (PASS_ENV,), no_prefill=args.no_prefill,
-        host="raiffeisen.at", log=log)
-    filled: set = set()
+# The site's own selectors drive the shared pre-fill, frame-aware and at
+# most once per field and page. Both fields must co-exist in one frame, so
+# a two-step login (identifier first, password later) leaves the pre-fill
+# idle and the credentials are typed by hand. It never submits: sign-in
+# and 2FA are driven by hand in the VNC session.
+SITE = explore.Site(
+    name="raiffeisen_at", url=elba.START_URL, profile_dir=DEFAULT_PROFILE_DIR,
+    env_file=DEFAULT_ENV_FILE, user_envs=(USER_ENV,), pass_envs=(PASS_ENV,),
+    host="raiffeisen.at", host_re=HOST_RE, user_selector=USER_SELECTOR,
+    password_selector=PWD_SELECTOR, event_prefix=EVENT_PREFIX,
+    init_js=CLICK_RECORDER_JS, walk=WALK,
+    fresh_note="the full pushTAN challenge will fire on next login",
+    observe_re=HOST_RE, label="raiffeisen")
 
-    with contextlib.ExitStack() as stack:
-        session = explore.Session.from_args(
-            stack, args, redact=debugcap.secret_redactor(username, password),
-            log=log, observe=HOST_RE, label="raiffeisen")
-        context = session.open_camoufox(stack, args.profile_dir)
-        session.attach(
-            context, init_js=CLICK_RECORDER_JS, event_prefix=EVENT_PREFIX,
-            prefill=(lambda page: _prefill(
-                page, username, password, filled)) if prefill else None)
-        session.open(args.url)
-        session.record(WALK, max_duration=args.max_duration)
-    session.report()
-    return 0
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    return explore.parser(SITE, __doc__).parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    return explore.main(SITE, argv, __doc__)
 
 
 if __name__ == "__main__":

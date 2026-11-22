@@ -148,7 +148,7 @@ func seedCard(t *testing.T, db *sql.DB) {
 
 func openConn(t *testing.T, path string) silver.Connection {
 	t.Helper()
-	return silvertest.Open(t, &Adapter{}, path)
+	return silvertest.Open(t, adapter, path)
 }
 
 // project runs the whole projection over the full window.
@@ -156,7 +156,7 @@ func project(t *testing.T, path string) (canonical.SnapshotBatch, canonical.Tran
 	t.Helper()
 	ctx := context.Background()
 	conn := openConn(t, path)
-	w := silvertest.FullWindow(t, conn)
+	w := silvertest.WindowSince0(t, conn)
 
 	snaps, err := conn.Snapshots(ctx, w)
 	if err != nil {
@@ -180,12 +180,6 @@ func project(t *testing.T, path string) (canonical.SnapshotBatch, canonical.Tran
 	return sb, tb
 }
 
-func TestKind(t *testing.T) {
-	if (&Adapter{}).Kind() != "chase" {
-		t.Fatalf("Kind = %q", (&Adapter{}).Kind())
-	}
-}
-
 // TestStatusAndChangeWindow pins spanExtrema: the snapshot range and the
 // re-emit window run from the first transaction (the first cash mark) to the
 // load. The load clock itself is silver's (TestLoadClock).
@@ -203,16 +197,15 @@ func TestStatusAndChangeWindow(t *testing.T) {
 		t.Errorf("snapshot range = [%d,%d], want [%d,%d]",
 			st.OldestSnapshotAt, st.LatestSnapshotAt, first, loadUnix)
 	}
-	if w := silvertest.FullWindow(t, conn); w.Start != first || w.End != loadUnix {
-		t.Errorf("window = [%d,%d], want [%d,%d]", w.Start, w.End, first, loadUnix)
+	if w := silvertest.WindowSince0(t, conn); !w.Full {
+		t.Errorf("window = %+v, want the whole history", w)
 	}
 }
 
 // A statement period whose transactions never reached silver still emits a
-// closing balance at its period_end, so the change window has to reach back to
-// it: gold deletes over [Start,End] before re-applying, and a record outside
-// that window is re-inserted without its predecessor being removed — it would
-// duplicate on every load.
+// closing balance at its period_end. The window is the whole history, so
+// gold deletes it before re-applying it, and the snapshot range reaches
+// it.
 func TestChangeWindowCoversStatementPeriodEnds(t *testing.T) {
 	path, db := newFixture(t)
 	seed(t, db)
@@ -220,10 +213,9 @@ func TestChangeWindowCoversStatementPeriodEnds(t *testing.T) {
 	conn := openConn(t, path)
 
 	quiet := silvertest.Day(2025, 10, 31) // earlier than any transaction or roster row
-	w := silvertest.FullWindow(t, conn)
-	if w.Start != quiet {
-		t.Errorf("window Start = %d, want %d (the earliest statement period_end)",
-			w.Start, quiet)
+	if w := silvertest.WindowSince0(t, conn); !w.Full {
+		t.Errorf("window = %+v, want the whole history, the earliest statement period_end %d in it",
+			w, quiet)
 	}
 	st, err := conn.Status(context.Background())
 	if err != nil {
@@ -233,13 +225,6 @@ func TestChangeWindowCoversStatementPeriodEnds(t *testing.T) {
 		t.Errorf("OldestSnapshotAt = %d, want %d", st.OldestSnapshotAt, quiet)
 	}
 
-	sb, _ := project(t, path)
-	for _, cb := range sb.CashBalances {
-		if cb.SnapshotAt < w.Start || cb.SnapshotAt > w.End {
-			t.Errorf("cash balance at %d outside the window [%d,%d]",
-				cb.SnapshotAt, w.Start, w.End)
-		}
-	}
 }
 
 func TestSnapshots(t *testing.T) {

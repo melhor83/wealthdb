@@ -3,11 +3,15 @@ package gold
 import (
 	"context"
 	"database/sql"
+	"maps"
 	"regexp"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
 )
 
 // mustExec runs one statement and fails the test on an error.
@@ -203,32 +207,231 @@ func TestCurrentSchemaVersionReturnsAnUnreadableSchemaMeta(t *testing.T) {
 	}
 }
 
-// TestAccountKindCheckAdmitsCard exercises migration 0037's widened
-// CHECK at the DDL level, below Writer's Go-side validation: 'card'
-// is admitted alongside the kinds 0036 already allowed, and an
-// unrecognised kind is still refused by the constraint.
-func TestAccountKindCheckAdmitsCard(t *testing.T) {
+// enumChecksDropped is the migration that recreates silver_sources and
+// accounts without their enum CHECKs.
+const enumChecksDropped = 188
+
+// enumCheckTables are the two tables that migration recreates.
+const enumCheckTables = `('silver_sources', 'accounts')`
+
+// TestEnumChecksDroppedKeepsRowsAndShape applies the migration to a gold
+// one version below it that holds rows in both tables and the derived
+// set, as a live gold does. Every row, every column's place, type,
+// default and NOT NULL, and every constraint but the CHECKs stay equal.
+// A value outside a vocabulary then reaches the table, and the writer
+// still refuses it.
+func TestEnumChecksDroppedKeepsRowsAndShape(t *testing.T) {
 	t.Parallel()
-	db, ctx := openMigrated(t)
-
-	insert := func(id, kind string) error {
-		_, err := db.ExecContext(ctx, `
-            INSERT INTO accounts (
-                silver_source_id, account_external_id, account_kind,
-                first_seen_at, last_seen_at
-            ) VALUES ('test-src', ?, ?, 1, 1)`, id, kind)
-		return err
+	ms, err := migrations()
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	for _, kind := range []string{"card", "cash", "mortgage", "donor_advised_fund"} {
-		if err := insert("ACC-"+kind, kind); err != nil {
-			t.Errorf("account_kind %q rejected by CHECK: %v", kind, err)
+	i := slices.IndexFunc(ms, func(m migration) bool { return m.version == enumChecksDropped })
+	if i < 1 {
+		t.Fatalf("no migration %04d above another", enumChecksDropped)
+	}
+	db, ctx := openAtVersion(t, ms[i-1].version)
+	set, err := derived()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The derived set reads the vocabulary's roles, the snapshot coverage,
+	// the private-markets rows and the capital accounts, which later
+	// migrations add; they touch neither table.
+	for _, suffix := range []string{"_vocabulary_roles.sql", "_snapshot_coverage.sql", "_private_markets.sql",
+		"_private_markets_as_of.sql", "_capital_accounts.sql"} {
+		j := slices.IndexFunc(ms, func(m migration) bool { return strings.HasSuffix(m.name, suffix) })
+		if j < 0 {
+			t.Fatalf("no migration *%s", suffix)
+		}
+		if err := applyMigration(ctx, db, ms[j]); err != nil {
+			t.Fatal(err)
 		}
 	}
-	for _, kind := range []string{"credit_card", "garbage", ""} {
-		if err := insert("REJ-"+kind, kind); err == nil {
-			t.Errorf("account_kind %q accepted, want CHECK violation", kind)
+	if err := applyDerived(ctx, db, set, ms[i-1].version, enumChecksDropped-1); err != nil {
+		t.Fatalf("apply the derived set: %v", err)
+	}
+	execEach(t, db,
+		`INSERT INTO silver_sources (silver_source_id, silver_kind, silver_path,
+		    high_watermark, first_loaded_at, last_loaded_at)
+		    VALUES ('src-a', 'schwab', '/silver/a.db', -1, 10, 20)`,
+		`INSERT INTO silver_sources VALUES ('src-b', 'viac', '/silver/b.db', 7, 11, 21, 2, 30, 40)`,
+		`INSERT INTO accounts (silver_source_id, account_external_id, account_kind,
+		    first_seen_at, last_seen_at)
+		    VALUES ('src-a', 'ACC-1', 'brokerage', 1, 2)`,
+		`INSERT INTO accounts VALUES ('src-b', 'ACC-2', 'custody', 'Name', 'CHF', 'REL',
+		    'Nick', 'Category', 'PF-1', 'pillar_3a', 'automated', 3, 4, '{"k": [1, "v"]}')`,
+	)
+
+	shape := func() map[string]string {
+		return map[string]string{
+			"columns": rowsDigest(t, ctx, db, `SELECT table_name, column_index, column_name,
+			    data_type, is_nullable, column_default
+			    FROM duckdb_columns() WHERE table_name IN `+enumCheckTables),
+			"constraints": rowsDigest(t, ctx, db, `SELECT table_name, constraint_type,
+			    constraint_column_names
+			    FROM duckdb_constraints()
+			    WHERE table_name IN `+enumCheckTables+` AND constraint_type <> 'CHECK'`),
+			"indexes": rowsDigest(t, ctx, db, `SELECT table_name, index_name
+			    FROM duckdb_indexes() WHERE table_name IN `+enumCheckTables),
+			"silver_sources": rowsDigest(t, ctx, db, `SELECT * FROM silver_sources`),
+			"accounts":       rowsDigest(t, ctx, db, `SELECT * FROM accounts`),
 		}
+	}
+	checks := func() string {
+		return rowsDigest(t, ctx, db, `SELECT table_name, constraint_column_names
+		    FROM duckdb_constraints()
+		    WHERE table_name IN `+enumCheckTables+` AND constraint_type = 'CHECK'`)
+	}
+	want := shape()
+	if checks() == "" {
+		t.Fatal("no CHECK before the migration: the test reads nothing")
+	}
+
+	if err := applyMigration(ctx, db, ms[i]); err != nil {
+		t.Fatalf("apply migration %04d: %v", enumChecksDropped, err)
+	}
+
+	got := shape()
+	for _, k := range slices.Sorted(maps.Keys(want)) {
+		if got[k] != want[k] {
+			t.Errorf("%s changed:\n got %s\nwant %s", k, got[k], want[k])
+		}
+	}
+	if c := checks(); c != "" {
+		t.Errorf("CHECKs survive: %s", c)
+	}
+
+	// The gate is the writer's: the tables take any text.
+	execEach(t, db,
+		`INSERT INTO silver_sources (silver_source_id, silver_kind, silver_path,
+		    high_watermark, first_loaded_at, last_loaded_at)
+		    VALUES ('src-c', 'not_a_kind', '/silver/c.db', -1, 0, 0)`,
+		`INSERT INTO accounts (silver_source_id, account_external_id, account_kind,
+		    tax_wrapper, management_style, first_seen_at, last_seen_at)
+		    VALUES ('src-c', 'ACC-3', 'not_a_kind', 'not_a_wrapper', 'not_a_style', 1, 1)`,
+	)
+	bad, wrapper, style := canonical.AccountKind("not_a_kind"),
+		canonical.TaxWrapper("not_a_wrapper"), canonical.ManagementStyle("not_a_style")
+	for name, a := range map[string]canonical.AccountChange{
+		"account_kind":     {AccountKind: bad},
+		"tax_wrapper":      {AccountKind: canonical.AccountKindCash, TaxWrapper: &wrapper},
+		"management_style": {AccountKind: canonical.AccountKindCash, ManagementStyle: &style},
+	} {
+		a.SilverSourceID, a.AccountExternalID, a.FirstSeenAt, a.LastSeenAt = "src-a", "ACC-4", 1, 1
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := NewWriter(tx).UpsertAccounts(ctx, []canonical.AccountChange{a}); err == nil {
+			t.Errorf("the writer took an invalid %s", name)
+		}
+		_ = tx.Rollback()
+	}
+}
+
+// transactionAction is the migration that adds transactions.action and
+// fills it for the rows already loaded.
+const transactionAction = 192
+
+// TestTransactionActionFillsLoadedRows applies the migration to a gold
+// one version below it, holding rows as a load wrote them before: their
+// action is in their own words. Each row of the three kinds that state
+// one gets the action its adapter writes, a ledger row and every other
+// kind's row none.
+func TestTransactionActionFillsLoadedRows(t *testing.T) {
+	t.Parallel()
+	ms, err := migrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	i := slices.IndexFunc(ms, func(m migration) bool { return m.version == transactionAction })
+	if i < 1 {
+		t.Fatalf("no migration %04d above another", transactionAction)
+	}
+	db, ctx := openAtVersion(t, ms[i-1].version)
+	execEach(t, db,
+		`INSERT INTO silver_sources (silver_source_id, silver_kind, silver_path, high_watermark, first_loaded_at,
+		    last_loaded_at) VALUES ('ct', 'cointracking', '/s/ct', -1, 0, 0), ('fid', 'fidelity', '/s/f', -1, 0, 0),
+		    ('sch', 'schwab', '/s/s', -1, 0, 0), ('pla', 'plaid', '/s/p', -1, 0, 0)`,
+		`INSERT INTO accounts (silver_source_id, account_external_id, account_kind, first_seen_at, last_seen_at)
+		    VALUES ('ct', 'A', 'crypto', 1, 1), ('fid', 'A', 'brokerage', 1, 1), ('sch', 'A', 'brokerage', 1, 1),
+		    ('pla', 'A', 'brokerage', 1, 1)`,
+		`INSERT INTO transactions (silver_source_id, transaction_external_id, occurred_at, account_external_id, kind,
+		    currency, description, payload) VALUES
+		    ('ct', 'dep', 1, 'A', 'transfer_in', 'BTC', NULL, '{"type": "Deposit"}'),
+		    ('ct', 'drop', 1, 'A', 'transfer_in', 'XYZ', NULL, '{"type": "Airdrop"}'),
+		    ('ct', 'dust-in', 1, 'A', 'transfer_in', 'BTC', NULL,
+		     '{"type": "Income (non taxable)", "comment": " dust SWEEPING\u00a0"}'),
+		    ('ct', 'move-in', 1, 'A', 'transfer_in', 'BTC', NULL, '{"type": "Income (non taxable)", "comment": "x"}'),
+		    ('ct', 'dust-out', 1, 'A', 'other', 'BNB', 'Other Expense',
+		     '{"type": "Other Expense", "comment": "Dust Sweeping"}'),
+		    ('ct', 'stolen', 1, 'A', 'other', 'BTC', 'Stolen', '{"type": "Stolen"}'),
+		    ('ct', 'fee-own', 1, 'A', 'buy', 'USD', NULL,
+		     '{"type": "Trade", "buy_currency": "BTC", "sell_currency": "USD", "fee_amount": 1, "fee_currency": "usd"}'),
+		    ('ct', 'fee-third', 1, 'A', 'sell', 'USD', NULL,
+		     '{"type": "Trade", "buy_currency": "USD", "sell_currency": "ETH", "fee_amount": 1, "fee_currency": "BNB"}'),
+		    ('ct', 'split:s', 1, 'A', 'sell', 'USD', NULL,
+		     '{"type": "Trade", "buy_currency": "ETH", "sell_currency": "BTC", "fee_amount": 1, "fee_currency": "BNB"}'),
+		    ('ct', 'split:b', 1, 'A', 'buy', 'USD', NULL,
+		     '{"type": "Trade", "buy_currency": "ETH", "sell_currency": "BTC", "fee_amount": 1, "fee_currency": "BNB"}'),
+		    ('ct', 'new-type', 1, 'A', 'other', 'USD', 'Margin Profit', '{"type": "Margin Profit"}'),
+		    ('ct', 'ledger', 1, 'A', 'transfer_in', 'BTC', NULL,
+		     '{"type": "Airdrop", "equity_transfer_ledger": "true"}'),
+		    ('fid', 'roc', 1, 'A', 'corporate_action', 'USD', 'RETURN OF CAPITAL EXAMPLE CORP', NULL),
+		    ('fid', 'lieu', 1, 'A', 'corporate_action', 'USD', 'In Lieu Of FRX SHARE', NULL),
+		    ('fid', 'merger', 1, 'A', 'corporate_action', 'USD', 'MERGER MER FROM 000000000', NULL),
+		    ('fid', 'bare', 1, 'A', 'corporate_action', 'USD', NULL, NULL),
+		    ('fid', 'option', 1, 'A', 'sell', 'USD', 'YOU SOLD CALL (XYZ) EXAMPLE CORP', NULL),
+		    ('fid', 'sale', 1, 'A', 'sell', 'USD', 'YOU SOLD EXAMPLE CORP', NULL),
+		    ('fid', 'ledger', 1, 'A', 'transfer_in', 'USD', 'PUT (XYZ) MOVED', '{"equity_transfer_ledger": "true"}'),
+		    ('sch', 'sys', 1, 'A', 'other', 'USD', 'SYSTEM TRANSFER', '{"type": "TRADE"}'),
+		    ('sch', 'memo', 1, 'A', 'other', 'USD', NULL, '{"type": "MEMORANDUM"}'),
+		    ('sch', 'jnl-lieu', 1, 'A', 'corporate_action', 'USD', 'CASH IN LIEU OF FRACTIONAL SHARES',
+		     '{"type": "JOURNAL"}'),
+		    ('sch', 'web-lieu', 1, 'A', 'corporate_action', 'USD', 'EXAMPLE CORP', '{"Action": "Cash In Lieu"}'),
+		    ('sch', 'stmt-roc', 1, 'A', 'corporate_action', 'USD', 'EXAMPLE CORP',
+		     '{"Action": null, "action": "Return Of Capital"}'),
+		    ('sch', 'rights', 1, 'A', 'corporate_action', 'USD', 'EXAMPLE CORP', '{"Action": "Litigation"}'),
+		    ('sch', 'exchange', 1, 'A', 'corporate_action', 'USD', 'Exchange CALL EXAMPLE', '{}'),
+		    ('sch', 'expired', 1, 'A', 'corporate_action', 'USD', 'Removed due to Expiration CALL', '{}'),
+		    ('sch', 'split', 1, 'A', 'corporate_action', 'USD', 'EXAMPLE REVERSE SPLIT', '{"type": "RECEIVE_AND_DELIVER"}'),
+		    ('sch', 'sale', 1, 'A', 'sell', 'USD', NULL, '{"type": "TRADE"}'),
+		    ('pla', 'merger', 1, 'A', 'corporate_action', 'USD', 'RETURN OF CAPITAL', '{"type": "TRADE"}')`,
+	)
+	if err := applyMigration(ctx, db, ms[i]); err != nil {
+		t.Fatalf("apply migration %04d: %v", transactionAction, err)
+	}
+	want := map[string]string{
+		"ct/dep": "in", "ct/drop": "income", "ct/dust-in": "acquired", "ct/move-in": "in", "ct/dust-out": "converted",
+		"ct/stolen": "lost", "ct/fee-third": "third_currency_fee", "ct/split:b": "third_currency_fee",
+		"fid/roc": "return_of_capital", "fid/lieu": "cash_in_lieu", "fid/merger": "reorganisation",
+		"fid/bare": "reorganisation", "fid/option": "ignore",
+		"sch/sys": "ignore", "sch/jnl-lieu": "cash_in_lieu", "sch/web-lieu": "cash_in_lieu",
+		"sch/stmt-roc": "return_of_capital", "sch/rights": "cash_only", "sch/exchange": "cash_only",
+		"sch/expired": "expiry", "sch/split": "reorganisation",
+	}
+	rows, err := db.QueryContext(ctx, `SELECT silver_source_id || '/' || transaction_external_id, action FROM transactions`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	got := map[string]string{}
+	for rows.Next() {
+		var id string
+		var a sql.NullString
+		if err := rows.Scan(&id, &a); err != nil {
+			t.Fatal(err)
+		}
+		if a.Valid {
+			got[id] = a.String
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !maps.Equal(got, want) {
+		t.Errorf("actions\n got %v\nwant %v", got, want)
 	}
 }
 

@@ -89,17 +89,17 @@ func nilIfEmpty(s string) any {
 
 func openConn(t *testing.T, path string) silver.Connection {
 	t.Helper()
-	return silvertest.Open(t, &Adapter{}, path)
+	return silvertest.Open(t, adapter, path)
 }
 
 func TestKind(t *testing.T) {
-	if (&Adapter{}).Kind() != "erstebank_at" {
-		t.Fatalf("Kind = %q", (&Adapter{}).Kind())
+	if got := adapter.Source().Kind; got != "erstebank_at" {
+		t.Fatalf("Kind = %q", got)
 	}
 }
 
 func TestEmptyStatus(t *testing.T) {
-	silvertest.AssertEmptyStatus(t, &Adapter{}, silverSchemaSQL)
+	silvertest.AssertEmptyStatus(t, adapter, silverSchemaSQL)
 }
 
 // The span reaches from the earliest record (the first ledger day) to the
@@ -120,9 +120,9 @@ func TestStatusAndChangeWindow(t *testing.T) {
 	if st.OldestTransactionAt != silvertest.Day(2026, 1, 5) || st.LatestTransactionAt != silvertest.Day(2026, 1, 31) {
 		t.Errorf("tx range = [%d,%d]", st.OldestTransactionAt, st.LatestTransactionAt)
 	}
-	w := silvertest.FullWindow(t, conn)
-	if w.Start != silvertest.Day(2026, 1, 5) || w.End != loadUnix {
-		t.Errorf("window = [%d,%d]", w.Start, w.End)
+	w := silvertest.WindowSince0(t, conn)
+	if !w.Full || w.NewChangeNumber != loadUnix {
+		t.Errorf("window = %+v, want the whole history at load %d", w, loadUnix)
 	}
 	idle, err := conn.ChangeWindow(ctx, loadUnix)
 	if err != nil {
@@ -139,7 +139,7 @@ func TestSnapshots(t *testing.T) {
 	path, db := newFixture(t)
 	seed(t, db)
 	conn := openConn(t, path)
-	batch := silvertest.Merged(t, conn, silvertest.FullWindow(t, conn))
+	batch := silvertest.Merged(t, conn, silvertest.WindowSince0(t, conn))
 
 	kinds := map[string]string{}
 	for _, a := range batch.Accounts {
@@ -182,7 +182,7 @@ func TestTransactions(t *testing.T) {
 	path, db := newFixture(t)
 	seed(t, db)
 	conn := openConn(t, path)
-	txs := silvertest.Transactions(t, conn, silvertest.FullWindow(t, conn))
+	txs := silvertest.Transactions(t, conn, silvertest.WindowSince0(t, conn))
 
 	byID := map[string]canonical.TransactionChange{}
 	for _, tx := range txs {
@@ -313,9 +313,9 @@ func TestCurrentBalanceAtEachRunThatListedTheAccount(t *testing.T) {
 	silvertest.Exec(t, db, `INSERT INTO run_accounts VALUES (?,?), (?,?), (?,?)`,
 		r0, left, r1, iban, r1, card)
 	conn := openConn(t, path)
-	w := silvertest.FullWindow(t, conn)
-	if w.End != r1 {
-		t.Errorf("window end = %d, want the latest run %d", w.End, r1)
+	w := silvertest.WindowSince0(t, conn)
+	if w.NewChangeNumber != r1 {
+		t.Errorf("NewChangeNumber = %d, want the latest run %d", w.NewChangeNumber, r1)
 	}
 	want := map[string]map[int64]string{
 		iban: {loadUnix: "1500 EUR", r1: "1500 EUR"},
@@ -324,17 +324,5 @@ func TestCurrentBalanceAtEachRunThatListedTheAccount(t *testing.T) {
 	}
 	if got := silvertest.CurrentsByInstant(silvertest.Merged(t, conn, w)); !reflect.DeepEqual(got, want) {
 		t.Errorf("CURRENT balances =\n %v\nwant\n %v", got, want)
-	}
-}
-
-// A silver without run_accounts fails the snapshots and names the load.
-func TestSnapshotsNeedRunAccounts(t *testing.T) {
-	path, db := newFixture(t)
-	seed(t, db)
-	silvertest.Exec(t, db, `DROP TABLE run_accounts`)
-	conn := openConn(t, path)
-	_, err := conn.Snapshots(context.Background(), silvertest.FullWindow(t, conn))
-	if want := "erstebank_at silver has no run_accounts; run `erstebank_at load` first"; err == nil || err.Error() != want {
-		t.Errorf("Snapshots = %v, want %q", err, want)
 	}
 }

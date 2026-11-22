@@ -7,11 +7,11 @@ import (
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
 )
 
-// TestPassRuleNamesADeclaredAccount: a rule's `far` writes the declared
-// account onto the row's far columns in both directions. The outbound
-// leg is the spending family's own row; the inbound leg is the income
-// family's verdict, and the spending pass carries its far account onto
-// the one overlay that has a column for it. A pin on such an inbound
+// TestPassRuleNamesADeclaredAccount: a rule's `far` links the row to the
+// declared account in both directions. The outbound leg is the spending
+// family's own row; the inbound leg is the income family's verdict, and
+// the spending pass links its far account from its own rows, the ones
+// transfer_links is written from. A pin on such an inbound
 // row outranks the rule, and the boundary block counts the
 // declarations off the dimension.
 func TestPassRuleNamesADeclaredAccount(t *testing.T) {
@@ -42,16 +42,16 @@ func TestPassRuleNamesADeclaredAccount(t *testing.T) {
 		},
 	})
 
-	if s, a, _ := farOf(t, db, ctx, "bank", "T-OUT"); s != canonical.DeclaredSourceID || a != "savings-bank" {
+	if s, a := farOf(t, db, ctx, "bank", "T-OUT"); s != canonical.DeclaredSourceID || a != "savings-bank" {
 		t.Errorf("T-OUT far = (%q, %q), want the declared account", s, a)
 	}
 	if d, p := verdictOf(t, db, ctx, "bank", "T-OUT"); d != canonical.SpendDetailedInternalTransfer || p != ProvenanceRule {
 		t.Errorf("T-OUT = (%q, %q)", d, p)
 	}
-	// The inbound leg: the income overlay carries the verdict, the
-	// spending overlay the far account.
-	if s, a, _ := farOf(t, db, ctx, "bank", "T-IN"); s != canonical.DeclaredSourceID || a != "savings-bank" {
-		t.Errorf("T-IN far = (%q, %q), want the declared account on the spending overlay", s, a)
+	// The inbound leg: the income overlay carries the verdict,
+	// transfer_links the far account.
+	if s, a := farOf(t, db, ctx, "bank", "T-IN"); s != canonical.DeclaredSourceID || a != "savings-bank" {
+		t.Errorf("T-IN far = (%q, %q), want the declared account linked", s, a)
 	}
 	var incomeDetailed, incomeProv string
 	if err := db.QueryRowContext(ctx, `
@@ -66,7 +66,7 @@ func TestPassRuleNamesADeclaredAccount(t *testing.T) {
 	// A pinned inbound row is the pin's, not the far rule's.
 	var n int
 	if err := db.QueryRowContext(ctx, `
-        SELECT COUNT(*) FROM spend_txn_enrichment
+        SELECT COUNT(*) FROM transfer_links
          WHERE transaction_external_id = 'T-IN-PINNED' AND far_account_external_id IS NOT NULL`).
 		Scan(&n); err != nil || n != 0 {
 		t.Errorf("the pinned inbound row took the rule's far account (n=%d err=%v)", n, err)
@@ -86,10 +86,10 @@ func TestPassRuleNamesADeclaredAccount(t *testing.T) {
 			res.Cashflow.DeclaredAccounts, res.Cashflow.DeclaredPooled, res.Cashflow.UnusedDeclarations)
 	}
 
-	// Without the far, the same rules leave the far columns empty.
+	// Without the far, the same rules link no far side.
 	bare := Rule{Match: far.Match, Category: far.Category}
 	runPass(t, db, ctx, Options{Rules: []Rule{bare}, Income: IncomeOptions{Rules: []Rule{bare}}})
-	if s, a, _ := farOf(t, db, ctx, "bank", "T-OUT"); s != "" || a != "" {
+	if s, a := farOf(t, db, ctx, "bank", "T-OUT"); s != "" || a != "" {
 		t.Errorf("a rule without far still wrote (%q, %q)", s, a)
 	}
 	if err := db.QueryRowContext(ctx, `
@@ -127,7 +127,7 @@ func TestPassScopedFarRuleReachesThePool(t *testing.T) {
 		Scope: RuleScope{Source: "bank", Account: "CASH1", Portfolio: "PF1", From: day(70)}}
 	runPass(t, db, ctx, Options{Rules: []Rule{far}, Income: IncomeOptions{Rules: []Rule{far}}})
 
-	if s, a, _ := farOf(t, db, ctx, "bank", "T-IN"); s != canonical.DeclaredSourceID || a != "savings-bank" {
+	if s, a := farOf(t, db, ctx, "bank", "T-IN"); s != canonical.DeclaredSourceID || a != "savings-bank" {
 		t.Errorf("T-IN far = (%q, %q), want the declared account through the scoped rule", s, a)
 	}
 	var n int
@@ -186,7 +186,7 @@ func TestPassScopedFarRuleReachesASpendingPin(t *testing.T) {
 			if _, ok := spendingBaseIDs(t, db, ctx)["T-IN"]; ok {
 				t.Fatal("the deposit is in the spending population; the test needs it outside")
 			}
-			if s, a, _ := farOf(t, db, ctx, "bank", "T-IN"); s != canonical.DeclaredSourceID || a != "savings-bank" {
+			if s, a := farOf(t, db, ctx, "bank", "T-IN"); s != canonical.DeclaredSourceID || a != "savings-bank" {
 				t.Errorf("T-IN far = (%q, %q), want the declared account", s, a)
 			}
 			if d, p := verdictOf(t, db, ctx, "bank", "T-IN"); d != canonical.SpendDetailedInternalTransfer || p != ProvenanceManual {
@@ -196,9 +196,41 @@ func TestPassScopedFarRuleReachesASpendingPin(t *testing.T) {
 			if tc.earlyFar {
 				want = "savings-bank"
 			}
-			if _, a, _ := farOf(t, db, ctx, "bank", "T-IN-EARLY"); a != want {
+			if _, a := farOf(t, db, ctx, "bank", "T-IN-EARLY"); a != want {
 				t.Errorf("T-IN-EARLY far account = %q, want %q", a, want)
 			}
 		})
+	}
+}
+
+// A far rule may match a row by its provider category alone, and it
+// reaches a row outside the spending population, and a pinned one, as
+// it reaches a population row: the rule reads the same fields on each.
+func TestAFarRuleMatchesTheProviderCategoryEverywhere(t *testing.T) {
+	db, ctx := openGold(t)
+	if _, err := db.ExecContext(ctx, `
+        INSERT INTO accounts (silver_source_id, account_external_id, account_kind,
+                              tax_wrapper, display_name, first_seen_at, last_seen_at)
+             VALUES (?, 'savings-bank', 'cash', 'taxable_personal', 'Example Savings', 1, 1)`,
+		canonical.DeclaredSourceID); err != nil {
+		t.Fatalf("declare accounts: %v", err)
+	}
+	seedTxns(t, db, ctx,
+		txn{"bank", "T-OUT", "CASH1", "withdrawal", day(70), -3000, "", "Standing order 17", "SAVINGS SWEEP"},
+		txn{"bank", "T-IN", "CASH1", "deposit", day(75), 2000, "", "Credit 18", "SAVINGS SWEEP"},
+		txn{"bank", "T-IN-PINNED", "CASH1", "deposit", day(76), 500, "", "Credit 19", "SAVINGS SWEEP"},
+	)
+	far := Rule{Match: regexp.MustCompile(`(?i)^SAVINGS SWEEP$`),
+		Category: canonical.SpendDetailedInternalTransfer, Far: "savings-bank"}
+	runPass(t, db, ctx, Options{
+		Rules: []Rule{far},
+		Pins: []Pin{{Source: "bank", Account: "CASH1", Day: day(76), Amount: 500,
+			Currency: "USD", Detailed: canonical.SpendDetailedInternalTransfer}},
+		Income: IncomeOptions{Rules: []Rule{far}},
+	})
+	for _, id := range []string{"T-OUT", "T-IN", "T-IN-PINNED"} {
+		if s, a := farOf(t, db, ctx, "bank", id); s != canonical.DeclaredSourceID || a != "savings-bank" {
+			t.Errorf("%s far = (%q, %q), want the declared account", id, s, a)
+		}
 	}
 }

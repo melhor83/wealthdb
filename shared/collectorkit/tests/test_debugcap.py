@@ -18,6 +18,7 @@ import json
 import logging
 import re
 import sys
+import types
 import unittest
 from unittest import mock
 import urllib.error
@@ -27,7 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from collectorkit import debugcap  # noqa: E402
+from collectorkit import debugcap, redact  # noqa: E402
 
 log = logging.getLogger("test.debugcap")
 
@@ -36,7 +37,7 @@ COLLECTORS = Path(__file__).resolve().parents[3] / "collectors"
 KIT_EXPLORE = Path(__file__).resolve().parents[1] / "collectorkit" / "explore.py"
 
 # Stated as literals, never imported from the module: a name removed from
-# debugcap._SECRET_PARAMS has to fail a test, and a test that reads the set
+# redact._SECRET_PARAMS has to fail a test, and a test that reads the set
 # it is checking would follow the removal instead of catching it.
 KNOWN_PARAMS = (
     "api_key", "apikey", "key", "token", "access_token", "refresh_token",
@@ -69,7 +70,7 @@ class RedactUrlTest(unittest.TestCase):
     def test_the_credential_parameter_set_is_the_one_stated_here(self):
         # Pins both directions: a name dropped from the module fails the
         # loop above, and one added without a test here fails this.
-        self.assertEqual(frozenset(KNOWN_PARAMS), debugcap._SECRET_PARAMS)
+        self.assertEqual(frozenset(KNOWN_PARAMS), redact._SECRET_PARAMS)
 
     def test_is_case_insensitive(self):
         out = debugcap.redact_url("https://x.invalid/a?API_KEY=LEAKME")
@@ -320,6 +321,42 @@ class ScrubDomTest(unittest.TestCase):
         out = self._entity_scrub('<div>a&amp;b"c&lt;d&gt;e</div>')
         self.assertEqual(out, f"<div>{debugcap.REDACTED}</div>")
 
+    def test_also_blank_blanks_a_marked_input(self):
+        # A one-time-code box is a plain text input holding one digit: the
+        # password rule and a value mask both miss it, its marker does not.
+        out = debugcap.scrub_dom(
+            "<input data-testid='Code-Box-0' type='text' value='7'>",
+            also_blank=("code-box",))
+        self.assertIn('value=""', out)
+        self.assertNotIn("value='7'", out)
+
+    def test_also_blank_leaves_unmarked_inputs_and_passwords_as_before(self):
+        markup = ('<input name="userid" value="keepme">'
+                  '<input type="password" value="pw">')
+        out = debugcap.scrub_dom(markup, also_blank=("code-box",))
+        self.assertIn('value="keepme"', out)
+        self.assertNotIn('"pw"', out)
+
+    def test_also_blank_runs_before_the_redactor(self):
+        out = debugcap.scrub_dom(
+            '<input id="code-box" value="7"><div>hunted</div>',
+            debugcap.secret_redactor("hunted"), also_blank=("code-box",))
+        self.assertEqual(
+            out, f'<input id="code-box" value=""><div>{debugcap.REDACTED}</div>')
+
+
+class RedactModuleTest(unittest.TestCase):
+    def test_debugcap_re_exports_the_redaction_library(self):
+        # Call sites and the source scans read the masks through debugcap;
+        # a name the re-export drops would fail at a capture, not here.
+        from collectorkit import redact
+        for name in ("REDACTED", "SessionMask", "env_redactor", "redact_body",
+                     "redact_har", "redact_headers", "redact_url",
+                     "safe_error", "scrub_dom", "secret_redactor",
+                     "secret_variants", "session_redactor", "url_shape"):
+            with self.subTest(name):
+                self.assertIs(getattr(debugcap, name), getattr(redact, name))
+
 
 @unittest.skipUnless(COLLECTORS.is_dir(), "collectors/ not present")
 class CollectorRedactionTest(unittest.TestCase):
@@ -485,11 +522,17 @@ class CollectorRedactionTest(unittest.TestCase):
         # scan reaching nothing would pass vacuously. Stated as the invariant
         # every harness must satisfy rather than as a collector count, it
         # holds at any point in history and cannot rot as sources are added.
+        # A harness that runs through explore.main gets the redactor main
+        # builds — the shared route, scanned here with the rest.
         harnesses = sorted(COLLECTORS.glob("*/explore.py"))
         self.assertTrue(harnesses, "no explore harness found to scan")
+        self.assertIn("debugcap.secret_redactor(",
+                      KIT_EXPLORE.read_text(encoding="utf-8"))
         for path in harnesses:
-            self.assertIn(
-                "debugcap.secret_redactor(", path.read_text(encoding="utf-8"),
+            text = path.read_text(encoding="utf-8")
+            self.assertTrue(
+                "debugcap.secret_redactor(" in text
+                or "explore.main(" in text,
                 f"{path} does not route its captures through "
                 f"collectorkit.debugcap.secret_redactor()")
 
@@ -700,7 +743,7 @@ class CapturePageTest(unittest.TestCase):
 
     def test_writes_dom_and_screenshot(self):
         p = self._Page()
-        debugcap.capture_page(p, self.run, "landing", log=log)
+        debugcap.capture_page(p, self.run, "landing", log=log, redact=None)
         d = self.run / debugcap.SCREENSHOTS_DIR
         self.assertEqual((d / "landing.html").read_text(), "<html>ok</html>")
         self.assertTrue((d / "landing.png").exists())
@@ -710,17 +753,19 @@ class CapturePageTest(unittest.TestCase):
         # be lost because a screenshot timed out on a busy page.
         p = self._Page(shot_raises=True)
         with self.assertLogs(log, level="WARNING"):
-            debugcap.capture_page(p, self.run, "landing", log=log)
+            debugcap.capture_page(p, self.run, "landing", log=log, redact=None)
         self.assertTrue((self.run / debugcap.SCREENSHOTS_DIR / "landing.html").exists())
 
     def test_a_dom_failure_never_propagates(self):
         p = self._Page(content_raises=True)
         with self.assertLogs(log, level="WARNING"):
-            debugcap.capture_page(p, self.run, "landing", log=log)   # no raise
+            debugcap.capture_page(p, self.run, "landing", log=log,
+                                  redact=None)   # no raise
 
     def test_png_can_be_skipped(self):
         p = self._Page()
-        debugcap.capture_page(p, self.run, "landing", log=log, png=False)
+        debugcap.capture_page(p, self.run, "landing", log=log, png=False,
+                              redact=None)
         d = self.run / debugcap.SCREENSHOTS_DIR
         self.assertTrue((d / "landing.html").exists())
         self.assertFalse((d / "landing.png").exists())
@@ -729,9 +774,14 @@ class CapturePageTest(unittest.TestCase):
         # A --debug capture of a sign-in page must not persist the typed
         # credential, whether or not the caller knows what it is.
         p = self._Page('<input type="password" value="s3cr3t">')
-        debugcap.capture_page(p, self.run, "signin", log=log)
+        debugcap.capture_page(p, self.run, "signin", log=log, redact=None)
         out = (self.run / debugcap.SCREENSHOTS_DIR / "signin.html").read_text()
         self.assertNotIn("s3cr3t", out)
+
+    def test_the_redactor_is_required(self):
+        # A site that masks nothing says so; one that forgets cannot.
+        with self.assertRaises(TypeError):
+            debugcap.capture_page(self._Page(), self.run, "landing", log=log)
 
     def test_a_redactor_masks_known_credentials_too(self):
         p = self._Page('<div>example-user</div>')
@@ -1152,7 +1202,7 @@ class RedactHarTest(unittest.TestCase):
         def _boom(src, dst):
             raise OSError("replace failed")
 
-        with mock.patch.object(debugcap.os, "replace", _boom):
+        with mock.patch("os.replace", _boom):
             with self.assertLogs(log, level="WARNING") as caught:
                 self.assertFalse(debugcap.redact_har(self.har, log=log))
 
@@ -1387,7 +1437,7 @@ class RedactHeadersTest(unittest.TestCase):
 
     def test_the_credential_header_set_is_the_one_stated_here(self):
         self.assertEqual(frozenset(KNOWN_PARAMS) | frozenset(HEADER_ONLY),
-                         debugcap._SECRET_HEADERS)
+                         redact._SECRET_HEADERS)
 
     def test_masks_the_url_a_redirect_names(self):
         # A sign-in's redirect is where an implicit grant hands over its
@@ -1491,7 +1541,8 @@ class CaptureLandmarkTest(unittest.TestCase):
 
     def test_writes_timestamped_dom_and_viewport_screenshot(self):
         page = _LandmarkPage()
-        debugcap.capture_landmark(page, self.dir, "signin", log=log)
+        debugcap.capture_landmark(page, self.dir, "signin", log=log,
+                                  redact=None)
         self.assertEqual(self._one(".html").read_text(), "<html>ok</html>")
         self._one(".png")
         self.assertEqual(page.shot["timeout"], 3_000)
@@ -1500,20 +1551,21 @@ class CaptureLandmarkTest(unittest.TestCase):
 
     def test_no_dir_captures_nothing(self):
         page = _LandmarkPage()
-        debugcap.capture_landmark(page, None, "signin", log=log)
+        debugcap.capture_landmark(page, None, "signin", log=log, redact=None)
         self.assertIsNone(page.shot)
 
     def test_a_navigating_page_falls_back_to_the_live_dom(self):
         page = _LandmarkPage(content_raises=True)
         debugcap.capture_landmark(page, self.dir, "signin", log=log,
-                                  png_timeout_ms=5_000)
+                                  png_timeout_ms=5_000, redact=None)
         self.assertEqual(self._one(".html").read_text(),
                          "<html>evaluated</html>")
         self.assertEqual(page.shot["timeout"], 5_000)
 
     def test_a_missed_screenshot_keeps_the_dom_and_never_raises(self):
         page = _LandmarkPage(shot_raises=True)
-        debugcap.capture_landmark(page, self.dir, "signin", log=log)
+        debugcap.capture_landmark(page, self.dir, "signin", log=log,
+                                  redact=None)
         self._one(".html")
         self.assertEqual(list(self.dir.glob("*.png")), [])
 
@@ -1526,6 +1578,98 @@ class CaptureLandmarkTest(unittest.TestCase):
         out = self._one(".html").read_text()
         self.assertNotIn("s3cr3t", out)
         self.assertNotIn("example-user", out)
+
+
+class LandmarkCapturerTest(unittest.TestCase):
+    """landmark_capturer: a landmark capture that always masks."""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name) / "shots"
+        env = mock.patch.dict("os.environ", {"EX_USER": "example-user",
+                                             "EX_ALT": "example-alt-user",
+                                             "EX_PASS": "p@ss+word"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _html(self):
+        (found,) = self.dir.glob("*-signin.html")
+        return found.read_text()
+
+    def test_masks_the_named_credentials_by_value(self):
+        capture = debugcap.landmark_capturer(
+            self.dir, user_env=("EX_USER", "EX_ALT"), pass_env="EX_PASS",
+            log=log)
+        capture(_LandmarkPage("<div>example-user example-alt-user "
+                              "p@ss+word</div>"), "signin")
+        out = self._html()
+        for secret in ("example-user", "example-alt-user", "p@ss+word"):
+            self.assertNotIn(secret, out)
+        self.assertEqual(out.count(debugcap.REDACTED), 3)
+
+    def test_reads_the_credentials_at_the_capture(self):
+        # The env file is sourced after the capture is wired, before the
+        # first landmark.
+        capture = debugcap.landmark_capturer(self.dir, user_env="EX_LATE",
+                                             log=log)
+        with mock.patch.dict("os.environ", {"EX_LATE": "late-user-value"}):
+            capture(_LandmarkPage("<div>late-user-value</div>"), "signin")
+        self.assertNotIn("late-user-value", self._html())
+
+    def test_each_capture_reads_the_jar_as_it_stands(self):
+        # A capturer kept across a sign-in sees the pre-login jar first and
+        # the minted session later; the later capture masks the session.
+        capture = debugcap.landmark_capturer(self.dir, session=True, log=log)
+        jar = []
+        context = types.SimpleNamespace(cookies=lambda: list(jar))
+        values = {"before": "EXAMPLEPRELOGINVALUE",
+                  "after": "EXAMPLEMINTEDSESSION"}
+        for label, value in values.items():
+            jar[:] = [{"name": "s", "value": value}]
+            page = _LandmarkPage(f"<meta content='{value}'>")
+            page.context = context
+            capture(page, label)
+        for label, value in values.items():
+            (found,) = self.dir.glob(f"*-{label}.html")
+            self.assertNotIn(value, found.read_text())
+
+    def test_masks_the_session_jar(self):
+        page = _LandmarkPage("<meta content='EXAMPLESESSIONVALUE'>")
+        page.context = types.SimpleNamespace(cookies=lambda: [
+            {"name": "s", "value": "EXAMPLESESSIONVALUE"}])
+        debugcap.landmark_capturer(self.dir, session=True, log=log)(
+            page, "signin")
+        self.assertNotIn("EXAMPLESESSIONVALUE", self._html())
+
+    def test_blanks_password_inputs_with_nothing_named(self):
+        debugcap.landmark_capturer(self.dir, log=log)(
+            _LandmarkPage('<input type="password" value="typed">'), "signin")
+        self.assertNotIn("typed", self._html())
+
+    def test_no_dir_captures_nothing(self):
+        page = _LandmarkPage()
+        debugcap.landmark_capturer(None, user_env="EX_USER", log=log)(
+            page, "signin")
+        self.assertIsNone(page.shot)
+
+    def test_never_raises(self):
+        page = _LandmarkPage(content_raises=True, shot_raises=True)
+        page.evaluate = mock.Mock(side_effect=RuntimeError("gone"))
+        page.context = types.SimpleNamespace(
+            cookies=mock.Mock(side_effect=RuntimeError("closed")))
+        with self.assertLogs(log, level="WARNING"):
+            debugcap.landmark_capturer(self.dir, session=True, log=log)(
+                page, "signin")
+
+    def test_the_screenshot_keeps_its_cap(self):
+        page = _LandmarkPage()
+        debugcap.landmark_capturer(self.dir, log=log, png_timeout_ms=5_000)(
+            page, "signin")
+        self.assertEqual(page.shot["timeout"], 5_000)
 
 
 class StopTraceTest(unittest.TestCase):

@@ -19,10 +19,14 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 # shellcheck disable=SC1091
 . "$ROOT/shared/wrappers/image-tag.sh"
-# shellcheck disable=SC1091
-. "$ROOT/shared/wrappers/envfile-lib.sh"
 wealthdb_export_image_tag "$ROOT" || exit 2
 WEALTHDB="${WEALTHDB_BIN:-$ROOT/wealthdb/wealthdb}"
+# The helpers web shares with mcp; Metabase listens on 3000 in the
+# container.
+SERVICE=web
+SERVICE_CPORT=3000
+# shellcheck disable=SC1091
+. "$ROOT/shared/wrappers/service-lib.sh"
 
 # ---- settings ---------------------------------------------------------
 
@@ -35,9 +39,8 @@ _resolve_knobs() {
     BIND="${WEALTHDB_WEB_BIND:-both}"   # both | v4 | v6
     H2_DIR="$DATA_DIR/metabase"
     SNAP="$DATA_DIR/snapshot/wealthdb.db"
-    # DuckDB spill space. The driver hard-wires its temp_directory to
-    # "<database_file>.tmp", which sits on the read-only snapshot mount —
-    # so a writable host dir is mounted at exactly that path, letting
+    # DuckDB spill space, mounted writable at /spill. provision.py names
+    # a directory under it as the connection's temp_directory, so
     # memory-capped queries spill to disk instead of dying.
     SPILL_DIR="$DATA_DIR/spill"
 }
@@ -52,26 +55,11 @@ _resolve_knobs() {
 # refresh run it under _timed, with errexit off. With CONFIG_LOADED set,
 # a start later in the same run does not run the engine again.
 _load_config() {
-    _require_docker || return 1
-    local out
-    if [ -n "${WEALTHDB_CONFIG:-}" ]; then
-        out="$("$WEALTHDB" -c "$WEALTHDB_CONFIG" config-env web)" || out=""
-    else
-        out="$("$WEALTHDB" config-env web)" || out=""
-    fi
-    if [ -z "$out" ]; then
-        echo "web: could not read settings via 'wealthdb config-env web' (is wealthdb.cfg valid?)" >&2
-        return 1
-    fi
-    eval "$out"
+    _config_env || return 1
     ENABLED="${WEALTHDB_WEB_ENABLED:-0}"
     PORT="${WEALTHDB_WEB_PORT:-3000}"
     GOLD_DB="${WEALTHDB_GOLD_DB:-}"
     CONFIG_LOADED=1
-}
-
-_require_docker() {
-    command -v docker >/dev/null 2>&1 || { echo "web: docker not found on PATH" >&2; return 1; }
 }
 
 # start and refresh time their steps and read the snapshot's mtime,
@@ -82,21 +70,14 @@ _require_python3() {
 
 # ---- pure helpers (unit-tested) ---------------------------------------
 
-# _publish_args PORT BIND → prints `docker run` -p flags (one token
-# per line) for loopback IPv4 and/or IPv6.
-_publish_args() {
-    local port="$1" bind="$2"
-    case "$bind" in
-        v4)   printf '%s\n' -p "127.0.0.1:${port}:3000" ;;
-        v6)   printf '%s\n' -p "[::1]:${port}:3000" ;;
-        both) printf '%s\n' -p "127.0.0.1:${port}:3000" -p "[::1]:${port}:3000" ;;
-        *)    echo "web: invalid WEALTHDB_WEB_BIND '$bind' (want both|v4|v6)" >&2; return 1 ;;
-    esac
-}
-
 # _docker_run_args populates the DOCKER_ARGS array from the resolved
-# globals (IMAGE, CONTAINER, PORT, BIND, H2_DIR, SNAP). Pure (no exec);
-# the unit test sets the globals and inspects the array.
+# globals (IMAGE, CONTAINER, PORT, BIND, H2_DIR, SNAP, SPILL_DIR). Pure
+# (no exec); the unit test sets the globals and inspects the array.
+#
+# The snapshot's directory is mounted, not the file. A snapshot swapped
+# in after the start is then visible to the running server under a new
+# name (_serving_name), and a refresh points the database at that name
+# instead of recreating the container.
 _docker_run_args() {
     DOCKER_ARGS=(
         run -d
@@ -124,8 +105,8 @@ _docker_run_args() {
         -e MB_AGGREGATED_QUERY_ROW_LIMIT=100000
         -e MB_UNAGGREGATED_QUERY_ROW_LIMIT=100000
         -v "${H2_DIR}:/metabase-data"
-        -v "${SNAP}:/gold/wealthdb.db:ro"
-        -v "${SPILL_DIR}:/gold/wealthdb.db.tmp"
+        -v "$(dirname "$SNAP"):/gold:ro"
+        -v "${SPILL_DIR}:/spill"
     )
     local tok
     while IFS= read -r tok; do
@@ -205,8 +186,6 @@ _snapshot_kept() {
 }
 
 _mtime()      { date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null || echo unknown; }
-_is_running() { [ -n "$(docker ps  -q -f "name=^${CONTAINER}\$" -f status=running 2>/dev/null)" ]; }
-_exists()     { [ -n "$(docker ps -aq -f "name=^${CONTAINER}\$" 2>/dev/null)" ]; }
 
 # ---- subcommands ------------------------------------------------------
 
@@ -241,11 +220,16 @@ web_start() {
     fi
     _exists && docker rm "$CONTAINER" >/dev/null 2>&1 || true
     mkdir -p "$H2_DIR" "$(dirname "$SNAP")" "$SPILL_DIR"
+    # A DuckDB that was killed leaves its spill files behind, and no
+    # later one reuses a directory named after another file. With no
+    # container left, no DuckDB has one open.
+    if ! _exists; then rm -rf "$SPILL_DIR"/wealthdb-*.db.tmp; fi
     if [ ! -f "$SNAP" ]; then
         _timed materialize _materialize
         echo "web: taking initial gold snapshot…" >&2
         _timed snapshot _snapshot "$GOLD_DB" "$SNAP"
     fi
+    _relink_snapshots || { echo "web: could not link the snapshot's serving names" >&2; return 1; }
 
     _docker_run_args
     if ! _timed "container start" docker "${DOCKER_ARGS[@]}" >/dev/null; then
@@ -259,10 +243,11 @@ web_start() {
             return 1
         fi
     fi
-    # The container resolved the snapshot path at this start. A later
-    # refresh treats that inode as the one being served.
+    # Every serving name links the snapshot of this start. A later
+    # refresh treats its inode as the one being served.
     _mark_snapshot_served
     _timed provision _provision
+    if [ "$PROV_SERVED" = 1 ]; then _prune_links; fi
     _start_banner
     # A snapshot older than the cards need leaves the server up with the
     # cards it had. Setup in the browser cannot mend that, so start says
@@ -332,16 +317,71 @@ p = sys.argv[2]
 print(getattr(os.stat(p), sys.argv[1]) if os.path.exists(p) else 0)' "$1" "$2"
 }
 
-# _mark_snapshot_served records the snapshot inode the container just
-# mounted. The snapshot keeps gold's mtime, so mtime cannot tell a file
-# the container opened from one swapped in after it started.
+# _mark_snapshot_served records the serving name of the snapshot the
+# server reads: at start, the one every serving name links; after a
+# confirmed refresh, the new one. The snapshot keeps gold's mtime, so
+# mtime alone cannot tell a file the server reads from one swapped in
+# after it started. A marker in any other form matches no name, so a
+# container started by another version is recreated.
 _mark_snapshot_served() {
-    _stat st_ino "$SNAP" > "${SNAP}.served"
+    _serving_name > "${SNAP}.served"
 }
 
 _snapshot_served() {
     [ -f "$SNAP" ] && [ -f "${SNAP}.served" ] \
-        && [ "$(_stat st_ino "$SNAP")" = "$(tr -d '[:space:]' < "${SNAP}.served")" ]
+        && [ "$(_serving_name)" = "$(tr -d '[:space:]' < "${SNAP}.served")" ]
+}
+
+# _serving_name prints the name the server reads the snapshot under, a
+# hard link of it named after its inode and mtime. A new snapshot is a
+# new inode, so the running server has never opened its name. A file
+# system may hand a freed inode number to a later copy, but a later
+# copy carries a newer gold's mtime, so the names still differ. The
+# driver's DuckDB keeps one open database per path, so a path the
+# server had open could hand back the old file; a new name opens the
+# new one.
+_serving_name() {
+    printf 'wealthdb-%s-%s.db\n' "$(_stat st_ino "$SNAP")" "$(_stat st_mtime_ns "$SNAP")"
+}
+
+# _serving_links prints the path of every serving name in the snapshot
+# directory.
+_serving_links() {
+    local l
+    for l in "$(dirname "$SNAP")"/wealthdb-*.db; do
+        if [ -e "$l" ]; then printf '%s\n' "$l"; fi
+    done
+}
+
+# _link_snapshot LINK makes LINK a hard link of the snapshot. A link
+# takes no space and leaves the snapshot where start, status and the
+# next copy look for it.
+_link_snapshot() {
+    [ -f "$SNAP" ] || return 1
+    [ "$(_stat st_ino "$1")" = "$(_stat st_ino "$SNAP")" ] || ln -f "$SNAP" "$1"
+}
+
+# _relink_snapshots makes every serving name a link of the current
+# snapshot. Start runs it before the server comes up, so a database
+# that provisioning cannot point at a new name (a changed admin
+# password) still reads the current snapshot.
+_relink_snapshots() {
+    local l
+    while IFS= read -r l; do
+        _link_snapshot "$l" || return 1
+    done < <(_serving_links)
+}
+
+# _prune_links removes every serving name but the current snapshot's.
+# It runs once the server reads the current one. An old name keeps an
+# old snapshot on disk; once the name goes, the file's space returns
+# when the server closes it.
+_prune_links() {
+    local keep l
+    keep="$(dirname "$SNAP")/$(_serving_name)"
+    while IFS= read -r l; do
+        if [ "$l" != "$keep" ]; then rm -f "$l"; fi
+    done < <(_serving_links)
 }
 
 web_refresh() {
@@ -350,9 +390,9 @@ web_refresh() {
     _timed materialize _materialize
     # Copy when the snapshot is missing or older than gold. A missing
     # gold file is stale too: the copy reports it. A running container
-    # is current only when it started on this snapshot's inode, so a
-    # refresh that died after the copy and before the restart still
-    # restarts the next time.
+    # is current only when it serves this snapshot's inode, so a
+    # refresh that died after the copy and before the server took it up
+    # still takes it up the next time.
     local stale=1 running=0
     if [ -f "$GOLD_DB" ] && [ -f "$SNAP" ] \
         && [ "$(_stat st_mtime_ns "$SNAP")" -ge "$(_stat st_mtime_ns "$GOLD_DB")" ]; then
@@ -363,6 +403,7 @@ web_refresh() {
         echo "web: snapshot unchanged" >&2
         if [ "$running" -eq 1 ]; then
             _timed provision _provision
+            if [ "$PROV_SERVED" = 1 ]; then _prune_links; fi
             return "$PROV_RC"
         fi
         return 0
@@ -373,14 +414,32 @@ web_refresh() {
         echo "web: snapshot updated (as of $(_mtime "$SNAP"))"
     fi
     if [ "$running" -eq 1 ]; then
-        # Recreate the container — do NOT `docker restart`. The snapshot is
-        # bind-mounted as a single file (see _docker_run_args) and _snapshot
-        # swaps it via atomic rename, so the new copy is a new inode. A bind
-        # mount tracks the inode it resolved at container-creation time; a
-        # restart preserves the old mount namespace and would keep serving the
-        # stale (now-unlinked) inode. rm + run re-resolves the path to the new
-        # file. Re-running start also re-provisions (idempotent), so new or
-        # renamed report models show up after a refresh too.
+        # The running server sees the new snapshot through the mounted
+        # directory. Provisioning points the database at its serving
+        # name, which makes Metabase close the connections to the old
+        # file, and confirms that the server reads the new one. It also
+        # converges the cards, so new or renamed report models show up.
+        if [ "${WEALTHDB_WEB_NO_PROVISION:-0}" != 1 ]; then
+            _timed provision _provision
+            if [ "$PROV_SERVED" = 1 ]; then
+                _mark_snapshot_served
+                _prune_links
+                return "$PROV_RC"
+            fi
+            # A new container could not link the snapshot either, so
+            # the running one keeps serving. Its marker still names the
+            # old snapshot, and the next refresh tries again.
+            if [ "${PROV_LINKED:-0}" != 1 ]; then
+                echo "web: $CONTAINER keeps serving the previous snapshot." >&2
+                return 1
+            fi
+        fi
+        # Without that confirmation the container is recreated, and the
+        # new one reads the current snapshot under every name. A
+        # container that mounts the snapshot file rather than its
+        # directory takes this path too: its marker names no serving
+        # name, so even an unchanged snapshot comes this way.
+        echo "web: Metabase did not confirm it reads the new snapshot; recreating $CONTAINER" >&2
         _timed stop web_stop >/dev/null
         web_start
     fi
@@ -400,10 +459,10 @@ _gen_password() {
 }
 
 # _materialize refreshes the serving tables and the report_returns (with
-# report_bridge and the benchmark tables), report_gains,
-# report_exposure*, report_yield_* and report_cashflow_plan tables in
-# LIVE gold via the engine's hidden web-materialize subcommand,
-# so the snapshot taken next carries them as fresh as the holdings. An
+# report_bridge, report_private_markets and the benchmark tables),
+# report_gains, report_exposure*, report_yield_* and
+# report_cashflow_plan tables in LIVE gold via the engine's hidden
+# web-materialize subcommand, so the snapshot taken next carries them as fresh as the holdings. An
 # engine-owned write, mutually exclusive with `wealthdb load` under the
 # engine's write mutex (a concurrent load makes it fail, not wait); it
 # runs BEFORE _snapshot, so a failure aborts under web_main's `set -e`
@@ -416,7 +475,7 @@ _gen_password() {
 # its inputs did not change, so an unchanged gold keeps its mtime and
 # the snapshot is not copied again.
 _materialize() {
-    echo "web: materializing serving tables, returns and the bridge, gains, exposure, yield and the cash flow projection into gold …" >&2
+    echo "web: materializing serving tables, returns, the bridge and the private funds, gains, exposure, yield and the cash flow projection into gold …" >&2
     local log rc=0 cfg=()
     log="$(mktemp "${TMPDIR:-/tmp}/wealthdb-web-materialize.XXXXXX")" || return 1
     trap 'rm -f "$log"; trap - RETURN' RETURN
@@ -444,24 +503,36 @@ _error_line() {
     printf '%s\n' "${line:-(the engine printed nothing)}"
 }
 
-# provision.py's exit status for a gold snapshot older than the cards
-# need (its EXIT_STALE_SNAPSHOT); any other failure exits 1.
+# provision.py's exit statuses: a gold snapshot older than the cards
+# need (its EXIT_STALE_SNAPSHOT), and an admin login it could not
+# verify, so that it checked and changed nothing (EXIT_UNVERIFIED). Any
+# other failure exits 1.
 PROV_STALE_SNAPSHOT=3
+PROV_UNVERIFIED=4
 
 # _provision creates the admin (skipping the browser setup wizard) and
 # pre-adds the gold DuckDB database via web/provision.py. Idempotent.
-# Admin email/password come from env (WEALTHDB_WEB_ADMIN_EMAIL/PASSWORD,
-# e.g. from ~/.secrets/wealthdb-web.env); an unset password is generated
-# once and saved (chmod 600). Sets PROV_LOGIN for the start banner and
-# PROV_RC to provision.py's exit status (0 when it does not run). Start
-# and refresh run it under _timed, with errexit off, so a password it
-# cannot read, generate or save stops it here.
+# The database reads the snapshot under its serving name, which this
+# links first. Admin email/password come from env
+# (WEALTHDB_WEB_ADMIN_EMAIL/PASSWORD, e.g. from
+# ~/.secrets/wealthdb-web.env); an unset password is generated once and
+# saved (chmod 600). Sets PROV_LOGIN for the start banner, PROV_RC to
+# provision.py's exit status (0 when it does not run, and for a login it
+# could not verify), PROV_LINKED to 1 once the serving name links the
+# snapshot, and PROV_SERVED to 1 when provision.py confirmed the server
+# reads the serving name. Start and refresh run it under
+# _timed, with errexit off, so a password it cannot read, generate or
+# save, or a link it cannot make, stops it here.
 _provision() {
-    PROV_RC=0
+    PROV_RC=0 PROV_SERVED=0 PROV_LINKED=0
     if [ "${WEALTHDB_WEB_NO_PROVISION:-0}" = 1 ]; then
         echo "web: auto-provision disabled (WEALTHDB_WEB_NO_PROVISION=1)." >&2
         return 0
     fi
+    local name
+    name="$(_serving_name)" && _link_snapshot "$(dirname "$SNAP")/$name" \
+        || { echo "web: could not link the snapshot as $name" >&2; return 1; }
+    PROV_LINKED=1
     local email pwfile pw pwhint
     email="${WEALTHDB_WEB_ADMIN_EMAIL:-admin@wealthdb.local}"
     pwfile="$DATA_DIR/admin-password.txt"
@@ -480,13 +551,16 @@ _provision() {
     # process on the host could read it from `ps`.
     WEALTHDB_WEB_ADMIN_PASSWORD="$pw" python3 "$HERE/provision.py" \
          --base "http://127.0.0.1:$PORT" \
-         --email "$email" --gold-path /gold/wealthdb.db --db-name gold \
+         --email "$email" --gold-path "/gold/$name" --spill-dir /spill --db-name gold \
          --default-currency "${WEALTHDB_DEFAULT_CURRENCY:-USD}" \
          --missing-basis "${WEALTHDB_MISSING_BASIS:-ignore}" \
          --source-colors "$DATA_DIR/source-colors.json" || PROV_RC=$?
     case "$PROV_RC" in
-        # The schema check follows the admin login, so the login stands.
-        0|"$PROV_STALE_SNAPSHOT") PROV_LOGIN="log in as $email (password $pwhint)" ;;
+        # The schema check follows the admin login and the check of the
+        # file the server reads, so the login stands.
+        0|"$PROV_STALE_SNAPSHOT") PROV_SERVED=1 PROV_LOGIN="log in as $email (password $pwhint)" ;;
+        # Setup was done before: the database stands as it was added.
+        "$PROV_UNVERIFIED") PROV_RC=0 PROV_LOGIN="log in as $email (password $pwhint)" ;;
         *) PROV_LOGIN="auto-provision incomplete — finish setup in the browser" ;;
     esac
 }
@@ -505,10 +579,10 @@ web: $CONTAINER is up → Metabase on http://127.0.0.1:$PORT/
   report models mirroring the global / portfolios / accounts /
   positions / transactions / returns commands, plus pre-defined
   questions and the Wealth Overview / Allocation / Returns / Spending
-  / Income / Cash Flow / Gains / Exposure / Yield / Data Freshness
-  dashboards, most with a privacy twin that hides absolute values (all
-  in the 'wealthdb (pre-defined)' collection; duplicate before
-  customizing).
+  / Income / Cash Flow / Gains / Exposure / Yield / Data Freshness /
+  Private Markets dashboards, most with a privacy twin that hides
+  absolute values (all in the 'wealthdb (pre-defined)' collection;
+  duplicate before customizing).
   Run 'wealthdb web refresh' after each 'wealthdb load' to update.
 EOF
 }
@@ -526,8 +600,8 @@ subcommands:
   status     running state, published port, snapshot freshness
   restart    stop then start
   refresh    re-materialize the serving and report tables, copy gold to
-             the read-only snapshot when gold changed, and restart
-             Metabase on a new snapshot (run after 'wealthdb load')
+             the read-only snapshot when gold changed, and point
+             Metabase at a new snapshot (run after 'wealthdb load')
   logs       follow the container logs
   build      build the wealthdb/metabase image
   help       this message
@@ -561,16 +635,8 @@ EOF
 
 web_main() {
     set -euo pipefail
-    # Optional secrets env for admin creds etc. (repo convention:
-    # secrets live in ~/.secrets, never in the config file). It is a bash
-    # script: syntax-checked, then sourced with every assignment exported.
-    # A file that does not parse stops the script, and bash's message is
-    # not shown, since it quotes the line.
-    local envf="${WEALTHDB_WEB_ENV_FILE:-$HOME/.secrets/wealthdb-web.env}"
-    if [ -f "$envf" ] && ! wealthdb_source_bash "$envf"; then
-        echo "web: $envf has a bash syntax error" >&2
-        return 1
-    fi
+    # Optional secrets env for admin creds etc.
+    _source_env_file || return 1
     _resolve_knobs
     local cmd="${1:-help}"
     if [ "$#" -gt 0 ]; then shift; fi

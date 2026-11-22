@@ -44,7 +44,7 @@ Subcommands:
                       portfolio_summary / timeseries, commitments,
                       funding_accounts + funding_transactions,
                       k1_capital_accounts, tax_documents.
-                      --force deletes the silver DB and rebuilds from all bronze.
+                      --force rebuilds the silver from all bronze.
   prune [args...]     Delete non-complete dumps (crashed / interrupted
                       downloads that never wrote a terminal run.json)
                       from the bronze tree. Runs host-side (pure stdlib;
@@ -60,7 +60,9 @@ Mounted into the container:
   <TMP>/w-angellist/home/.secrets  ->  /secrets
   <TMP>/w-angellist/xdgdata/wealthdb/angellist     ->  /data
   <TMP>/w-angellist/xdgcache/wealthdb/startupcache  ->  /cache/startupcache
+  <TMP>/w-angellist/xdgcache/wealthdb/angellist  ->  /cache/collector
   <TMP>/w-angellist/xdgcache/wealthdb/debug/angellist    ->  /debug
+  <TMP>/w-angellist/tree/collectors/angellist  ->  /app
 
 Override mounts via env:
   ANGELLIST_SECRETS_DIR=/path/to/secrets
@@ -122,7 +124,7 @@ Subcommands:
                       portfolio_summary / timeseries, commitments,
                       funding_accounts + funding_transactions,
                       k1_capital_accounts, tax_documents.
-                      --force deletes the silver DB and rebuilds from all bronze.
+                      --force rebuilds the silver from all bronze.
   prune [args...]     Delete non-complete dumps (crashed / interrupted
                       downloads that never wrote a terminal run.json)
                       from the bronze tree. Runs host-side (pure stdlib;
@@ -138,7 +140,9 @@ Mounted into the container:
   <TMP>/w-angellist/home/.secrets  ->  /secrets
   <TMP>/w-angellist/xdgdata/wealthdb/angellist     ->  /data
   <TMP>/w-angellist/xdgcache/wealthdb/startupcache  ->  /cache/startupcache
+  <TMP>/w-angellist/xdgcache/wealthdb/angellist  ->  /cache/collector
   <TMP>/w-angellist/xdgcache/wealthdb/debug/angellist    ->  /debug
+  <TMP>/w-angellist/tree/collectors/angellist  ->  /app
 
 Override mounts via env:
   ANGELLIST_SECRETS_DIR=/path/to/secrets
@@ -222,6 +226,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-angellist/xdgcache/wealthdb/angellist:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-angellist/xdgcache/wealthdb/debug/angellist:/debug
   -v
   <TMP>/w-angellist/tree/collectors/angellist:/app
@@ -275,6 +283,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-angellist/xdgcache/wealthdb/angellist:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-angellist/xdgcache/wealthdb/debug/angellist:/debug
   -v
   <TMP>/w-angellist/tree/collectors/angellist:/app
@@ -320,6 +332,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-angellist/xdgcache/wealthdb/angellist:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-angellist/xdgcache/wealthdb/debug/angellist:/debug
   -v
   <TMP>/w-angellist/tree/collectors/angellist:/app
@@ -364,6 +380,10 @@ docker
   <TMP>/w-angellist/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-angellist/xdgcache/wealthdb/angellist:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-angellist/xdgcache/wealthdb/debug/angellist:/debug
   -v
@@ -421,6 +441,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-angellist/xdgcache/wealthdb/angellist:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-angellist/xdgcache/wealthdb/debug/angellist:/debug
   -v
   <TMP>/w-angellist/tree/collectors/angellist:/app
@@ -465,6 +489,10 @@ docker
   <TMP>/w-angellist/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-angellist/xdgcache/wealthdb/angellist:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-angellist/xdgcache/wealthdb/debug/angellist:/debug
   -v
@@ -519,6 +547,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-angellist/xdgcache/wealthdb/angellist:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-angellist/xdgcache/wealthdb/debug/angellist:/debug
   -v
   <TMP>/w-angellist/tree/collectors/angellist:/app
@@ -564,6 +596,10 @@ docker
   <TMP>/w-angellist/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-angellist/xdgcache/wealthdb/angellist:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-angellist/xdgcache/wealthdb/debug/angellist:/debug
   -v
@@ -612,6 +648,10 @@ docker
   <TMP>/w-angellist/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-angellist/xdgcache/wealthdb/angellist:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-angellist/silver:/silver
   -v
@@ -662,6 +702,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-angellist/xdgcache/wealthdb/angellist:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-angellist/silver:/silver
   -v
   <TMP>/w-angellist/xdgcache/wealthdb/debug/angellist:/debug
@@ -711,6 +755,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-angellist/xdgcache/wealthdb/angellist:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-angellist/xdgcache/wealthdb/debug/angellist:/debug
   -v
   <TMP>/w-angellist/tree/collectors/angellist:/app
@@ -755,6 +803,10 @@ docker
   <TMP>/w-angellist/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-angellist/xdgcache/wealthdb/angellist:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-angellist/xdgcache/wealthdb/debug/angellist:/debug
   -v
@@ -801,6 +853,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-angellist/xdgcache/wealthdb/angellist:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-angellist/xdgcache/wealthdb/debug/angellist:/debug
   -v
   <TMP>/w-angellist/tree/collectors/angellist:/app
@@ -846,6 +902,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-angellist/xdgcache/wealthdb/angellist:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-angellist/xdgcache/wealthdb/debug/angellist:/debug
   -v
   <TMP>/w-angellist/tree/collectors/angellist:/app
@@ -890,6 +950,10 @@ docker
   <TMP>/w-angellist/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-angellist/xdgcache/wealthdb/angellist:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-angellist/xdgcache/wealthdb/debug/angellist:/debug
   -v

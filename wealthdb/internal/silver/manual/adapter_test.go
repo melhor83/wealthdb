@@ -62,12 +62,6 @@ func seed(t *testing.T, db *sql.DB) {
 	}
 }
 
-func TestKindIsManual(t *testing.T) {
-	if got := (&Adapter{}).Kind(); got != "manual" {
-		t.Errorf("Kind() = %q, want manual", got)
-	}
-}
-
 func TestStatusEmpty(t *testing.T) {
 	silvertest.AssertEmptyStatus(t, &Adapter{}, silverSchemaSQL)
 }
@@ -100,9 +94,8 @@ func TestStatusAndChangeWindow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !w.HasChanges || w.Start != silvertest.ISO(t, "2020-01-01") || w.End != silvertest.ISO(t, "2023-01-01") || w.NewChangeNumber != 1700000000 {
-		t.Errorf("ChangeWindow(-1) = %+v, want HasChanges Start=%d End=%d NewCN=1700000000",
-			w, silvertest.ISO(t, "2020-01-01"), silvertest.ISO(t, "2023-01-01"))
+	if !w.HasChanges || !w.Full || w.NewChangeNumber != 1700000000 {
+		t.Errorf("ChangeWindow(-1) = %+v, want the whole history up to NewCN=1700000000", w)
 	}
 	// Idle reload (watermark already at the latest load) → no changes.
 	w2, err := conn.ChangeWindow(context.Background(), 1700000000)

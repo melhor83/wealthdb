@@ -68,19 +68,14 @@ func (c *apiReader) Snapshots(ctx context.Context, w canonical.Window) (silver.S
 // fills the name and the payload a statement's row of the same bond
 // leaves empty.
 func (c *apiReader) appendInstrumentBonds(ctx context.Context, w canonical.Window, byTime silver.Batches) error {
-	exists, err := silver.HasTables(ctx, c.db, "instruments")
-	if err != nil || !exists {
+	s, err := c.schema(ctx)
+	if err != nil || !s.instruments {
 		return err
 	}
-	rows, err := c.db.QueryContext(ctx, `
+	return silver.ScanRows(ctx, c.db, "appendInstrumentBonds", `
 SELECT snapshot_at, symbol, payload FROM instruments
  WHERE snapshot_at BETWEEN ? AND ?
- ORDER BY snapshot_at, symbol`, w.Start, w.End)
-	if err != nil {
-		return fmt.Errorf("appendInstrumentBonds: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
+ ORDER BY snapshot_at, symbol`, func(rows *sql.Rows) error {
 		var snap int64
 		var symbol, payload string
 		if err := rows.Scan(&snap, &symbol, &payload); err != nil {
@@ -88,15 +83,15 @@ SELECT snapshot_at, symbol, payload FROM instruments
 		}
 		batch, ok := byTime[snap]
 		if !ok {
-			continue
+			return nil
 		}
 		var i schwabInstrument
 		if json.Unmarshal([]byte(payload), &i) != nil {
-			continue
+			return nil
 		}
 		acNew, vehicle := taxonomyFor(i.AssetType, i.Type, i.Description)
 		if vehicle != canonical.VehicleBond {
-			continue
+			return nil
 		}
 		key := preferredInstrumentKey(i)
 		if key == "" {
@@ -114,8 +109,8 @@ SELECT snapshot_at, symbol, payload FROM instruments
 			LastSeenAt:           snap,
 			Payload:              bondTermsPayload(vehicle, i),
 		})
-	}
-	return rows.Err()
+		return nil
+	}, w.Start, w.End)
 }
 
 // dumpTimesInWindow returns the distinct dump_runs.snapshot_at values
@@ -125,21 +120,14 @@ func dumpTimesInWindow(ctx context.Context, db *sql.DB, w canonical.Window) ([]i
 SELECT snapshot_at FROM dump_runs
  WHERE snapshot_at BETWEEN ? AND ?
  ORDER BY snapshot_at`
-	rows, err := db.QueryContext(ctx, q, w.Start, w.End)
-	if err != nil {
-		return nil, fmt.Errorf("dump_runs in window: %w", err)
-	}
-	defer rows.Close()
 
-	var out []int64
-	for rows.Next() {
+	return silver.Query(ctx, db, "dump_runs in window", q, func(rows *sql.Rows) (int64, error) {
 		var t int64
 		if err := rows.Scan(&t); err != nil {
-			return nil, fmt.Errorf("dump_runs in window scan: %w", err)
+			return 0, fmt.Errorf("dump_runs in window scan: %w", err)
 		}
-		out = append(out, t)
-	}
-	return out, rows.Err()
+		return t, nil
+	}, w.Start, w.End)
 }
 
 // schwabAccountPayload covers the {accountNumber, hashValue}
@@ -161,21 +149,17 @@ type schwabAccountPayload struct {
 // management wrapper category, so it is filled in via the
 // config-side override.
 func (c *apiReader) appendAccounts(ctx context.Context, w canonical.Window, byTime map[int64]*canonical.SnapshotBatch) error {
-	hasNickname, err := silver.HasColumn(ctx, c.db, "accounts", "nickname")
+	s, err := c.schema(ctx)
 	if err != nil {
 		return err
 	}
+	hasNickname := s.nickname
 	q := `SELECT snapshot_at, account_external_id, payload, NULL FROM accounts WHERE snapshot_at BETWEEN ? AND ?`
 	if hasNickname {
 		q = `SELECT snapshot_at, account_external_id, payload, nickname FROM accounts WHERE snapshot_at BETWEEN ? AND ?`
 	}
-	rows, err := c.db.QueryContext(ctx, q, w.Start, w.End)
-	if err != nil {
-		return fmt.Errorf("appendAccounts: %w", err)
-	}
-	defer rows.Close()
 
-	for rows.Next() {
+	return silver.ScanRows(ctx, c.db, "appendAccounts", q, func(rows *sql.Rows) error {
 		var (
 			snap     int64
 			extID    string
@@ -187,7 +171,7 @@ func (c *apiReader) appendAccounts(ctx context.Context, w canonical.Window, byTi
 		}
 		batch, ok := byTime[snap]
 		if !ok {
-			continue
+			return nil
 		}
 
 		var p schwabAccountPayload
@@ -203,8 +187,8 @@ func (c *apiReader) appendAccounts(ctx context.Context, w canonical.Window, byTi
 			LastSeenAt:        snap,
 			Payload:           json.RawMessage(payload),
 		})
-	}
-	return rows.Err()
+		return nil
+	}, w.Start, w.End)
 }
 
 // schwabBalancePayload covers the field read from account_balances
@@ -223,13 +207,8 @@ func (c *apiReader) appendAccountBalances(ctx context.Context, w canonical.Windo
 SELECT snapshot_at, account_external_id, balance_kind, payload
   FROM account_balances
  WHERE snapshot_at BETWEEN ? AND ?`
-	rows, err := c.db.QueryContext(ctx, q, w.Start, w.End)
-	if err != nil {
-		return fmt.Errorf("appendAccountBalances: %w", err)
-	}
-	defer rows.Close()
 
-	for rows.Next() {
+	return silver.ScanRows(ctx, c.db, "appendAccountBalances", q, func(rows *sql.Rows) error {
 		var (
 			snap        int64
 			extID, kind string
@@ -240,7 +219,7 @@ SELECT snapshot_at, account_external_id, balance_kind, payload
 		}
 		batch, ok := byTime[snap]
 		if !ok {
-			continue
+			return nil
 		}
 
 		var bp schwabBalancePayload
@@ -248,14 +227,14 @@ SELECT snapshot_at, account_external_id, balance_kind, payload
 			return fmt.Errorf("appendAccountBalances row (snap=%d, kind=%s): %w", snap, kind, err)
 		}
 		if bp.CashBalance == nil {
-			continue
+			return nil
 		}
 
 		bk := canonicalBalanceKind(kind)
 		if !bk.Valid() {
 			// Unknown silver balance_kind; skip rather than emit a
 			// row that would fail the gold-side enum guard.
-			continue
+			return nil
 		}
 		batch.CashBalances = append(batch.CashBalances, canonical.CashBalanceChange{
 			SnapshotAt:        snap,
@@ -265,8 +244,8 @@ SELECT snapshot_at, account_external_id, balance_kind, payload
 			Amount:            *bp.CashBalance,
 			Payload:           json.RawMessage(payload),
 		})
-	}
-	return rows.Err()
+		return nil
+	}, w.Start, w.End)
 }
 
 func canonicalBalanceKind(silverKind string) canonical.BalanceKind {
@@ -284,8 +263,9 @@ func canonicalBalanceKind(silverKind string) canonical.BalanceKind {
 	}
 }
 
-// schwabInstrument is the embedded instrument descriptor that
-// appears under both positions and transactions[].transferItems[].
+// schwabInstrument is the instrument descriptor of an instruments row
+// and of transactions[].transferItems[]; a position states its own in
+// columns (apiHolding).
 type schwabInstrument struct {
 	AssetType   string `json:"assetType"`
 	Type        string `json:"type"`
@@ -297,16 +277,6 @@ type schwabInstrument struct {
 	// percent: the schwab-api collector reads it so.
 	MaturityDate string   `json:"maturityDate"`
 	VariableRate *float64 `json:"variableRate"`
-}
-
-// schwabPositionPayload covers the fields read from each
-// positions row.
-type schwabPositionPayload struct {
-	LongQuantity  canonical.Decimal  `json:"longQuantity"`
-	ShortQuantity canonical.Decimal  `json:"shortQuantity"`
-	AveragePrice  *canonical.Decimal `json:"averagePrice"`
-	MarketValue   *canonical.Decimal `json:"marketValue"`
-	Instrument    schwabInstrument   `json:"instrument"`
 }
 
 // appendPositions emits InstrumentChange + PositionChange for each
@@ -328,23 +298,19 @@ type schwabPositionPayload struct {
 func (c *apiReader) appendPositions(ctx context.Context, byTime map[int64]*canonical.SnapshotBatch, instrumentNames map[string]string) error {
 	// Silver migration 0005 promoted the open P/L; an older silver
 	// states none, and its positions carry no book value.
-	hasOpenPL, err := silver.HasColumn(ctx, c.db, "positions", "unrealized_gain_loss")
+	s, err := c.schema(ctx)
 	if err != nil {
 		return err
 	}
-	openPLCol := "NULL"
-	if hasOpenPL {
-		openPLCol = "unrealized_gain_loss"
+	openPLCol := silver.ColumnOr(s.unrealizedGain, "unrealized_gain_loss")
+	holding, err := c.holdingRead(ctx)
+	if err != nil {
+		return err
 	}
 	q := fmt.Sprintf(`
-SELECT snapshot_at, account_external_id, instrument_key, payload, %s
+SELECT snapshot_at, account_external_id, instrument_key, payload, %s, %s
   FROM positions
- ORDER BY snapshot_at, account_external_id, instrument_key`, openPLCol)
-	rows, err := c.db.QueryContext(ctx, q)
-	if err != nil {
-		return fmt.Errorf("appendPositions: %w", err)
-	}
-	defer rows.Close()
+ ORDER BY snapshot_at, account_external_id, instrument_key`, openPLCol, holding.selectList())
 
 	// The first pass reads every position and feeds the mark guard; the
 	// second emits the window's rows with the guard's fixes.
@@ -353,23 +319,25 @@ SELECT snapshot_at, account_external_id, instrument_key, payload, %s
 		extID, posKey string
 		payload       string
 		openPL        sql.NullFloat64
-		pp            schwabPositionPayload
+		pp            apiHolding
 		cash          bool
 		assetClass    canonical.AssetClass
 		vehicle       canonical.Vehicle
 		name          string
 		quantity      canonical.Decimal
 	}
-	var read []apiPosition
 	guard := newMarkGuard(c.marks)
-	for rows.Next() {
+	read, err := silver.Query(ctx, c.db, "appendPositions", q, func(rows *sql.Rows) (apiPosition, error) {
 		var r apiPosition
-		if err := rows.Scan(&r.snap, &r.extID, &r.posKey, &r.payload, &r.openPL); err != nil {
-			return fmt.Errorf("appendPositions scan: %w", err)
+		h := holding.scan()
+		if err := rows.Scan(append([]any{&r.snap, &r.extID, &r.posKey, &r.payload, &r.openPL}, h.dest()...)...); err != nil {
+			return apiPosition{}, fmt.Errorf("appendPositions scan: %w", err)
 		}
-		if err := json.Unmarshal([]byte(r.payload), &r.pp); err != nil {
-			return fmt.Errorf("appendPositions row (snap=%d, key=%s): %w", r.snap, r.posKey, err)
+		pp, err := h.holding()
+		if err != nil {
+			return apiPosition{}, fmt.Errorf("appendPositions row (snap=%d, key=%s): %w", r.snap, r.posKey, err)
 		}
+		r.pp = pp
 		guard.snapshot(r.snap)
 		// Cash-like assetType → cash_balances, not positions.
 		r.cash = isCashAssetType(r.pp.Instrument.AssetType)
@@ -387,9 +355,9 @@ SELECT snapshot_at, account_external_id, instrument_key, payload, %s
 				guard.observe(markSeries{r.extID, r.posKey}, r.snap, r.quantity, r.pp.MarketValue)
 			}
 		}
-		read = append(read, r)
-	}
-	if err := rows.Err(); err != nil {
+		return r, nil
+	})
+	if err != nil {
 		return err
 	}
 	fixes := guard.fixes()
@@ -464,7 +432,7 @@ SELECT snapshot_at, account_external_id, instrument_key, payload, %s
 // side's when the position is short. A row long and short at once
 // states the P/L of its short side only, which says nothing of the
 // whole; it carries no basis.
-func apiBookValue(pp schwabPositionPayload, openPL sql.NullFloat64) *canonical.Decimal {
+func apiBookValue(pp apiHolding, openPL sql.NullFloat64) *canonical.Decimal {
 	long, short := pp.LongQuantity.IsPositive(), pp.ShortQuantity.IsPositive()
 	if long && short {
 		return nil
@@ -481,12 +449,12 @@ func apiBookValue(pp schwabPositionPayload, openPL sql.NullFloat64) *canonical.D
 // per-snapshot instrument descriptions, so callers get the freshest
 // label known for that symbol.
 func (c *apiReader) latestKnownInstrumentNames(ctx context.Context) (map[string]string, error) {
-	exists, err := silver.HasTables(ctx, c.db, "instruments")
+	s, err := c.schema(ctx)
 	if err != nil {
 		return nil, err
 	}
 	out := make(map[string]string)
-	if !exists {
+	if !s.instruments {
 		return out, nil
 	}
 	const q = `
@@ -497,15 +465,10 @@ SELECT i.symbol, i.payload
          GROUP BY symbol) m
     ON i.symbol = m.symbol
    AND i.snapshot_at = m.max_snap`
-	rows, err := c.db.QueryContext(ctx, q)
-	if err != nil {
-		return nil, fmt.Errorf("latestKnownInstrumentNames: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
+	if err := silver.ScanRows(ctx, c.db, "latestKnownInstrumentNames", q, func(rows *sql.Rows) error {
 		var sym, payload string
 		if err := rows.Scan(&sym, &payload); err != nil {
-			return nil, fmt.Errorf("latestKnownInstrumentNames scan: %w", err)
+			return fmt.Errorf("latestKnownInstrumentNames scan: %w", err)
 		}
 		var p struct {
 			Description string `json:"description"`
@@ -514,6 +477,9 @@ SELECT i.symbol, i.payload
 		if p.Description != "" {
 			out[sym] = p.Description
 		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
-	return out, rows.Err()
+	return out, nil
 }

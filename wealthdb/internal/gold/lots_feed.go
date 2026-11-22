@@ -8,8 +8,10 @@ import (
 )
 
 // The lot engine's feed: gold rows into lots.Events (docs/LOTS.md §3).
-// One generic reader serves every source; the source kind's registered
-// lots.Policy says how to read its transactions.
+// One generic reader serves every source. A transaction reads by the
+// action its adapter states, else by its kind (lotClassify); the source
+// kind's registered lots.Policy holds the rest of what the engine knows
+// of its feed.
 
 type lotFeed struct {
 	cfg     lots.Config
@@ -33,7 +35,10 @@ type lotFeed struct {
 	// transits numbers the paired transfers (lots.Event.Transit).
 	transits int32
 	legs     []lotLeg
-	corp     []lotCorpLeg
+	// links names each leg's partner where a transfer_links row of
+	// measure in_kind states it, keyed by (source, transaction).
+	links map[[2]string][2]string
+	corp  []lotCorpLeg
 
 	// targets are the rows each observation writes to.
 	targets []lotObs
@@ -65,6 +70,7 @@ func newLotFeed(ctx context.Context, db *sql.DB, cfg lots.Config) (*lotFeed, err
 		documented:   map[[2]string]bool{},
 		skipped:      map[string]int{},
 		statedPol:    map[string]lots.Policy{},
+		links:        map[[2]string][2]string{},
 	}
 	return f, f.readSources(ctx, db)
 }
@@ -87,7 +93,7 @@ func (f *lotFeed) read(ctx context.Context, db *sql.DB) error {
 		return nil
 	}
 	for _, step := range []func(context.Context, *sql.DB) error{
-		f.readPortfolios, f.readClasses, f.readRates, f.readTransactions,
+		f.readPortfolios, f.readClasses, f.readRates, f.readTransactions, f.readLinks,
 		f.readRealized, f.readDocumented, f.readPositions, f.readAnchors,
 	} {
 		if err := step(ctx, db); err != nil {

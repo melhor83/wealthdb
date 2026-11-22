@@ -40,7 +40,7 @@ a refund (§3, *Reimbursements*).
 The taxonomy carries only what this side may assign. It drops five of
 Plaid's primaries: `TRANSFER_IN`, `TRANSFER_OUT`, `LOAN_PAYMENTS`,
 `LOAN_DISBURSEMENTS` and `OTHER` (§2). Plaid's `INCOME` primary is
-vendored for the income family (migration 0069). Investment fees stay
+vendored for the income family. Investment fees stay
 in: they are money leaving, and they have a value of their own (§2).
 
 The population is layered in SQL, each layer narrower
@@ -105,12 +105,12 @@ diffs cleanly against the table.
 
 It is vendored rather than fetched, so a taxonomy revision arrives as
 a reviewable diff instead of silently re-labelling history. Gold's
-`spend_categories` dimension is seeded from this table, one migration
-per change. Migration 0040 seeded the vendored spending rows, 0069 the
-income side and the `family` column, and 0111 moved the vendored rows
-to version 2. A generator-style test pins the migrated dimension to
-the table, so the two cannot drift. A new value is a row here plus a
-new migration. An applied migration is never edited.
+`spend_categories` dimension holds this table. The derived set stamps
+it whole: each value with its label, its catch-all flag and its roles
+(`canonical.CategoryRoles`: which base it leaves and where the cash
+flow statement draws it). So the two cannot drift. A new value is a
+row here and a new derived version. A value that is renamed or retired
+also needs a migration that moves the stored verdicts.
 
 wealthdb vendors 13 of the 18 primaries:
 
@@ -331,15 +331,15 @@ The vendored values shout in full caps and repeat their primary in the
 detail; the deltas are lower-case, because one vocabulary is
 Plaid's and the other is ours. Each row therefore carries what it
 should READ as beside what it IS: `spend_categories.label` and
-`.primary_label` (migration 0058). `canonical.SpendLabel` is the rule
-the seeds are generated from, and a test holds the two together.
+`.primary_label`. The derived set stamps both from
+`canonical.SpendLabel` and `canonical.SpendPrimaryLabel`.
 `FOOD_AND_DRINK_GROCERIES` reads "Groceries",
 `GENERAL_MERCHANDISE_OTHER_GENERAL_MERCHANDISE` reads "Other general
 merchandise", `internal_transfer` reads "Internal transfer".
 
 The rule is mechanical, so a value it reads wrongly is corrected by
-hand in `canonical.spendLabelOverrides`, and the same correction is
-seeded into the dimension. Six values carry one:
+hand in `canonical.spendLabelOverrides`, and the dimension carries the
+correction. Six values carry one:
 
 - `card_spend` reads **"Uncategorized card spend"**. The rule reads it
   "Card spend", which is true of every card purchase in the product.
@@ -568,6 +568,36 @@ bank), **every** account in gold participates whatever its kind and
 whether or not spending is scoped to it, and amounts and currencies
 are **native**, converted only in the converted phase.
 
+A leg's amount is its `net_amount`, which gold keeps to four places.
+A coin's leg booked in the coin itself can be smaller than that. Its
+`net_amount` then reads zero, so the matcher reads its quantity, kept
+to eight places, instead. The dust keeps its size and its sign, and it
+pairs like any other leg (the pool's `match_amount`). An override line
+names it by that amount too.
+
+**A coin pairs by the coin rule.** A leg moves a coin when its
+instrument is its currency and that instrument is a coin: asset class
+`crypto`, vehicle `physical`, the row's own where it states them, else
+the instrument's. A coin leg's amount is a quantity of the coin, so a
+cent and the absolute cap are no bound for it. Two coin
+legs are one transfer when all of these hold:
+
+- the receipt lies within 2 days of the withdrawal, in either order,
+  as venues stamp the two ends at different times;
+- the coin received is at most 0.1% more than the coin sent;
+- the fee, sent less received, is at most the larger of 0.1% of the
+  coin sent and 100 USD's worth, and always less than a quarter of the
+  coin sent.
+
+The USD price is the coin's own rate in `fx_daily` on the withdrawal's
+day, the latest one at most 7 days old. A coin with no such rate may
+lose 1% of what it sent. Among several candidates the smallest shortfall
+wins, then the nearest day. So a small withdrawal never takes the
+receipt of a larger one beside it. The same rule pairs a coin in
+returns and in the lot engine (RETURNS-NOTES "Netting and closure",
+[LOTS.md](LOTS.md) §3.4). Every other leg pairs on the window and the
+tolerance below, as cash.
+
 The core pairs in **seven phases**, each withdrawing the legs it claims
 before the next one looks, in the order of what the evidence is worth:
 
@@ -587,7 +617,8 @@ before the next one looks, in the order of what the evidence is worth:
    account's leg that reads as its reversal (below).
 
 Phases 4 to 7 are windowed. `window_days` bounds all four, and
-`tolerance_pct` bounds the named, amount and reversal phases. The
+`tolerance_pct` bounds the named, amount and reversal phases. Two coin
+legs take the coin rule's days and amounts instead. The
 converted phase has its own band of 1%, and it needs a name: one leg's
 narrative must name the other's account. The first three read what
 the holder or the source said, so there is no band to draw around
@@ -605,10 +636,11 @@ wording on either (a refunded fee, a cancelled or returned wire, a
 `STORNO`). A payment out and a credit that merely share an account and
 a size stay two rows. A reversal pair's legs read `internal_transfer`,
 with their own account as the far account, so they leave income and
-spending and the cash flow reads them as internal. The returns matcher
-does not run this phase: it reads such a pair as two boundary flows. A
-`match` line pairs what it names, and an `unmatch` line keeps a leg
-out.
+spending and the cash flow reads them as internal. With
+`returns_transfer_matching` enabled, returns counts a reversal pair of
+deposit and withdrawal legs as two flows at the accounts grain and nets
+it above (DESIGN.md §5.8). A `match` line pairs what it names, and an
+`unmatch` line keeps a leg out.
 
 The kind set below excludes `purchase` and `refund`, so a card
 purchase and its refund never reach the matcher at all. When a
@@ -639,7 +671,12 @@ or account is its own institution speaking and names nothing. Then:
 - the named phases pair as many legs as they can — a debit takes its
   best free candidate, and one left with none moves an earlier debit to
   that debit's other candidate — so a run of identical transfers
-  between two accounts leaves no leg stranded.
+  between two accounts leaves no leg stranded;
+- a deposit dated on or after its withdrawal wins over an earlier one.
+  A debit left holding an earlier deposit moves to its best candidate
+  dated on or after its own day, when no other debit holds that one and
+  its amount is no further off. No other pair moves, and the deposit
+  it leaves goes back to the pool.
 
 With no names configured the matcher pairs on amount and day alone.
 
@@ -658,8 +695,7 @@ credit in two currencies when all of these hold:
 The name is what makes it safe. A size and a day across a currency
 pair are far more often a coincidence than a conversion, so the name
 is required. Where no narrative names the pair, the override ledger's
-`match` line is the declared pair (below). The returns caller does not
-run this phase.
+`match` line is the declared pair (below).
 
 Two further bounds close what those leave open, because amount and day
 proximity alone are only ever a coincidence of size, never evidence
@@ -698,7 +734,10 @@ transaction id. The columns are `verb`, `silver_source_id`, `account`,
 names with a `_b` suffix for the second, and an optional `note`.
 Columns are found by header name, and a column the format does not
 know is refused, as in the pins. `account` is an
-`account_external_id`; a nickname does not resolve here.
+`account_external_id`; a nickname does not resolve here. An amount
+names a leg within a cent. A coin's leg it names by the coin rule
+instead: the two amounts have one sign, and the smaller is what a
+transfer of the larger would deliver.
 
 | verb | legs given | meaning |
 |---|---|---|
@@ -708,7 +747,8 @@ know is refused, as in the pins. `account` is an
 | `reimburse` | both | the leg with the positive amount repays the other, an outflow; it pairs no transfer (*Reimbursements*, below) |
 
 `match` exists for the movement whose halves no window can reach: a
-bank posting its side of an ACH days after the other side credited.
+bank posting its side of an ACH days after the other side credited, or
+a coin staked and returned weeks later with its reward.
 Forced pairs are asserted first of all and withdrawn from the pool, so
 a stated pair cannot lose either half to a nearer coincidence.
 
@@ -726,7 +766,9 @@ movement: the clerk stamped a number, the holder was there.
 A rule that names no leg is **reported, not dropped** — the pass counts
 it exactly as it counts an unmatched pin. An override is something a
 person wrote down about a row they believe exists, so one that quietly
-does nothing is the worst outcome available.
+does nothing is the worst outcome available. A `match` line that names
+both legs but pairs none is reported too. Its two legs read as one
+direction, one of them is zero, or another line took one of them first.
 
 The ledger is read once and handed to BOTH matchers. The core is
 shared, so a pair the holder has settled must be settled the same way
@@ -774,7 +816,7 @@ cash flow statement draws a linked repayment on the outflow's side
 ([CASHFLOW.md](CASHFLOW.md) §4). An insurance payout is income, not a
 repayment ([INCOME.md](INCOME.md) §2).
 
-The matcher and the returns engine skip a `reimburse` line.
+The matcher skips a `reimburse` line.
 
 ### The reference road
 
@@ -887,7 +929,7 @@ code.
 |---|---|---|
 | `card_payment` | `card_spend` | A card bill with no counter-leg in gold is a bill for a card wealthdb does not itemise — a card no collector exists for, or the deep era, where a card payment is dated before the card's own ledger begins — and the bill is the only trace of that spending. So it is kept in the base as generic card spend, not deleted as an own-account move; a bill whose card *is* in gold never reaches this verdict, because the matcher outranks it. Matched on card-payment phrases and an issuer table, never on a store card that names its merchant, and refused outright on a row the `atm` rule matches — cash taken at a machine carries the same masked card number — or a row the provider filed under another value. A match on a named issuer's descriptor also LABELS the bill with that issuer, which is what the line carries as its merchant (§7). |
 | `atm` | `cash_withdrawal` | The money is gone, but *what it bought* has no record anywhere. Stands down on a row the provider filed as a bank fee or as a payment on a debt, since the fee for taking cash and the repayment of a cash advance are booked in the same words as the cash. |
-| `mortgage` | `internal_transfer` | The mortgage is a tracked account; counting the payment as spend would double-count against the liability it reduces. It matches a NARRATIVE, so it fires whether or not the lender is tracked — and where no pair exists, nothing else on the row says where the money went, so it records `mortgage` as the cashflow class it stands for (`far_class`, migration 0079). That column is not the card rule's `merchant_label`: a class name there would print as the merchant of every card bill. The rule places the payment whole. Only the principal share is an own-account move, and the cash flow statement derives the interest/principal split from the mortgage balance ([CASHFLOW.md](CASHFLOW.md) §5); a rule sees one row's text and never a balance. |
+| `mortgage` | `mortgage_transfer` | A mortgage instalment is debt service; counting it as spend would double-count against the liability it reduces. It matches a NARRATIVE, so it fires whether or not the lender is tracked, and the value reaches the cash flow statement's `financing · Mortgage` with or without a far account. A payment the matcher pairs with a mortgage gold holds is an own-account move instead. The rule places the payment whole. Only the principal share is an own-account move, and the cash flow statement derives the interest/principal split from the mortgage balance ([CASHFLOW.md](CASHFLOW.md) §5); a rule sees one row's text and never a balance. |
 | `investment_fee` | `BANK_FEES_INVESTMENT_FEES` | A custodian's per-security pass-through, such as an ADR depositary charge, booked once per security per period. The narrative names the security and never a payee, so nothing else can reach it. It is a cost of INVESTING rather than of banking, which is what the extension exists to say. Stands down where the provider named a specific bank fee, as every fee rule does. |
 | `wire_fee` | `BANK_FEES_OTHER_BANK_FEES` | Sits on the same statements as the pass-through above and is deliberately not one: paying to move money is a banking service, and filing it as an investment fee would overstate what holding the assets costs. Not the wire itself, which no rule places — that is the matcher's to pair or nobody's to guess. |
 | `withholding` | `GOVERNMENT_AND_NON_PROFIT_WITHHOLDING_TAX` | Tax deducted at source on foreign dividend income. The gross dividend is booked as income, so leaving the withholding out would report the gross as though it were net. |
@@ -1079,12 +1121,12 @@ never fires — a scope that can admit nothing is a typo every time.
 **Naming the far side.** A rule placing `internal_transfer` may carry
 `far`, the id of a `declared_accounts` entry: the holder's own account
 at an institution the product does not collect, declared with the
-kind and wrapper it would carry if it were. The row's far columns then
-hold the declaration, and the cash flow statement places the move by
-that wrapper instead of drawing it as a move to a destination nothing
-identifies (CASHFLOW.md §4). `far` is refused beside any other
-category — only an own-account move has a far side — and where it
-names no declaration.
+kind and wrapper it would carry if it were. The row's link in
+`transfer_links` then names the declaration. The cash flow statement
+places the move by that wrapper instead of drawing it as a move to a
+destination nothing identifies (CASHFLOW.md §4). `far` is refused
+beside any other category, because only an own-account move has a far
+side. It is also refused where it names no declaration.
 
 Config rules exist for three populations neither the matcher nor the
 model can ever reach. One is own-money movement whose receiving side is booked
@@ -1157,7 +1199,8 @@ into gold verbatim as `transactions.provider_category`: a card issuer's
 spend category, or a bank's booking type. The translation maps are per
 **product** rather than per source, because the vocabulary belongs to
 the provider's product (`providerVocabularies` in
-`internal/spending/providermap.go`):
+`internal/spending/providermap.go`; each kind's tables in
+`vocab_<kind>.go`):
 
 - a map's key is a silver kind, optionally narrowed to one account kind
   (`ubs/card` before `ubs`);
@@ -1858,10 +1901,9 @@ A value is a catch-all when its detail part is `OTHER` or starts with
 off, and the convention is Plaid's own.
 `GENERAL_MERCHANDISE_OTHER_GENERAL_MERCHANDISE` is one, and so is
 `INCOME_OTHER`, the income side's only catch-all. A delta never is.
-`spend_categories.catch_all` (migration 0060, recomputed by 0111) is
-the same predicate as `canonical.CatchAllSpendDetailed` and
-`CatchAllIncomeDetailed`, as data, so the query and the enrichment pass
-share one definition of what a catch-all is.
+`spend_categories.catch_all` is `canonical.CatchAllSpendDetailed` and
+`CatchAllIncomeDetailed` stamped as data, so the query and the
+enrichment pass share one definition of what a catch-all is.
 
 ---
 
@@ -1869,7 +1911,8 @@ share one definition of what a catch-all is.
 
 Three views, one per report macro, with the grain in a positional and
 everything else in a flag, as the returns family does, and a fourth,
-`fees`, below. DESIGN.md §4.12 has the flags.
+`fees`, below. `categories` also reads against last year (below).
+DESIGN.md §4.12 has the flags.
 
 | view | a row is |
 |---|---|
@@ -2019,7 +2062,7 @@ ranks as the merchant it is.
 
 Delta-ness is read off the `spend_categories` dimension rather than
 restated as a list: a delta is primary-level (`spend_primary =
-spend_detailed`, §2), so a delta added to `canonical` and seeded is
+spend_detailed`, §2), so a delta added to `canonical` is
 blank in the merchant column with no change to the macro — and, being
 unlabelled, blank whatever the enrichment row holds. Everything
 downstream inherits the column from `spend_txn_categories()` by name —
@@ -2074,6 +2117,44 @@ from the config, prints as a pseudonym such as `nickname-1`
 ([DESIGN.md §4.6](DESIGN.md), *Typed names*). Spending categories,
 provenance and `share_pct` stay legible, like the returns percentages.
 
+### Against last year
+
+`wealthdb spending categories --vs-last-year` says which categories
+grew. Each row stands beside the same bucket of the window a year
+earlier. Three columns follow the plain view's:
+
+| column | reads |
+|---|---|
+| `year_before` | the category's `net_spend` over the same days a year earlier |
+| `change_pct` | the change from `year_before`, in percent of its size. Blank where `year_before` is zero or has no rate |
+| `quality` | `no_year_before`, `in_progress` |
+
+Both sides cover the same days. A window from 15 March compares with
+the year before from 15 March. A window from 29 February starts the
+year before on 28 February. A window through 28 February ends the year
+before on the 29th where that year has one. A category that only one
+side has reads 0 on the other.
+
+`--period` is `monthly`, `quarterly`, `annual` or `total`. A day or a
+week a year earlier is a different weekday, so those two are refused.
+
+The macro `report_spending_categories_vs` defines the figures. The MCP
+`spending` tool takes the same option as `vs_last_year`, and the
+Spending dashboard's two tiles read the same macro by month and primary
+category (web/DESIGN.md). `-p` hides both amounts and keeps
+`change_pct`. The dashboard's twin shows each side as a share of its
+own window.
+
+Limits:
+
+- `in_progress`: the bucket's part of the window ends today or later,
+  so this side is still accruing. The dashboard's rows stop at the last whole month.
+- Each side converts at its own lines' historic rates, so a currency
+  move can read as a change.
+- `no_year_before`: gold's first spending line falls after the year
+  before starts, so the first year has little or nothing to compare
+  with.
+
 ### Fees by portfolio
 
 `wealthdb spending fees` says what each portfolio cost, in money and as
@@ -2085,8 +2166,8 @@ fee line: a portfolio, else an account outside any portfolio.
 | `fees` | the spending lines in primary `BANK_FEES`, net of refunds |
 | `fees_investment`, `fees_bank`, `fees_atm`, `fees_other` | the same lines by detailed group: `BANK_FEES_INVESTMENT_FEES`; other bank fees, overdraft and insufficient funds; ATM fees; the rest |
 | `mean_value` | the entity's mean daily value, over the days it held one. A portfolio's leaves out its mortgages and cards, as its `twr_pct` does |
-| `fee_rate_pct` | `fees` over `mean_value`, annualized over the days the entity held a value, on a 365-day year. Blank where the mean value is not above zero |
-| `twr_pct` | the entity's monthly returns from a since-inception run of `returns portfolios` or `returns accounts`, chained over the months that end inside the window. Blank where `returns` has no month, as for plumbing cash accounts |
+| `fee_rate_pct` | `fees` over `mean_value`, annualized over the days the entity held a value, on a 365-day year. Blank where the mean value is not above zero (a millionth or less counts as zero) |
+| `twr_pct` | the entity's monthly returns from a since-inception run of `returns portfolios` or `returns accounts`, chained over the months that end inside the window. Blank where `returns` has no month, as for plumbing cash accounts. A month that lost everything is left out of the chain |
 | `quality` | `no_mean_value`, `part_window_value`, `no_return`, `unpriced_fees=N`, and the tags of the months chained |
 
 `--period` is `monthly`, `quarterly`, `annual` or `total`, the default.
@@ -2123,7 +2204,9 @@ Limits:
 The Spending dashboard's fee tiles read `web_fees`:
 the same lines, daily values and monthly returns, at day grain. A
 portfolio's value there leaves out its mortgages and cards too. So
-every figure on them is this view's over any window.
+every figure on them is this view's over any window. The tiles compute
+`fee_rate_pct` and `twr_pct` with the macros `fee_rate_pct` and
+`chain_returns`, the same rules as this view.
 
 ## 8. Storage and lifecycle
 
@@ -2133,17 +2216,17 @@ every figure on them is this view's over any window.
 | `spend_merchant_categories` | merchant_signature | GLOBAL and paid for; survives `reset`, and `reload -a` carries it across the fresh-file swap because nothing could regenerate it; a row leaves only by `categorizations --forget` |
 | `spend_account_scope` | (silver_source_id, account_external_id) | configuration stamped into gold; re-stamped whole every pass |
 | `spend_reimbursement_pairs` | (silver_source_id, transaction_external_id) of the repayment | derived; rewritten whole by every pass from the ledger's `reimburse` lines (§3, *Reimbursements*) |
-| `transfer_links` | (silver_source_id, transaction_external_id) of the leg | derived; rewritten whole by every pass: the far account, partner leg and evidence of each row whose far columns are set |
+| `transfer_links` | (silver_source_id, transaction_external_id) of the leg | derived; rewritten whole by every pass: the far account, partner leg and evidence of each row whose far side the pass knows, and both legs of each move one equity-transfer ledger row states (DESIGN.md §13.9; evidence `equity-ledger`, measure `in_kind`) |
 
-`spend_txn_enrichment` also carries the far-account columns of
-migration 0079, which only the cash flow statement reads. They hold the
-first of these that exists:
+`transfer_links` holds each move's far side. Three readers use it:
 
-- the partner leg's account, for a matched row;
-- the account the SOURCE itself named, where no pairing exists: a
-  counter account in the row's payload, resolved against the accounts
-  gold holds;
-- the class a rule stands for, where neither reached one.
+- the cash flow statement places a move by it
+  ([CASHFLOW.md](CASHFLOW.md) §4, which lists the roads to a far
+  account);
+- returns nets its pairs when `returns_transfer_matching` is enabled
+  (DESIGN.md §5.8);
+- the lot engine pairs its `in_kind` links first
+  ([LOTS.md](LOTS.md) §3.4).
 
 `reset <source>` clears THAT source's enrichment rows only. The
 surviving leg of a cross-source matcher pair keeps its
@@ -2189,7 +2272,7 @@ Each decision points to the section that argues it.
   ([CASHFLOW.md](CASHFLOW.md)).
 - **Plaid PFC version 2, vendored verbatim**, plus extensions and
   deltas (§2). A revision arrives as a diff. One dimension carries both
-  families, told apart by a `family` column (migration 0069). The two
+  families, told apart by a `family` column. The two
   vocabularies are fenced from each other by predicate, so a spending
   rule cannot place an income value.
 - **A rewards credit is income, not an offset against card spend**
@@ -2262,14 +2345,13 @@ Each decision points to the section that argues it.
   verdict but never override one.
 - **Deterministic enrichment is folded into `load`**; the model tier
   is only ever explicit (§6).
-- **The matcher's window defaults to 5 days**, the same as the returns
-  matcher. One matching core and one banding keep a movement from being
-  internal in one report and external in the other.
+- **The matcher's window defaults to 5 days.** With
+  `returns_transfer_matching` enabled, returns reads the pairs it stores
+  (DESIGN.md §5.8).
 - **Two legs of one account pair only as a reversal, last** (§3). A
   leg with a partner on another account keeps it; a leg still unpaired
   pairs with its own account's leg that reads as its reversal (one
-  signature, or reversal wording). The returns matcher does not pair
-  legs of one account.
+  signature, or reversal wording).
 - **The catch-all kinds (`other`, `journal`) are outside the
   population.** Neither carries a reliable sign. `wealthdb status -v`
   counts the in-scope rows of either kind, so the gap is visible.

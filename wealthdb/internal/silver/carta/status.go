@@ -2,8 +2,6 @@ package carta
 
 import (
 	"context"
-	"database/sql"
-	"fmt"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver"
@@ -12,9 +10,8 @@ import (
 // contentSpan is the MIN/MAX snapshot_at across the position-bearing content
 // tables. carta reconstructs one download into event-dated deltas (an
 // exercise, a later acquisition, a quarterly NAV), which sit years
-// before the download. The observable snapshot range — and the load window —
-// must track THIS span, not dump_runs (the download time), so the historical
-// deltas fall in-window and reach gold's as-of query.
+// before the download. The observable snapshot range tracks THIS span, not
+// dump_runs (the download time).
 const contentSpan = `
 SELECT MIN(snapshot_at), MAX(snapshot_at) FROM (
     SELECT snapshot_at FROM entities
@@ -22,148 +19,111 @@ SELECT MIN(snapshot_at), MAX(snapshot_at) FROM (
     UNION ALL SELECT snapshot_at FROM fund_metrics
 )`
 
-// Status reports the observable snapshot + transaction ranges. The snapshot
-// range spans the event-dated content, the days a fund's carried value
-// changes (fundcarry.go), and the removals and K-1 period ends
-// (snapshots.go); the transaction range is the cash-flow ledger
-// (transactions.go). LatestChangeNumber is the newest dump (the
-// live-time signal, one row per ingested bronze run, so an idle reload is a
-// no-op).
-func (c *Connection) Status(ctx context.Context) (canonical.Status, error) {
-	s := canonical.UnknownStatus()
-	var oldS, newS, latestRun sql.NullInt64
-	if err := c.db.QueryRowContext(ctx, contentSpan).Scan(&oldS, &newS); err != nil {
-		return s, fmt.Errorf("carta Status span: %w", err)
+// clock: a new download, any dump past the watermark, re-emits the whole
+// history (silver.FullSpan), so every reconstructed delta and every
+// ledger row reaches gold. The snapshot range spans the
+// event-dated content, the days a fund's carried value changes
+// (fundcarry.go), and the removals and K-1 period ends (snapshots.go);
+// the transaction range is the cash-flow days (flow_at) of the ledger
+// (transactions.go). A fund's calls can precede its first statement, so
+// those days can fall outside the content span. A silver without flow_at
+// states no ledger. The change number is the newest dump, one row per
+// ingested bronze run, so an idle reload is a no-op.
+func (c *Connection) clock() silver.Clock {
+	var ledger []string
+	if c.schema.flowAt {
+		ledger = []string{silver.Range("cash_flows", "flow_at")}
 	}
-	if err := c.db.QueryRowContext(ctx,
-		`SELECT MAX(snapshot_at) FROM dump_runs`).Scan(&latestRun); err != nil {
-		return s, fmt.Errorf("carta Status dump: %w", err)
+	return silver.Clock{
+		Kind:     "carta",
+		Runs:     silver.LatestDump,
+		Snapshot: []string{contentSpan},
+		Extra:    c.snapshotDates,
+		Ledger:   ledger,
+		Observed: silver.Observed{Runs: `SELECT MAX(snapshot_at) FROM dump_runs WHERE dry_run = 0`},
+		Pin:      true,
+		Mode:     silver.FullSpan{},
 	}
-	if oldS.Valid {
-		s.OldestSnapshotAt = oldS.Int64
-	}
-	if newS.Valid {
-		s.LatestSnapshotAt = newS.Int64
-	}
-	ledger, err := c.loadFundLedger(ctx)
+}
+
+// reach is the latest removal and K-1 period end, -1 where there is none.
+func (c *Connection) reach(ctx context.Context) (int64, error) {
+	removals, err := c.memo.removals(ctx, c)
 	if err != nil {
-		return s, err
+		return -1, err
 	}
+	inKind, err := c.memo.inKind(ctx, c)
+	if err != nil {
+		return -1, err
+	}
+	return inKind.Reach(removals.Reach(-1)), nil
+}
+
+// snapshotDates are the carry dates, the removals and the K-1 period ends.
+func (c *Connection) snapshotDates(ctx context.Context) (lo, hi int64, err error) {
+	ledger, err := c.memo.ledger(ctx, c)
+	if err != nil {
+		return -1, -1, err
+	}
+	lo, hi = -1, -1
 	for _, t := range ledger.carryDates() {
-		if s.OldestSnapshotAt == -1 || t < s.OldestSnapshotAt {
-			s.OldestSnapshotAt = t
+		if lo == -1 || t < lo {
+			lo = t
 		}
-		if t > s.LatestSnapshotAt {
-			s.LatestSnapshotAt = t
-		}
+		hi = max(hi, t)
 	}
-	// A dump that stopped listing a company, and a K-1's period end, are
-	// snapshot times (snapshots.go) that can lie after every mark.
-	removals, err := c.removals(ctx)
-	if err != nil {
-		return s, err
-	}
-	inKind, err := c.readInKind(ctx)
-	if err != nil {
-		return s, err
-	}
-	s.LatestSnapshotAt = inKind.Reach(removals.Reach(s.LatestSnapshotAt))
-	if latestRun.Valid {
-		s.LatestChangeNumber = latestRun.Int64
-	}
-	if oldestTx, latestTx, ok, err := c.transactionExtrema(ctx); err != nil {
-		return s, err
-	} else if ok {
-		s.OldestTransactionAt = oldestTx
-		s.LatestTransactionAt = latestTx
-	}
-	if err := silver.ObserveByRuns(ctx, c.db, "carta", `SELECT MAX(snapshot_at) FROM dump_runs WHERE dry_run = 0`, &s); err != nil {
-		return s, err
-	}
-	return s, nil
+	r, err := c.reach(ctx)
+	return lo, max(hi, r), err
 }
 
-// transactionExtrema is the MIN/MAX cash-flow date — the transaction ledger
-// (transactions.go). flow_date is mixed-format TEXT, so it is parsed in Go
-// (flowDateUnix) rather than via strftime. A fund's calls can precede its
-// first statement, so these dates can fall outside the content span, and
-// ChangeWindow widens the window to cover them.
-func (c *Connection) transactionExtrema(ctx context.Context) (oldest, latest int64, ok bool, err error) {
-	rows, err := c.db.QueryContext(ctx,
-		`SELECT flow_date FROM cash_flows WHERE flow_date IS NOT NULL`)
-	if err != nil {
-		return 0, 0, false, fmt.Errorf("carta transactionExtrema: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var d string
-		if err := rows.Scan(&d); err != nil {
-			return 0, 0, false, err
-		}
-		ts, parsed := flowDateUnix(d)
-		if !parsed {
-			continue
-		}
-		if !ok || ts < oldest {
-			oldest = ts
-		}
-		if !ok || ts > latest {
-			latest = ts
-		}
-		ok = true
-	}
-	return oldest, latest, ok, rows.Err()
+// memo holds the reads that Status, ChangeWindow and Snapshots each need,
+// read once per connection: the removals, the K-1 distributions and the
+// fund ledger. The connection opens one silver read-only for one load. A
+// nil field is not read yet; a failed read is read again.
+type memo struct {
+	removed silver.Removals
+	k1      *silver.InKind
+	funds   fundLedger
 }
 
-// ChangeWindow triggers on any dump_run past `since` (a new download), but the
-// window spans the full event-dated content range, every cash-flow date, and
-// the snapshot times a removal or a K-1's period end adds, so every
-// reconstructed delta and every ledger row is re-emitted and reaches
-// gold. NewChangeNumber is
-// MAX(dump_runs.snapshot_at) so an idle reload (no new dump) is a no-op.
+func (m *memo) removals(ctx context.Context, c *Connection) (silver.Removals, error) {
+	if m.removed == nil {
+		r, err := c.removals(ctx)
+		if err != nil {
+			return nil, err
+		}
+		m.removed = r
+	}
+	return m.removed, nil
+}
+
+func (m *memo) inKind(ctx context.Context, c *Connection) (*silver.InKind, error) {
+	if m.k1 == nil {
+		k, err := c.readInKind(ctx)
+		if err != nil {
+			return nil, err
+		}
+		m.k1 = k
+	}
+	return m.k1, nil
+}
+
+func (m *memo) ledger(ctx context.Context, c *Connection) (fundLedger, error) {
+	if m.funds == nil {
+		l, err := c.loadFundLedger(ctx)
+		if err != nil {
+			return nil, err
+		}
+		m.funds = l
+	}
+	return m.funds, nil
+}
+
+// Status and ChangeWindow are the clock's (silver.Clock).
+func (c *Connection) Status(ctx context.Context) (canonical.Status, error) {
+	return c.clock().Status(ctx, c.db)
+}
+
 func (c *Connection) ChangeWindow(ctx context.Context, since int64) (canonical.Window, error) {
-	w := canonical.Window{NewChangeNumber: since}
-
-	var hasChanges bool
-	if err := c.db.QueryRowContext(ctx,
-		`SELECT EXISTS(SELECT 1 FROM dump_runs WHERE snapshot_at > ?)`, since).
-		Scan(&hasChanges); err != nil {
-		return w, fmt.Errorf("carta ChangeWindow trigger: %w", err)
-	}
-
-	var start, end, newCN sql.NullInt64
-	if err := c.db.QueryRowContext(ctx, contentSpan).Scan(&start, &end); err != nil {
-		return w, fmt.Errorf("carta ChangeWindow span: %w", err)
-	}
-	if err := c.db.QueryRowContext(ctx,
-		`SELECT MAX(snapshot_at) FROM dump_runs`).Scan(&newCN); err != nil {
-		return w, fmt.Errorf("carta ChangeWindow dump: %w", err)
-	}
-
-	if hasChanges && start.Valid && end.Valid {
-		w.Start = start.Int64
-		w.End = end.Int64
-		w.HasChanges = true
-		oldest, latest, ok, err := c.transactionExtrema(ctx)
-		if err != nil {
-			return w, err
-		}
-		if ok {
-			w.Start = min(w.Start, oldest)
-			w.End = max(w.End, latest)
-		}
-		removals, err := c.removals(ctx)
-		if err != nil {
-			return w, err
-		}
-		inKind, err := c.readInKind(ctx)
-		if err != nil {
-			return w, err
-		}
-		w.End = inKind.Reach(removals.Reach(w.End))
-	}
-	if newCN.Valid {
-		w.NewChangeNumber = newCN.Int64
-	}
-	return w, nil
+	return c.clock().ChangeWindow(ctx, c.db, since)
 }

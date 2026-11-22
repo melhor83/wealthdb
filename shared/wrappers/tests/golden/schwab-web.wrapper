@@ -46,7 +46,9 @@ Mounted into the container:
   <TMP>/w-schwab-web/home/.secrets  ->  /secrets
   <TMP>/w-schwab-web/xdgdata/wealthdb/schwab-web     ->  /data
   <TMP>/w-schwab-web/xdgcache/wealthdb/startupcache  ->  /cache/startupcache
+  <TMP>/w-schwab-web/xdgcache/wealthdb/schwab-web  ->  /cache/collector
   <TMP>/w-schwab-web/xdgcache/wealthdb/debug/schwab-web    ->  /debug
+  <TMP>/w-schwab-web/tree/collectors/schwab-web  ->  /app
 
 Override mounts via env:
   SCHWAB_WEB_SECRETS_DIR=/path/to/secrets
@@ -116,7 +118,9 @@ Mounted into the container:
   <TMP>/w-schwab-web/home/.secrets  ->  /secrets
   <TMP>/w-schwab-web/xdgdata/wealthdb/schwab-web     ->  /data
   <TMP>/w-schwab-web/xdgcache/wealthdb/startupcache  ->  /cache/startupcache
+  <TMP>/w-schwab-web/xdgcache/wealthdb/schwab-web  ->  /cache/collector
   <TMP>/w-schwab-web/xdgcache/wealthdb/debug/schwab-web    ->  /debug
+  <TMP>/w-schwab-web/tree/collectors/schwab-web  ->  /app
 
 Override mounts via env:
   SCHWAB_WEB_SECRETS_DIR=/path/to/secrets
@@ -198,6 +202,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-schwab-web/xdgcache/wealthdb/schwab-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-schwab-web/xdgcache/wealthdb/debug/schwab-web:/debug
   -v
   <TMP>/w-schwab-web/tree/collectors/schwab-web:/app
@@ -243,6 +251,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-schwab-web/xdgcache/wealthdb/schwab-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-schwab-web/xdgcache/wealthdb/debug/schwab-web:/debug
   -v
   <TMP>/w-schwab-web/tree/collectors/schwab-web:/app
@@ -287,6 +299,10 @@ docker
   <TMP>/w-schwab-web/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-schwab-web/xdgcache/wealthdb/schwab-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-schwab-web/xdgcache/wealthdb/debug/schwab-web:/debug
   -v
@@ -352,6 +368,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-schwab-web/xdgcache/wealthdb/schwab-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-schwab-web/xdgcache/wealthdb/debug/schwab-web:/debug
   -v
   <TMP>/w-schwab-web/tree/collectors/schwab-web:/app
@@ -397,6 +417,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-schwab-web/xdgcache/wealthdb/schwab-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-schwab-web/xdgcache/wealthdb/debug/schwab-web:/debug
   -v
   <TMP>/w-schwab-web/tree/collectors/schwab-web:/app
@@ -441,6 +465,10 @@ docker
   <TMP>/w-schwab-web/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-schwab-web/xdgcache/wealthdb/schwab-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-schwab-web/xdgcache/wealthdb/debug/schwab-web:/debug
   -v
@@ -505,6 +533,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-schwab-web/xdgcache/wealthdb/schwab-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-schwab-web/xdgcache/wealthdb/debug/schwab-web:/debug
   -v
   <TMP>/w-schwab-web/tree/collectors/schwab-web:/app
@@ -552,6 +584,10 @@ docker
   <TMP>/w-schwab-web/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-schwab-web/xdgcache/wealthdb/schwab-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-schwab-web/silver:/silver
   -v
@@ -602,6 +638,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-schwab-web/xdgcache/wealthdb/schwab-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-schwab-web/silver:/silver
   -v
   <TMP>/w-schwab-web/xdgcache/wealthdb/debug/schwab-web:/debug
@@ -651,6 +691,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-schwab-web/xdgcache/wealthdb/schwab-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-schwab-web/xdgcache/wealthdb/debug/schwab-web:/debug
   -v
   <TMP>/w-schwab-web/tree/collectors/schwab-web:/app
@@ -695,6 +739,10 @@ docker
   <TMP>/w-schwab-web/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-schwab-web/xdgcache/wealthdb/schwab-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-schwab-web/xdgcache/wealthdb/debug/schwab-web:/debug
   -v
@@ -741,6 +789,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-schwab-web/xdgcache/wealthdb/schwab-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-schwab-web/xdgcache/wealthdb/debug/schwab-web:/debug
   -v
   <TMP>/w-schwab-web/tree/collectors/schwab-web:/app
@@ -786,6 +838,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-schwab-web/xdgcache/wealthdb/schwab-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-schwab-web/xdgcache/wealthdb/debug/schwab-web:/debug
   -v
   <TMP>/w-schwab-web/tree/collectors/schwab-web:/app
@@ -830,6 +886,10 @@ docker
   <TMP>/w-schwab-web/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-schwab-web/xdgcache/wealthdb/schwab-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-schwab-web/xdgcache/wealthdb/debug/schwab-web:/debug
   -v

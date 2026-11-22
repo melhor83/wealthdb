@@ -18,7 +18,7 @@ COLLECTOR = HERE.parent
 sys.path.insert(0, str(COLLECTOR))
 
 import load as loader  # noqa: E402
-from collectorkit import silver  # noqa: E402
+from collectorkit import incremental, silver  # noqa: E402
 
 RUN_SLUG = "20240401T000000Z"
 ACCT_PLAIN = "12345678"
@@ -54,20 +54,30 @@ def _seed_bronze(root: Path, slug: str = RUN_SLUG) -> Path:
     return _mark_complete(dump)
 
 
-def _fresh_db(tmp_path: Path) -> sqlite3.Connection:
-    conn = loader.open_db(tmp_path / "schwab-api.db")
+def _load(db: Path, bronze: Path, *extra: str) -> int:
+    return loader.main(["--silver-db", str(db), "--bronze-dir", str(bronze),
+                        *extra])
+
+
+def _open(db: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(db))
     conn.row_factory = sqlite3.Row  # column-name access in assertions
-    silver.apply_migrations(conn, loader.MIGRATIONS_DIR)
     return conn
 
 
-def test_load_accounts_and_positions(tmp_path):
-    dump = _seed_bronze(tmp_path / "bronze")
-    conn = _fresh_db(tmp_path)
-    stats = loader.load_dump(conn, dump)
-    assert stats["skipped"] is False
-    assert stats["accounts"] == 1
-    assert stats["positions"] == 1
+def _count(conn: sqlite3.Connection, table: str) -> int:
+    return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+
+def test_load_accounts_and_positions(tmp_path, caplog):
+    _seed_bronze(tmp_path / "bronze")
+    db = tmp_path / "schwab-api.db"
+    with caplog.at_level("INFO", logger="schwab-api.load"):
+        assert _load(db, tmp_path / "bronze") == 0
+    assert (f"loaded run {RUN_SLUG}: 1 accounts, 0 user preferences, "
+            "1 positions, 1 balances, 0 transactions, 0 open orders, "
+            "0 instruments") in caplog.text
+    conn = _open(db)
 
     # Account keyed by the hash (plaintext number never stored as the key).
     acct = conn.execute(
@@ -89,13 +99,14 @@ def test_load_accounts_and_positions(tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM dump_runs").fetchone()[0] == 1
 
 
-def test_skips_already_loaded(tmp_path):
-    dump = _seed_bronze(tmp_path / "bronze")
-    conn = _fresh_db(tmp_path)
-    loader.load_dump(conn, dump)
-    again = loader.load_dump(conn, dump)
-    assert again["skipped"] is True
-    assert conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0] == 1
+def test_skips_already_loaded(tmp_path, caplog):
+    _seed_bronze(tmp_path / "bronze")
+    db = tmp_path / "schwab-api.db"
+    assert _load(db, tmp_path / "bronze") == 0
+    with caplog.at_level("INFO", logger="schwab-api.load"):
+        assert _load(db, tmp_path / "bronze") == 0
+    assert f"{RUN_SLUG}: skipped (already loaded)" in caplog.text
+    assert _count(_open(db), "positions") == 1
 
 
 @pytest.mark.parametrize("status", ["in-progress", "dry-run"])
@@ -105,15 +116,16 @@ def test_skips_non_complete_dump(tmp_path, status):
     dump = _seed_bronze(tmp_path / "bronze")
     (dump / "run.json").write_text(json.dumps({"status": status}),
                                    encoding="utf-8")
-    conn = _fresh_db(tmp_path)
-    stats = loader.load_dump(conn, dump)
-    assert stats["skipped"] is True
-    assert conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 0
-    assert conn.execute("SELECT COUNT(*) FROM dump_runs").fetchone()[0] == 0
+    db = tmp_path / "schwab-api.db"
+    assert _load(db, tmp_path / "bronze") == 0
+    conn = _open(db)
+    assert _count(conn, "accounts") == 0
+    assert _count(conn, "dump_runs") == 0
 
     # Once the download finishes, the same dump loads.
     _mark_complete(dump)
-    assert loader.load_dump(conn, dump)["skipped"] is False
+    assert _load(db, tmp_path / "bronze") == 0
+    assert _count(conn, "dump_runs") == 1
 
 
 def test_a_dir_with_no_run_json_is_neither_loaded_nor_recorded(tmp_path):
@@ -144,9 +156,9 @@ def test_a_legacy_dump_without_run_json_still_loads(tmp_path):
     (dump / "run.json").unlink()
     (dump / "open_orders.json").write_text(json.dumps({"orders": []}),
                                            encoding="utf-8")
-    conn = _fresh_db(tmp_path)
-    assert loader.load_dump(conn, dump)["skipped"] is False
-    assert conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0] == 1
+    db = tmp_path / "schwab-api.db"
+    assert _load(db, tmp_path / "bronze") == 0
+    assert _count(_open(db), "positions") == 1
 
 
 def _seed_with_txns(root: Path, slug: str,
@@ -198,31 +210,29 @@ def test_txn_outside_declared_window_does_not_pk_collide(tmp_path):
     DELETE in load_transactions would miss the prior dump's row, and a
     naive INSERT would PK-collide on activity_id."""
     bronze = tmp_path / "bronze"
-    conn = _fresh_db(tmp_path)
+    db = tmp_path / "schwab-api.db"
 
     # Dump 1: wide window covering the txn's event time.
-    dump1 = _seed_with_txns(
+    _seed_with_txns(
         bronze, "20260601T000000Z",
         window_start="2026-06-01", window_end="2026-06-07",
         txn_specs=[("990000000001", "2026-06-06T12:00:00+0000")],
     )
-    stats1 = loader.load_dump(conn, dump1)
-    assert stats1["transactions"] == 1
+    assert _load(db, bronze) == 0
 
     # Dump 2: a narrower, later window. Schwab still returns the same
     # activity_id (posted in-window) but its `time` is 2026-06-06, before
     # the new window_start of 2026-06-08. Without the fix this raises
     # sqlite3.IntegrityError on the activity_id PK.
-    dump2 = _seed_with_txns(
+    _seed_with_txns(
         bronze, "20260615T000000Z",
         window_start="2026-06-08", window_end="2026-06-15",
         txn_specs=[("990000000001", "2026-06-06T12:00:00+0000")],
     )
-    stats2 = loader.load_dump(conn, dump2)
-    assert stats2["transactions"] == 1
+    assert _load(db, bronze) == 0
 
     # Exactly one row for that activity_id; the second load replaced it.
-    rows = conn.execute(
+    rows = _open(db).execute(
         "SELECT activity_id, timestamp FROM transactions "
         "WHERE activity_id = '990000000001'"
     ).fetchall()
@@ -325,8 +335,10 @@ def _cost_columns(conn) -> dict:
 
 
 def test_load_writes_position_cost_columns(tmp_path):
-    conn = _fresh_db(tmp_path)
-    loader.load_dump(conn, _seed_cost_positions(tmp_path / "bronze"))
+    _seed_cost_positions(tmp_path / "bronze")
+    db = tmp_path / "schwab-api.db"
+    assert _load(db, tmp_path / "bronze") == 0
+    conn = _open(db)
     assert _cost_columns(conn) == _COST_EXPECTED
     # The payload keeps the raw object, averageLongPrice included.
     payload = json.loads(conn.execute(
@@ -354,8 +366,190 @@ def test_migration_0005_backfills_rows_loaded_before_it(tmp_path):
              for key, pos in _COST_POSITIONS.items()],
         )
 
-    assert silver.apply_migrations(conn, loader.MIGRATIONS_DIR) == 5
+    assert silver.apply_migrations(conn, loader.MIGRATIONS_DIR) == 6
     assert _cost_columns(conn) == _COST_EXPECTED
+
+
+# ============================================================
+# Promoted position fields and transaction legs (migration 0006)
+# ============================================================
+#
+# Codes verbatim, numbers as decimal text with the payload's digits,
+# the maturity as the day it names. Invented figures only.
+
+def _numbers_position(symbol: str, value) -> dict:
+    return {"instrument": {"symbol": symbol, "assetType": "EQUITY"},
+            "longQuantity": value, "marketValue": value}
+
+
+# A number the payload states, and the text the column holds for it.
+_NUMBERS = {
+    "INT": (10, "10"),
+    "FLOAT": (2500.0, "2500.0"),
+    "LONGFLOAT": (0.30000000000000004, "0.30000000000000004"),
+    "SMALL": (1e-05, "0.00001"),
+    "SMALLER": (-2.5e-07, "-0.00000025"),
+    "LARGE": (1.2345e+16, "12345000000000000"),
+    "NEGZERO": (-0.0, "-0.0"),
+    "BIGINT": (12345678901234567890, "12345678901234567890"),
+    "TEXT": ("10", None),
+    "BOOL": (True, None),
+    "NULL": (None, None),
+}
+
+_FIELD_POSITIONS = [
+    {"instrument": {"symbol": "912796ZZ9", "cusip": "912796ZZ9",
+                    "assetType": "FIXED_INCOME", "description": "US T-BILL",
+                    "maturityDate": "2099-09-09T05:00:00.000+00:00",
+                    "variableRate": 4.125},
+     "longQuantity": 10000, "shortQuantity": 0, "marketValue": 9950.5},
+    {"instrument": {"symbol": "VTI", "cusip": "", "type": "EXCHANGE_TRADED_FUND",
+                    "assetType": "COLLECTIVE_INVESTMENT",
+                    "maturityDate": "2099-02-30", "variableRate": 0}},
+    {"instrument": {"symbol": "BADDAY", "maturityDate": "2099-9-09T00:00:00"}},
+    {"instrument": {"symbol": "NOINST", "description": 5}, "shortQuantity": 2},
+    *(_numbers_position(sym, v) for sym, (v, _) in _NUMBERS.items()),
+]
+
+_FIELD_COLUMNS = ("instrument_key, asset_type, instrument_type, cusip, symbol, "
+                  "description, maturity_date, variable_rate, long_quantity, "
+                  "short_quantity, market_value")
+
+_FIELD_EXPECTED = {
+    ("912796ZZ9", "FIXED_INCOME", None, "912796ZZ9", "912796ZZ9", "US T-BILL",
+     4092595200, "4.125", "10000", "0", "9950.5"),
+    ("VTI", "COLLECTIVE_INVESTMENT", "EXCHANGE_TRADED_FUND", "", "VTI", None,
+     None, "0", None, None, None),
+    ("BADDAY", None, None, None, "BADDAY", None, None, None, None, None, None),
+    ("NOINST", None, None, None, "NOINST", None, None, None, None, "2", None),
+    *((sym, "EQUITY", None, None, sym, None, None, None, text, None, text)
+      for sym, (_, text) in _NUMBERS.items()),
+}
+
+_LEG_TXN = {
+    "activityId": "990000000001", "time": "2024-02-01T12:00:00+0000",
+    "type": "TRADE", "netAmount": -1505.0,
+    "transferItems": [
+        {"instrument": {"assetType": "EQUITY", "cusip": "999999999",
+                        "symbol": "VTI"},
+         "amount": 10, "cost": -1500.0, "price": 150.0},
+        {"instrument": {"assetType": "CURRENCY", "symbol": "CURRENCY_USD"},
+         "amount": -1505.0, "cost": -1.5e-05},
+        {"instrument": None, "amount": "3", "price": None},
+    ],
+}
+
+_LEG_EXPECTED = {
+    ("990000000001", 0, "EQUITY", "999999999", "VTI", "10", "-1500.0", "150.0"),
+    ("990000000001", 1, "CURRENCY", None, "CURRENCY_USD", "-1505.0",
+     "-0.000015", None),
+    ("990000000001", 2, None, None, None, None, None, None),
+}
+
+
+def _seed_field_bronze(root: Path) -> Path:
+    dump = _seed_bronze(root)
+    (dump / "accounts_positions.json").write_text(json.dumps([
+        {"securitiesAccount": {"accountNumber": ACCT_PLAIN, "type": "MARGIN",
+                               "positions": _FIELD_POSITIONS}},
+    ]), encoding="utf-8")
+    (dump / "transactions_000.json").write_text(json.dumps({
+        "account_hash": ACCT_HASH, "window_start": "2024-01-01",
+        "window_end": "2024-03-31", "transactions": [
+            _LEG_TXN,
+            {"activityId": "990000000002", "time": "2024-02-02T12:00:00+0000",
+             "type": "JOURNAL"},
+        ]}), encoding="utf-8")
+    return dump
+
+
+def _rows(conn, sql: str) -> set:
+    return {tuple(r) for r in conn.execute(sql)}
+
+
+def test_load_writes_the_promoted_position_fields(tmp_path):
+    _seed_field_bronze(tmp_path / "bronze")
+    db = tmp_path / "schwab-api.db"
+    assert _load(db, tmp_path / "bronze") == 0
+    assert _rows(_open(db), f"SELECT {_FIELD_COLUMNS} FROM positions"
+                 ) == _FIELD_EXPECTED
+
+
+def test_load_writes_every_leg_at_its_place(tmp_path):
+    _seed_field_bronze(tmp_path / "bronze")
+    db = tmp_path / "schwab-api.db"
+    assert _load(db, tmp_path / "bronze") == 0
+    assert _rows(_open(db), "SELECT * FROM transaction_legs") == _LEG_EXPECTED
+
+
+def test_a_replaced_window_replaces_its_legs(tmp_path):
+    bronze = tmp_path / "bronze"
+    db = tmp_path / "schwab-api.db"
+    _seed_field_bronze(bronze)
+    assert _load(db, bronze) == 0
+    # The later dump states the window again without the trade.
+    _seed_with_txns(bronze, "20240402T000000Z", window_start="2024-01-01",
+                    window_end="2024-03-31",
+                    txn_specs=[("990000000003", "2024-02-03T12:00:00+0000")])
+    assert _load(db, bronze) == 0
+    assert _count(_open(db), "transaction_legs") == 0
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("2099-09-09T05:00:00.000+00:00", 4092595200),
+    ("2099-09-09", 4092595200),
+    ("2099-02-30T00:00:00", None),
+    ("0000-01-01T00:00:00", None),
+    ("99-09-09", None),
+    (20990909, None),
+    (None, None),
+])
+def test_a_stamp_reads_as_the_day_it_begins_with(value, expected):
+    assert loader.stamped_day(value) == expected
+
+
+def test_a_payload_like_the_latest_adds_no_row(tmp_path):
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE instruments"
+                 "(snapshot_at INTEGER, symbol TEXT, payload TEXT)")
+    conn.executemany("INSERT INTO instruments VALUES (?, ?, ?)",
+                     [(1, "VTI", "old"), (2, "VTI", "new")])
+    assert loader._latest_payload(conn, "instruments", "symbol", "VTI") == "new"
+    assert loader._latest_payload(conn, "instruments", "symbol", "QQQ") is None
+    response = {"instruments": [{"symbol": "VTI"}, {"symbol": "QQQ"}]}
+    assert loader.load_instruments(conn, 3, response) == 2
+    assert loader.load_instruments(conn, 4, response) == 0
+
+
+def test_migration_0006_fills_what_the_loader_writes(tmp_path):
+    """A silver at schema 0005, holding the rows a load writes, gets from
+    the migration exactly the fields a fresh load of the same bronze
+    writes."""
+    _seed_field_bronze(tmp_path / "bronze")
+    fresh = tmp_path / "fresh.db"
+    assert _load(fresh, tmp_path / "bronze") == 0
+
+    pre = tmp_path / "migrations-0005"
+    pre.mkdir()
+    for f in sorted(loader.MIGRATIONS_DIR.glob("000[1-5]_*.sql")):
+        (pre / f.name).write_text(f.read_text(encoding="utf-8"),
+                                  encoding="utf-8")
+    old = tmp_path / "old.db"
+    conn = loader.open_db(old)
+    assert silver.apply_migrations(conn, pre) == 5
+    conn.execute("ATTACH DATABASE ? AS fresh", (str(fresh),))
+    with conn:
+        for table in _BRONZE_TABLES:
+            if table == "transaction_legs":
+                continue
+            cols = ", ".join(r[1] for r in conn.execute(
+                f"PRAGMA main.table_info({table})"))
+            conn.execute(f"INSERT INTO main.{table} ({cols}) "
+                         f"SELECT {cols} FROM fresh.{table}")
+    conn.execute("DETACH DATABASE fresh")
+    assert silver.apply_migrations(conn, loader.MIGRATIONS_DIR) == 6
+    conn.close()
+    assert _dump_tables(old) == _dump_tables(fresh)
 
 
 # ============================================================
@@ -375,7 +569,8 @@ def test_migration_0005_backfills_rows_loaded_before_it(tmp_path):
 # (migration timestamps) are deliberately excluded from the comparison.
 _BRONZE_TABLES = (
     "accounts", "user_preference", "account_balances",
-    "positions", "open_orders", "transactions", "instruments",
+    "positions", "open_orders", "transactions", "transaction_legs",
+    "instruments",
 )
 
 
@@ -590,3 +785,42 @@ def test_recompress_compresses_data_leaves_run_json(tmp_path):
     assert loader.main(["--silver-db", str(db_after),
                         "--bronze-dir", str(bronze)]) == 0
     assert _dump_tables(db_after) == before
+
+
+# ============================================================
+# The load frame
+# ============================================================
+
+def test_runs_loaded_one_at_a_time_build_what_force_builds(tmp_path):
+    # The later run states the first one's window again: its journal
+    # replaces the trade at the same activity id, and a row joins.
+    fixture = tmp_path / "fixture"
+    runs = [
+        _seed_full_bronze(fixture),
+        _seed_with_txns(fixture, "20240402T000000Z",
+                        window_start="2024-01-15", window_end="2024-04-02",
+                        txn_specs=[("990000000001", "2024-02-01T12:00:00+0000"),
+                                   ("990000000002", "2024-03-01T12:00:00+0000")]),
+    ]
+    incremental.check(loader.main, lambda db, bronze: [
+        "--silver-db", str(db), "--bronze-dir", str(bronze)], runs,
+        tmp_path / "work")
+
+
+def test_a_missing_bronze_dir_ends_the_load(tmp_path):
+    with pytest.raises(SystemExit, match="Bronze directory not found"):
+        _load(tmp_path / "schwab-api.db", tmp_path / "nope")
+
+
+def test_force_rebuilds_from_every_dump(tmp_path):
+    bronze = tmp_path / "bronze"
+    _seed_full_bronze(bronze)
+    db = tmp_path / "schwab-api.db"
+    assert _load(db, bronze) == 0
+    before = _dump_tables(db)
+    conn = _open(db)
+    conn.execute("DELETE FROM positions")
+    conn.commit()
+    conn.close()
+    assert _load(db, bronze, "--force") == 0
+    assert _dump_tables(db) == before

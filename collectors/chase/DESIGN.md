@@ -22,12 +22,12 @@ The README holds the quick start, the bronze layout and the silver tables.
   autopay, limits, disputes, lock/unlock, anything that mutates state at
   the provider) is out of scope in code and docs, as is any other product
   the same login may expose. See the §4 scope note for the decision.
-- **Conduit accounts.** The deposit accounts are conduits: cash passes
-  through them on its way to and from other sources. Their transactions
-  matter for cross-source money-flow tracking. Their own return rows are
-  noise, so the registered ReturnsPolicy hides them while the coarse grains
-  keep their balances and flows. The credit cards are not conduits. They
-  are revolving-credit liabilities, and gold keeps every `card` account out
+- **Deposit accounts are not investments.** Their transactions matter for
+  cross-source money-flow tracking. Their own return rows are noise. A
+  deposit account is a `cash` account, which the returns engine hides on
+  any source, while the coarse grains keep its balances and flows. The
+  credit cards are not deposit accounts. They are revolving-credit
+  liabilities, and gold keeps every `card` account out
   of returns altogether. The gold side is
   [docs/adapters/chase.md](../../wealthdb/docs/adapters/chase.md) §7.
 - **No self-service retail API.** Akoya is partner-gated. The
@@ -457,28 +457,36 @@ rows.
 - A statement row's id hashes the **description the parser read**, and
   `_insert_transaction` is `INSERT OR IGNORE`, so editing the parser re-keys
   the rows and the next load would insert the new ones beside the old — a
-  silent, permanent double-count of those outflows. `parser_generations`
-  (migration 0005) records which generation of `statement_parser` produced
-  the rows silver is holding; when it has moved, every `source='statement'`
-  row **and every period anchor** is dropped before the passes re-derive
-  them, so a re-parse REPLACES. The anchors go too because
-  `statement_balances` is keyed on the period the parser READ, so a shifted
-  period mints a new anchor and orphans the old one — and
-  `_card_balance_anchors` takes every anchor an account has, so the orphan
-  lands in the span walk `derive_card_balances` rolls between. Both
-  statement passes share one generation and one purge: they both write
+  silent, permanent double-count of those outflows. `document_derivations`
+  (migration 0006) records, per document, which generation of
+  `statement_parser` produced the rows silver is holding; when one has
+  moved, every `source='statement'` row **and every period anchor** is
+  dropped before the passes re-derive them, so a re-parse REPLACES. A
+  document with no record yet is new, not moved, and purges nothing. The
+  anchors go too because `statement_balances` is keyed on the period the
+  parser READ, so a shifted period mints a new anchor and orphans the old
+  one — and `_card_balance_anchors` takes every anchor an account has, so
+  the orphan lands in the span walk `derive_card_balances` rolls between.
+  Both statement passes share one generation and one purge: they both write
   `source='statement'` and nothing on a row separates a deposit statement's
   from a card's. The export ledgers are untouched — migration 0002 moved
   them onto structural ids that carry no parsed text.
 - A moved generation **raises the post-pass gate by itself**. A parser-only
   change lands no bronze run, so `post_passes_pending` stays down and
   nothing else would ever run the passes again. Two guards bound what a
-  re-derivation can do: the stamp is written only once all three passes
-  return, so a pass that dies leaves the older generation stored; and a
-  re-derivation that comes back with FEWER rows than silver held is not
-  stamped at all, so the next load tries again rather than committing the
+  re-derivation can do: the documents are recorded only once all three
+  passes return, so a pass that dies leaves the older generation stored;
+  and a re-derivation that comes back with FEWER rows than silver held is
+  not recorded at all, so the next load tries again rather than committing the
   shortfall. That settles after one retry, which has nothing better to
   compare against, and warns each time.
+- Every statement parse is **cached by content**: a parse result is stored
+  under the document's hash and the parser generation, one namespace per
+  document kind, in the collector's parse cache
+  (`~/.cache/wealthdb/chase/parse-cache/`). The passes a new run owes read
+  every document they have read before from there, so `pdftotext` runs
+  only on new bytes. A parse that raises is never stored, and a new
+  generation reads none of the old entries; each load sweeps them.
 - The export reduces a cheque to `CHECK <n>`, while the statement prints one
   the payee converted to an electronic debit as `Check # <n> <payee> Payment
   Arc ID: …` — the only place its payee appears. `annotate_export_cheques`
@@ -560,7 +568,7 @@ login and scrape run in one browser lifetime, and `login` folds into
 ### load — silver
 
 `load.py` parses each bronze run into the silver schema
-(`migrations/0001` … `0005`): accounts (content-deduped per snapshot), the
+(`migrations/0001` … `0006`): accounts (content-deduped per snapshot), the
 transaction ledger, and the statement inventory. The ledger is the
 **CSV↔QFX join** (§E). The QFX row is the row of record, and the CSV
 running balance joins on **(post date, amount)**. The check number is a
@@ -710,10 +718,10 @@ account, `card` for a credit card. Neither product carries an instrument,
 so it emits cash balances, not positions, plus the whole transaction
 ledger keyed on silver's content-derived `fitid`. Silver keeps every card
 figure the provider's way, and the adapter turns the sign exactly once: a
-card's owed balance becomes gold's negative cash. The deposit accounts are
-conduits whose own return rows the registered ReturnsPolicy hides; cards
-never enter returns. The mapping, the balance sources and the returns
-treatment are in
+card's owed balance becomes gold's negative cash. The returns engine
+hides the deposit accounts' own return rows, as it hides every cash
+account. Cards never enter returns. The mapping, the balance sources
+and the returns treatment are in
 [docs/adapters/chase.md](../../wealthdb/docs/adapters/chase.md).
 
 ### Scope decision: credit cards — reads in, management out
@@ -738,9 +746,9 @@ liabilities for net worth and statement-balance payments for money-flow
 reconciliation. Card *reads* are in scope; card *management* is not, and
 never will be without a fresh written opt-in. Cards cost separate
 card-activity / card-statement endpoints to capture, a liability
-`account_kind` and revolving-credit shape in the adapter. They have **no
-conduit-returns rationale**: a card is not a conduit, and gold keeps card
-accounts out of returns by their kind, not by the conduit policy.
+`account_kind` and revolving-credit shape in the adapter. They need **no
+returns policy of their own**: gold keeps card accounts out of returns by
+their kind, as it hides the deposit accounts by theirs.
 
 ## 5. Operation & status
 

@@ -28,7 +28,7 @@ func kindFor(silverKind, narrative string, creditDebit, txnType string) canonica
 	case "fx_option_confirmation":
 		// No dedicated fx_option TxKind in the canonical
 		// taxonomy; the option settlement is effectively an fx
-		// conversion at expiry, so we route to the generic fx
+		// conversion at expiry, so it routes to the generic fx
 		// kind. Revisit if a distinct kind becomes useful for
 		// analytics.
 		return canonical.TxKindFx
@@ -84,7 +84,7 @@ func kindFor(silverKind, narrative string, creditDebit, txnType string) canonica
 // Read as that kind, a reversed trade (NSEC) would be a second trade to
 // every pass that reads trades, and a reversed conversion (NFEX) a
 // second conversion. The direction-only fallback keeps a reversal a
-// plain movement, and buildTransaction signs it by its mark.
+// plain movement, and feedRow.transaction signs it by its mark.
 //
 // The exception is NDIV on the reversal of a credit: the bank taking
 // back a dividend it paid. That is the dividend's reversal, a negative
@@ -183,7 +183,7 @@ func cashMovementKind(narrative, creditDebit, txnType string) canonical.TxKind {
 	// capital instead of a cost inside the return. Match the distinctive
 	// stamp-duty terms anywhere in the narrative so the duty always lands in
 	// tax. (Defensive: no live UBS stamp-duty sample to confirm the exact
-	// wording, so we cover the standard FR/DE/EN forms.)
+	// wording, so the standard FR/DE/EN forms are all covered.)
 	if strings.Contains(upper, "TIMBRE") ||
 		strings.Contains(upper, "UMSATZABGABE") ||
 		strings.Contains(upper, "STEMPEL") ||

@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/returns"
 )
 
@@ -82,11 +81,7 @@ const bridgeTol = 0.005
 // config's returns settings, the window (whole months; FromEpoch <= 0 is
 // since inception) and the bucket size in Period.
 func RunBridge(ctx context.Context, db *sql.DB, p ReturnParams) ([]BridgeRow, error) {
-	fx, err := loadFxBounds(ctx, db)
-	if err != nil {
-		return nil, err
-	}
-	ds, err := loadReturnsDataset(ctx, db, p.OutCcy, fx, p.PolicyOverrides, p.TransferMatching)
+	ds, err := loadRunDataset(ctx, db, p)
 	if err != nil {
 		return nil, err
 	}
@@ -160,8 +155,8 @@ func loadDebtRates(ctx context.Context, db *sql.DB, outCcy string) (map[string]m
 func computeBridge(in bridgeInput, p ReturnParams) []BridgeRow {
 	// The window runs read the residue in residueCurrency, as returns does.
 	in.ds.ensureTwins()
-	assets := bridgeAssets(in.ds, p)
-	months := in.months(assets, p)
+	e := in.ds.whole(p.ReturnsExclude)
+	months := in.months(e, p)
 	var firstDay int64
 	if len(months) > 0 {
 		firstDay = months[0].startDay
@@ -173,7 +168,7 @@ func computeBridge(in bridgeInput, p ReturnParams) []BridgeRow {
 			return
 		}
 		row := sumBridgeMonths(bucket, p.Period)
-		row.Quality = dedupeStrings(append(in.windowTags(assets, p, bucket, firstDay), bucketTags(bucket)...))
+		row.Quality = dedupeStrings(append(in.windowTags(e, p, bucket, firstDay), bucketTags(bucket)...))
 		out = append(out, row)
 		bucket = nil
 	}
@@ -187,43 +182,36 @@ func computeBridge(in bridgeInput, p ReturnParams) []BridgeRow {
 	return out
 }
 
-// bridgeAssets is what the global grain of returns measures.
-func bridgeAssets(ds *returnsDataset, p ReturnParams) []*accountData {
-	groups, _ := groupAccounts("global", ds.accts, p.ReturnsExclude)
-	_, assets := splitLiabilities(groups["global"])
-	return assets
-}
-
 // bridgeRunParams is p as the since-inception global run the months come
-// from: the run `returns global` makes with its default settings.
+// from: the default run, its rates by time and never annualized.
 func bridgeRunParams(p ReturnParams) ReturnParams {
-	p.Level, p.FromEpoch, p.Method, p.Period, p.Annualize = "global", 0, "twr", "monthly", "never"
-	p.Netting, p.Inception = true, "full"
-	return p
+	run := p.defaultRun(grainGlobal.name, "monthly", p.OutCcy, 0, p.ToEpoch)
+	run.Method, run.Annualize = "twr", "never"
+	return run
 }
 
 // months computes the history's months from one since-inception run of the
 // global grain. The caller's window plays no part, so a month reads the same
 // in every window and months add up to quarters and years.
-func (in bridgeInput) months(assets []*accountData, p ReturnParams) []bridgeMonth {
-	if len(assets) == 0 {
+func (in bridgeInput) months(e *entity, p ReturnParams) []bridgeMonth {
+	if e == nil {
 		return nil
 	}
 	run := bridgeRunParams(p)
 	toDay := in.ds.globalMax
 	run.ToEpoch = toDay * SecondsPerDay
-	winFrom, winTo, _ := entityWindow(assets, run, toDay)
-	if winTo <= winFrom {
+	r := e.run(run, toDay)
+	if r == nil {
 		return nil
 	}
-	rows, flows := computeEntityReturnFlows(assets, run, toDay, in.ds.fx)
+	winFrom, winTo, rows, flows := r.win.from, r.win.to, r.rows(in.ds.fx), r.flows
 	bucketQuality := map[int64][]string{}
 	for _, r := range rows {
 		if !r.IsSummary {
 			bucketQuality[r.EndDay] = r.Quality
 		}
 	}
-	av := entityValue(assets)
+	av := e.value
 	var out []bridgeMonth
 	for _, b := range returns.BucketBoundaries(winFrom, winTo, returns.BucketMonthly) {
 		m := bridgeMonth{startDay: b[0], endDay: b[1], tags: slices.Clone(bucketQuality[b[1]])}
@@ -339,7 +327,7 @@ func (in bridgeInput) gapAt(av func(int64) (float64, bool), day int64) float64 {
 		gap -= v
 	}
 	for _, a := range in.ds.accts {
-		if a.kind == string(canonical.AccountKindMortgage) {
+		if a.liability() {
 			if v, ok := a.valueAt(day); ok {
 				gap -= v
 			}
@@ -356,7 +344,7 @@ func (in bridgeInput) gapAt(av func(int64) (float64, bool), day int64) float64 {
 // windowTags are returns' tags for the bucket's own window: what
 // `returns global FROM TO --period total` flags. They carry first, as the
 // summary row's do, and the window's opening tag joins the first bucket.
-func (in bridgeInput) windowTags(assets []*accountData, p ReturnParams, bucket []bridgeMonth, firstDay int64) []string {
+func (in bridgeInput) windowTags(e *entity, p ReturnParams, bucket []bridgeMonth, firstDay int64) []string {
 	start, end := bucket[0].startDay, bucket[len(bucket)-1].endDay
 	w := bridgeRunParams(p)
 	w.FromEpoch, w.ToEpoch, w.Period = start*SecondsPerDay, end*SecondsPerDay, "total"
@@ -369,7 +357,8 @@ func (in bridgeInput) windowTags(assets []*accountData, p ReturnParams, bucket [
 			tags = append(tags, "partial_window")
 		}
 	}
-	if rows := computeEntityReturn(assets, w, end, in.ds.fx); len(rows) > 0 {
+	if r := e.run(w, end); r != nil {
+		rows := r.rows(in.ds.fx)
 		// rolled_forward speaks of the rates' values; the bridge reads the
 		// carried values, as holdings does.
 		tags = append(tags, slices.DeleteFunc(rows[len(rows)-1].Quality, func(t string) bool { return t == "rolled_forward" })...)
@@ -409,7 +398,7 @@ func bridgeLabel(endDay int64, period string) string {
 	if period == "total" {
 		return "total"
 	}
-	return periodLabel(endDay+1, period)
+	return PeriodLabel(returns.DayToTimeUTC(endDay), period)
 }
 
 // sumBridgeMonths adds a bucket's months. The start is the first month's,
@@ -456,12 +445,8 @@ func centsStr(c int64) *string {
 
 // ---- materialization -----------------------------------------------------
 
-// bridgeInsertSQL writes one report_bridge row.
-const bridgeInsertSQL = `INSERT INTO report_bridge (computed_at, currency, period, start_day, end_day,
-    start_net_worth, end_net_worth, net_flow, onboarded, debt_repaid, net_saved, gain, bridge_gap, quality)
-    VALUES (?, ?, ?, ?, ?, CAST(? AS DECIMAL(24,2)), CAST(? AS DECIMAL(24,2)), CAST(? AS DECIMAL(24,2)),
-            CAST(? AS DECIMAL(24,2)), CAST(? AS DECIMAL(24,2)), CAST(? AS DECIMAL(24,2)),
-            CAST(? AS DECIMAL(24,2)), CAST(? AS DECIMAL(24,2)), ?)`
+const bridgeCols = `computed_at, currency, period, start_day, end_day, start_net_worth, end_net_worth,
+    net_flow, onboarded, debt_repaid, net_saved, gain, bridge_gap, quality`
 
 // bridgeMaterial is each reporting currency's monthly rows, ready to write.
 type bridgeMaterial map[string][]BridgeRow
@@ -479,32 +464,34 @@ func computeMaterialBridge(ctx context.Context, db *sql.DB, datasets map[string]
 		if err != nil {
 			return nil, err
 		}
-		out[ccy] = computeBridge(bridgeInput{ds: datasets[ccy], debts: debts, rates: rates}, ReturnParams{
-			ToEpoch: p.ToEpoch, OutCcy: ccy, Period: "monthly",
-			InceptionOverrides: p.InceptionOverrides, ReturnsExclude: p.ReturnsExclude, ReturnsHide: p.ReturnsHide,
-		})
+		out[ccy] = computeBridge(bridgeInput{ds: datasets[ccy], debts: debts, rates: rates},
+			p.defaultRun(grainGlobal.name, "monthly", ccy, 0, p.ToEpoch))
 	}
 	return out, nil
 }
 
-// write replaces report_bridge's rows.
+// write inserts report_bridge's rows, currency by currency. The money
+// columns carry the bridge's cents as decimal strings.
 func (m bridgeMaterial) write(ctx context.Context, tx *sql.Tx, computedAt int64) error {
-	if _, err := tx.ExecContext(ctx, `DELETE FROM report_bridge`); err != nil {
-		return fmt.Errorf("report_bridge delete: %w", err)
+	type ref struct {
+		ccy string
+		row int
 	}
-	stmt, err := tx.PrepareContext(ctx, bridgeInsertSQL)
-	if err != nil {
-		return fmt.Errorf("report_bridge prepare: %w", err)
-	}
-	defer stmt.Close()
+	var refs []ref
 	for _, ccy := range materializeCurrencies {
-		for _, r := range m[ccy] {
-			if _, err := stmt.ExecContext(ctx, computedAt, ccy, r.Period, r.StartDay*SecondsPerDay, r.EndDay*SecondsPerDay,
-				*r.StartNetWorth, *r.EndNetWorth, *r.NetFlow, *r.Onboarded, *r.DebtRepaid, *r.NetSaved, *r.Gain, *r.Gap,
-				strings.Join(r.Quality, ";")); err != nil {
-				return fmt.Errorf("report_bridge insert: %w", err)
-			}
+		for j := range m[ccy] {
+			refs = append(refs, ref{ccy, j})
 		}
 	}
-	return nil
+	if len(refs) == 0 {
+		return nil
+	}
+	return insertColumns(ctx, tx, "report_bridge", "report_bridge", bridgeCols, len(refs),
+		func(i int, args []any) []any {
+			ccy := refs[i].ccy
+			r := &m[ccy][refs[i].row]
+			return append(args, computedAt, ccy, r.Period, r.StartDay*SecondsPerDay, r.EndDay*SecondsPerDay,
+				*r.StartNetWorth, *r.EndNetWorth, *r.NetFlow, *r.Onboarded, *r.DebtRepaid, *r.NetSaved, *r.Gain, *r.Gap,
+				strings.Join(r.Quality, ";"))
+		})
 }

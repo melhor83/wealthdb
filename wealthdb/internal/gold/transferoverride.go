@@ -2,6 +2,7 @@ package gold
 
 import (
 	"fmt"
+	"math"
 	"sort"
 )
 
@@ -103,17 +104,91 @@ func (o TransferOverrides) blocks(d, c TransferLeg) bool {
 }
 
 // TransferOverrideSelector names one leg the way a person reads it off a
-// statement — the same natural key the pins ledger uses, and for the same
-// reason: gold's transaction_external_id is opaque and adapter-specific, and
+// statement — the natural key the pins ledger uses, except that a match or
+// unmatch line names a coin's dust by its quantity, and for the same reason: gold's transaction_external_id is opaque and adapter-specific, and
 // nobody can write one down. The key is deliberately not unique; where two
 // identical rows share a day, an override describes both, and anyone needing
 // to separate them has a distinction gold does not carry either.
 type TransferOverrideSelector struct {
-	Source   string
-	Account  string  // gold account_external_id
-	Day      int64   // UTC midnight of occurred_at, Unix seconds
-	Amount   float64 // net_amount as gold stores it: canonical sign
+	Source  string
+	Account string // gold account_external_id
+	Day     int64  // UTC midnight of occurred_at, Unix seconds
+	// Amount: for match and unmatch, the matcher's amount (TransferLeg.Amt,
+	// the pool's match_amount), within a cent, or for a coin's leg as the
+	// coin rule reads it (TransferLeg.answers); for reimburse, net_amount
+	// as gold stores it (the pins key).
+	Amount   float64
 	Currency string
+}
+
+// legDay is what a selector names a leg by beside its amount: the
+// source, the account, the currency and the epoch day.
+type legDay struct {
+	group, owner, ccy string
+	day               int64
+}
+
+// legIndex holds the legs by legDay, so a selector reads its own day's
+// legs alone, not the whole pool.
+type legIndex map[legDay][]TransferLeg
+
+func indexLegs(legs []TransferLeg) legIndex {
+	idx := legIndex{}
+	for _, l := range legs {
+		k := legDay{l.Group, l.Owner, l.Ccy, l.Day}
+		idx[k] = append(idx[k], l)
+	}
+	return idx
+}
+
+// legsAt are the legs s names: those on its account, day and currency whose
+// amount answers to s's (TransferLeg.answers). Of the coin legs that
+// answer, only those nearest s's amount are named: the coin rule's bound
+// can hold two legs of one day, and an exact amount, or a rounded one,
+// means the leg it is written from.
+func (idx legIndex) legsAt(s TransferOverrideSelector) []LegRef {
+	var out, coins []LegRef
+	nearest := math.Inf(1)
+	for _, l := range idx[legDay{s.Source, s.Account, s.Currency, EpochDay(s.Day)}] {
+		if !l.answers(s.Amount) {
+			continue
+		}
+		ref := LegRef{l.Group, l.Owner, l.ID}
+		if !l.Coin {
+			out = append(out, ref)
+			continue
+		}
+		switch d := math.Abs(l.Amt - s.Amount); {
+		case d < nearest:
+			nearest, coins = d, append(coins[:0], ref)
+		case d == nearest:
+			coins = append(coins, ref)
+		}
+	}
+	return append(out, coins...)
+}
+
+// answers says l is the leg a selector of amount names. A coin's leg
+// answers where the two amounts have one sign and the smaller is what a
+// transfer of the larger delivers (coinQuantities, at l's price): a cent
+// is no bound in a coin's own unit, too wide for one coin and too narrow
+// for another. Every other leg answers within a cent.
+func (l TransferLeg) answers(amount float64) bool {
+	if !l.Coin {
+		diff := l.Amt - amount
+		return diff <= TransferMatchMinEps && diff >= -TransferMatchMinEps
+	}
+	if l.Amt == amount {
+		return true
+	}
+	if (l.Amt < 0) != (amount < 0) {
+		return false
+	}
+	larger, smaller := math.Abs(l.Amt), math.Abs(amount)
+	if smaller > larger {
+		larger, smaller = smaller, larger
+	}
+	return coinQuantities(larger, smaller, l.USD)
 }
 
 // TransferOverrideRule is one line of the ledger before resolution.
@@ -141,33 +216,21 @@ type TransferOverrideRule struct {
 // list is returned rather than raised, so a caller can warn and carry on
 // rather than fail a whole pass over one stale line.
 func ResolveTransferOverrides(rules []TransferOverrideRule, legs []TransferLeg) (TransferOverrides, []TransferOverrideRule, error) {
-	find := func(s TransferOverrideSelector) []LegRef {
-		var out []LegRef
-		for _, l := range legs {
-			if l.Group != s.Source || l.Owner != s.Account || l.Ccy != s.Currency {
-				continue
-			}
-			if l.Day != EpochDay(s.Day) {
-				continue
-			}
-			if diff := l.Amt - s.Amount; diff > TransferMatchMinEps || diff < -TransferMatchMinEps {
-				continue
-			}
-			out = append(out, LegRef{l.Group, l.Owner, l.ID})
-		}
-		return out
-	}
 	var (
 		isolated  []LegRef
 		forbidden [][2]LegRef
 		forced    []ForcedPair
 		unmatched []TransferOverrideRule
+		idx       legIndex
 	)
+	if len(rules) > 0 {
+		idx = indexLegs(legs)
+	}
 	for _, r := range rules {
 		if r.Verb == VerbReimburse {
 			continue // pairs no transfer: the spending pass reads it
 		}
-		as := find(r.A)
+		as := idx.legsAt(r.A)
 		if len(as) == 0 {
 			unmatched = append(unmatched, r)
 			continue
@@ -180,7 +243,7 @@ func ResolveTransferOverrides(rules []TransferOverrideRule, legs []TransferLeg) 
 			isolated = append(isolated, as...)
 			continue
 		}
-		bs := find(*r.B)
+		bs := idx.legsAt(*r.B)
 		if len(bs) == 0 {
 			unmatched = append(unmatched, r)
 			continue
@@ -211,4 +274,45 @@ func ResolveTransferOverrides(rules []TransferOverrideRule, legs []TransferLeg) 
 	}
 	o, err := newTransferOverrides(isolated, forbidden, forced)
 	return o, unmatched, err
+}
+
+// IdleTransferMatches returns the `match` rules that name a leg on both
+// sides but that no pair of the matcher answers to: no override pair joins
+// a leg of the one side and a leg of the other. Such a line resolves, so
+// ResolveTransferOverrides does not report it, and still does nothing. Its
+// two legs read as one direction, or one of them is zero and pairs in no
+// phase, or both sides name one leg, or another line claimed a leg first.
+// It is reported for the reason an unresolved line is.
+func IdleTransferMatches(rules []TransferOverrideRule, legs []TransferLeg, pairs []TransferMatchPair) []TransferOverrideRule {
+	if len(rules) == 0 {
+		return nil
+	}
+	idx := indexLegs(legs)
+	forced := map[string]bool{}
+	for _, p := range pairs {
+		if p.By == MatchedByOverride {
+			forced[pairKey(LegRef{p.Debit.Group, p.Debit.Owner, p.Debit.ID},
+				LegRef{p.Credit.Group, p.Credit.Owner, p.Credit.ID})] = true
+		}
+	}
+	var idle []TransferOverrideRule
+	for _, r := range rules {
+		if r.Verb != VerbMatch || r.B == nil {
+			continue
+		}
+		as, bs := idx.legsAt(r.A), idx.legsAt(*r.B)
+		if len(as) == 0 || len(bs) == 0 {
+			continue // unresolved: ResolveTransferOverrides reports it
+		}
+		paired := false
+		for _, a := range as {
+			for _, b := range bs {
+				paired = paired || forced[pairKey(a, b)]
+			}
+		}
+		if !paired {
+			idle = append(idle, r)
+		}
+	}
+	return idle
 }

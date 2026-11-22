@@ -15,13 +15,14 @@ import (
 // movement pairs a web-side mirror in the same-day offset veto (see
 // buildSameDayOffsetVeto); those are demoted to a non-flow kind here, exactly
 // as the web loop demotes its half — a pair must drop on both sides or the
-// survivor books a one-sided phantom external flow. hints.withheld names the
-// conversion mirrors and the cash legs an export row records instead, which
-// are not emitted. Both are empty when the merged connection has no web
-// subsource.
+// survivor books a one-sided phantom external flow. hints.rc is the
+// reconcile table's verdict (reconcile.go), which the caller always
+// passes: the MT940 lines that give way to a trade confirmation are not
+// emitted, nor the conversion mirrors and the cash legs it withholds.
 // hints.securities links a dividend line past its confirmation and names
-// the reversals that are dividend reversals (psnHints). Without a web
-// subsource the stream builds the feed's own.
+// the reversals that are dividend reversals, and hints.funds a line to the
+// private-equity fund whose corporate action it books or that it names
+// (psnHints). Without a web subsource the stream builds the feed's own.
 //
 // Beside the events, the stream books rows the feed does not carry:
 //
@@ -35,14 +36,12 @@ func (r *psnReader) Transactions(ctx context.Context, w canonical.Window, hints 
 		return silver.NewTransactionStream(canonical.TransactionBatch{}), nil
 	}
 
-	ibans, err := r.cashAccountIBANs(ctx)
+	roster, err := r.roster(ctx)
 	if err != nil {
 		return nil, err
 	}
-	settled, err := r.buildSettlementFold(ctx, ibans)
-	if err != nil {
-		return nil, err
-	}
+	ibans := roster.cashAccountIBANs()
+	rc := hints.rc
 	coverage, err := r.cashCoverage(ctx)
 	if err != nil {
 		return nil, err
@@ -51,7 +50,7 @@ func (r *psnReader) Transactions(ctx context.Context, w canonical.Window, hints 
 	if err != nil {
 		return nil, err
 	}
-	cashLegs, err := r.corporateActionCashLegs(ctx, w, coverage, ibans, hints.withheld)
+	cashLegs, err := r.corporateActionCashLegs(ctx, w, coverage, ibans, rc.withheld)
 	if err != nil {
 		return nil, err
 	}
@@ -59,36 +58,35 @@ func (r *psnReader) Transactions(ctx context.Context, w canonical.Window, hints 
 	if err != nil {
 		return nil, err
 	}
-
-	const q = `
-SELECT event_external_id, timestamp, account_external_id, kind, currency_iso, payload
-  FROM events
- WHERE timestamp BETWEEN ? AND ?`
-	rows, err := r.db.QueryContext(ctx, q, w.Start, w.End)
-	if err != nil {
-		return nil, fmt.Errorf("ubs Transactions: %w", err)
+	funds := hints.funds
+	if funds == nil {
+		places, err := cashAccountPortfolios(ctx, r, nil)
+		if err != nil {
+			return nil, err
+		}
+		if funds, err = buildPrivateFunds(ctx, r, nil, places); err != nil {
+			return nil, err
+		}
+		if err := funds.pairConfirmations(ctx, r, nil, rc, nil); err != nil {
+			return nil, err
+		}
 	}
-	defer rows.Close()
 
+	feed, err := r.feed(ctx)
+	if err != nil {
+		return nil, err
+	}
 	out := canonical.TransactionBatch{}
 	mirrored, grossed := 0, 0
-	for rows.Next() {
-		var (
-			eventID, extID, kind, payload string
-			currencyISO                   *string
-			occurredAt                    int64
-		)
-		if err := rows.Scan(&eventID, &occurredAt, &extID, &kind, &currencyISO, &payload); err != nil {
-			return nil, fmt.Errorf("ubs Transactions scan: %w", err)
+	emit := func(row *feedRow) error {
+		eventID, kind := row.eventID, row.kind
+		if row.kind == "cash_movement" && rc.lostTo(recFeed, eventID) != "" {
+			return nil
 		}
 
-		if settled.covers(kind, extID, currencyISO, occurredAt, payload) {
-			continue
-		}
-
-		tx, err := buildTransaction(eventID, occurredAt, extID, kind, currencyISO, payload, ibans)
+		tx, err := row.transaction(ibans)
 		if err != nil {
-			return nil, fmt.Errorf("ubs Transactions (event_id=%s): %w", eventID, err)
+			return fmt.Errorf("ubs Transactions (event_id=%s): %w", eventID, err)
 		}
 		// A dividend line names its security and, where its confirmation
 		// states the gross, reads the gross with the tax withheld beside it.
@@ -100,18 +98,31 @@ SELECT event_external_id, timestamp, account_external_id, kind, currency_iso, pa
 			taxed bool
 		)
 		if kind == "cash_movement" {
-			// The payload decodes: buildTransaction read it above.
-			var p cashMovementPayload
-			if err := json.Unmarshal([]byte(payload), &p); err != nil {
-				return nil, fmt.Errorf("ubs Transactions (event_id=%s): %w", eventID, err)
-			}
+			// The payload decodes: transaction read it above.
+			p := row.pl
 			var reversed bool
 			if tax, taxed, reversed, err = dividends.reverse(&tx); err != nil {
-				return nil, fmt.Errorf("ubs Transactions (event_id=%s): %w", eventID, err)
+				return fmt.Errorf("ubs Transactions (event_id=%s): %w", eventID, err)
 			}
 			if !reversed && tx.Kind == canonical.TxKindDividend {
 				if tax, taxed, err = dividends.settle(&tx, p); err != nil {
-					return nil, fmt.Errorf("ubs Transactions (event_id=%s): %w", eventID, err)
+					return fmt.Errorf("ubs Transactions (event_id=%s): %w", eventID, err)
+				}
+			}
+			// A line no road above linked takes the private-equity fund
+			// whose corporate action it books, else the one its narrative
+			// names, and books as what it is (private_funds.go). A line
+			// the offset veto pairs, or whose narrative names an internal
+			// transfer, moves cash between own accounts and pays no fund
+			// itself. An MT940 line states no counter account.
+			if tx.InstrumentExternalID == nil && !hints.veto[eventID] && !namesInternalTransfer(p.Narrative) {
+				isin, k, ok := funds.pairedLink(eventID, tx.Kind)
+				if !ok {
+					isin, k, ok = funds.link(tx.AccountExternalID, markedFlow(tx.Kind, p.CreditDebit),
+						p.Narrative, p.CustomerRef)
+				}
+				if ok {
+					tx.InstrumentExternalID, tx.Kind = &isin, k
 				}
 			}
 		}
@@ -130,7 +141,7 @@ SELECT event_external_id, timestamp, account_external_id, kind, currency_iso, pa
 		// the one gold holds and the feed row still names it.
 		if m, ok := mirrors.bySource[eventID]; ok {
 			tx.Payload = withStatedConversion(tx.Payload, m)
-			if !hints.withheld[m.tx.TransactionExternalID] {
+			if !rc.withheld[m.tx.TransactionExternalID] {
 				mirror := m.tx
 				if hints.veto[mirror.TransactionExternalID] {
 					mirror.Payload, mirror.Kind = markReturnsInternal(mirror.Payload, mirror.Kind)
@@ -144,9 +155,14 @@ SELECT event_external_id, timestamp, account_external_id, kind, currency_iso, pa
 			out.Transactions = append(out.Transactions, tax)
 			grossed++
 		}
+		return nil
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+	for i := range feed.events {
+		if row := &feed.events[i]; row.at >= w.Start && row.at <= w.End {
+			if err := emit(row); err != nil {
+				return nil, err
+			}
+		}
 	}
 	if grossed > 0 {
 		log.Printf("ubs adapter: booked %d MT940 dividend line(s) or reversal(s) at the gross, a tax row beside each", grossed)
@@ -178,7 +194,7 @@ type tradeConfirmationPayload struct {
 	SecurityName          string `json:"security_name"`
 	// SettlementDateUnix is `:98A::SETT//`, the day the cash leg hits
 	// the account. It is the day the MT940 statement books that leg
-	// on, which is what pairs the two records (settlementFold).
+	// on, which is what pairs the two records (settlementKey).
 	SettlementDateUnix int64 `json:"settlement_date_unix"`
 }
 
@@ -211,49 +227,6 @@ type corporateActionPayload struct {
 	CAEV string `json:"caev"`
 }
 
-// A securities trade reaches PSN twice, on two rails that share no id:
-// the MT515 confirmation of the trade and the MT940 `:61:` line for the
-// cash leg settling it. Both name the same cash account and the same
-// figure, so left alone one trade is two rows in the ledger — and every
-// count, turnover and per-instrument total built over it is doubled.
-//
-// The confirmation is the one that survives, and that is the rail's
-// property rather than a per-row judgement: it carries the instrument,
-// the quantity, the price and the side, where the statement line
-// carries a bare booking code (`B37?`) and no security at all. So the
-// fold drops the cash line, exactly as buildEraFold drops the
-// reconstruction and keeps the machine-readable record.
-//
-// Only a line the bank itself typed as a securities settlement is
-// eligible (`:61:` NSEC). A trade the MT940 feed never carried — the
-// minor-currency cash accounts it does not deliver — has nothing to
-// fold and keeps its confirmation, which is why the confirmation is
-// also the rail that reads completely.
-//
-// The whole silver, unwindowed, for buildEraFold's reason: whether a
-// booking is recorded twice depends on silver's contents alone and
-// never on which slice of time a load happens to cover. A window that
-// held the cash line but not its confirmation would otherwise emit the
-// duplicate the next window folds away.
-type settlementFold struct {
-	// unpaired counts the confirmations still to be matched at each
-	// key, and covers spends one per cash leg it folds. A set would
-	// fold EVERY leg that hashes to a key against a single
-	// confirmation: two NSEC lines on one account, day, currency and
-	// magnitude — one settling a trade, one not — would both vanish,
-	// and the second booking's money would leave the cash ledger
-	// entirely. Counting bounds the fold at N legs for N
-	// confirmations, which is buildEraFold's 1:1 rule in the form a
-	// streaming pass can hold.
-	//
-	// Which of two indistinguishable legs is folded is left to row
-	// order, and deliberately: at equal account, day, currency and
-	// magnitude the two differ only in their id, so no field the
-	// ledger carries can prefer one.
-	unpaired map[settlementKey]int
-	ibans    map[string]string
-}
-
 // settlementKey is the identity the two rails' id schemes cannot
 // express: one cash account, one currency, one figure, one settlement
 // day (UTC; both rails date the settlement to the day and neither
@@ -282,107 +255,6 @@ func newSettlementKey(account, currency string, amount *canonical.Decimal, settl
 		amount:   abs.String(),
 		day:      utcDay(settlementUnix),
 	}, true
-}
-
-// buildSettlementFold reads every trade confirmation the silver holds
-// and records the cash leg each one settles.
-func (r *psnReader) buildSettlementFold(ctx context.Context, ibans map[string]string) (*settlementFold, error) {
-	out := &settlementFold{unpaired: map[settlementKey]int{}, ibans: ibans}
-	if r == nil || r.db == nil {
-		return out, nil
-	}
-	rows, err := r.db.QueryContext(ctx, `
-SELECT currency_iso, payload FROM events WHERE kind = 'trade_confirmation'`)
-	if err != nil {
-		return nil, fmt.Errorf("ubs buildSettlementFold: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var (
-			currencyISO *string
-			payload     string
-		)
-		if err := rows.Scan(&currencyISO, &payload); err != nil {
-			return nil, fmt.Errorf("ubs buildSettlementFold scan: %w", err)
-		}
-		var p tradeConfirmationPayload
-		if err := json.Unmarshal([]byte(payload), &p); err != nil {
-			return nil, fmt.Errorf("ubs buildSettlementFold payload: %w", err)
-		}
-		currency := p.NetCurrency
-		if currency == "" && currencyISO != nil {
-			currency = *currencyISO
-		}
-		key, ok := newSettlementKey(
-			cashIBAN(ibans, p.CashAccountExternalID), currency,
-			p.NetAmount, p.SettlementDateUnix)
-		if ok {
-			out.unpaired[key]++
-		}
-	}
-	return out, rows.Err()
-}
-
-// covers reports whether an event is the cash leg of a trade a
-// confirmation already records in full, and SPENDS that confirmation:
-// each one folds at most one leg, so a second leg at the same key
-// survives and reaches gold on its own classification. That is the
-// conservative direction — a duplicate row is visible and fixable, a
-// vanished booking is not.
-func (f *settlementFold) covers(kind, account string, currencyISO *string, occurredAt int64, payload string) bool {
-	if f == nil || len(f.unpaired) == 0 || kind != "cash_movement" {
-		return false
-	}
-	var p cashMovementPayload
-	if err := json.Unmarshal([]byte(payload), &p); err != nil {
-		return false
-	}
-	if strings.ToUpper(strings.TrimSpace(p.TxnType)) != "NSEC" {
-		return false
-	}
-	acct := account
-	if p.Account != "" {
-		acct = p.Account
-	}
-	currency := p.Funds
-	if currency == "" && currencyISO != nil {
-		currency = *currencyISO
-	}
-	key, ok := newSettlementKey(cashIBAN(f.ibans, acct), currency, p.Amount, occurredAt)
-	if !ok || f.unpaired[key] == 0 {
-		return false
-	}
-	f.unpaired[key]--
-	return true
-}
-
-// cashAccountIBANs maps the bank's internal cash-account id onto the
-// IBAN the rest of the adapter — and gold's account registry — is keyed
-// by. The master-data feed states both, and the MT940 feed already
-// names accounts by IBAN; only the MT515 confirmation uses the internal
-// form, so without the map its rows name an account nothing else does.
-func (r *psnReader) cashAccountIBANs(ctx context.Context) (map[string]string, error) {
-	out := map[string]string{}
-	if r == nil || r.db == nil {
-		return out, nil
-	}
-	rows, err := r.db.QueryContext(ctx, `
-SELECT DISTINCT json_extract(payload, '$.AcctId'), account_external_id
-  FROM cash_accounts`)
-	if err != nil {
-		return nil, fmt.Errorf("ubs cashAccountIBANs: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var acctID, iban *string
-		if err := rows.Scan(&acctID, &iban); err != nil {
-			return nil, fmt.Errorf("ubs cashAccountIBANs scan: %w", err)
-		}
-		if acctID != nil && iban != nil && *acctID != "" && *iban != "" {
-			out[*acctID] = *iban
-		}
-	}
-	return out, rows.Err()
 }
 
 // isSellSide reports whether a trade confirmation's side is the one
@@ -417,33 +289,30 @@ func cashIBAN(ibans map[string]string, id string) string {
 	return id
 }
 
-// buildTransaction routes a silver event into a TransactionChange.
-// Each silverKind variant has its own payload shape; common fields
-// (account, instrument, kind) fall out per branch. `ibans` maps the
-// bank's internal cash-account ids onto the IBANs the account registry
-// is keyed by (cashAccountIBANs); nil where the caller emits no kind
-// that names a cash account of its own.
-func buildTransaction(eventID string, occurredAt int64, defaultAcct, silverKind string, defaultCcy *string, payload string, ibans map[string]string) (canonical.TransactionChange, error) {
+// transaction routes a silver event into a TransactionChange.
+// Each kind has its own payload shape; common fields (account,
+// instrument, kind) fall out per branch. A cash movement and a trade
+// confirmation read the payload the feed decoded (decode), and either
+// fails where it does not decode. `ibans` maps the bank's internal
+// cash-account ids onto the IBANs the account registry is keyed by
+// (cashAccountIBANs); nil where the caller emits no kind that names a
+// cash account of its own.
+func (row *feedRow) transaction(ibans map[string]string) (canonical.TransactionChange, error) {
 	tx := canonical.TransactionChange{
-		TransactionExternalID: eventID,
-		OccurredAt:            occurredAt,
-		AccountExternalID:     defaultAcct,
-		Payload:               json.RawMessage(payload),
+		TransactionExternalID: row.eventID,
+		OccurredAt:            row.at,
+		AccountExternalID:     row.account,
+		Payload:               json.RawMessage(row.payload),
 	}
-	if defaultCcy != nil {
-		tx.Currency = *defaultCcy
+	if row.currency.Valid {
+		tx.Currency = row.currency.String
 	}
-	// reversal is an MT940 line's reversal mark, `RC` or `RD`, else "":
-	// the bank taking back a credit, or returning a debit. The mark, not
-	// the kind, says which way the money moved.
-	var reversal string
-
-	switch silverKind {
+	switch silverKind := row.kind; silverKind {
 	case "trade_confirmation":
-		var p tradeConfirmationPayload
-		if err := json.Unmarshal([]byte(payload), &p); err != nil {
-			return tx, err
+		if row.err != nil {
+			return tx, row.err
 		}
+		p := row.trade
 		tx.Kind = kindFor(silverKind, "", "", "") // Buy default; side flips below
 		if isSellSide(p.Side) {
 			tx.Kind = canonical.TxKindSell
@@ -463,17 +332,19 @@ func buildTransaction(eventID string, occurredAt int64, defaultAcct, silverKind 
 		if p.NetCurrency != "" {
 			tx.Currency = p.NetCurrency
 		}
-		tx.GrossAmount = p.GrossAmount
-		tx.NetAmount = p.NetAmount
+		// The confirmation states magnitudes, and its side the
+		// direction: the kind carries the side, so the kind signs them.
+		tx.GrossAmount = canonical.ApplyCanonicalSign(tx.Kind, p.GrossAmount)
+		tx.NetAmount = canonical.ApplyCanonicalSign(tx.Kind, p.NetAmount)
 		tx.Quantity = p.Quantity
 		tx.Price = p.Price
 		tx.Description = textPtr(p.SecurityName)
 
 	case "cash_movement":
-		var p cashMovementPayload
-		if err := json.Unmarshal([]byte(payload), &p); err != nil {
-			return tx, err
+		if row.err != nil {
+			return tx, row.err
 		}
+		p := row.pl
 		tx.Kind = kindFor(silverKind, p.Narrative, p.CreditDebit, p.TxnType)
 		if p.Account != "" {
 			tx.AccountExternalID = p.Account
@@ -481,23 +352,7 @@ func buildTransaction(eventID string, occurredAt int64, defaultAcct, silverKind 
 		if p.Funds != "" {
 			tx.Currency = p.Funds
 		}
-		// MT940 stores amount as a positive number with the
-		// direction in `credit_debit` ("C" / "D"; a reversal, "RC" /
-		// "RD", is signed below). A debit is pre-signed here so
-		// reversals from elsewhere — sources that DO supply a signed
-		// amount with a deliberate negative — aren't silently
-		// re-flipped by ApplyCanonicalSign. After this branch the
-		// helper sees an already-signed amount and only acts when
-		// sign and kind agree.
-		amt := p.Amount
-		if amt != nil && p.CreditDebit == "D" && !amt.IsNegative() {
-			n := amt.Neg()
-			amt = &n
-		}
-		tx.NetAmount = amt
-		if isReversalMark(p.CreditDebit) {
-			reversal = p.CreditDebit
-		}
+		tx.NetAmount = markSigned(tx.Kind, p.CreditDebit, p.Amount)
 		// Text columns (docs/adapters/ubs.md §7): the :86: narrative,
 		// flattened to one line, is the description — a bare code
 		// passes through as that code — and the :61: type code is the
@@ -521,7 +376,7 @@ func buildTransaction(eventID string, occurredAt int64, defaultAcct, silverKind 
 		"corporate_action_notification",
 		"corporate_action_narrative":
 		var p corporateActionPayload
-		if err := json.Unmarshal([]byte(payload), &p); err != nil {
+		if err := json.Unmarshal([]byte(row.payload), &p); err != nil {
 			return tx, err
 		}
 		tx.Kind = kindFor(silverKind, "", "", "")
@@ -544,31 +399,50 @@ func buildTransaction(eventID string, occurredAt int64, defaultAcct, silverKind 
 		tx.Currency = "XXX"
 	}
 
-	// Normalise amount signs per the canonical convention. UBS
-	// MT940 supplies positive amounts plus a credit/debit flag,
-	// and the kind already encodes the direction; collapsing both
-	// into a signed amount happens here.
-	//
-	// A reversal is the exception, as sign.go prescribes for a
-	// reversal row: its mark gives the sign, whatever kind it reads as.
-	// The reversal of a credit (`RC`) takes money back and is negative:
-	// a `DIVIDENDE` narrative on one is a dividend the bank debits, which
-	// the canonical sign would book as one it paid. The reversal of a
-	// debit (`RD`) returns money and is positive: a returned payment
-	// reads as a withdrawal, which the canonical sign would book as a
-	// second payment. The stream, the era fold and the offset veto all
-	// project the row here, so they read the one sign.
-	tx.GrossAmount = canonical.ApplyCanonicalSign(tx.Kind, tx.GrossAmount)
-	switch {
-	case reversal != "" && tx.NetAmount != nil:
-		signed := tx.NetAmount.Abs()
-		if isCreditReversal(reversal) {
-			signed = signed.Neg()
-		}
-		tx.NetAmount = &signed
-	default:
-		tx.NetAmount = canonical.ApplyCanonicalSign(tx.Kind, tx.NetAmount)
-	}
-
 	return tx, nil
+}
+
+// markedFlow is the side of a booking a deposit or withdrawal line makes
+// or undoes, by its mark: a credit and a credit taken back (`RC`) are a
+// deposit's side, a debit and a returned debit (`RD`) a withdrawal's. The
+// line's amount (markSigned) says which way the money moved. Any other
+// kind, or a line with no mark, keeps its kind.
+func markedFlow(kind canonical.TxKind, mark string) canonical.TxKind {
+	if kind != canonical.TxKindDeposit && kind != canonical.TxKindWithdrawal {
+		return kind
+	}
+	switch strings.ToUpper(strings.TrimSpace(mark)) {
+	case "C", "RC":
+		return canonical.TxKindDeposit
+	case "D", "RD":
+		return canonical.TxKindWithdrawal
+	}
+	return kind
+}
+
+// markSigned is an MT940 line's amount signed by its credit/debit mark.
+// MT940 states the amount as a magnitude and the direction in the mark,
+// and the mark, not the kind, says which way the money moved. A credit
+// (`C`) and the reversal of a debit (`RD`, a returned payment) bring
+// money in. A debit (`D`) and the reversal of a credit (`RC`, the bank
+// taking it back) take money out. The kind's canonical sign would book
+// either reversal as a second copy of what it cancels: a `DIVIDENDE`
+// narrative on an `RC` as a dividend paid, a returned payment as a
+// second payment. The stream, the reconcile table and the offset veto
+// all project the row here, so they read the one sign. A line with no
+// mark is signed by its kind (canonical.ApplyCanonicalSign).
+func markSigned(kind canonical.TxKind, mark string, amount *canonical.Decimal) *canonical.Decimal {
+	if amount == nil {
+		return nil
+	}
+	var signed canonical.Decimal
+	switch strings.ToUpper(strings.TrimSpace(mark)) {
+	case "C", "RD":
+		signed = amount.Abs()
+	case "D", "RC":
+		signed = amount.Abs().Neg()
+	default:
+		return canonical.ApplyCanonicalSign(kind, amount)
+	}
+	return &signed
 }

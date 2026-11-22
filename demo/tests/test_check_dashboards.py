@@ -16,6 +16,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import check_dashboards  # noqa: E402
 # check_dashboards puts web/ on the path.
+import metabase  # noqa: E402
+import pickers  # noqa: E402
 import provision  # noqa: E402
 
 DASH, DC = {"id": 1}, {"id": 2, "card_id": 3, "parameter_mappings": []}
@@ -24,10 +26,10 @@ DONE = (202, {"status": "completed", "data": {"rows": [[1]]}})
 
 class RunCard(unittest.TestCase):
     def run_with(self, *answers):
-        calls = mock.Mock(side_effect=list(answers))
-        with mock.patch.object(check_dashboards, "call", calls):
-            ok, rows, err, _params = check_dashboards.run_card("http://x", {}, DASH, DC, {}, {})
-        return ok, rows, err, calls.call_count
+        client = mock.Mock()
+        client.post.side_effect = list(answers)
+        ok, rows, err, _params = check_dashboards.run_card(client, DASH, DC, {}, {})
+        return ok, rows, err, client.post.call_count
 
     def test_a_cut_off_response_is_asked_once_more(self):
         self.assertEqual(self.run_with((202, None), DONE), (True, [[1]], None, 2))
@@ -46,8 +48,7 @@ class Combos(unittest.TestCase):
     provisioning gives it."""
 
     def params(self, dashboard):
-        models = {name: i for i, name in enumerate(provision.report_models(), start=1)}
-        return provision.dashboard_parameters(models, "range", dashboard)
+        return provision.dashboard_parameters(dashboard)
 
     def combos(self, dashboard="Income"):
         return dict(check_dashboards.combos(self.params(dashboard), ["src-1"], ["USD", "CHF"], 2024,
@@ -70,8 +71,8 @@ class Combos(unittest.TestCase):
 
     def test_the_shift_runs_100_basis_points_lower(self):
         combos = self.combos()
-        self.assertEqual(combos["defaults"][provision.SHIFT_PARAM_ID], [0])
-        self.assertEqual(combos["shift [-100]"], {**combos["defaults"], provision.SHIFT_PARAM_ID: [-100]})
+        self.assertEqual(combos["defaults"][pickers.SHIFT_PARAM_ID], [0])
+        self.assertEqual(combos["shift [-100]"], {**combos["defaults"], pickers.SHIFT_PARAM_ID: [-100]})
 
     def test_the_time_range_and_source_variations(self):
         combos = self.combos()
@@ -162,15 +163,16 @@ class BrokenClicks(unittest.TestCase):
         self.assertEqual(check_dashboards.unchecked_columns(dashes), 1)
 
 
-class FakeMetabase:
+class FakeMetabase(metabase.Client):
     """Recorded answers of a Metabase with one dashboard of two tiles
-    and no pickers, for check_dashboards.call. `rows` is card id -> the
-    rows its query answers."""
+    and no pickers, in the pre-defined collection unless `listed` is
+    False. `rows` is card id -> the rows its query answers."""
 
-    def __init__(self, rows):
-        self.rows = rows
+    def __init__(self, rows, listed=True):
+        super().__init__("http://mb")
+        self.rows, self.listed = rows, listed
 
-    def __call__(self, base, path, method="GET", body=None, headers=None):
+    def call(self, path, method="GET", data=None, timeout=None):
         if path == "/api/session":
             return 200, {"id": "sess"}
         if path == "/api/permissions/group":
@@ -180,7 +182,7 @@ class FakeMetabase:
         if path.startswith("/api/api-key/"):
             return 204, None
         if path == "/api/collection":
-            return 200, [{"id": 7, "name": provision.COLLECTION_NAME}]
+            return 200, [{"id": 7, "name": provision.COLLECTION_NAME}] if self.listed else []
         if path.startswith("/api/collection/7/items"):
             return 200, {"data": [{"id": 1, "name": "Board"}]}
         if path == "/api/dashboard/1":
@@ -195,14 +197,13 @@ class SavedRows(unittest.TestCase):
     """--save-rows keeps every run's rows; --compare names each run that
     differs, floats within the bar, and fails on any."""
 
-    def run_main(self, rows, *flags):
+    def run_main(self, rows, *flags, fake=None):
         with tempfile.TemporaryDirectory() as d:
             pw = pathlib.Path(d, "pw")
             pw.write_text("synthetic\n")
             out = io.StringIO()
-            with mock.patch.object(check_dashboards, "call", FakeMetabase(rows)), \
-                    contextlib.redirect_stdout(out):
-                rc = check_dashboards.main(["--password-file", str(pw), *flags])
+            with contextlib.redirect_stdout(out):
+                rc = check_dashboards.main(["--password-file", str(pw), *flags], fake or FakeMetabase(rows))
         return rc, out.getvalue()
 
     def test_saved_rows_compare_equal_and_name_a_difference(self):
@@ -224,6 +225,21 @@ class SavedRows(unittest.TestCase):
             self.assertEqual(rc, 1)
             self.assertIn("DIFF Board | Tile 3 | defaults | 1 of 2 rows differ, the first is row 1", out)
             self.assertIn("DIFF Board | Tile 4 | defaults | 1 rows saved, 2 now", out)
+
+    def test_a_missing_collection_stops(self):
+        with self.assertRaises(SystemExit) as e:
+            self.run_main({}, fake=FakeMetabase({}, listed=False))
+        self.assertIn("collection not found", str(e.exception))
+
+    def test_a_failed_listing_stops_with_its_status(self):
+        class Failing(FakeMetabase):
+            def call(self, path, method="GET", data=None, timeout=None):
+                if path == "/api/collection":
+                    return 500, {"message": "down"}
+                return super().call(path, method, data, timeout)
+        with self.assertRaises(SystemExit) as e:
+            self.run_main({}, fake=Failing({}))
+        self.assertEqual(str(e.exception), "could not list collections (500): {'message': 'down'}")
 
 
 class CompareRuns(unittest.TestCase):

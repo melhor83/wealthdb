@@ -27,6 +27,8 @@ Mounted into the container:
   <TMP>/w-viac/home/.secrets  ->  /secrets
   <TMP>/w-viac/xdgdata/wealthdb/viac     ->  /data
   <TMP>/w-viac/xdgcache/wealthdb/startupcache  ->  /cache/startupcache
+  <TMP>/w-viac/xdgcache/wealthdb/viac  ->  /cache/collector
+  <TMP>/w-viac/tree/collectors/viac  ->  /app
 
 Override mounts via env:
   VIAC_SECRETS_DIR=/path/to/secrets
@@ -72,6 +74,8 @@ Mounted into the container:
   <TMP>/w-viac/home/.secrets  ->  /secrets
   <TMP>/w-viac/xdgdata/wealthdb/viac     ->  /data
   <TMP>/w-viac/xdgcache/wealthdb/startupcache  ->  /cache/startupcache
+  <TMP>/w-viac/xdgcache/wealthdb/viac  ->  /cache/collector
+  <TMP>/w-viac/tree/collectors/viac  ->  /app
 
 Override mounts via env:
   VIAC_SECRETS_DIR=/path/to/secrets
@@ -148,6 +152,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-viac/xdgcache/wealthdb/viac:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-viac/tree/collectors/viac:/app
   wealthdb/viac:latest
   login
@@ -191,6 +199,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-viac/xdgcache/wealthdb/viac:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-viac/tree/collectors/viac:/app
   wealthdb/viac:latest
   download
@@ -233,6 +245,10 @@ docker
   <TMP>/w-viac/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-viac/xdgcache/wealthdb/viac:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-viac/tree/collectors/viac:/app
   wealthdb/viac:latest
@@ -286,6 +302,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-viac/xdgcache/wealthdb/viac:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-viac/tree/collectors/viac:/app
   wealthdb/viac:latest
   sh
@@ -328,6 +348,10 @@ docker
   <TMP>/w-viac/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-viac/xdgcache/wealthdb/viac:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-viac/tree/collectors/viac:/app
   wealthdb/viac:latest
@@ -372,6 +396,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-viac/xdgcache/wealthdb/viac:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-viac/tree/collectors/viac:/app
   wealthdb/viac:latest
   login
@@ -415,6 +443,10 @@ docker
   <TMP>/w-viac/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-viac/xdgcache/wealthdb/viac:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-viac/tree/collectors/viac:/app
   wealthdb/viac:latest
@@ -461,6 +493,10 @@ docker
   <TMP>/w-viac/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-viac/xdgcache/wealthdb/viac:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-viac/silver:/silver
   -v
@@ -509,6 +545,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-viac/xdgcache/wealthdb/viac:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-viac/silver:/silver
   -v
   <TMP>/w-viac/tree/collectors/viac:/app
@@ -556,6 +596,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-viac/xdgcache/wealthdb/viac:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-viac/tree/collectors/viac:/app
   wealthdb/viac:latest
   load
@@ -598,6 +642,10 @@ docker
   <TMP>/w-viac/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-viac/xdgcache/wealthdb/viac:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-viac/tree/collectors/viac:/app
   wealthdb/viac:latest
@@ -642,6 +690,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-viac/xdgcache/wealthdb/viac:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-viac/tree/collectors/viac:/app
   wealthdb/viac:latest
   download
@@ -685,6 +737,10 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-viac/xdgcache/wealthdb/viac:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-viac/tree/collectors/viac:/app
   wealthdb/viac:latest
   download
@@ -727,6 +783,10 @@ docker
   <TMP>/w-viac/xdgcache/wealthdb/startupcache:/cache/startupcache
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
+  -v
+  <TMP>/w-viac/xdgcache/wealthdb/viac:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
   -v
   <TMP>/w-viac/tree/collectors/viac:/app
   wealthdb/viac:latest

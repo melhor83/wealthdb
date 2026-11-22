@@ -14,11 +14,11 @@ the runtime (§4).
 - **The model is chase.** The [Chase](../chase/DESIGN.md) collector is
   the twin for a US retail deposit bank. This collector starts from
   chase and diverges only where the source differs.
-- **Conduit accounts.** Cash passes through these accounts on its way to
-  and from other sources. Their transactions matter for cross-source
-  money-flow tracking. Their own return rows are noise, so the
-  registered ReturnsPolicy (`internal/silver/firstcitizens/policy.go`)
-  hides them, with chase's conduit reasoning.
+- **Deposit accounts are not investments.** Their transactions matter for
+  cross-source money-flow tracking. Their own return rows are noise.
+  They are `cash` accounts, which the returns engine hides on any source
+  ([docs/adapters/chase.md](../../wealthdb/docs/adapters/chase.md) §7).
+  Their balances and flows still enter every aggregate.
 - **The data surface is a Q2 REST API.** The digital banking runs on a
   **Q2 white-label platform** at
   `digitalbanking.firstcitizens.com/FCBTCOnline/`. Every datum arrives
@@ -208,10 +208,14 @@ then leaves Sign In to the person at the VNC display.
     is not used, because the pinned Camoufox may drop it.
   - The human picks Text or Call. The code is read from stdin, typed into
     `q2-input#tacEntry` and submitted via `q2-btn[test-id="btnSubmit"]`.
-    `btnRegister` then registers the device.
+    `btnRegister` then registers the device. A login that cannot click it
+    warns: the next `download` meets the challenge again.
   - These are Stencil shadow-DOM controls. Every click targets the
     **inner `<button>`** of the `q2-btn`. A click on the `q2-btn` host
     reports actionable, but the Stencil handler never fires.
+  - A cookie-consent banner covers the bottom of the viewport, and with
+    it `btnRegister`. A covered button gets its click event dispatched
+    instead. The banner is never answered.
   - `vnc-login` (`--no-cli-mfa`) is the by-hand fallback. `--fresh`
     wipes the profile to force this untrusted path.
 
@@ -286,9 +290,9 @@ for its cycle and its rate lines, into `statement_rates`:
 
 The bank renders a statement anew on every download. The first copy
 read writes the cycle's row. A copy with other figures is kept out with
-a warning. `parsed_statements` marks each document read, so a load
-reads only new documents. A moved parser generation reads them all
-again.
+a warning. `document_derivations` records each document read and the
+parser generation that read it, so a load reads only new documents. A
+moved parser generation reads them all again.
 
 The roster keeps a row only when an account changed. The
 `run_accounts` table records the accounts each run listed, so a run
@@ -303,8 +307,12 @@ that still listed an unchanged account is visible.
 - a closing-balance series from the per-row running balance, each
   stamped at its day's last second;
 - a current balance from the roster at each run that listed the account
-  (`run_accounts`). An account the bank stops listing has no balance
-  after its last listing run, so gold can end it;
+  (`run_accounts`);
+- the coverage of each such run. The run reads the whole roster, so it
+  covers every account the roster held by then. An account the bank
+  stops listing ends at the first run that leaves it out
+  ([wealthdb/docs/DESIGN.md](../../wealthdb/docs/DESIGN.md) §10.7). A
+  listed account with no roster balance is not covered at that run;
 - every transaction: interest and fee recognised from the description,
   else deposit or withdrawal by sign;
 - each statement's rate, as `interest_rate`, `interest_side` `credit`
@@ -314,7 +322,5 @@ that still listed an unchanged account is visible.
   is an earlier one. A cycle in which the balance never moved has no
   closing balance, and its rate is not used.
 
-The adapter registers via a blank import in `cmd/wealthdb/main.go` and
-the `silver_sources` migration
-(`internal/gold/migrations/0034_silver_sources_firstcitizens.sql`). Its
+The adapter registers via its import in `internal/silver/all`. Its
 return rows are hidden per §1.

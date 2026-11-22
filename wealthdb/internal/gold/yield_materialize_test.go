@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/enrichtest"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/yield"
 )
 
@@ -25,13 +26,25 @@ func partIncomeSQL(ccy string) string {
 	        * p.fx_` + ccy
 }
 
+// materializeYieldToday runs MaterializeYield's core at the one instant
+// at, in every reporting currency, as MaterializeYield runs it: what a
+// test of today's tables reads, without the twelve month ends before.
+func materializeYieldToday(t *testing.T, ctx context.Context, db *sql.DB, at int64) {
+	t.Helper()
+	if _, err := rewriteTables(ctx, db, "MaterializeYield", beginPinned, yieldMaterialized, func(tx *sql.Tx) (int, error) {
+		return materializeYield(ctx, tx, []int64{at}, materializeCurrencies, 42, 12)
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // The materialized yield tables are the report's: each instant's
 // positions sum to the yield report's value, the rate table holds every
 // month of both paths, and a rerun replaces the tables.
 func TestMaterializeYieldMatchesTheReport(t *testing.T) {
 	t.Parallel()
 	db, ctx, at := seedYieldExposure(t)
-	n, err := MaterializeYield(ctx, db, at, 42, 12)
+	n, err := MaterializeYield(ctx, db, MaterializeParams{ToEpoch: at, ComputedAt: 42, CashflowLookback: 12})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +127,7 @@ func TestMaterializeYieldMatchesTheReport(t *testing.T) {
 	}
 	stored.Close()
 	// A rerun replaces the tables.
-	if n2, err := MaterializeYield(ctx, db, at, 43, 12); err != nil || n2 != n {
+	if n2, err := MaterializeYield(ctx, db, MaterializeParams{ToEpoch: at, ComputedAt: 43, CashflowLookback: 12}); err != nil || n2 != n {
 		t.Errorf("rerun: %d rows (%v), want %d", n2, err, n)
 	}
 }
@@ -134,9 +147,6 @@ func seedYieldBookFX(t *testing.T) (*sql.DB, context.Context, int64) {
 		    VALUES ('test-src', ` + itoa(snap) + `, 'F', 'CHF', 'current', 2000)`,
 		`INSERT INTO transactions (silver_source_id, transaction_external_id, occurred_at, account_external_id, kind,
 		    currency, net_amount) VALUES ('test-src', 'R1', ` + itoa(ymd(2026, 3, 1).Unix()) + `, 'F', 'deposit', 'CHF', 1500)`,
-		`INSERT INTO income_txn_enrichment (silver_source_id, transaction_external_id, payer_signature,
-		    signature_version, income_detailed, provenance, assigned_at) VALUES
-		    ('test-src', 'R1', 'sig-tenant', 1, 'INCOME_RENTAL', 'rule', 100)`,
 		`INSERT INTO rate_observations (silver_source_id, series_id, as_of, value) VALUES
 		    ('rates', 'USD-3M', ` + itoa(snap) + `, 4.0), ('rates', 'USD-1Y', ` + itoa(snap) + `, 4.2),
 		    ('rates', 'USD-10Y', ` + itoa(snap) + `, 4.6)`,
@@ -151,6 +161,8 @@ func seedYieldBookFX(t *testing.T) (*sql.DB, context.Context, int64) {
 		           ('fx', `+itoa(snap)+`, 'USD', '`+ccy+`', `+strconv.FormatFloat(1/usd, 'f', -1, 64)+`)`)
 	}
 	execEach(t, db, q...)
+	enrichtest.SeedIncome(t, db, enrichtest.Income{Source: "test-src", Txn: "R1", Signature: "sig-tenant",
+		Detailed: "INCOME_RENTAL", Provenance: "rule"})
 	return db, ctx, at
 }
 
@@ -162,9 +174,7 @@ func seedYieldBookFX(t *testing.T) (*sql.DB, context.Context, int64) {
 func TestMaterializeYieldMatchesEachBook(t *testing.T) {
 	t.Parallel()
 	db, ctx, at := seedYieldBookFX(t)
-	if _, err := MaterializeYield(ctx, db, at, 42, 12); err != nil {
-		t.Fatal(err)
-	}
+	materializeYieldToday(t, ctx, db, at)
 	for _, ccy := range materializeCurrencies {
 		in, err := YieldInputs(ctx, db, at, ccy)
 		if err != nil {
@@ -234,9 +244,7 @@ func TestMaterializeYieldCurveIsTheBooks(t *testing.T) {
 	if _, err := RebuildYield(ctx, db); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := MaterializeYield(ctx, db, at, 42, 12); err != nil {
-		t.Fatal(err)
-	}
+	materializeYieldToday(t, ctx, db, at)
 	for _, ccy := range materializeCurrencies {
 		in, err := YieldInputs(ctx, db, at, ccy)
 		if err != nil {
@@ -271,10 +279,13 @@ func seedPlanWage(t *testing.T, db *sql.DB) {
 	t.Helper()
 	execEach(t, db,
 		`INSERT INTO transactions (silver_source_id, transaction_external_id, occurred_at, account_external_id, kind,
-		    currency, net_amount) VALUES ('test-src', 'W1', `+itoa(ymd(2026, 4, 15).Unix())+`, 'F', 'deposit', 'CHF', 3000)`,
-		`INSERT INTO income_txn_enrichment (silver_source_id, transaction_external_id, payer_signature,
-		    signature_version, income_detailed, provenance, assigned_at) VALUES
-		    ('test-src', 'W1', 'sig-employer', 1, 'INCOME_SALARY', 'rule', 100)`)
+		    currency, net_amount) VALUES ('test-src', 'W1', `+itoa(ymd(2026, 4, 15).Unix())+`, 'F', 'deposit', 'CHF', 3000)`)
+	enrichtest.SeedIncome(t, db, ruleIncome("W1", "sig-employer", "INCOME_SALARY"))
+}
+
+// ruleIncome is a test-src income overlay row a rule wrote.
+func ruleIncome(txn, sig, detailed string) enrichtest.Income {
+	return enrichtest.Income{Source: "test-src", Txn: txn, Signature: sig, Detailed: detailed, Provenance: "rule"}
 }
 
 // The stored other income is a row per class and account, each with
@@ -283,9 +294,7 @@ func TestThePlansOtherIncomeIsStoredByClassAndAccount(t *testing.T) {
 	t.Parallel()
 	db, ctx, at := seedYieldBookFX(t)
 	seedPlanWage(t, db)
-	if _, err := MaterializeYield(ctx, db, at, 42, 12); err != nil {
-		t.Fatal(err)
-	}
+	materializeYieldToday(t, ctx, db, at)
 	keys := scanStrings(t, db, `SELECT DISTINCT class || ' ' || silver_source_id || ' ' || account_external_id
 	    FROM web_cashflow_plan WHERE part = 'other_income'`)
 	if !slices.Equal(keys, []string{"earnings test-src F"}) {
@@ -320,12 +329,9 @@ func seedPlanVehicle(t *testing.T, db *sql.DB) {
 		    currency, net_amount) VALUES
 		    ('test-src', 'V0', `+itoa(ymd(2026, 1, 12).Unix())+`, 'V', 'deposit', 'USD', 40),
 		    ('test-src', 'V1', `+itoa(ymd(2026, 3, 10).Unix())+`, 'V', 'deposit', 'USD', 1200),
-		    ('test-src', 'V2', `+itoa(ymd(2026, 5, 10).Unix())+`, 'V', 'deposit', 'USD', 1200)`,
-		`INSERT INTO income_txn_enrichment (silver_source_id, transaction_external_id, payer_signature,
-		    signature_version, income_detailed, provenance, assigned_at) VALUES
-		    ('test-src', 'V0', 'sig-fund', 1, 'INCOME_DIVIDENDS', 'rule', 100),
-		    ('test-src', 'V1', 'sig-employer', 1, 'INCOME_SALARY', 'rule', 100),
-		    ('test-src', 'V2', 'sig-employer', 1, 'INCOME_SALARY', 'rule', 100)`)
+		    ('test-src', 'V2', `+itoa(ymd(2026, 5, 10).Unix())+`, 'V', 'deposit', 'USD', 1200)`)
+	enrichtest.SeedIncome(t, db, ruleIncome("V0", "sig-fund", "INCOME_DIVIDENDS"),
+		ruleIncome("V1", "sig-employer", "INCOME_SALARY"), ruleIncome("V2", "sig-employer", "INCOME_SALARY"))
 }
 
 // A wage on a pool account and one on a retirement account both have a
@@ -349,9 +355,7 @@ func TestThePlansOutsideIncomeIsTheVehiclesRunRate(t *testing.T) {
 	if err != nil || fmt.Sprint(after) != fmt.Sprint(before) {
 		t.Errorf("look-back %+v (%v), before the vehicle %+v", after, err, before)
 	}
-	if _, err := MaterializeYield(ctx, db, at, 42, 12); err != nil {
-		t.Fatal(err)
-	}
+	materializeYieldToday(t, ctx, db, at)
 	keys := func(part string) []string {
 		return scanStrings(t, db, `SELECT DISTINCT class || ' ' || silver_source_id || ' ' || account_external_id
 		    FROM web_cashflow_plan WHERE part = ? ORDER BY 1`, part)
@@ -395,11 +399,8 @@ func TestThePlansOutsideIncomeFollowsADatedWrapper(t *testing.T) {
 		`INSERT INTO transactions (silver_source_id, transaction_external_id, occurred_at, account_external_id, kind,
 		    currency, net_amount) VALUES
 		    ('test-src', 'T1', `+itoa(ymd(2026, 3, 5).Unix())+`, 'T', 'deposit', 'USD', 700),
-		    ('test-src', 'T2', `+itoa(ymd(2026, 4, 20).Unix())+`, 'T', 'deposit', 'USD', 900)`,
-		`INSERT INTO income_txn_enrichment (silver_source_id, transaction_external_id, payer_signature,
-		    signature_version, income_detailed, provenance, assigned_at) VALUES
-		    ('test-src', 'T1', 'sig-employer', 1, 'INCOME_SALARY', 'rule', 100),
-		    ('test-src', 'T2', 'sig-employer', 1, 'INCOME_SALARY', 'rule', 100)`)
+		    ('test-src', 'T2', `+itoa(ymd(2026, 4, 20).Unix())+`, 'T', 'deposit', 'USD', 900)`)
+	enrichtest.SeedIncome(t, db, ruleIncome("T1", "sig-employer", "INCOME_SALARY"), ruleIncome("T2", "sig-employer", "INCOME_SALARY"))
 	from, to := PlanWindow(time.Unix(at, 0), 12)
 	lb, err := CashflowPlanLookback(ctx, db, from, to, "USD")
 	if err != nil {
@@ -445,14 +446,9 @@ func TestThePlansPoolIncomeIsTheIncomeLinesAverage(t *testing.T) {
 		`INSERT INTO transactions (silver_source_id, transaction_external_id, occurred_at, account_external_id, kind,
 		    currency, net_amount) VALUES
 		    ('test-src', 'C1', `+itoa(ymd(2026, 5, 2).Unix())+`, 'F', 'deposit', 'CHF', 250),
-		    ('test-src', 'G1', `+itoa(ymd(2026, 5, 9).Unix())+`, 'F', 'deposit', 'CHF', 80)`,
-		`INSERT INTO income_txn_enrichment (silver_source_id, transaction_external_id, payer_signature,
-		    signature_version, income_detailed, provenance, assigned_at) VALUES
-		    ('test-src', 'C1', 'sig-insurer', 1, 'reimbursement', 'rule', 100),
-		    ('test-src', 'G1', 'sig-shop', 1, 'INCOME_REWARDS', 'rule', 100)`)
-	if _, err := MaterializeYield(ctx, db, at, 42, 12); err != nil {
-		t.Fatal(err)
-	}
+		    ('test-src', 'G1', `+itoa(ymd(2026, 5, 9).Unix())+`, 'F', 'deposit', 'CHF', 80)`)
+	enrichtest.SeedIncome(t, db, ruleIncome("C1", "sig-insurer", "reimbursement"), ruleIncome("G1", "sig-shop", "INCOME_REWARDS"))
+	materializeYieldToday(t, ctx, db, at)
 	from, to := PlanWindow(time.Unix(at, 0), 12)
 	lb, err := CashflowPlanLookback(ctx, db, from, to, "USD")
 	if err != nil {
@@ -569,7 +565,8 @@ func seedYieldYear(t *testing.T) (*sql.DB, context.Context, int64) {
 		    asset_class, vehicle, currency, quantity, market_value) VALUES `+strings.Join(positions, ", "),
 		`INSERT INTO cash_balances (silver_source_id, snapshot_at, account_external_id, currency, balance_kind, amount)
 		    VALUES `+strings.Join(balances, ", "))
-	var txns, kinds []string
+	var txns []string
+	var overlay []enrichtest.Income
 	income := func(id, src, acct, kind, ccy, iid, detailed string, day time.Time, amount int64) {
 		instrument := "NULL"
 		if iid != "" {
@@ -577,7 +574,8 @@ func seedYieldYear(t *testing.T) (*sql.DB, context.Context, int64) {
 		}
 		txns = append(txns, "('"+src+"', '"+id+"', "+itoa(day.Unix()+36000)+", '"+acct+"', '"+kind+"', '"+ccy+"', "+
 			itoa(amount)+", "+instrument+")")
-		kinds = append(kinds, "('"+src+"', '"+id+"', 'sig-"+id+"', 1, '"+detailed+"', 'rule', 100)")
+		overlay = append(overlay, enrichtest.Income{Source: src, Txn: id, Signature: "sig-" + id,
+			Detailed: detailed, Provenance: "rule"})
 	}
 	for i, d := range []time.Time{ymd(2025, 9, 15), ymd(2025, 12, 15), ymd(2026, 3, 15), ymd(2026, 6, 15)} {
 		income("D"+itoa(int64(i)), "broker", "B1", "dividend", "USD", "QA", "INCOME_DIVIDENDS", d, 50)
@@ -590,9 +588,7 @@ func seedYieldYear(t *testing.T) (*sql.DB, context.Context, int64) {
 	income("K2", "bank", "K", "interest", "USD", "", "INCOME_INTEREST_EARNED", ymd(2026, 6, 29), 20)
 	q = append(q,
 		`INSERT INTO transactions (silver_source_id, transaction_external_id, occurred_at, account_external_id, kind,
-		    currency, net_amount, instrument_external_id) VALUES `+strings.Join(txns, ", "),
-		`INSERT INTO income_txn_enrichment (silver_source_id, transaction_external_id, payer_signature,
-		    signature_version, income_detailed, provenance, assigned_at) VALUES `+strings.Join(kinds, ", "))
+		    currency, net_amount, instrument_external_id) VALUES `+strings.Join(txns, ", "))
 	for _, r := range []struct {
 		day  time.Time
 		rate float64
@@ -602,6 +598,7 @@ func seedYieldYear(t *testing.T) (*sql.DB, context.Context, int64) {
 		           ('fx', `+itoa(r.day.Unix())+`, 'USD', 'CHF', `+strconv.FormatFloat(1/r.rate, 'f', -1, 64)+`)`)
 	}
 	execEach(t, db, q...)
+	enrichtest.SeedIncome(t, db, overlay...)
 	rebuildExposureWithDefaults(t, db, ctx)
 	if _, err := RebuildYield(ctx, db); err != nil {
 		t.Fatal(err)
@@ -622,7 +619,7 @@ func seedYieldYear(t *testing.T) (*sql.DB, context.Context, int64) {
 func TestMaterializedRealizedYieldIsTheBooks(t *testing.T) {
 	t.Parallel()
 	db, ctx, at := seedYieldYear(t)
-	if _, err := MaterializeYield(ctx, db, at, 42, 12); err != nil {
+	if _, err := MaterializeYield(ctx, db, MaterializeParams{ToEpoch: at, ComputedAt: 42, CashflowLookback: 12}); err != nil {
 		t.Fatal(err)
 	}
 	figures, thin := 0, 0

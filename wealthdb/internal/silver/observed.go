@@ -29,32 +29,6 @@ func LatestRun(ctx context.Context, db *sql.DB, kind, q string) (int64, error) {
 	return t.Int64, nil
 }
 
-// FetchRunStatus is the Status of a silver of observations fetched in
-// runs (dump_runs): the observation-date range extrema yields, and the
-// latest fetch run as the change number and both observed watermarks. It
-// records no transactions, so the transaction range is the "no
-// observable state" sentinel.
-func FetchRunStatus(ctx context.Context, db *sql.DB, kind, extrema string) (canonical.Status, error) {
-	s := canonical.UnknownStatus()
-	var oldS, newS sql.NullInt64
-	if err := db.QueryRowContext(ctx, extrema).Scan(&oldS, &newS); err != nil {
-		return s, fmt.Errorf("%s Status snapshot: %w", kind, err)
-	}
-	if oldS.Valid {
-		s.OldestSnapshotAt = oldS.Int64
-	}
-	if newS.Valid {
-		s.LatestSnapshotAt = newS.Int64
-	}
-	latest, err := LatestRun(ctx, db, kind, `SELECT MAX(snapshot_at) FROM dump_runs`)
-	if err != nil {
-		return s, err
-	}
-	s.LatestChangeNumber = latest
-	s.ObservedSnapshotsThrough, s.ObservedTransactionsThrough = latest, latest
-	return s, nil
-}
-
 // ObserveByRuns sets both observed watermarks of s to the latest run
 // (LatestRun).
 func ObserveByRuns(ctx context.Context, db *sql.DB, kind, q string, s *canonical.Status) error {
@@ -104,23 +78,11 @@ func CoveredThrough(spans []Span, slack int64) int64 {
 
 // RunSpans reads the (since, until) rows a query yields, one per run.
 func RunSpans(ctx context.Context, db *sql.DB, kind, q string) ([]Span, error) {
-	rows, err := db.QueryContext(ctx, q)
-	if err != nil {
-		return nil, fmt.Errorf("%s Status windows: %w", kind, err)
-	}
-	defer rows.Close()
-	var spans []Span
-	for rows.Next() {
+	label := kind + " Status windows"
+	return Query(ctx, db, label, q, func(rows *sql.Rows) (Span, error) {
 		var sp Span
-		if err := rows.Scan(&sp.Since, &sp.Until); err != nil {
-			return nil, fmt.Errorf("%s Status windows: %w", kind, err)
-		}
-		spans = append(spans, sp)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("%s Status windows: %w", kind, err)
-	}
-	return spans, nil
+		return sp, labelled(label, rows.Scan(&sp.Since, &sp.Until))
+	})
 }
 
 // CoveredByRuns is CoveredThrough over RunSpans.

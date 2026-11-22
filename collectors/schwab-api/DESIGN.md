@@ -166,13 +166,15 @@ a `load --force` rebuild must produce identical silver.
 
 Owns "parse bronze JSON, apply migrations, insert into SQLite".
 
-Three discipline points:
+`load.py` states its tables in a `collectorkit.loader.LoaderSpec`. The
+kit's load frame carries out the three points below.
 
 1. **Apply pending migrations on startup**, before any data load.
    Read `MAX(silver_schema_version) FROM schema_meta`, compare to
    the highest numbered file in `migrations/`, execute any forward
    migrations in order. Silver must always be at the latest schema;
-   no backward-compat in queries.
+   no backward-compat in queries. A silver whose schema is newer than
+   the code stops the load before anything is written.
 
 2. **One dump = one transaction.** Open a SQLite transaction at the
    start of loading a dump directory; record the dump in `dump_runs`
@@ -273,8 +275,9 @@ For Schwab silver:
 - `positions`: `(snapshot_at, account_external_id, instrument_key)`
 - `transactions`: `(activity_id)` PK + secondary index on
   `(account_external_id, timestamp)`
-- everything else is in `payload` — instrument descriptions, prices,
-  fee types, transaction subtypes, etc.
+- everything else is in `payload` — prices, fee types, transaction
+  subtypes, etc. — except the fields below that an adapter reads on
+  every row.
 
 `positions` also carries two cost-basis columns. They hold Schwab's
 adjusted tax-lot basis, so an adapter reads it without a
@@ -290,6 +293,19 @@ no per-asset-class scale. The header of
 [migrations/0005_position_cost.sql](migrations/0005_position_cost.sql)
 gives the price convention of `average_cost`, the meaning of zero and
 NULL, and why `averageLongPrice` stays in `payload`.
+
+Migration 0006 promotes what a reader needs of each holding and each
+trade leg. `positions` gains the instrument (`asset_type`,
+`instrument_type`, `cusip`, `symbol`, `description`, `maturity_date`,
+`variable_rate`) and the figures (`long_quantity`, `short_quantity`,
+`market_value`). `transaction_legs` holds one row per element of a
+transaction's `transferItems`: its instrument's `asset_type`, `cusip`
+and `symbol`, and its `amount`, `cost` and `price`. The loader
+classifies nothing. A code is the source's text. A number is decimal
+text with the payload's digits, so a reader parses the same decimal
+from the column as from the payload. A date is unix seconds at 00:00
+UTC of the day the stamp names. The migration fills the rows loaded
+before it from `payload` by the same rules.
 
 **Why not promote more columns?** Because the upstream's schema
 evolves. Schwab adds new fields all the time; UBS varies what each
@@ -482,7 +498,8 @@ original for anyone who genuinely needs to trace a specific request.
   loader's "migration completed" marker.
 
 A crash mid-migration can leave a partial schema. The recovery is
-`load --force`, which deletes the silver DB and rebuilds it from bronze.
+`load --force`. It builds a fresh silver from bronze beside the old one
+and puts it in place only when the load succeeds.
 
 The loader:
 1. On startup, reads the maximum `silver_schema_version` from

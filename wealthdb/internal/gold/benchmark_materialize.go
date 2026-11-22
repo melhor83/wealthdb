@@ -75,10 +75,7 @@ func benchmarksInCurrency(benchmarks []*Benchmark, ccy string, ds *returnsDatase
 			if year > 0 {
 				from = time.Date(year, time.January, 1, 0, 0, 0, 0, time.UTC).Unix()
 			}
-			row, w := benchmarkTotal(windows, b, ReturnParams{
-				FromEpoch: from, ToEpoch: p.ToEpoch, OutCcy: ccy, Annualize: "auto", Netting: true, Inception: "full",
-				InceptionOverrides: p.InceptionOverrides, ReturnsExclude: p.ReturnsExclude, ReturnsHide: p.ReturnsHide,
-			}, year)
+			row, w := benchmarkTotal(windows, b, p.defaultRun(grainGlobal.name, "total", ccy, from, p.ToEpoch), year)
 			if row.EndDay > 0 {
 				out.returns = append(out.returns, row)
 			}
@@ -101,14 +98,9 @@ func benchmarksInCurrency(benchmarks []*Benchmark, ccy string, ds *returnsDatase
 	return out
 }
 
-// write replaces the benchmark tables' rows and returns how many it
+// write inserts the benchmark tables' rows and returns how many it
 // wrote.
 func (t *benchmarkTables) write(ctx context.Context, tx *sql.Tx, computedAt int64) (int, error) {
-	for _, table := range []string{"benchmark_returns", "benchmark_mwr"} {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM `+table); err != nil {
-			return 0, fmt.Errorf("%s: delete: %w", table, err)
-		}
-	}
 	if len(t.returns) > 0 {
 		if err := insertColumns(ctx, tx, "benchmark_returns", "benchmark_returns", benchmarkReturnCols, len(t.returns),
 			func(i int, args []any) []any {

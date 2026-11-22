@@ -296,8 +296,7 @@ compound primary key was built for (§3.6 above, migration 0001): the
 missing leg lands beside the leg the export already holds, and a
 consumer that pairs legs on a shared transaction number finds both.
 
-Three consequences follow from sharing the export's id space rather
-than minting one:
+Two consequences follow from the advice's id:
 
 - **An advice never overwrites.** It states four facts — direction,
   amount, currency, and the booking and value dates — where the export
@@ -305,32 +304,15 @@ than minting one:
   counterparty and the trade date. Because the two feeds meet on the
   same key here, the insert is `ON CONFLICT DO NOTHING`: the advice
   fills a hole, it does not restate a row that already has an owner.
-- **An advice never restates a movement the statement era already
-  printed.** Against the statement the key argues the other way: a
-  statement row is keyed by a minted `stmt:` hash, so the very booking
-  an advice names can already sit on the same account under an id the
-  primary key can never collide with, an advice having been issued for
-  a payment the account's own statement went on to print in its ledger.
-  Writing it again would not fill a hole, it would book the payment
-  twice, which is the phantom flow this path exists to remove. So the
-  movement is looked for by its CONTENT before an advice is written —
-  same account, same currency, either date, same column, same
-  magnitude — and an advice that finds it is dropped in favour of the
-  ledger row, which carries a booking type and reconciled against the
-  statement's printed running balance.
-  Each existing row can excuse at most one advice, so two genuinely
-  distinct same-day payments of one amount both still land; and the
-  advices are written after every statement in the same pass, so the
-  order the PDF workers happen to finish in cannot change the result.
-- **The MT940 floor does not gate it.** That floor exists because the
-  statement era mints ids of its own, so a statement and the feed
-  recording one booking produce two rows nothing can recognise as one.
-  An advice carries the feed's own id, so an overlap there collides on
-  the key and the first rule resolves it in the richer row's favour —
-  and the floor is keyed by account, while the whole value of an
-  advice is the leg on the account the feed does not cover at all. What
-  the floor would have caught against the statement era, the content
-  check above catches on the movement itself.
+- **An advice is written beside the statement ledger.** A statement row
+  is keyed by a minted `stmt:` hash, so the very booking an advice names
+  can sit on the same account under an id the primary key never collides
+  with: an advice is often issued for a payment the account's own
+  statement goes on to print. Both rows are written. The UBS adapter
+  keeps the ledger's row where it holds the advice's movement (same
+  account, currency, column and magnitude, on either date), one advice
+  per ledger row. The ledger row carries a booking type and reconciled
+  against the statement's printed running balance.
 
 The price is that the prefix rule above does not identify the rail
 on its own: an advice row has no prefix and is not an export row. What
@@ -364,12 +346,11 @@ The PDF archive reaches further back than the export window and the
 feed, and its coverage runs forward into both. Silver keeps each era's
 rows as it finds them: the statement loader dedups only *within* the
 archive (the same booking printed on a monthly and an annual statement
-hashes identically, so the upsert collapses it) and stops each account
-at its MT940 floor, but nothing in silver reconciles a statement row
-against the export's or the feed's record of the same booking — the
-ids do not meet, and silver does not decide merge policy. The wealthdb
-UBS adapter owns that reconciliation: see the era fold in
-[the adapter doc](../../wealthdb/docs/adapters/ubs.md).
+hashes identically, so the upsert collapses it), but nothing in silver
+reconciles a statement row against the export's or the feed's record of
+the same booking — the ids do not meet, and silver does not decide merge
+policy. The wealthdb UBS adapter owns that reconciliation: see the
+reconcile table in [the adapter doc](../../wealthdb/docs/adapters/ubs.md).
 
 **A batch order becomes its payments.** The statement books a batch of
 e-banking payments as ONE movement carrying the batch total, listing the
@@ -400,9 +381,10 @@ them were never printed. The row ids are the movement's content hash
 suffixed with the payment's position, so a batch re-read from the annual
 statement still dedups against the monthly one, and identical amounts
 inside one batch stay apart. `payload.multi_leg` records the position,
-the count and the rail. A batch row written by a load that predates the
-split is retired when its payments land, so the total is never counted
-both whole and in parts.
+the count and the rail. A statement that prints the batch whole beside
+one that lists its payments leaves both in silver, under the movement's
+id and its payments' ids. The UBS adapter keeps the payments, so the
+total is never counted both whole and in parts.
 
 ### 3.7 Documents (PDFs)
 
@@ -593,7 +575,8 @@ in §3.6):
 | --- | --- | --- |
 | `historical_position_snapshots` | "Statement of assets" PDFs (semi-annual, sometimes quarterly) | One row per `(as_of_date, portfolio, account, ISIN)`. Cash positions have `instrument_isin = NULL` and a populated `account_external_id` (IBAN); securities have `instrument_isin` set and `account_external_id = ''` (UBS does not surface the safekeeping account in the printed text in a way we can extract). |
 | `historical_cash_balances` | "Account Statement" PDFs (monthly) | One row per `(period_end, account_external_id)` with opening / closing balance + turnover totals. UBS only issues an Account Statement for a given month when the account had activity in that month, so coverage is uneven; year-end months tend to cover the full account inventory. |
-| `historical_mortgages` | "Maturity notice" PDFs (one per fixed-rate / SARON interest-roll period, typically quarterly) | One row per `(as_of_date, account_external_id)` with the outstanding principal (negated to liability sign), the product line → rate type, and the collateral description (migration 0005). |
+| `historical_mortgages` | "Maturity notice" PDFs (one per fixed-rate / SARON interest-roll period, typically quarterly) | One row per `(as_of_date, account_external_id)` with the outstanding principal as printed (a positive amount; the gold adapter gives the liability its sign), the product line and the rate type the loader reads off it, and the collateral description (migrations 0005, 0018). |
+| `statement_overview_totals` | "Statement of assets" PDFs: the relationship overview | One row per `(document, portfolio, asset class)`: a "Precious metals & commodities" total as printed, in the currency the copy is valued in (migration 0018). |
 
 (The live-fetch side of mortgages is the `mortgages` table —
 migration 0004 — fed by positions.csv's "Pro memoria - Mortgages"
@@ -625,14 +608,12 @@ headline comes in three flavours:
 3. **Overview-only asset classes** — UBS issues no Detailed-positions
    page for some portfolio types (e.g. precious-metals custody), so
    such a holding has no per-instrument row anywhere in the PDF. Its
-   asset-class total is recovered from the relationship overview as a
-   single synthetic position (`description = "Precious metals &
-   commodities"`, a non-ISIN-shaped `instrument_isin` key of the form
-   `PM-<portfolio>`). The overview prints the figure once per
-   portfolio-currency PDF, so the walker emits it only from
-   USD-valued PDFs (the reporting-currency baseline); the
-   duplicate USD copies collapse on the silver PK. The gold adapter
-   recognises the non-ISIN key and leaves the canonical ISIN null.
+   asset-class total is read from the relationship overview into
+   `statement_overview_totals`, one row per statement copy. The
+   overview prints the figure once per portfolio-currency PDF, and
+   every copy is kept. The gold adapter turns one copy into the
+   portfolio's position
+   ([ubs.md §9](../../wealthdb/docs/adapters/ubs.md#9-historical-pdf-reconstructed-data)).
 
 **Headlines whose figures run together.** The listed and
 private-markets patterns find where one figure ends by the decimal
@@ -735,8 +716,8 @@ The cash rows stay even though the gold adapter reads cash from
 quarter-end date that series has no row for, and such an observation
 exists nowhere else.
 
-**Known parser limitations.** The parsers in
-[pdf_parsers.py](pdf_parsers.py) are best-effort:
+**Known parser limitations.** The document readers
+([pdf_parsers.py](pdf_parsers.py) names them) are best-effort:
 
 - The "sector" field on securities sometimes captures the
   preceding `Distribution:` line instead of the actual sector
@@ -1022,43 +1003,54 @@ exposure record and a composition for the fund
 - **Bronze scan.** Walk `<bronze-root>` for subdirectories
   matching `YYYYMMDDTHHMMSSZ` and skip those already in
   `dump_runs`.
-- **Per dump:**
-  1. Parse `run.json` to get the window bounds; write `dump_runs`.
-  2. Parse `positions/*.csv` (per-portfolio CSVs first, then the
+- **Per dump** (the module that runs each step is named in
+  brackets; the row rules the steps share are in `load_rows.py`):
+  1. [`load.py`] Parse `run.json` to get the window bounds; write `dump_runs`.
+  2. [`export_load.py`] Parse `positions/*.csv` (per-portfolio CSVs first, then the
      consolidated default-view CSV) → upsert
      `banking_relationships`, `portfolios`, `accounts`,
      `positions`. Per-portfolio first means real portfolio
      assignments win and only truly-unassigned accounts land
      under the synthetic catch-all portfolio.
-  3. Parse `transactions/cash_*.csv` (per-account, per-window) →
-     upsert `transactions` keyed by `(transaction_external_id,
+  3. [`export_load.py`, the ids in `txn_ids.py`] Parse
+     `transactions/cash_*.csv` (per-account, per-window) → upsert
+     `transactions` keyed by `(transaction_external_id,
      account_external_id)`. The `.mt940` files stay in bronze; no
      loader reads them.
-  4. Parse `portfolio_transactions/*.csv` → `portfolio_transactions`
+  4. [`export_load.py`] Parse `portfolio_transactions/*.csv` → `portfolio_transactions`
      (§3.7b).
-  5. Catalog `documents/*.pdf` files referenced in `run.json` →
+  5. [`documents_load.py`] Catalog `documents/*.pdf` files referenced in `run.json` →
      upsert `documents`, computing `content_sha256` per file.
-  6. Walk the `documents` table, route every PDF whose label or
-     `doc_type` names a type the parsers read to `pdf_parsers.py`, and
-     upsert the parsed positions / cash balances into the
-     `historical_*` tables. The Account-Statement movement walker
+  6. [`documents_load.py`, the statement and advice movements in
+     `statement_ledger.py`] Walk the `documents` table, route every PDF whose label or
+     `doc_type` names a type the parsers read to that type's reader
+     (`pdf_parsers.py`), and upsert the parsed positions / cash
+     balances into the `historical_*` tables and the overview totals
+     into `statement_overview_totals`. The Account-Statement movement walker
      and the Credit/Debit Advice parser write `transactions` from
      the same walk (§3.6), and the capital-call and contract-note
      parsers write `advices` (§3.9). A Statement of assets also
      writes its transaction list to `statement_trades` (§3.10), and a
      quarterly report writes `private_market_reports` (§3.12).
-  7. Parse `cards/` → the `card_*` tables (§5.9).
-  8. Parse `rates/` → `account_rates` (§3.11).
+  7. [`cards_load.py`] Parse `cards/` → the `card_*` tables (§5.9).
+  8. [`rates_load.py`] Parse `rates/` → `account_rates` (§3.11).
 
 - **PDF parsing isolation.** `pdfplumber` is bundled in the
-  Docker image (`requirements.txt`). The parsers live in
-  `pdf_parsers.py` and have no DB-side dependencies, so they
-  can be unit-tested against a static PDF without spinning up
-  silver.
+  Docker image (`requirements.txt`). Each document kind has a
+  reader module of its own, which reads the extracted document
+  (`collectorkit.words`) and has no DB-side or extraction
+  dependencies, so it can be unit-tested against synthetic pages
+  without spinning up silver. `pdf_parsers.py` holds the one
+  extraction they read, cached by content under the collector's
+  cache root.
 - **Idempotency.** Re-running the loader on the same bronze dir
   is a no-op (PK collisions caught + content-dedup).
-- **Atomicity.** One transaction per dump-run. Roll back on any
-  parsing failure; re-run after fixing.
+- **Atomicity.** One transaction per dump. A dump that fails is
+  rolled back and logged. The later dumps still load, and the load
+  exits non-zero. The next load runs the failed dump again: it adds
+  the rows silver lacks and leaves every row a newer dump wrote as it
+  is. A document that fails to parse is logged and left out of that
+  walk. It is not cached, so the next walk parses it again.
 - **Run status + pruning.** The `run.json` status lifecycle and the
   `prune` safety envelope are fleet-wide
   ([collectors/README.md](../README.md#debug-artefacts-run-status-and-pruning-bronze)).

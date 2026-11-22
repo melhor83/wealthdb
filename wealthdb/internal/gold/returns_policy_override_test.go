@@ -87,15 +87,14 @@ func TestPolicyOverrideFlowRegime(t *testing.T) {
 	}
 }
 
-// TestPolicyOverrideAccountsGrain pins the accounts_grain override in the
-// restoring direction: chase registers hidden plumbing by default (see
-// internal/silver/chase/policy.go), so its rows are absent everywhere — and
-// the "normal" override brings back an account the policy hid. It cannot
-// bring back a cash account, which hides whatever the policy says.
+// TestPolicyOverrideAccountsGrain pins the accounts_grain override both
+// ways: "hidden" takes a source's accounts out of every grain, and "normal"
+// brings them back. Neither brings back a cash account, which hides whatever
+// the policy says.
 func TestPolicyOverrideAccountsGrain(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)
-	seedReturnsSource(t, db, ctx, "chx", "chase")
+	seedReturnsSource(t, db, ctx, "chx", "schwab")
 
 	a, b := dy(2024, time.January, 2), dy(2024, time.December, 30)
 	seedAcct(t, db, ctx, "chx", "SWEEP", canonical.AccountKindBrokerage, nil,
@@ -104,16 +103,18 @@ func TestPolicyOverrideAccountsGrain(t *testing.T) {
 		[]snap{{a, 900}, {b, 950}}, nil)
 	end := eod(2024, time.December, 30)
 
-	rows, err := RunReturns(ctx, db, params("accounts", 0, end))
+	hidden := returns.AccountsGrainHidden
+	p := params("accounts", 0, end)
+	p.PolicyOverrides = map[string]ReturnsPolicyOverride{"chx": {AccountsGrain: &hidden}}
+	rows, err := RunReturns(ctx, db, p)
 	if err != nil {
 		t.Fatalf("RunReturns: %v", err)
 	}
 	if _, ok := summaryFor(rows, "SWEEP"); ok {
-		t.Fatal("hidden plumbing must emit no accounts row without the override")
+		t.Fatal("the hidden override must leave no accounts row")
 	}
 
 	normal := returns.AccountsGrainNormal
-	p := params("accounts", 0, end)
 	p.PolicyOverrides = map[string]ReturnsPolicyOverride{"chx": {AccountsGrain: &normal}}
 	rows, err = RunReturns(ctx, db, p)
 	if err != nil {
@@ -134,32 +135,57 @@ func TestPolicyOverrideAccountsGrain(t *testing.T) {
 	}
 }
 
-// TestPolicyOverrideMultiLoader pins that the multi-currency loader threads
-// the override map identically to the single-currency path — otherwise the
-// materialized report_returns would silently diverge from the CLI.
-func TestPolicyOverrideMultiLoader(t *testing.T) {
+// TestPolicyOverrideAccountsGrainBlanked locks the "blanked" override: on the
+// accounts grain the source's row keeps its start and end values but blanks
+// TWR and MWR to n/a with accounts_grain_meaningless, while the portfolios,
+// sources and global grains still compute real numbers.
+func TestPolicyOverrideAccountsGrainBlanked(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)
-	seedReturnsSource(t, db, ctx, "man", "manual")
-	a, b := dy(2024, time.January, 2), dy(2024, time.December, 30)
-	seedAcct(t, db, ctx, "man", "RE", canonical.AccountKindBrokerage, nil,
-		[]snap{{a, 2000}, {b, 2100}}, nil)
+	seedReturnsSource(t, db, ctx, "ctag", "cointracking")
 
-	fx, err := loadFxBounds(ctx, db)
-	if err != nil {
-		t.Fatalf("loadFxBounds: %v", err)
+	wStart := dy(2023, time.January, 2)
+	end := dy(2023, time.December, 29)
+
+	pf := "PF1"
+	seedAcct(t, db, ctx, "ctag", "WALLET", canonical.AccountKindCrypto, &pf,
+		[]snap{{wStart, 5000}, {end, 6000}},
+		[]txn{{wStart, canonical.TxKindDeposit, 5000}})
+
+	blanked := returns.AccountsGrainBlanked
+	run := func(level string) []ReturnRow {
+		t.Helper()
+		p := params(level, 0, eod(2023, time.December, 29))
+		p.PolicyOverrides = map[string]ReturnsPolicyOverride{"ctag": {AccountsGrain: &blanked}}
+		rows, err := RunReturns(ctx, db, p)
+		if err != nil {
+			t.Fatalf("RunReturns %s: %v", level, err)
+		}
+		return rows
 	}
-	fc := returns.RegimeFlowComplete
-	ov := map[string]ReturnsPolicyOverride{"man": {FlowRegime: &fc}}
-	multi, err := loadReturnsDatasetsMulti(ctx, db, fx, ov, nil)
-	if err != nil {
-		t.Fatalf("loadReturnsDatasetsMulti: %v", err)
+
+	w, ok := summaryFor(run("accounts"), "WALLET")
+	if !ok {
+		t.Fatal("no WALLET accounts row")
 	}
-	acct := multi["USD"].accts[acctKey("man", "RE")]
-	if acct == nil {
-		t.Fatal("multi loader missing man/RE")
+	if w.StartValue == nil || w.EndValue == nil {
+		t.Errorf("wallet start/end must be populated (start=%v end=%v)", w.StartValue, w.EndValue)
 	}
-	if acct.policy.Regime != returns.RegimeFlowComplete || !acct.policy.IsExternal(canonical.TxKindDeposit) {
-		t.Errorf("multi loader must apply the override (regime=%v)", acct.policy.Regime)
+	if w.TWR != nil || w.TWRAnnualized != nil || w.MWR != nil || w.MWRAnnualized != nil {
+		t.Errorf("wallet TWR/MWR must be n/a (got TWR=%v MWR=%v)", w.TWR, w.MWR)
+	}
+	if !qualityHas(w, "accounts_grain_meaningless") {
+		t.Errorf("quality = %v, want accounts_grain_meaningless", w.Quality)
+	}
+
+	// The coarser grains are coherent units: real numbers, never gated.
+	for _, g := range []struct{ level, entity string }{{"portfolios", "PF1"}, {"sources", "ctag"}, {"global", ""}} {
+		r, ok := summaryFor(run(g.level), g.entity)
+		if !ok {
+			t.Fatalf("no %s row", g.level)
+		}
+		if r.TWR == nil || qualityHas(r, "accounts_grain_meaningless") {
+			t.Errorf("%s grain must compute a real number and not be gated (TWR=%v q=%v)", g.level, r.TWR, r.Quality)
+		}
 	}
 }

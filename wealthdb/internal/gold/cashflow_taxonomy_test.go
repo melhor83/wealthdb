@@ -6,17 +6,17 @@ import (
 	"testing"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/enrichtest"
 )
 
 // The cash flow taxonomy pins: the five values exist in the dimension,
 // and both bases drop a row that resolves to one of them.
 //
-// TestSpendCategoriesMatchGoTable already compares the whole dimension
-// against canonical.SpendCategories, so nothing here re-checks the
-// seed's contents. What it checks is the consequence: a base names its
-// exclusions one by one, so a value added to the taxonomy without a
-// base edit would stay IN the base and double-count against the
-// cashflow statement that placed it.
+// The derived set stamps the whole dimension from
+// canonical.SpendCategories (TestDerivedStampsTheVocabulary), so nothing
+// here re-checks its contents. What it checks is the consequence: a
+// value placed in the taxonomy as a movement must leave both bases, or
+// it would double-count against the cashflow statement that placed it.
 
 // seedCashflowTaxonomyFixture lays down one transaction per new value,
 // on its own account, with the overlay row a rule would have written.
@@ -45,28 +45,28 @@ func seedCashflowTaxonomyFixture(t *testing.T, db *sql.DB, ctx context.Context) 
             ('cf-src', 'T-EDU-IN',    1000, 'CASH1', 'deposit',    'USD',  120),
             ('cf-src', 'T-HSA-IN',    1000, 'CASH1', 'deposit',    'USD',  130),
             ('cf-src', 'T-TRU-IN',    1000, 'CASH1', 'deposit',    'USD',  140);
-
-        INSERT INTO spend_txn_enrichment (silver_source_id, transaction_external_id,
-                                          merchant_signature, signature_version,
-                                          spend_detailed, provenance, assigned_at) VALUES
-            ('cf-src', 'T-BUY',      'sig-shop',  1, 'FOOD_AND_DRINK_GROCERIES', 'rule', 100),
-            ('cf-src', 'T-LOAN-OUT', 'sig-loan',  1, 'debt_repayment',           'rule', 100),
-            ('cf-src', 'T-RET-OUT',  'sig-plan',  1, 'retirement_transfer',      'rule', 100),
-            ('cf-src', 'T-EDU-OUT',  'sig-plan',  1, 'education_transfer',       'rule', 100),
-            ('cf-src', 'T-HSA-OUT',  'sig-plan',  1, 'health_transfer',          'rule', 100),
-            ('cf-src', 'T-TRU-OUT',  'sig-plan',  1, 'trust_transfer',           'rule', 100);
-
-        INSERT INTO income_txn_enrichment (silver_source_id, transaction_external_id,
-                                           payer_signature, signature_version,
-                                           income_detailed, provenance, assigned_at) VALUES
-            ('cf-src', 'T-PAID',   'sig-payer', 1, 'INCOME_SALARY',       'rule', 100),
-            ('cf-src', 'T-RET-IN', 'sig-plan',  1, 'retirement_transfer', 'rule', 100),
-            ('cf-src', 'T-EDU-IN', 'sig-plan',  1, 'education_transfer',  'rule', 100),
-            ('cf-src', 'T-HSA-IN', 'sig-plan',  1, 'health_transfer',     'rule', 100),
-            ('cf-src', 'T-TRU-IN', 'sig-plan',  1, 'trust_transfer',      'rule', 100);
     `); err != nil {
 		t.Fatalf("seed cashflow taxonomy fixture: %v", err)
 	}
+	spend := func(txn, sig, detailed string) enrichtest.Spend {
+		return enrichtest.Spend{Source: "cf-src", Txn: txn, Signature: sig, Detailed: detailed, Provenance: "rule"}
+	}
+	enrichtest.SeedSpend(t, db,
+		spend("T-BUY", "sig-shop", "FOOD_AND_DRINK_GROCERIES"),
+		spend("T-LOAN-OUT", "sig-loan", "debt_repayment"),
+		spend("T-RET-OUT", "sig-plan", "retirement_transfer"),
+		spend("T-EDU-OUT", "sig-plan", "education_transfer"),
+		spend("T-HSA-OUT", "sig-plan", "health_transfer"),
+		spend("T-TRU-OUT", "sig-plan", "trust_transfer"))
+	income := func(txn, sig, detailed string) enrichtest.Income {
+		return enrichtest.Income{Source: "cf-src", Txn: txn, Signature: sig, Detailed: detailed, Provenance: "rule"}
+	}
+	enrichtest.SeedIncome(t, db,
+		income("T-PAID", "sig-payer", "INCOME_SALARY"),
+		income("T-RET-IN", "sig-plan", "retirement_transfer"),
+		income("T-EDU-IN", "sig-plan", "education_transfer"),
+		income("T-HSA-IN", "sig-plan", "health_transfer"),
+		income("T-TRU-IN", "sig-plan", "trust_transfer"))
 }
 
 // TestCashflowDeltasLeaveBothBases pins what the five values do: the five
@@ -183,29 +183,6 @@ func TestDebtRepaymentIsSeededAndNotSpend(t *testing.T) {
 	}
 	if _, ok := macroTxnIDs(t, db, ctx, "spending_lines_base", 0, 5000)["T-LOAN-OUT"]; ok {
 		t.Error("the spending base charts a debt repayment")
-	}
-}
-
-// TestEnrichmentHoldsTheFarClass: the enrichment overlay carries the far
-// account's class.
-func TestEnrichmentHoldsTheFarClass(t *testing.T) {
-	t.Parallel()
-	db, ctx := openMigrated(t)
-	seedCashflowTaxonomyFixture(t, db, ctx)
-	if _, err := db.ExecContext(ctx, `
-        UPDATE spend_txn_enrichment SET far_class = 'mortgage'
-         WHERE transaction_external_id = 'T-LOAN-OUT'`); err != nil {
-		t.Fatalf("seed a far class: %v", err)
-	}
-
-	var class sql.NullString
-	if err := db.QueryRowContext(ctx, `
-        SELECT far_class FROM spend_txn_enrichment
-         WHERE transaction_external_id = 'T-LOAN-OUT'`).Scan(&class); err != nil {
-		t.Fatalf("read far class: %v", err)
-	}
-	if class.String != "mortgage" {
-		t.Errorf("far_class = %q, want mortgage", class.String)
 	}
 }
 

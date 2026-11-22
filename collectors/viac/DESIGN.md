@@ -254,7 +254,11 @@ same `positions` / `cash_balances` tables as the live scrapes,
 tagged `source = 'report:<docid>'` and keyed on the as-of date
 (which never collides with the live scrape timestamps). Re-parsing
 the same stable report across successive dumps converges
-(`INSERT OR REPLACE`). Reconstructed rows reconcile to the cent
+(`INSERT OR REPLACE`), and each report's earlier rows are dropped
+first. Each read is recorded with its parser generation
+(`document_derivations`). After the dumps, `load` reads every indexed
+report the current generation has not read, from its stored PDF, so a
+parser change reaches the whole archive at the next load. Reconstructed rows reconcile to the cent
 against each report's printed "Balance in CHF". Instruments held
 only historically (a fund merged away, for example) enter the
 `instruments` catalogue through this path, and live instruments
@@ -288,7 +292,7 @@ creates no run dir. The viac specifics:
 
 ## 6. Silver schema
 
-Materialised in [`migrations/`](migrations/) (0001 to 0005);
+Materialised in [`migrations/`](migrations/) (0001 to 0007);
 read those files for column-level commentary, this section for
 the overview.
 
@@ -298,12 +302,12 @@ the overview.
 | `dump_runs` | `snapshot_at` | One row per ingested bronze run; full `run.json` in `payload`. Promotes `dry_run`, `with_transaction_documents`, document-counter columns. |
 | `accounts` | `(snapshot_at, account_external_id)` | One row per (snapshot, portfolio). Promotes `product_code` ('3' p3a / '2' pvb / '1' inv) and `portfolio_index` parsed from the dotted number; plus the inventory + strategy union. p3a portfolios populate `strategy_*` and `custody_bank`; pvb portfolios populate `foundation` + `portfolio_type`. `management_style` is `'automated'` for every VIAC account (see §7). |
 | `cash_balances` | `(snapshot_at, account_external_id, currency, balance_kind)` | One row per (snapshot, account, currency, kind). `balance_kind` is always `'cash'`. `source` (schema v3) is `'live'` for `assetsOverview.cashAmount` rows, `'report:<docid>'` for the 3a-account liquidity reconstructed from a Reporting PDF (§5.1). |
-| `positions` | `(snapshot_at, account_external_id, instrument_external_id)` | Holdings, `instrument_external_id` = ISIN. Promotes `quantity` (fund units; VIAC's confusingly-named `amount` JSON field), `market_value_chf` (CHF mark-to-market; VIAC's `ratioInChf`), `ratio` (fraction of portfolio), `acquisition_price`, `asset_price`, canonical `asset_class` + VIAC's raw `viac_asset_class` + `sub_asset_class`. `source` (schema v3) splits **live** rows from `assetsOverview` (snapshot_at = scrape time) and **historical** rows from the Reporting PDFs (`'report:<docid>'`, snapshot_at = the report's period-end date; §5.1). Both coexist; the gold adapter reads every snapshot_at uniformly, so a historical snapshot answers `wealthdb holdings positions --as-of <past date>`. |
+| `positions` | `(snapshot_at, account_external_id, instrument_external_id)` | Holdings, `instrument_external_id` = ISIN. Promotes `quantity` (fund units; VIAC's confusingly-named `amount` JSON field), `market_value_chf` (CHF mark-to-market; VIAC's `ratioInChf`), `ratio` (fraction of portfolio), `acquisition_price`, `asset_price`, `asset_class` + VIAC's raw `viac_asset_class` + `sub_asset_class`. A live row's `asset_class` is the class the loader maps from the API key; a report row's is the section as printed, which the gold adapter maps (migration 0007). `source` (schema v3) splits **live** rows from `assetsOverview` (snapshot_at = scrape time) and **historical** rows from the Reporting PDFs (`'report:<docid>'`, snapshot_at = the report's period-end date; §5.1). Both coexist; the gold adapter reads every snapshot_at uniformly, so a historical snapshot answers `wealthdb holdings positions --as-of <past date>`. |
 | `instruments` | `instrument_external_id` | Slow-changing master data; ISIN-keyed. Upserts advance `last_seen_at`. |
 | `transactions` | `transaction_external_id` | One row per event from `/p3a/portfolio/transactions`. `transaction_external_id` synthesised per §3.3. `kind` is the canonical mapping (`buy`, `sell`, `dividend`, `interest`, `fee`, `deposit`, `corporate_action`, `other`). `instrument_external_id` (migration 0005) is the ISIN of the one instrument whose `name` equals the transaction's `description`; NULL when no name or several match. |
 | `wealth_history` | `(snapshot_at, value_date)` | Customer-level daily NAV from `/wealth/summary`. Zips `dailyWealth` + `dailyPerformance` + `dailyInvestedAmounts` by date. A scalar arrives either wrapped as `{"__type": "VIAC_DECIMAL", "__value": "<decimal string>"}` or as a bare JSON number; the loader reads both. Customer-level **by choice**: the same response carries a per-portfolio series under `p3aSummary` / `pvbSummary` → `portfolioWealthSummaries`, which the loader does not read. |
 | `documents` | `content_sha256` | Content-deduped PDF index. Promotes `viac_doc_id`, `doc_type`, `doc_subtype`, `timestamp`, `product`. `bronze_path` is relative to bronze root. |
-| `parser_generations` | `scope` | Which generation of the Reporting-PDF parsing logic produced the rows a pass is holding (`collectorkit.srcfp` fingerprint). A moved generation drops them before the pass re-derives, so a re-parse replaces rather than accumulates. |
+| `document_derivations` | `(content_sha256, scope)` | Which generation of the Reporting-PDF parsing logic (`collectorkit.srcfp` fingerprint) read each report, and how many rows it wrote (migration 0006). A load reads every indexed report without a row under the current generation, so a re-parse reaches the whole archive. |
 
 The loader runs pending migrations on every invocation. An
 applied migration is never rewritten; a change is a new file.

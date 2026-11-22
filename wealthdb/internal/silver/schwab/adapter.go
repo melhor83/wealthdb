@@ -7,7 +7,10 @@ package schwab
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/returns"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver"
 )
 
@@ -17,14 +20,26 @@ import (
 // "schwab-web". Mirrors the UBS adapter's subsource pattern.
 const kindName = "schwab"
 
+// init registers the kind (silver.Source).
+//
+// Returns: flow-complete bank/pension (every capital kind counts),
+// forward knobs defaulted (no-op). The API states a
+// corporate action's cash signed, and the adapter passes it through
+// (canonical.CashSignedKinds).
 func init() {
-	silver.Register(&Adapter{})
+	rp := returns.DefaultReturnsPolicy(returns.BankFlowPolicy())
+	silver.Register(silver.Source{
+		Kind:       kindName,
+		Settings:   &silver.Settings{Key: "schwab", Parse: parseSettings},
+		Open:       (&Adapter{}).Open,
+		Returns:    &rp,
+		Lots:       lotPolicy(),
+		CashSigned: []canonical.TxKind{canonical.TxKindCorporateAction},
+	})
 }
 
 // Adapter implements silver.Adapter.
 type Adapter struct{}
-
-func (*Adapter) Kind() string { return kindName }
 
 // Open attaches the configured Schwab silvers.
 //
@@ -41,7 +56,7 @@ func (*Adapter) Kind() string { return kindName }
 // that api doesn't surface. With web alone, an account's id is its
 // full account number, which the web silver states for every account
 // (webOnlyBridge). See merge.go.
-func (*Adapter) Open(_ context.Context, spec silver.OpenSpec) (silver.Connection, error) {
+func (*Adapter) Open(ctx context.Context, spec silver.OpenSpec) (silver.Connection, error) {
 	c := &Connection{}
 
 	// Single-path form: a schwab-api silver.
@@ -50,7 +65,11 @@ func (*Adapter) Open(_ context.Context, spec silver.OpenSpec) (silver.Connection
 		if err != nil {
 			return nil, err
 		}
-		c.api = &apiReader{db: db, marks: spec.MarkGuard}
+		c.api = &apiReader{db: db, marks: markGuardOf(spec), file: filepath.Base(spec.Path)}
+		if _, err := c.api.schema(ctx); err != nil {
+			_ = c.Close()
+			return nil, err
+		}
 		return c, nil
 	}
 
@@ -62,9 +81,9 @@ func (*Adapter) Open(_ context.Context, spec silver.OpenSpec) (silver.Connection
 		}
 		switch s.Kind {
 		case "schwab-api":
-			c.api = &apiReader{db: db, marks: spec.MarkGuard}
+			c.api = &apiReader{db: db, marks: markGuardOf(spec), file: filepath.Base(s.Path)}
 		case "schwab-web":
-			c.web = &webReader{db: db}
+			c.web = &webReader{db: db, file: filepath.Base(s.Path)}
 		default:
 			_ = db.Close()
 			_ = c.Close()
@@ -73,6 +92,18 @@ func (*Adapter) Open(_ context.Context, spec silver.OpenSpec) (silver.Connection
 	}
 	if c.api == nil && c.web == nil {
 		return nil, fmt.Errorf("schwab: configure subsources schwab-api, schwab-web or both")
+	}
+	if c.api != nil {
+		if _, err := c.api.schema(ctx); err != nil {
+			_ = c.Close()
+			return nil, err
+		}
+	}
+	if c.web != nil {
+		if _, err := c.web.schema(ctx); err != nil {
+			_ = c.Close()
+			return nil, err
+		}
 	}
 	return c, nil
 }

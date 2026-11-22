@@ -9,10 +9,9 @@ import (
 )
 
 // ClassRefiner reads a lookup's type of a security over the pair an
-// adapter gave its instrument (silver.ClassRefiner): it returns the
+// adapter gave its instrument (silver.RefineClass): it returns the
 // (asset_class, vehicle) of an instrument named name, which the adapter
-// classed (ac, v) and OpenFIGI types securityType. It is an alias so
-// that silver.ClassRefiners' map is the pass's map.
+// classed (ac, v) and OpenFIGI types securityType.
 type ClassRefiner = func(securityType string, ac canonical.AssetClass, v canonical.Vehicle, name string) (canonical.AssetClass, canonical.Vehicle)
 
 // ClassCounts is what the class pass rewrote: the instrument rows and
@@ -21,21 +20,31 @@ type ClassCounts struct {
 	Instruments, Positions int64
 }
 
-// RefineClasses is the class pass. For each source whose kind has a
-// refiner (refiners, by kind), it reads OpenFIGI's type of each
-// instrument's security over the pair the load gave the instrument and
-// every position row of it. pinned names, per source, the instruments
-// the config pins (instrument_overrides): they keep the config's pair.
+// ClassPin is a pair the config pins on an instrument
+// (instrument_overrides): the instrument and every position row of it
+// read it, whatever the adapter or a lookup says.
+type ClassPin struct {
+	AssetClass canonical.AssetClass
+	Vehicle    canonical.Vehicle
+}
+
+// RefineClasses is the class pass. pins names, per source, the
+// instruments the config pins. Each of them, and every position row of
+// it, takes the pinned pair. Where refine is set, the pass reads
+// OpenFIGI's type of every other instrument's security, in every
+// source, over the pair the load gave the instrument and every position
+// row of it.
 //
 // It runs after the per-source loads, so a type a later refdata load
-// brings reaches every source. It reads every row each time: a load
-// writes an instrument's pair as the adapter reads it, and the pass reads
-// the type over it again. A refiner reads its own output as it is, so a
-// second pass changes nothing. One transaction.
-func RefineClasses(ctx context.Context, db *sql.DB, refiners map[string]ClassRefiner,
-	pinned map[string]map[string]bool) (ClassCounts, error) {
+// brings reaches every source, and a pin reaches rows an earlier load
+// wrote. It reads every row each time: a load writes an instrument's
+// pair as the adapter reads it, and the pass reads the pin or the type
+// over it again. A refiner reads its own output as it is, so a second
+// pass changes nothing. One transaction.
+func RefineClasses(ctx context.Context, db *sql.DB, refine ClassRefiner,
+	pins map[string]map[string]ClassPin) (ClassCounts, error) {
 	var n ClassCounts
-	if len(refiners) == 0 {
+	if refine == nil && len(pins) == 0 {
 		return n, nil
 	}
 	tx, err := db.BeginTx(ctx, nil)
@@ -44,23 +53,10 @@ func RefineClasses(ctx context.Context, db *sql.DB, refiners map[string]ClassRef
 	}
 	defer tx.Rollback() //nolint:errcheck — no-op after Commit
 
-	bySource := map[string]ClassRefiner{}
 	types := map[string]string{}
 	typed := map[[2]string]typedInstrument{}
 	var changes []classChange
 	if err := runSteps("class pass", []step{
-		{"sources", func() error {
-			return scanAll(ctx, tx, `SELECT silver_source_id, silver_kind FROM silver_sources`, func(rows *sql.Rows) error {
-				var id, kind string
-				if err := rows.Scan(&id, &kind); err != nil {
-					return err
-				}
-				if r := refiners[kind]; r != nil {
-					bySource[id] = r
-				}
-				return nil
-			})
-		}},
 		{"types", func() error {
 			return scanAll(ctx, tx, figiTypesSQL, func(rows *sql.Rows) error {
 				var key, typ string
@@ -80,7 +76,7 @@ SELECT silver_source_id, instrument_external_id, COALESCE(isin, ''), COALESCE(cu
 				if err := rows.Scan(&src, &iid, &isin, &cusip, &symbol, &name); err != nil {
 					return err
 				}
-				if bySource[src] == nil || pinned[src][iid] {
+				if _, pinned := pins[src][iid]; pinned || refine == nil {
 					return nil
 				}
 				if t := figiType(types, isin, cusip, symbol); t != "" {
@@ -101,11 +97,13 @@ SELECT silver_source_id, instrument_external_id, asset_class, COALESCE(vehicle, 
 				}
 				c := classChange{src: src, iid: iid, fromClass: canonical.AssetClass(class),
 					fromVehicle: canonical.Vehicle(vehicle)}
-				t, ok := typed[[2]string{c.src, c.iid}]
-				if !ok {
+				if pin, ok := pins[c.src][c.iid]; ok {
+					c.toClass, c.toVehicle = pin.AssetClass, pin.Vehicle
+				} else if t, ok := typed[[2]string{c.src, c.iid}]; ok {
+					c.toClass, c.toVehicle = refine(t.securityType, c.fromClass, c.fromVehicle, t.name)
+				} else {
 					return nil
 				}
-				c.toClass, c.toVehicle = bySource[c.src](t.securityType, c.fromClass, c.fromVehicle, t.name)
 				if c.toClass != c.fromClass || c.toVehicle != c.fromVehicle {
 					changes = append(changes, c)
 				}

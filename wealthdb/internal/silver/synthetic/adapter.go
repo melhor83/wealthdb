@@ -5,11 +5,11 @@
 // row means. This one reads a silver shaped by the canonical model itself:
 // one table per record type — portfolios, accounts, instruments, positions,
 // open lots, cash balances, fx rates, transactions, realized lots, the
-// reference records and the rate observations — so a row is the change
-// record it becomes, column for column (testdata/silver_schema.sql is the
-// schema's one definition). No collector and no bronze stand behind
-// it; a generator writes it, and nothing about any one generator is known
-// here.
+// reference records, the rate observations and the capital accounts — so a
+// row is the change record it becomes, column for column
+// (testdata/silver_schema.sql is the schema's one definition). No collector
+// and no bronze stand behind it; a generator writes it, and nothing about
+// any one generator is known here.
 //
 // The projection is therefore a pass-through with the cross-cutting guards
 // every adapter applies (docs/DESIGN.md §6.8): a value outside a canonical
@@ -26,6 +26,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"path/filepath"
+	"slices"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver"
@@ -33,24 +35,78 @@ import (
 
 const kindName = "synthetic"
 
+// init registers the kind (silver.Source).
 func init() {
-	silver.Register(&Adapter{})
+	silver.Register(silver.Source{
+		Kind:    kindName,
+		Open:    (&Adapter{}).Open,
+		Returns: returnsPolicy(),
+	})
 }
 
 type Adapter struct{}
 
-func (*Adapter) Kind() string { return kindName }
-
-func (*Adapter) Open(_ context.Context, spec silver.OpenSpec) (silver.Connection, error) {
+func (*Adapter) Open(ctx context.Context, spec silver.OpenSpec) (silver.Connection, error) {
 	db, err := silver.OpenReadOnlySQLite(spec.Path, "synthetic silver")
 	if err != nil {
 		return nil, err
 	}
-	return &Connection{db: db}, nil
+	c := &Connection{db: db}
+	note, err := silver.ProbeOptional(ctx, db, filepath.Base(spec.Path), c.schema.optional()...)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	c.Note(note)
+	if c.schema.hasReference() {
+		// The reference tables' versions are the refdata collector's
+		// schema versions, not this silver's, so the probe's note is
+		// left out.
+		if c.reference, _, err = silver.ProbeReferenceSchema(ctx, db, ""); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
+	return c, nil
 }
 
 type Connection struct {
-	db *sql.DB
+	db     *sql.DB
+	schema schema
+	// reference is which later parts of the reference schema the file
+	// holds, where it holds every reference table (schema.reference).
+	reference silver.ReferenceSchema
+	silver.Advice
+}
+
+// schema is which optional parts of the silver schema a file holds,
+// probed once at open. A file older than a table states none of its
+// records.
+type schema struct {
+	reference    []bool // each of silver.ReferenceTables
+	rates        bool   // silver.RatesTable
+	positionLots bool   // the position_lots table
+	realizedLots bool   // the realized_lots table
+	capital      bool   // the capital_accounts table
+}
+
+func (s *schema) optional() []silver.Optional {
+	s.reference = make([]bool, len(silver.ReferenceTables))
+	out := []silver.Optional{
+		{Table: silver.RatesTable, Has: &s.rates},
+		{Table: "position_lots", Has: &s.positionLots},
+		{Table: "realized_lots", Has: &s.realizedLots},
+		{Table: "capital_accounts", Has: &s.capital},
+	}
+	for i, t := range silver.ReferenceTables {
+		out = append(out, silver.Optional{Table: t, Has: &s.reference[i]})
+	}
+	return out
+}
+
+// hasReference reports whether the file holds every reference table.
+func (s schema) hasReference() bool {
+	return !slices.Contains(s.reference, false)
 }
 
 func (c *Connection) Close() error { return silver.CloseDB(&c.db) }

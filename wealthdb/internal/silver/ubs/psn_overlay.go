@@ -3,10 +3,10 @@ package ubs
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver"
 )
 
 // PSN-side overlay helpers. The orchestrator pre-fetches PSN
@@ -72,53 +72,23 @@ func (r *psnReader) taxPairByISIN(ctx context.Context) (map[string]taxPair, erro
 // ambiguous — one continuous series cut in two, with a seam on a date
 // where nothing happened to the holding.
 //
-// Built from the latest roster snapshot (the portfolio↔safekeeping
-// relationship is long-lived; we apply today's structure
+// Built from the current roster (psnRoster: the portfolio↔safekeeping
+// relationship is long-lived; today's structure applies
 // retroactively to the historical PDFs).
 func (r *psnReader) safekeepingByPortfolio(ctx context.Context) (map[string]string, error) {
 	if r == nil {
 		return nil, nil
 	}
-	var latest sql.NullInt64
-	if err := r.db.QueryRowContext(ctx,
-		`SELECT MAX(snapshot_at) FROM safekeeping_accounts`,
-	).Scan(&latest); err != nil {
-		return nil, fmt.Errorf("psn safekeepingByPortfolio latest: %w", err)
+	roster, err := r.roster(ctx)
+	if err != nil {
+		return nil, err
 	}
-	if !latest.Valid {
+	accountsPerPortfolio, ok := roster.custodyByPortfolio()
+	if !ok {
 		return nil, nil
 	}
 	holdsSecurities, err := r.safekeepingAccountsWithHoldings(ctx)
 	if err != nil {
-		return nil, err
-	}
-	const q = `
-SELECT account_external_id, payload
-  FROM safekeeping_accounts
- WHERE snapshot_at = ?
- ORDER BY account_external_id`
-	rows, err := r.db.QueryContext(ctx, q, latest.Int64)
-	if err != nil {
-		return nil, fmt.Errorf("psn safekeepingByPortfolio: %w", err)
-	}
-	defer rows.Close()
-	accountsPerPortfolio := map[string][]string{}
-	for rows.Next() {
-		var acctID, payload string
-		if err := rows.Scan(&acctID, &payload); err != nil {
-			return nil, err
-		}
-		var p struct {
-			PrtflId string `json:"PrtflId"`
-		}
-		_ = json.Unmarshal([]byte(payload), &p)
-		if p.PrtflId == "" {
-			continue
-		}
-		accountsPerPortfolio[p.PrtflId] = append(
-			accountsPerPortfolio[p.PrtflId], acctID)
-	}
-	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	out := make(map[string]string, len(accountsPerPortfolio))
@@ -158,21 +128,18 @@ func filterHoldsSecurities(accts []string, holdsSecurities map[string]bool) []st
 // statement per safekeeping account per day whether or not anything is
 // pending, so every account appears in it.
 func (r *psnReader) safekeepingAccountsWithHoldings(ctx context.Context) (map[string]bool, error) {
-	rows, err := r.db.QueryContext(ctx,
-		`SELECT DISTINCT safekeeping_external_id FROM holdings`)
-	if err != nil {
-		return nil, fmt.Errorf("psn safekeepingAccountsWithHoldings: %w", err)
-	}
-	defer rows.Close()
 	out := map[string]bool{}
-	for rows.Next() {
+	if err := silver.ScanRows(ctx, r.db, "psn safekeepingAccountsWithHoldings", `SELECT DISTINCT safekeeping_external_id FROM holdings`, func(rows *sql.Rows) error {
 		var id string
 		if err := rows.Scan(&id); err != nil {
-			return nil, err
+			return err
 		}
 		out[id] = true
+		return nil
+	}); err != nil {
+		return nil, err
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // holdingsSnapshotRange returns the snapshot_at of PSN's earliest and

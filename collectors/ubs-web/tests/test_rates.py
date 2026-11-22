@@ -872,6 +872,12 @@ def test_the_legacy_page_reads_both_tables_from_the_first_copy():
     assert rate_parsers.legacy_iban(html) == IBAN_LEGACY
 
 
+def test_a_legacy_iban_printed_with_no_break_spaces_reads():
+    html = _legacy_page([("01.01.2026", "0.100%", "")], [],
+                        iban=IBAN_LEGACY_PRINTED.replace(" ", "&nbsp;"))
+    assert rate_parsers.legacy_iban(html) == IBAN_LEGACY
+
+
 def test_a_legacy_page_with_headers_and_no_rows_states_nothing():
     html = _legacy_page([], [], repeated=False)
     assert rate_parsers.legacy_conditions(html) == []
@@ -1003,7 +1009,7 @@ def test_load_reads_both_surfaces_onto_their_accounts(tmp_path):
         _legacy_page([("01.01.2026", "5.000%", "")], [],
                      iban=IBAN_API_PRINTED))
     conn = fresh_db(tmp_path)
-    load.load_dump(conn, dump, 16, {}, {})
+    load.load_dump(conn, dump, 16, None)
     assert _rows(conn) == [
         (IBAN_LEGACY, "credit", 1, 0.1, None, "2026-01-01", "legacy"),
         (IBAN_LEGACY, "debit", 1, 7.5, None, "2025-07-01", "legacy"),
@@ -1013,7 +1019,7 @@ def test_load_reads_both_surfaces_onto_their_accounts(tmp_path):
         (IBAN_API, "debit", 1, 9.75, None, "2025-07-01", "api"),
     ]
     snap = conn.execute("SELECT DISTINCT snapshot_at FROM account_rates").fetchall()
-    assert [s[0] for s in snap] == [load.ts_from_dir(dump.name)]
+    assert [s[0] for s in snap] == [bronze.parse_run_ts(dump.name)]
 
 
 def test_an_account_with_no_conditions_writes_no_row(tmp_path):
@@ -1023,7 +1029,7 @@ def test_an_account_with_no_conditions_writes_no_row(tmp_path):
     (dump / "rates" / rates.legacy_file_name(IBAN_LEGACY)).write_text(
         _legacy_page([], [], repeated=False))
     conn = fresh_db(tmp_path)
-    load.load_dump(conn, dump, 16, {}, {})
+    load.load_dump(conn, dump, 16, None)
     assert _rows(conn) == []
 
 
@@ -1035,7 +1041,7 @@ def test_an_api_file_stating_no_conditions_leaves_the_legacy_page(tmp_path):
     (dump / "rates" / rates.legacy_file_name(IBAN_LEGACY)).write_text(
         _legacy_page([("01.01.2026", "0.100%", "")], []))
     conn = fresh_db(tmp_path)
-    load.load_dump(conn, dump, 16, {}, {})
+    load.load_dump(conn, dump, 16, None)
     assert _rows(conn) == [
         (IBAN_LEGACY, "credit", 1, 0.1, None, "2026-01-01", "legacy")]
 
@@ -1054,7 +1060,7 @@ def test_a_rate_artefact_that_does_not_read_is_skipped(tmp_path, caplog,
         _legacy_page([("01.01.2026", "0.100%", "")], []))
     (dump / "rates" / name).write_text(body)
     conn = fresh_db(tmp_path)
-    load.load_dump(conn, dump, 16, {}, {})
+    load.load_dump(conn, dump, 16, None)
     assert _rows(conn) == [
         (IBAN_LEGACY, "credit", 1, 0.1, None, "2026-01-01", "legacy")]
     assert name in caplog.text
@@ -1073,7 +1079,7 @@ def test_a_reread_with_fewer_tiers_leaves_no_old_row(tmp_path):
     path = dump / "rates" / "acct-opaque-1.json"
     path.write_text(json.dumps(_api_payload()))
     conn = fresh_db(tmp_path)
-    snapshot_at = load.ts_from_dir(dump.name)
+    snapshot_at = bronze.parse_run_ts(dump.name)
     assert load._load_rates(conn, snapshot_at, dump) == 4
     # Another dump's rows are not this dump's to drop.
     conn.execute(

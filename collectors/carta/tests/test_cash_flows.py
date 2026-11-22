@@ -1,5 +1,5 @@
 """
-Unit tests for load.py's cash-flow ledger (migration 0003).
+Unit tests for the loader's cash-flow ledger (migration 0003).
 
 Covers the inception-to-date statement parsing, the per-period differencing,
 the cap-table cash-flow synthesis (exercises + exit), and the fund ledger:
@@ -11,10 +11,16 @@ holdings or figures.
 from __future__ import annotations
 
 import json
+import shutil
+import sqlite3
 from pathlib import Path
 
+import captable
+import common
+import fund_documents
 import load
-from conftest import MIGRATIONS_DIR, docs_dir
+from collectorkit import pdftotext, silver
+from conftest import MIGRATIONS_DIR, docs_dir, load_one
 
 
 # ---- statement inception-to-date parsing -----------------------------------
@@ -29,11 +35,11 @@ def test_statement_flows_takes_inception_to_date_not_receivable():
         "Capital contributions receivable                            99,999\n"
         "Capital contributions          —              —            100,000\n"
         "Capital distributions          —          (2,500)           (2,500)\n")
-    assert load._statement_flows_from_text(text) == (100000.0, 2500.0)
+    assert fund_documents._statement_flows_from_text(text) == (100000.0, 2500.0)
 
 
 def test_statement_flows_absent_lines():
-    assert load._statement_flows_from_text("nothing relevant here") == (None, None)
+    assert fund_documents._statement_flows_from_text("nothing relevant here") == (None, None)
 
 
 def test_statement_nav_row_carries_contributed_capital(migrated, tmp_path, monkeypatch):
@@ -44,12 +50,12 @@ def test_statement_nav_row_carries_contributed_capital(migrated, tmp_path, monke
         {"id": "s2", "document_type": "Capital account statement",
          "document_date": "03/31/2099", "fund_id": "42"},
     ])
-    monkeypatch.setattr(load, "_pdf_text", lambda pdf: {
+    monkeypatch.setattr(fund_documents, "_pdf_text", lambda pdf: {
         "s1": "Capital contributions   51,374   51,374   103,861\n"
               "Ending balance   $   121,947   $   121,947   $   121,947\n",
         "s2": "Ending balance   $   89,513   $   89,513   $   89,513\n",
     }[pdf.stem.removeprefix("doc_")])
-    assert load.load_statement_nav(migrated, docs, 42) == 2
+    assert fund_documents.load_statement_nav(migrated, docs, 42) == 2
     rows = migrated.execute(
         "SELECT net_asset_value, capital_contributed, "
         "json_extract(payload, '$.capital_contributed') FROM fund_metrics "
@@ -68,7 +74,7 @@ def test_period_deltas_difference_and_sort():
         ("12/31/2024", "d2", 150000.0, None),
         ("03/31/2025", "d3", 150000.0, 2500.0),
     ]
-    assert load._period_deltas(stmts) == [
+    assert fund_documents._period_deltas(stmts) == [
         ("d1", "09/30/2023", "capital_call", 100000.0),
         ("d2", "12/31/2024", "capital_call", 50000.0),
         ("d3", "03/31/2025", "distribution", 2500.0),
@@ -80,7 +86,7 @@ def test_period_deltas_skip_flat_and_none():
     stmts = [("01/01/2024", "a", 100.0, None),
              ("04/01/2024", "b", 100.0, None),   # flat -> no jump
              ("07/01/2024", "c", None, None)]     # missing -> nothing
-    assert load._period_deltas(stmts) == [("a", "01/01/2024", "capital_call", 100.0)]
+    assert fund_documents._period_deltas(stmts) == [("a", "01/01/2024", "capital_call", 100.0)]
 
 
 # ---- cap-table cash flows (exercises + exit) -------------------------------
@@ -99,7 +105,7 @@ def _captable_edir(tmp_path: Path, canceled: str | None = None) -> Path:
 
 
 def test_captable_exercises_one_per_cert(migrated, tmp_path):
-    n = load._captable_cash_flows(migrated, 7, _captable_edir(tmp_path),
+    n = captable._captable_cash_flows(migrated, 7, _captable_edir(tmp_path),
                                   1_700_000_000, tmp_path)
     assert n == 2  # one exercise per share cert; no exit (live holding)
     rows = migrated.execute(
@@ -112,7 +118,7 @@ def test_captable_exercises_one_per_cert(migrated, tmp_path):
 
 
 def test_captable_exit_zero_proceeds(migrated, tmp_path):
-    load._captable_cash_flows(
+    captable._captable_cash_flows(
         migrated, 7, _captable_edir(tmp_path, canceled="03/03/2099"),
         1_700_000_000, tmp_path)
     # $0 recorded proceeds (Carta purges the payout); total held shares; the
@@ -129,7 +135,7 @@ def test_captable_convertible_purchase(migrated, tmp_path):
     (edir / "convertibles.json").write_text(json.dumps({"rows": [
         {"id": 9, "cost": 100000.0, "issue_date": "06/30/2026", "quantity": 0},
     ]}))
-    n = load._captable_cash_flows(migrated, 7, edir, 1_700_000_000, tmp_path)
+    n = captable._captable_cash_flows(migrated, 7, edir, 1_700_000_000, tmp_path)
     assert n == 3  # 2 exercises + 1 convertible_purchase
     assert migrated.execute(
         "SELECT kind, flow_date, amount, shares, price_per_share, description "
@@ -146,7 +152,7 @@ def test_read_transactions_csv(tmp_path):
                  "2099-03-03,sell,7000.00,1500,sale of all shares\n"
                  "2099-03-03,withdrawal,6000.00,,to bank\n"
                  "2099-03-03,withdrawal,1000.00,,to second bank\n")
-    rows = load._read_transactions_csv(p)
+    rows = common._read_transactions_csv(p)
     assert rows == [
         {"flow_date": "2099-03-03", "kind": "sell", "amount": 7000.0,
          "shares": 1500.0, "description": "sale of all shares"},
@@ -169,7 +175,7 @@ def test_captable_side_loaded_exit_replaces_auto_exit(migrated, tmp_path):
         "2099-03-03,sell,7000.00,1500,sale\n"
         "2099-03-03,withdrawal,6000.00,,bank\n"
         "2099-03-03,withdrawal,1000.00,,second bank\n")
-    load._captable_cash_flows(migrated, 7, edir, 1_700_000_000, tmp_path)
+    captable._captable_cash_flows(migrated, 7, edir, 1_700_000_000, tmp_path)
 
     # No 'exit' row survives; the explicit legs are present and net to 0.
     assert migrated.execute("SELECT COUNT(*) FROM cash_flows WHERE kind='exit'").fetchone()[0] == 0
@@ -224,7 +230,7 @@ def test_a_call_notice_yields_its_due_date_and_amount():
     # The point of reading notices at all: a statement can only place a call
     # in the period it fell in, so every call lands at the period end that
     # follows it. The notice states the day the money was due.
-    got = load.parse_notice_text(_CALL_NOTICE)
+    got = fund_documents.parse_notice_text(_CALL_NOTICE)
     assert got["kind"] == "capital_call"
     assert got["date"] == "06/15/2098"       # due date, not the notice date
     assert got["issued"] == "05/20/2098"     # kept for dating the residue
@@ -233,7 +239,7 @@ def test_a_call_notice_yields_its_due_date_and_amount():
 
 
 def test_a_distribution_notice_reads_its_own_labels():
-    got = load.parse_notice_text(_DIST_NOTICE)
+    got = fund_documents.parse_notice_text(_DIST_NOTICE)
     assert got["kind"] == "distribution"
     assert got["date"] == "01/15/2099"
     assert got["amount"] == 1234.56          # to the cent; the statement rounds
@@ -243,20 +249,20 @@ def test_a_distribution_notice_reads_its_own_labels():
 def test_the_amount_label_does_not_read_the_line_below_it():
     # "Distribution" must not match "Distribution date", and the
     # "Amount due to ..." restatement under it is not the figure.
-    got = load.parse_notice_text(_DIST_NOTICE.replace("$1,234.56", "$1.00", 1))
+    got = fund_documents.parse_notice_text(_DIST_NOTICE.replace("$1,234.56", "$1.00", 1))
     assert got["amount"] == 1.00
 
 
 def test_a_document_that_is_neither_notice_is_skipped():
-    assert load.parse_notice_text("Capital Account Statement\nEnding balance $10") is None
+    assert fund_documents.parse_notice_text("Capital Account Statement\nEnding balance $10") is None
 
 
 def test_the_residue_is_what_the_earliest_notice_says_preceded_it():
     # Called capital post-call, less this call, is everything called before
     # Carta shared anything — stated by the fund, not derived.
-    notice = load.parse_notice_text(_CALL_NOTICE)
-    assert load._residue_from_cumulative(notice) == 156250.0
-    assert load._residue_from_cumulative({"amount": 1.0, "cumulative": None}) is None
+    notice = fund_documents.parse_notice_text(_CALL_NOTICE)
+    assert fund_documents._residue_from_cumulative(notice) == 156250.0
+    assert fund_documents._residue_from_cumulative({"amount": 1.0, "cumulative": None}) is None
 
 
 # ============================================================
@@ -266,9 +272,9 @@ def test_the_residue_is_what_the_earliest_notice_says_preceded_it():
 def _stub_parsers(monkeypatch, statements: dict, notices: dict):
     """Keyed by document id: `statements` yields (contributions, distributions)
     inception-to-date, `notices` yields a parsed notice."""
-    monkeypatch.setattr(load, "_parse_statement_flows",
+    monkeypatch.setattr(fund_documents, "_parse_statement_flows",
                         lambda pdf: statements[pdf.stem.removeprefix("doc_")])
-    monkeypatch.setattr(load, "_parse_notice",
+    monkeypatch.setattr(fund_documents, "_parse_notice",
                         lambda pdf: notices.get(pdf.stem.removeprefix("doc_")))
 
 
@@ -308,7 +314,7 @@ def test_fund_notices_win_and_the_remainder_is_one_residue_row(migrated, tmp_pat
     docs = docs_dir(tmp_path, [_STMT_ROW, _CALL_A, _CALL_B])
     _stub_parsers(monkeypatch, {"s1": (281250.0, 46250.0)}, _two_call_notices())
 
-    assert load._fund_cash_flows(migrated, 42, docs, 1_700_000_000, tmp_path) == 4
+    assert fund_documents._fund_cash_flows(migrated, 42, docs, 1_700_000_000, tmp_path) == 4
     assert _ledger(migrated) == [
         ("call:42:notice:n1", "capital_call", "06/15/2098", 61250.0),
         ("call:42:notice:n2", "capital_call", "09/16/2098", 93750.0),
@@ -334,7 +340,7 @@ def test_fund_falls_back_to_statement_differencing_without_notices(migrated,
     _stub_parsers(monkeypatch,
                   {"s1": (281250.0, 0.0), "s2": (358750.0, 46250.0)}, {})
 
-    assert load._fund_cash_flows(migrated, 42, docs, 1_700_000_000, tmp_path) == 3
+    assert fund_documents._fund_cash_flows(migrated, 42, docs, 1_700_000_000, tmp_path) == 3
     assert _ledger(migrated) == [
         ("call:42:s1", "capital_call", "12/31/2098", 281250.0),
         ("call:42:s2", "capital_call", "12/31/2099", 77500.0),
@@ -355,7 +361,7 @@ def test_fund_ledger_is_rebuilt_not_accumulated(migrated, tmp_path, monkeypatch)
     docs = docs_dir(tmp_path, [_STMT_ROW, _CALL_A, _CALL_B])
     _stub_parsers(monkeypatch, {"s1": (281250.0, 0.0)}, _two_call_notices())
 
-    load._fund_cash_flows(migrated, 42, docs, 1_700_000_000, tmp_path)
+    fund_documents._fund_cash_flows(migrated, 42, docs, 1_700_000_000, tmp_path)
     ids = [r[0] for r in _ledger(migrated)]
     assert "call:42:s1" not in ids                 # the superseded shape is gone
     assert "exercise:42:c1" in ids                 # another kind is untouched
@@ -371,7 +377,7 @@ def test_fund_warns_when_the_two_sources_leave_capital_unaccounted(
     _stub_parsers(monkeypatch, {"s1": (406250.0, 0.0)}, _two_call_notices())
 
     with caplog.at_level("WARNING"):
-        load._fund_cash_flows(migrated, 42, docs, 1_700_000_000, tmp_path)
+        fund_documents._fund_cash_flows(migrated, 42, docs, 1_700_000_000, tmp_path)
     assert "accounted for by neither" in caplog.text
     residue = migrated.execute(
         "SELECT amount FROM cash_flows WHERE cash_flow_external_id = "
@@ -400,7 +406,7 @@ def test_supplied_calls_itemise_the_residue_before_the_earliest_notice(
               "2097-03-01,capital_call,90000,,first call",
               "2097-11-15,capital_call,66250,,")
 
-    assert load._fund_cash_flows(migrated, 42, docs, 1_700_000_000, tmp_path) == 4
+    assert fund_documents._fund_cash_flows(migrated, 42, docs, 1_700_000_000, tmp_path) == 4
     assert _ledger(migrated) == [
         ("call:42:notice:n1", "capital_call", "06/15/2098", 61250.0),
         ("call:42:notice:n2", "capital_call", "09/16/2098", 93750.0),
@@ -419,7 +425,7 @@ def test_the_residue_keeps_what_the_supplied_calls_leave(migrated, tmp_path,
     _stub_parsers(monkeypatch, {"s1": (281250.0, 0.0)}, _two_call_notices())
     _supplied(tmp_path, "2097-03-01,capital_call,90000,,")
 
-    load._fund_cash_flows(migrated, 42, docs, 1_700_000_000, tmp_path)
+    fund_documents._fund_cash_flows(migrated, 42, docs, 1_700_000_000, tmp_path)
     ledger = {r[0]: r[3] for r in _ledger(migrated)}
     assert ledger["call:42:supplied:0"] == 90000.0
     assert ledger["call:42:pre:n1"] == 66250.0
@@ -434,7 +440,7 @@ def test_a_supplied_call_after_the_lump_is_not_part_of_it(migrated, tmp_path,
     _supplied(tmp_path, "2098-07-01,capital_call,40000,,")
 
     with caplog.at_level("WARNING"):
-        load._fund_cash_flows(migrated, 42, docs, 1_700_000_000, tmp_path)
+        fund_documents._fund_cash_flows(migrated, 42, docs, 1_700_000_000, tmp_path)
     assert "not dated on or before" in caplog.text
     ledger = {r[0]: r[3] for r in _ledger(migrated)}
     assert "call:42:supplied:0" not in ledger
@@ -450,7 +456,7 @@ def test_supplied_calls_beyond_the_lump_are_kept_and_the_excess_logged(
     _supplied(tmp_path, "2097-03-01,capital_call,210000,,")
 
     with caplog.at_level("WARNING"):
-        load._fund_cash_flows(migrated, 42, docs, 1_700_000_000, tmp_path)
+        fund_documents._fund_cash_flows(migrated, 42, docs, 1_700_000_000, tmp_path)
     assert "exceed what the fund reports" in caplog.text
     ledger = {r[0]: r[3] for r in _ledger(migrated)}
     assert ledger["call:42:supplied:0"] == 210000.0
@@ -468,7 +474,7 @@ def test_supplied_calls_itemise_the_first_statement_without_notices(
                   {"s1": (281250.0, 0.0), "s2": (358750.0, 0.0)}, {})
     _supplied(tmp_path, "2097-03-01,capital_call,210000,,")
 
-    load._fund_cash_flows(migrated, 42, docs, 1_700_000_000, tmp_path)
+    fund_documents._fund_cash_flows(migrated, 42, docs, 1_700_000_000, tmp_path)
     assert _ledger(migrated) == [
         ("call:42:s1", "capital_call", "12/31/2098", 71250.0),
         ("call:42:s2", "capital_call", "12/31/2099", 77500.0),
@@ -485,7 +491,7 @@ def test_a_fund_ignores_a_supplied_row_it_cannot_pair(migrated, tmp_path,
     _supplied(tmp_path, "2097-03-01,deposit,90000,,")
 
     with caplog.at_level("WARNING"):
-        load._fund_cash_flows(migrated, 42, docs, 1_700_000_000, tmp_path)
+        fund_documents._fund_cash_flows(migrated, 42, docs, 1_700_000_000, tmp_path)
     assert "not a capital_call or distribution with an amount" in caplog.text
     assert not [r for r in _ledger(migrated) if ":supplied:" in r[0]]
 
@@ -532,18 +538,18 @@ def test_each_fund_reads_only_its_own_documents(tmp_path, monkeypatch, caplog):
     texts = {"s1": _statement("217,500", "224,931"), "n1": _CALL_NOTICE,
              "t1": _statement("95,380", "101,742"), "d1": _DIST_NOTICE,
              "u1": _statement("70,113", "73,309")}
-    monkeypatch.setattr(load, "_pdf_text",
+    monkeypatch.setattr(fund_documents, "_pdf_text",
                         lambda pdf: texts[pdf.stem.removeprefix("doc_")])
-    conn = load.silver.open_db(tmp_path / "carta.db")
-    load.silver.apply_migrations(conn, MIGRATIONS_DIR)
+    conn = silver.open_db(tmp_path / "carta.db")
+    silver.apply_migrations(conn, MIGRATIONS_DIR)
 
     with caplog.at_level("WARNING"):
-        assert load.load_run(conn, _two_fund_run(tmp_path))
+        assert load_one(conn, _two_fund_run(tmp_path))
 
     assert [tuple(r) for r in conn.execute(
         "SELECT entity_external_id, net_asset_value, capital_contributed "
         "FROM fund_metrics WHERE snapshot_at = ? ORDER BY 1",
-        (load._date_ts("12/31/2098"),))] == [
+        (common._date_ts("12/31/2098"),))] == [
             (42, "224931", "217500.00"), (43, "101742", "95380.00")]
     assert [tuple(r) for r in _ledger(conn)] == [
         ("call:42:notice:n1", "capital_call", "06/15/2098", 61250.0),
@@ -554,6 +560,65 @@ def test_each_fund_reads_only_its_own_documents(tmp_path, monkeypatch, caplog):
     assert [m for m in caplog.messages if "belongs to no fund entity" in m] == [
         "document u1 (Capital account statements) belongs to no fund entity "
         "of this run; not read"]
+    conn.close()
+
+
+def test_each_document_is_extracted_once(tmp_path, monkeypatch):
+    # A statement feeds both its NAV row and the fund ledger, and a later
+    # run holds the same bytes again: pdftotext reads each document once,
+    # in the first load.
+    texts = {"s1": _statement("217,500", "224,931"), "n1": _CALL_NOTICE}
+    calls = []
+
+    def layout_text(pdf, timeout=None):
+        calls.append(Path(pdf).name)
+        return texts[Path(pdf).stem.removeprefix("doc_")]
+
+    monkeypatch.setattr(pdftotext, "layout_text", layout_text)
+    bronze, db = tmp_path / "bronze", tmp_path / "carta.db"
+    argv = ["--bronze-dir", str(bronze), "--silver-db", str(db)]
+    for name in ("20990201T000000Z", "20990301T000000Z"):
+        run = bronze / name
+        edir = run / "entities" / "fund_42"
+        edir.mkdir(parents=True)
+        (edir / "meta.json").write_text(json.dumps(
+            {"corporation_id": 42, "is_fund_investment": True}))
+        docs_dir(run, [
+            {"id": "s1", "document_type": "Capital account statements",
+             "document_date": "12/31/2098", "fund_id": "42"},
+            {"id": "n1", "document_type": "Capital calls", "fund_id": "42"}])
+        (run / "run.json").write_text(json.dumps(
+            {"status": "complete", "individual_id": "ind-1"}))
+        assert load.main(argv) == 0
+    assert calls == ["doc_s1.pdf", "doc_n1.pdf"]
+
+
+def test_a_statement_that_cannot_be_extracted_is_skipped(tmp_path,
+                                                         monkeypatch, caplog):
+    # Fund 42's statement gives neither a NAV row nor statement-differenced
+    # flows; fund 43 loads as before.
+    texts = {"n1": _CALL_NOTICE, "t1": _statement("95,380", "101,742"),
+             "d1": _DIST_NOTICE, "u1": _statement("70,113", "73,309")}
+
+    def layout_text(pdf, timeout=None):
+        doc = Path(pdf).stem.removeprefix("doc_")
+        if doc not in texts:
+            raise pdftotext.ExtractionError("pdftotext exited 1: damaged")
+        return texts[doc]
+
+    monkeypatch.setattr(pdftotext, "layout_text", layout_text)
+    conn = silver.open_db(tmp_path / "carta.db")
+    silver.apply_migrations(conn, MIGRATIONS_DIR)
+    with caplog.at_level("WARNING"):
+        assert load_one(conn, _two_fund_run(tmp_path))
+
+    assert [tuple(r) for r in conn.execute(
+        "SELECT entity_external_id FROM fund_metrics WHERE snapshot_at = ?",
+        (common._date_ts("12/31/2098"),))] == [(43,)]
+    assert not [r for r in _ledger(conn) if r[0] == "call:42:s1"]
+    assert ("call:43:t1", "capital_call", "12/31/2098", 95380.0) in [
+        tuple(r) for r in _ledger(conn)]
+    assert any("pdftotext failed on doc_s1.pdf" in m for m in caplog.messages)
     conn.close()
 
 
@@ -574,19 +639,19 @@ def test_a_file_that_is_not_a_pdf_reads_as_not_downloaded(tmp_path,
     index.write_text(json.dumps({"results": rows}))
     texts = {"t1": _statement("95,380", "101,742"), "d1": _DIST_NOTICE,
              "u1": _statement("70,113", "73,309")}
-    monkeypatch.setattr(load, "_pdf_text",
+    monkeypatch.setattr(fund_documents, "_pdf_text",
                         lambda pdf: texts[pdf.stem.removeprefix("doc_")])
-    conn = load.silver.open_db(tmp_path / "carta.db")
-    load.silver.apply_migrations(conn, MIGRATIONS_DIR)
+    conn = silver.open_db(tmp_path / "carta.db")
+    silver.apply_migrations(conn, MIGRATIONS_DIR)
 
     with caplog.at_level("INFO"):
-        assert load.load_run(conn, run)
+        assert load_one(conn, run)
 
     assert sorted(r[0] for r in conn.execute(
         "SELECT doc_id FROM documents")) == ["d1", "t1", "u1"]
     assert [tuple(r) for r in conn.execute(
         "SELECT entity_external_id FROM fund_metrics WHERE snapshot_at = ?",
-        (load._date_ts("12/31/2098"),))] == [(43,)]
+        (common._date_ts("12/31/2098"),))] == [(43,)]
     assert [tuple(r) for r in _ledger(conn)] == [
         ("call:43:t1", "capital_call", "12/31/2098", 95380.0),
         ("dist:43:notice:d1", "distribution", "01/15/2099", 1234.56),
@@ -599,9 +664,9 @@ def test_a_file_that_is_not_a_pdf_reads_as_not_downloaded(tmp_path,
 def test_document_pdf_is_the_file_only_when_it_is_a_pdf(tmp_path):
     (tmp_path / "doc_1.pdf").write_bytes(b"%PDF-1.7\n")
     (tmp_path / "doc_2.pdf").write_text('{"url": "https://cdn.example/2"}')
-    assert load._document_pdf(tmp_path, {"id": 1}) == tmp_path / "doc_1.pdf"
-    assert load._document_pdf(tmp_path, {"id": 2}) is None
-    assert load._document_pdf(tmp_path, {"id": 3}) is None
+    assert fund_documents._document_pdf(tmp_path, {"id": 1}) == tmp_path / "doc_1.pdf"
+    assert fund_documents._document_pdf(tmp_path, {"id": 2}) is None
+    assert fund_documents._document_pdf(tmp_path, {"id": 3}) is None
 
 
 def test_a_row_with_only_a_uuid_names_its_blob_by_the_uuid(migrated, tmp_path):
@@ -613,8 +678,58 @@ def test_a_row_with_only_a_uuid_names_its_blob_by_the_uuid(migrated, tmp_path):
            "document_type": "Annual and quarterly report"}
     (docs / "index.json").write_text(json.dumps({"results": [row]}))
     (docs / "doc_u-0001.pdf").write_bytes(b"%PDF-1.7 synthetic\n")
-    assert load._document_pdf(docs, row) == docs / "doc_u-0001.pdf"
-    assert load.load_documents(migrated, 0, "20990101T000000Z", docs) == 1
+    assert fund_documents._document_pdf(docs, row) == docs / "doc_u-0001.pdf"
+    assert fund_documents.load_documents(migrated, 0, "20990101T000000Z", docs) == 1
     assert migrated.execute(
         "SELECT doc_id, uuid, file_size, bronze_path FROM documents").fetchall() == [
             ("u-0001", "u-0001", 19, "20990101T000000Z/documents/doc_u-0001.pdf")]
+
+
+# ============================================================
+# flow_at: the flow date as unix seconds (migration 0007)
+# ============================================================
+
+# Each shape a flow date takes, and the near misses of each.
+_FLOW_DATES = [
+    "06/15/2098", "2099-06-30", "02/29/2096", "2096-02-29", "2000-02-29",
+    "0000-01-01", "9999-12-31", "12/31/1969", "01/01/1970",
+    "02/29/2098", "2100-02-29", "02/30/2098", "13/01/2098", "00/10/2098",
+    "2098-00-10", "2098-01-00", "2098-1-05", "6/15/2098", " 2098-01-05",
+    "2098-01-05 ", "2098/01/05", "06-15-2098", "2098-01-05T00:00:00",
+    "June 15, 2098", "", "٢٠٩٨-01-05", None]
+
+
+def test_flow_at_is_the_day_at_utc_midnight():
+    assert common._flow_at("06/15/2098") == common._date_ts("06/15/2098")
+    assert common._flow_at("2099-06-30") == common._date_ts("2099-06-30")
+    assert common._flow_at("01/01/1970") == 0
+    assert common._flow_at("0000-01-01") == -62167219200
+    for raw in ("02/30/2098", "2098-1-05", " 2098-01-05", "June 15, 2098", None):
+        assert common._flow_at(raw) is None, raw
+
+
+def test_migration_0007_backfills_flow_at_by_the_loaders_rule(tmp_path):
+    older = tmp_path / "migrations"
+    older.mkdir()
+    for f in MIGRATIONS_DIR.glob("000[1-6]_*.sql"):
+        shutil.copy(f, older)
+    c = sqlite3.connect(":memory:")
+    silver.apply_migrations(c, older)
+    c.executemany(
+        "INSERT INTO cash_flows (cash_flow_external_id, entity_external_id, "
+        "snapshot_at, kind, flow_date, payload) VALUES (?, 7, 0, 'exit', ?, '{}')",
+        [(f"cf{i}", raw) for i, raw in enumerate(_FLOW_DATES)])
+    c.commit()
+    silver.apply_migrations(c, MIGRATIONS_DIR)
+    got = dict(c.execute("SELECT flow_date, flow_at FROM cash_flows "
+                         "WHERE flow_date IS NOT NULL"))
+    assert got == {raw: common._flow_at(raw) for raw in _FLOW_DATES
+                   if raw is not None}
+    assert sum(v is not None for v in got.values()) == 9
+
+
+def test_the_loader_writes_flow_at(migrated):
+    common._insert_cash_flow(migrated, "exit:7", 7, 0, "exit", "2099-06-30",
+                           0.0, 10.0, 0.0, "acquisition / exit")
+    assert migrated.execute("SELECT flow_at FROM cash_flows").fetchone() == (
+        common._date_ts("2099-06-30"),)

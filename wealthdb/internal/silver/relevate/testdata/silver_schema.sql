@@ -63,5 +63,37 @@ CREATE TABLE transactions (
     price                   REAL,
     source                  TEXT    NOT NULL
         CHECK (source IN ('deposits_endpoint', 'credit_note_pdf', 'manual')),
-    payload                 TEXT    NOT NULL
+    payload                 TEXT    NOT NULL,
+    -- 0005: the dump that brought the row's PDF (dump_runs.snapshot_at);
+    -- NULL on a row written before 0005. Probed at open (schema.optional).
+    run_snapshot_at         INTEGER
+);
+
+-- 0002_historical_snapshots.sql: the quarterly reports' holdings and cash.
+CREATE TABLE historical_position_snapshots (
+    snapshot_at           INTEGER NOT NULL,
+    account_external_id   TEXT    NOT NULL,
+    isin                  TEXT    NOT NULL,
+    security_name         TEXT    NOT NULL,
+    asset_class           TEXT,
+    currency              TEXT    NOT NULL,
+    units                 REAL,
+    allocation_pct        REAL,
+    market_value          REAL    NOT NULL,
+    document_id           INTEGER,
+    source_sha256         TEXT    NOT NULL,
+    payload               TEXT    NOT NULL,
+    PRIMARY KEY (snapshot_at, account_external_id, isin)
+);
+
+CREATE TABLE historical_cash_balances (
+    snapshot_at           INTEGER NOT NULL,
+    account_external_id   TEXT    NOT NULL,
+    currency              TEXT    NOT NULL,
+    balance_kind          TEXT    NOT NULL,
+    amount                REAL    NOT NULL,
+    document_id           INTEGER,
+    source_sha256         TEXT    NOT NULL,
+    payload               TEXT    NOT NULL,
+    PRIMARY KEY (snapshot_at, account_external_id, currency, balance_kind)
 );

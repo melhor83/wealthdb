@@ -3,58 +3,11 @@ package main
 import (
 	"context"
 	"database/sql"
-	"flag"
-	"fmt"
-	"io"
 	"strings"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/config"
-	"github.com/smartpointer-com/wealthdb/wealthdb/internal/errs"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/gold"
-	"github.com/smartpointer-com/wealthdb/wealthdb/internal/output"
 )
-
-// statedRefusedFlags are the returns flags that have no meaning on the
-// stated view: the document fixes the periods, and the view computes no
-// return of its own. -x is refused beside them.
-var statedRefusedFlags = []string{"method", "period", "annualize", "netting", "inception", "benchmark"}
-
-// `wealthdb returns stated`: each period a document states for an account
-// (stated_periods) beside what the returns engine computes for that
-// account over the same months, in the stated currency. Its window and
-// output flags are the other views'. The return flags
-// (statedRefusedFlags) and -x do not apply, since the period and the
-// currency are the document's, and are refused by name.
-func runReturnsStated(ctx context.Context, g globalFlags, args []string, stdout, stderr io.Writer) error {
-	fs := flag.NewFlagSet("wealthdb returns stated", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	refused := refuseFlags(fs, "returns", "stated", statedRefusedFlags)
-	rf := registerReportFlags(fs, true)
-	fs.Usage = func() { fmt.Fprintln(stderr, returnsStatedUsage()) }
-	if err := parseFlags(fs, args, "returns"); err != nil {
-		return err
-	}
-	if err := refused(); err != nil {
-		return err
-	}
-	if isSet(fs, "x", "currency") {
-		return errs.Newf(errs.ExitUsage, "returns: stated takes no -x/--currency — "+
-			"every amount is in the currency the document states")
-	}
-	fromEpoch, toEpoch, err := parseReturnsWindow(fs.Args(), g.clock())
-	if err != nil {
-		fs.Usage()
-		return errs.Newf(errs.ExitUsage, "returns: %s", err.Error())
-	}
-	fmtChoice, cfg, _, err := rf.resolve(g, "returns")
-	if err != nil {
-		return err
-	}
-	req := request{view: "stated", from: fromEpoch, to: toEpoch}
-	rep := returnsStatedReport(req, cfg)
-	open := func() (*sql.DB, error) { return openGoldForRead(g, cfg) }
-	return writeReport(ctx, rep, rf.output(fmtChoice, "returns", returnsFamily, req, cfg, g.clock()), open, stdout)
-}
 
 // returnsStatedReport runs the reconciliation with the config's returns
 // settings, so its engine figures are the ones `returns accounts` prints.
@@ -63,7 +16,7 @@ func returnsStatedReport(req request, cfg *config.Config) *report {
 	nicknames := accountNicknames{}
 	fetch := func(ctx context.Context, db *sql.DB) ([]gold.StatedPeriodRow, error) {
 		return gold.ReconcileStatedPeriods(ctx, db, withReturnsCfg(cfg, gold.ReturnParams{
-			FromEpoch: req.from, ToEpoch: req.to, Annualize: "auto", Netting: true, Inception: "full",
+			FromEpoch: req.from, ToEpoch: req.to,
 		}))
 	}
 	return withLoads(newReport(buildStatedColumnRegistry(kindOf, nicknames), defaultStatedColumns, fetch),
@@ -88,22 +41,21 @@ func buildStatedColumnRegistry(kindOf func(string) string, nicknames accountNick
 		asDate(strCol("start_date", func(r gold.StatedPeriodRow) string { return formatEpochDay(r.StartDay) })),
 		asDate(strCol("end_date", func(r gold.StatedPeriodRow) string { return formatEpochDay(r.EndDay) })),
 		strCol("currency", func(r gold.StatedPeriodRow) string { return r.Currency }),
-		moneyCol("stated_beginning", "", func(r gold.StatedPeriodRow) *string { return r.StatedBeginning }),
-		moneyCol("stated_ending", "", func(r gold.StatedPeriodRow) *string { return r.StatedEnding }),
-		moneyCol("stated_accrual", "", func(r gold.StatedPeriodRow) *string { return r.StatedAccrual }),
-		moneyCol("stated_net_additions", "", func(r gold.StatedPeriodRow) *string { return r.StatedNetAdditions }),
-		moneyCol("stated_net_gain", "", func(r gold.StatedPeriodRow) *string { return r.StatedNetGain }),
-		moneyCol("stated_income", "", func(r gold.StatedPeriodRow) *string { return r.StatedIncome }),
-		moneyCol("stated_fees", "", func(r gold.StatedPeriodRow) *string { return r.StatedFees }),
-		moneyCol("start_value", "", func(r gold.StatedPeriodRow) *string { return r.StartValue }),
-		moneyCol("end_value", "", func(r gold.StatedPeriodRow) *string { return r.EndValue }),
-		moneyCol("net_flow", "", func(r gold.StatedPeriodRow) *string { return r.NetFlow }),
-		moneyCol("flow_gap", "", func(r gold.StatedPeriodRow) *string { return r.FlowGap }),
-		moneyCol("value_gap", "", func(r gold.StatedPeriodRow) *string { return r.ValueGap }),
+		moneyCol("stated_beginning", func(r gold.StatedPeriodRow) *string { return r.StatedBeginning }),
+		moneyCol("stated_ending", func(r gold.StatedPeriodRow) *string { return r.StatedEnding }),
+		moneyCol("stated_accrual", func(r gold.StatedPeriodRow) *string { return r.StatedAccrual }),
+		moneyCol("stated_net_additions", func(r gold.StatedPeriodRow) *string { return r.StatedNetAdditions }),
+		moneyCol("stated_net_gain", func(r gold.StatedPeriodRow) *string { return r.StatedNetGain }),
+		moneyCol("stated_income", func(r gold.StatedPeriodRow) *string { return r.StatedIncome }),
+		moneyCol("stated_fees", func(r gold.StatedPeriodRow) *string { return r.StatedFees }),
+		moneyCol("start_value", func(r gold.StatedPeriodRow) *string { return r.StartValue }),
+		moneyCol("end_value", func(r gold.StatedPeriodRow) *string { return r.EndValue }),
+		moneyCol("net_flow", func(r gold.StatedPeriodRow) *string { return r.NetFlow }),
+		moneyCol("flow_gap", func(r gold.StatedPeriodRow) *string { return r.FlowGap }),
+		moneyCol("value_gap", func(r gold.StatedPeriodRow) *string { return r.ValueGap }),
 		// The stating document's sha256 names no person, but it is the
 		// handle on a private file, so -p redacts it like an id.
-		{Name: "document", Align: output.AlignLeft, Privacy: PrivacyAccountID,
-			Extract: func(r gold.StatedPeriodRow) string { return r.SourceSHA256 }},
+		privateCol("document", PrivacyAccountID, func(r gold.StatedPeriodRow) string { return r.SourceSHA256 }),
 		qualityCol(func(r gold.StatedPeriodRow) string { return strings.Join(r.Quality, ";") }),
 	}
 }

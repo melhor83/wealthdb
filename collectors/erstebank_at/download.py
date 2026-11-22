@@ -253,11 +253,12 @@ def walk(api, bronze_dir: Path, *, since: date | None = None,
     dir, history narrowed to `[since, until]` (`--lookback`). --dry-run
     reads the rosters only and stamps the manifest 'dry-run'. `pump` waits
     `ms` milliseconds while keeping the browser's event loop running."""
-    run_dir = bronze.run_dir(bronze_dir, bronze.ts_slug())
+    run = bronze.open_run(bronze_dir, dry_run=dry_run, dry_policy="stamp",
+                          meta=build_manifest(
+                              bronze.IN_PROGRESS, accounts=[], cards=[],
+                              counts={}, since=since, until=until))
+    run_dir = run.dir
     (run_dir / "raw").mkdir(parents=True, exist_ok=True)
-    bronze.atomic_write_json(run_dir / "run.json", build_manifest(
-        "in-progress", accounts=[], cards=[], counts={}, since=since,
-        until=until))
 
     accounts = fetch_roster(api, run_dir)
     bronze.atomic_write_json(run_dir / "accounts.json", accounts)
@@ -309,8 +310,8 @@ def walk(api, bronze_dir: Path, *, since: date | None = None,
         if documents:
             download_documents(api, docs, counts, pump)
 
-    status_str = "dry-run" if dry_run else "complete"
-    bronze.atomic_write_json(run_dir / "run.json", build_manifest(
+    status_str = bronze.DRY_RUN if dry_run else bronze.COMPLETE_STATUS
+    run.finish(build_manifest(
         status_str, accounts=account_ids, cards=card_products, counts=counts,
         since=since, until=until))
     log.info("download %s: %s", status_str, counts)

@@ -22,9 +22,10 @@
 //     only while it holds something then.
 //
 //   - One INSTRUMENT + one POSITION per held asset, keyed on the position id.
-//     The bronze `kind` IS the canonical asset_class (identity classmap,
-//     classmap.go). Manual holdings have no ISIN/CUSIP/symbol, so the
-//     instrument is adapter-scoped.
+//     The bronze `kind` sets the exposure and silver's `vehicle` column
+//     the vehicle, with a kind-derived default (classmap.go). Manual
+//     holdings have no ISIN/CUSIP/symbol, so the instrument is
+//     adapter-scoped.
 //
 //   - POSITIONS are per-date forward-filled snapshots reconstructed from the
 //     valuations time series (snapshots.go): for every event date a COMPLETE
@@ -49,45 +50,70 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"path/filepath"
 
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/lots"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver"
 )
 
 const kindName = "manual"
 
+// init registers the kind (silver.Source).
+//
+// Lots: the cost basis of the holdings it is typed from is what the
+// source states, capital paid in, and no lot book describes it
+// (docs/LOTS.md §6). The engine builds none and realizes a sale against
+// the stated basis. Its account labels and holdings are named by hand:
+// the holder's own words.
 func init() {
-	silver.Register(&Adapter{})
+	lp := lots.StatedPolicy()
+	silver.Register(silver.Source{
+		Kind:    kindName,
+		Open:    (&Adapter{}).Open,
+		Returns: returnsPolicy(),
+		Lots:    &lp,
+		Labels:  silver.LabelTraits{TypedAccountLabels: true, TypedHoldings: true},
+	})
 }
 
 type Adapter struct{}
-
-func (*Adapter) Kind() string { return kindName }
 
 func (*Adapter) Open(ctx context.Context, spec silver.OpenSpec) (silver.Connection, error) {
 	db, err := silver.OpenReadOnlySQLite(spec.Path, "manual silver")
 	if err != nil {
 		return nil, err
 	}
-	costBasis, err := silver.HasTables(ctx, db, "cost_basis")
+	c := &Connection{db: db}
+	note, err := silver.ProbeOptional(ctx, db, filepath.Base(spec.Path), c.schema.optional()...)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("manual silver: %w", err)
 	}
-	exits, err := silver.HasTables(ctx, db, "exits")
-	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("manual silver: %w", err)
-	}
-	return &Connection{db: db, costBasis: costBasis, exits: exits}, nil
+	c.Note(note)
+	return c, nil
 }
 
-// Connection reads one manual silver. costBasis and exits say whether it
-// holds the paid-in series and the exits tables: a silver last loaded
-// before a table existed lacks it until the next load, and reads as a
-// book without that series.
+// Connection reads one manual silver.
 type Connection struct {
-	db               *sql.DB
+	db     *sql.DB
+	schema schema
+	silver.Advice
+}
+
+// schema is which optional parts of the silver schema a file holds,
+// probed once at open. costBasis and exits say whether it holds the
+// paid-in series and the exits tables: a silver last loaded before a
+// table existed lacks it until the next load, and reads as a book
+// without that series.
+type schema struct {
 	costBasis, exits bool
+}
+
+func (s *schema) optional() []silver.Optional {
+	return []silver.Optional{
+		{Table: "cost_basis", Version: 4, Has: &s.costBasis},
+		{Table: "exits", Version: 5, Has: &s.exits},
+	}
 }
 
 // eventDates is the SQL that lists every holding event date, as unix
@@ -98,7 +124,7 @@ func (c *Connection) eventDates() string {
     SELECT CAST(strftime('%s', acquired_at) AS INTEGER) AS t FROM positions
     UNION ALL SELECT CAST(strftime('%s', closed_at)  AS INTEGER) FROM positions WHERE closed_at IS NOT NULL
     UNION ALL SELECT CAST(strftime('%s', as_of_date) AS INTEGER) FROM valuations`
-	if c.costBasis {
+	if c.schema.costBasis {
 		q += `
     UNION ALL SELECT CAST(strftime('%s', as_of_date) AS INTEGER) FROM cost_basis`
 	}

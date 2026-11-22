@@ -71,8 +71,7 @@ a run within `max_age_days` asked for them. So a second `download` on
 the same day fetches nothing.
 
 A held fund also wants facts beyond its composition: its risk metrics,
-its characteristics, its money-market figures, the durations of its
-lines and its dividend calendar
+its characteristics, its money-market figures and its dividend calendar
 ([adapters/refdata.md §5](../../wealthdb/docs/adapters/refdata.md#5-the-wanted-list)).
 The providers that answer a fact are offered it in `providers` order,
 even where another provider serves the composition. The first that
@@ -93,12 +92,6 @@ states no figure, such as an accumulating equity fund's, still answers
 them for `max_age_days`. iShares checks no layout: its page answers them
 only where it states a figure. Each provider section says what its fund
 page is.
-
-The durations of a fund's lines come only with a composition that
-states them, such as an iShares bond fund's holdings file. No request
-asks for them alone. A run asks for them when it asks such a provider
-for the fund's composition. A composition an earlier run fetched from
-it counts for `max_age_days` after that run.
 
 The dividend calendar lists each distribution: its ex, record and pay
 days, its amount and its currency. Gold reads a payment's record day
@@ -159,9 +152,6 @@ The reason for one left is one of these:
 
 - `no enabled provider answers it`: no provider of the collector
   answers the fact.
-- `comes only with a composition from: NAMES`: only a composition from
-  these providers states the fact, and the run asks none of them for
-  the fund's composition.
 - `provider off: NAMES`: only providers that the run does not ask
   answer it.
 - `no provider claims it`: the providers that answer it do not know the
@@ -174,19 +164,22 @@ The reason for one left is one of these:
   asked about the fund. A timeout does this.
 
 A download logs the same counts, one line per fact. It closes with one
-`lost:` line per fund whose fact a failure cost this run. That is a
-failed fetch with no other answer, a failed claim or date list, or for
-`monthly_returns` any one date that failed:
+`lost:` line per fund, security or bulk request a failure cost a want
+this run. That is a failed fetch with no other answer, a failed claim
+or date list, or for `monthly_returns` any one date that failed:
 
 ```text
 lost: symbol:ACWI: this run failed on monthly_returns; rerun with --backfill --ref symbol:ACWI
 ```
 
-The rerun recovers the fund, and asks only the dates still missing. A
-line names `--backfill` only where the run had it. A `lost:` line does
-not change the exit code, so one timeout does not fail a nightly run. A
-provider can answer that it has nothing for a fund. That loses nothing,
-and no line names the fund.
+The line names the ref a rerun asks for: the fund, the security, or the
+bulk request that failed. A fund is named by the facts it lost. Its
+composition is named only where it lost nothing else, as the rerun asks
+for it too. The rerun recovers the want, and asks only the dates still
+missing. A line names `--backfill` only where the run had it. A `lost:`
+line does not change the exit code, so one timeout does not fail a
+nightly run. A provider can answer that it has nothing for a fund. That
+loses nothing, and no line names the fund.
 
 ## Settings
 
@@ -345,11 +338,13 @@ US registered funds and ETFs, from their N-PORT filings on SEC EDGAR.
 
 A filing states each share class's total return for the three months
 that end at its report date. The collector keeps the class the fund's
-ticker maps to, in `fund_returns`. Another class has other fees, so it
-is another fund. `sec-nport` is asked for these figures for a fund whose
+ticker maps to, in `fund_returns`
+([refdata.md §2](../../wealthdb/docs/adapters/refdata.md#2-coverage-matrix)).
+Another class has other fees, so it is another fund. `sec-nport` is
+asked for these figures for a fund whose
 wanted-list entry wants `monthly_returns`: a fund a benchmark names.
-`--backfill` reads them for every filing from the entry's `history_from`
-on, whatever days the fund was held. A composition fetched earlier does
+`--backfill` reads them for every filing from the start of the
+monthly_returns want on, whatever days the fund was held. A composition fetched earlier does
 not count as having them, so no `load --force` is needed:
 
 ```sh
@@ -433,10 +428,10 @@ fiscal year, so the P/E is not read. The figures of the fund's index are
 not read either. A UCITS page writes decimal commas. The page names its
 own number format, and its figures are read through it.
 
-For a fund that wants characteristics, a fetch makes one more request,
-for this page. Each figure carries the day its table states, else the
-day of the holdings file. A page without a table of the fund's figures
-is no fund page.
+For a request that asks for characteristics, a fetch makes one more
+request, for this page. Each figure carries the day its table states,
+else the day of the holdings file. A page without a table of the fund's
+figures is no fund page.
 
 The dividend calendar comes from one workbook per region. Each lists
 every distribution of the region's funds:
@@ -574,7 +569,7 @@ The fund page states figures for the fund as a whole:
 The weighted average maturity is kept in years. A page that states it
 in days is converted at 365.25 days a year.
 
-For a fund that wants characteristics, a US fetch makes one more
+For a request that asks for characteristics, a US fetch makes one more
 request, for this page. It keeps the fund's entry in the product list,
 which fills a figure the page lacks. A Swiss fetch keeps the page it
 already reads. Each figure carries the day the page or the entry states
@@ -623,7 +618,7 @@ and average coupon. It states no figure of an equity fund's own: the
 P/E and the dividend yield it shows are its index's. It shows no
 credit-quality or maturity breakdown.
 
-The page is a script app. For a fund that wants characteristics, a
+The page is a script app. For a request that asks for characteristics, a
 fetch makes one more request, for the data the page reads. Each figure
 carries the day the page states, else the day of the fetch. Data
 without the fund's key facts is no fund page's.
@@ -675,15 +670,15 @@ The forward P/E is a forecast, so it is not read. A UCITS fund's
 answers name a breakdown's parts by a key, such as `aA` or
 `5to10Years`. They are kept as named.
 
-For a fund that wants characteristics, a fetch makes two more requests:
-the fund's characteristics and its yields. For a bond fund it makes two
-more, for the breakdowns. A view of the fund page makes more requests
+For a request that asks for characteristics, a fetch makes two more
+requests: the fund's characteristics and its yields. For a bond fund it
+makes two more, for the breakdowns. A view of the fund page makes more requests
 than these. Each figure carries the day its answer states, else the day
 of the holdings. Answers of which none is an object are no fund page's.
 The answers name no asset class: a fund whose characteristics state a
 bond figure reads no P/E.
 
-For a fund that wants its dividend calendar, a fetch makes one more
+For a request that asks for its dividend calendar, a fetch makes one more
 request, for the fund's distributions:
 
 - A US fund's answer lists every distribution with its ex, record and
@@ -723,7 +718,8 @@ Swiss site.
   fund in `exposure.proxies`.
 
 For a fund that wants its dividend calendar, the same POST asks for
-the fund's dividend history too. So the calendar costs no request more.
+the fund's dividend history too, whatever its request asks for. So the
+calendar costs no request more.
 
 - The history states each dividend's amount and currency by one date,
   the ex day. It states no record or pay day. Gold derives the record
@@ -1071,7 +1067,9 @@ Exchange Group's daily ex-rights list.
 - The list states no pay day and no amount.
 - A file leaves the page after five business days, and the list covers
   coming days only. A run at least once a week misses no file.
-- Gold joins a row to a share by the share's TSE code.
+- Gold joins a row to a share by the share's TSE code. A
+  five-character code whose last character is 0, the check digit a list
+  may add, reads as its first four.
 - The client asks JPX at most once every five seconds.
 
 **Terms.** JPX's terms of use state: "The collection of data or

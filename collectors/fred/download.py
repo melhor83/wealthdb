@@ -28,7 +28,7 @@ from the starting point it names to today. The default is ~90 days and
 clamps the window to each series' own start.
 
 Usage:
-    download.py --bronze-dir <dir> [--api-key KEY] [--series ID,...]
+    download.py --bronze-dir <dir> [--series ID,...]
                 [--lookback PRESET|YYYY-MM-DD] [--dry-run]
 """
 
@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import urllib.error
 import urllib.parse
@@ -142,11 +143,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
              "resolved (also honours the FRED_ENV_FILE env var). The wrapper "
              "already sources <secrets-dir>/fred.env, so this is for running "
              "download.py directly.",
-    )
-    p.add_argument(
-        "--api-key", default=None,
-        help="FRED API key. Falls back to the FRED_API_KEY environment "
-             "variable (sourced from <secrets>/fred.env by the wrapper).",
     )
     p.add_argument(
         "--base-url", type=_endpoint, default=DEFAULT_BASE_URL,
@@ -255,9 +251,13 @@ def main(argv: list[str] | None = None) -> int:
 
     # A direct `download.py` run needs no wrapper: the named file is
     # sourced through bash, as the wrapper sources it, and its values win.
-    envfile.source_named_env_file(args.env_file, "FRED_ENV_FILE")
-    api_key = envfile.resolve_credential(args.api_key, "FRED_API_KEY",
-                                         "--api-key")
+    envfile.load(args.env_file, env_var="FRED_ENV_FILE", logger=log)
+    # The key comes from the environment alone: on the command line it
+    # would show in `ps` and the shell history.
+    api_key = os.environ.get("FRED_API_KEY")
+    if not api_key:
+        raise SystemExit("Missing credential: set FRED_API_KEY in the env "
+                         "file.")
     if args.check:
         return _check_credential(args.base_url, api_key)
     if args.bronze_dir is None:
@@ -282,7 +282,6 @@ def main(argv: list[str] | None = None) -> int:
 
     args.bronze_dir.mkdir(parents=True, exist_ok=True)
     slug = bronze.ts_slug()
-    run = None if args.dry_run else bronze.run_dir(args.bronze_dir, slug)
     manifest = {
         "slug": slug,
         "since": since.isoformat(),
@@ -291,20 +290,18 @@ def main(argv: list[str] | None = None) -> int:
         "series": {},
     }
 
-    # Drop an "in-progress" manifest up front — this lazily creates the run
-    # dir and makes the run's state legible before the fetch loop starts.
-    # A walk that crashes mid-fetch thus leaves status="in-progress": load
+    # The "in-progress" manifest goes down before the fetch loop starts,
+    # and makes the run dir; a dry run makes none and writes nothing. A
+    # walk that crashes mid-fetch thus leaves status="in-progress": load
     # skips such a dump rather than ingesting its partial series, and prune
-    # reclaims it as a non-complete dump once quiescent. The terminal write
-    # below atomically overwrites this marker with status="complete".
-    if run is not None:
-        manifest["status"] = "in-progress"
-        bronze.atomic_write_json(run / "run.json", manifest)
+    # reclaims it as a non-complete dump once quiescent.
+    run = bronze.open_run(args.bronze_dir, slug, dry_run=args.dry_run,
+                          meta=manifest)
 
     # One trace for the whole fetch loop. A dry-run creates no run dir, so
     # there is nowhere for a capture to land: HttpTrace(None) makes that an
     # explicit no-op instead of a write against a directory that isn't there.
-    trace = debugcap.HttpTrace(run, log=log, enabled=args.debug)
+    trace = debugcap.HttpTrace(run.dir, log=log, enabled=args.debug)
 
     total = failures = 0
     for sid in series_ids:
@@ -325,8 +322,7 @@ def main(argv: list[str] | None = None) -> int:
         manifest["series"][sid] = {**SERIES[sid], "rows": n}
         log.info("series %s (%s): %d dated observations", sid,
                  _describe(sid), n)
-        if not args.dry_run:
-            bronze.atomic_write_json(run / f"{sid}.json", doc)
+        run.write_json(f"{sid}.json", doc)
 
     # A run with zero usable series is a failure worth a non-zero exit, a
     # dry run included.
@@ -336,10 +332,9 @@ def main(argv: list[str] | None = None) -> int:
                  "(nothing written)", total, len(manifest["series"]), failures)
         return rc
 
-    manifest["status"] = "complete"
-    bronze.atomic_write_json(run / "run.json", manifest)
+    run.finish(manifest)
     log.info("wrote %d series (%d observations, %d failures) to %s",
-             len(manifest["series"]), total, failures, run)
+             len(manifest["series"]), total, failures, run.dir)
     return rc
 
 

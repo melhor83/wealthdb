@@ -139,7 +139,7 @@ verdict.`)
 		if dumpFlag != "" {
 			return errs.Newf(errs.ExitUsage, "categorizations: %s applies to the dump, not to --forget", dumpFlag)
 		}
-		cfg, err := config.Load(g.ConfigPath)
+		cfg, err := g.loadConfig()
 		if err != nil {
 			return err
 		}
@@ -153,7 +153,7 @@ verdict.`)
 	if err != nil {
 		return errs.Newf(errs.ExitUsage, "categorizations: %s", err.Error())
 	}
-	cfg, err := config.Load(g.ConfigPath)
+	cfg, err := g.loadConfig()
 	if err != nil {
 		return err
 	}
@@ -247,19 +247,13 @@ type categorizationRow struct {
 // vocabulary — the category, the version, the date and the model.
 func categorizationColumns() []columnSpec[categorizationRow] {
 	return []columnSpec[categorizationRow]{
-		{Name: "family", Align: output.AlignLeft,
-			Extract: func(r categorizationRow) string { return r.Family }},
-		{Name: "signature", Align: output.AlignLeft, Privacy: PrivacyFreeText,
-			Extract: func(r categorizationRow) string { return r.Signature }},
-		{Name: "name", Align: output.AlignLeft, Privacy: PrivacyFreeText,
-			Extract: func(r categorizationRow) string { return r.Name }},
-		{Name: "detailed", Align: output.AlignLeft,
-			Extract: func(r categorizationRow) string { return r.Detailed }},
+		strCol("family", func(r categorizationRow) string { return r.Family }),
+		privateCol("signature", PrivacyFreeText, func(r categorizationRow) string { return r.Signature }),
+		privateCol("name", PrivacyFreeText, func(r categorizationRow) string { return r.Name }),
+		strCol("detailed", func(r categorizationRow) string { return r.Detailed }),
 		countCol("signature_version", func(r categorizationRow) int64 { return int64(r.Version) }),
-		{Name: "assigned_at", Align: output.AlignLeft, Date: true,
-			Extract: func(r categorizationRow) string { return formatDate(r.AssignedAt) }},
-		{Name: "model_name", Align: output.AlignLeft,
-			Extract: func(r categorizationRow) string { return r.ModelName }},
+		asDate(strCol("assigned_at", func(r categorizationRow) string { return formatDate(r.AssignedAt) })),
+		strCol("model_name", func(r categorizationRow) string { return r.ModelName }),
 	}
 }
 

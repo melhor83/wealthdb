@@ -46,7 +46,7 @@ func TestIncomePositionsAndTheCalendarAgree(t *testing.T) {
 			kinds = append(kinds, "('brk', '"+id+"', 'sig-exin', 1, 'INCOME_DIVIDENDS', 'rule', 100)")
 		}
 	}
-	rate := `'{"CdtIntrstRate1": "1.5", "CdtLmtAmt1": "0", "CalIntrstBasisDesc": "act/360", "EndOfDurtn": "9999-12-31"}'`
+	rate := `'{"interest_rate": "1.5", "interest_day_count": "ACT/360"}'`
 	for _, q := range []string{
 		`INSERT INTO silver_sources (silver_source_id, silver_kind, silver_path, high_watermark, first_loaded_at, last_loaded_at)
 		 VALUES ('brk', 'synthetic', '/tmp/brk.db', -1, 0, 0)`,
@@ -87,7 +87,7 @@ func TestIncomePositionsAndTheCalendarAgree(t *testing.T) {
 		req := request{view: v, currency: "USD", from: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).Unix(),
 			to: time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC).Unix() - 1, asOf: time.Date(2026, 11, 20, 23, 59, 59, 0,
 				time.UTC).Unix(), period: "annual", assumptions: yield.DefaultAssumptions}
-		rep := incomeForwardReport(req)
+		rep := incomeFamily.build(nil, req)
 		rows, err := rep.fetch(ctx, db)
 		if err != nil {
 			t.Fatalf("%s: %v", v, err)

@@ -2,7 +2,6 @@ package ubs
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -30,8 +29,8 @@ import (
 // stated amount in the stated currency, on the same value day. Only
 // where nothing else records it: the feed does not speak for the
 // account on that day (psnCashCoverage), and the export did not emit
-// the booking either (the web pass withholds a mirror whose booking it
-// already carries — see buildSameDayOffsetVeto).
+// the booking either (the reconcile table withholds a mirror whose
+// booking the export already carries).
 //
 // What it closes is the hole the header of portfolio_txn.go names: an
 // account the bank sends no MT940 for had its conversions on no rail at
@@ -51,7 +50,7 @@ import (
 //
 // A statement copy of the mirrored leg, reconstructed from a later
 // annual statement, folds onto the mirror like any statement copy of a
-// feed row (buildEraFold): the derived row keeps the booking and takes
+// feed row (reconcile.go): the derived row keeps the booking and takes
 // the statement's narrative.
 
 // conversionMirror is one such counter-leg: the feed row it was read
@@ -109,64 +108,6 @@ func normalizeHolderName(s string) string {
 	return strings.ToUpper(strings.Join(strings.Fields(s), " "))
 }
 
-// holderNames reads the names the relationship is held under, as the
-// master-data feed states them. A conversion between own accounts names
-// the holder on both sides; a payment abroad in a foreign currency,
-// which carries the same subfield, names someone else.
-func (r *psnReader) holderNames(ctx context.Context) (map[string]bool, error) {
-	out := map[string]bool{}
-	if r == nil || r.db == nil {
-		return out, nil
-	}
-	rows, err := r.db.QueryContext(ctx, `
-SELECT DISTINCT json_extract(payload, '$.FrstSurNm') FROM account_holders`)
-	if err != nil {
-		return nil, fmt.Errorf("ubs holderNames: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var name sql.NullString
-		if err := rows.Scan(&name); err != nil {
-			return nil, fmt.Errorf("ubs holderNames scan: %w", err)
-		}
-		if n := normalizeHolderName(name.String); n != "" {
-			out[n] = true
-		}
-	}
-	return out, rows.Err()
-}
-
-// portfolioOfCashAccount maps each cash account onto the portfolio it
-// belongs to, from the account master data's latest snapshot — the
-// other half of portfolioCashKey for a row the feed booked on a cash
-// account.
-func (r *psnReader) portfolioOfCashAccount(ctx context.Context) (map[string]string, error) {
-	out := map[string]string{}
-	if r == nil || r.db == nil {
-		return out, nil
-	}
-	rows, err := r.db.QueryContext(ctx, `
-SELECT account_external_id,
-       COALESCE(portfolio_external_id, json_extract(payload, '$.PrtflId'))
-  FROM cash_accounts
- WHERE snapshot_at = (SELECT MAX(snapshot_at) FROM cash_accounts)`)
-	if err != nil {
-		return nil, fmt.Errorf("ubs portfolioOfCashAccount: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var account string
-		var portfolio sql.NullString
-		if err := rows.Scan(&account, &portfolio); err != nil {
-			return nil, fmt.Errorf("ubs portfolioOfCashAccount scan: %w", err)
-		}
-		if portfolio.String != "" {
-			out[account] = portfolio.String
-		}
-	}
-	return out, rows.Err()
-}
-
 // mirrorPayload is what a mirror's payload states: the feed row it was
 // read from, and the other leg — which is the feed row's own account,
 // currency and figure — under the keys every consumer of a counter
@@ -182,28 +123,24 @@ type mirrorPayload struct {
 
 // conversionMirrors is readConversionMirrors over the feed's own
 // coverage. The first call reads them and later calls return the same
-// set: the era fold, the offset veto and the PSN stream all ask.
+// set: the reconcile table, the offset veto and the PSN stream all ask.
 func (r *psnReader) conversionMirrors(ctx context.Context) (*conversionMirrors, error) {
 	if r == nil || r.db == nil {
 		return r.readConversionMirrors(ctx, nil)
 	}
-	if r.mirrors != nil {
-		return r.mirrors, nil
-	}
-	coverage, err := r.cashCoverage(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if r.mirrors, err = r.readConversionMirrors(ctx, coverage); err != nil {
-		return nil, err
-	}
-	return r.mirrors, nil
+	return r.mirrors.Get(func() (*conversionMirrors, error) {
+		coverage, err := r.cashCoverage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return r.readConversionMirrors(ctx, coverage)
+	})
 }
 
 // readConversionMirrors reads every conversion the feed describes whose
 // other account it does not speak for, and builds the missing leg.
 //
-// The whole silver, unwindowed, for buildEraFold's reason: which
+// The whole silver, unwindowed, for the reconcile table's reason: which
 // bookings exist depends on silver's contents alone, never on which
 // slice of time a load covers. The emitting loop selects by the feed
 // row's own date.
@@ -215,24 +152,18 @@ func (r *psnReader) readConversionMirrors(ctx context.Context, coverage psnCashC
 	if r == nil || r.db == nil {
 		return out, nil
 	}
-	holders, err := r.holderNames(ctx)
+	roster, err := r.roster(ctx)
 	if err != nil {
 		return nil, err
 	}
+	holders := roster.holderNames()
 	if len(holders) == 0 {
 		return out, nil
 	}
-	portfolioOf, err := r.portfolioOfCashAccount(ctx)
-	if err != nil {
-		return nil, err
-	}
-	cashOf, err := r.portfolioCashAccounts(ctx)
-	if err != nil {
-		return nil, err
-	}
-	err = r.eachCashMovement(ctx, "ubs-psn conversionMirrors", func(row psnCashRow) error {
-		var p cashMovementPayload
-		if err := json.Unmarshal([]byte(row.payload), &p); err != nil || p.Amount == nil {
+	portfolioOf, cashOf := roster.portfolioOfCashAccount(), roster.portfolioCashAccounts()
+	err = r.eachCashMovement(ctx, func(row *feedRow) error {
+		p := row.pl
+		if !row.decoded || p.Amount == nil {
 			return nil
 		}
 		// A reversal is marked RC / RD; its sign is not the movement's,
@@ -247,10 +178,7 @@ func (r *psnReader) readConversionMirrors(ctx context.Context, coverage psnCashC
 		if !holders[normalizeHolderName(narrativeBeneficiary(p.Narrative))] {
 			return nil
 		}
-		source := row.account
-		if p.Account != "" {
-			source = p.Account
-		}
+		source := row.bookedAccount()
 		target := cashOf[portfolioCashKey{portfolio: portfolioOf[source], currency: bookingCurrency(currency)}]
 		if target == "" || target == source || coverage.speaksFor(target, row.at) {
 			return nil

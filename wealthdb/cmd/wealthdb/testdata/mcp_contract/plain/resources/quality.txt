@@ -2,17 +2,19 @@ The returns quality column gives the reason for every n/a and tags every approxi
 - since_data_inception: the return runs from the entity's first snapshot, not from when the account opened.
 - configured_inception: the window starts at an inception date set in the config.
 - staggered_inception: the entity's parts began on different dates.
-- accounts_grain_meaningless: a return for this one account is noise (a single crypto wallet, say); read a coarser view.
+- accounts_grain_meaningless: this source's accounts are set to show values without returns (config returns_policy_overrides); read a coarser view.
 - empty_bucket, carried_forward: no snapshot fell in the bucket; the value is carried from before it.
 - boundary_same_snapshot: the bucket starts and ends on the same snapshot.
 - stale_snapshot: the end value rests on a snapshot much older than the entity's usual gap; the feed may have stopped.
 - dietz_degenerate: the bucket's approximation has no defined value.
+- loss_beyond_total: twr is n/a: a period lost more than everything while the value stayed at zero or above, so its flows and values disagree, or the period is too coarse.
 - post_exit_residue: money left nearly all of the entity; twr leaves out the periods on what remained, while gain and mwr still count its income.
 - nonpositive_base: a loan or a net-negative entity; a return means nothing.
 - mwr_no_flows: no money moved in or out, so there is no money-weighted return; read twr.
 - mwr_no_sign_change, mwr_nonunique, mwr_no_converge: the money-weighted return has no single answer.
 - mwr_negative_net_capital: the money put in, net, is zero or less.
 - unmatched_transfers=N: N transfers found no matching leg on another account.
+- cross_source_netted=N: N transfer pairs the load stored netted out inside the entity, across sources or inside one source.
 - nav_only, nav_only_capital_call_risk: a source that reports values only (private funds); the return is rough.
 - pre_fx_history: part of the window lies before the exchange-rate history begins.
 - flows_before_inception: money moved before the date the measurement starts; it counts in no window.
@@ -28,6 +30,16 @@ The returns quality column gives the reason for every n/a and tags every approxi
 - debt_unpriced: (view=bridge) a debt has no rate to the currency; its fall is left to gain.
 - bridge_gap: (view=bridge) net worth less returns' value is not the mortgages and cards; gain holds the difference.
 - tracking_netted: (view=bridge) net_flow and onboarded had opposite signs, so the smaller size reads as a move into or out of tracking, in neither column.
+- no_mark: (view=private) the holding never had a value but 0 and nothing came back, so nav, tvpi and irr_pct are blank.
+- no_cost: (view=private) no call and no stated cost, so paid_in, dpi, tvpi and irr_pct are blank.
+- paid_in_from_cost: (view=private) paid_in is the holding's stated cost on its acquisition day, not a cash leg.
+- exited: (view=private) the status is exited: nav is 0 after something came back, or the holding left the holdings.
+- at_cost: (view=private) the source carries the NAV at cost, before any valuation: with nothing back, tvpi reads 1 and irr_pct 0.
+- call_after_mark, distribution_after_mark: (view=private) a call, or a distribution or exit, came after the mark, so tvpi reads low, or high.
+- exit_unvalued=N: (view=private) N exits in kind state no value.
+- unattributed_exit=N: (view=private, the total) N exits in kind name no holding: the total counts them, no row does.
+- unmatched_commitment=N: (view=private, the total) N stated commitments of a private holding that no row takes: the total leaves them out.
+- unpriced=N: (view=private) N legs, lines or commitments have no rate to the currency: the sums leave them out, and an unpriced leg blanks irr_pct.
 Other tags name their reason the same way.
 
 On spending view=fees, quality says what a row misses, beside the return's tags:
@@ -119,3 +131,7 @@ On cashflow's projection, quality lists what a row rests on:
 - trailing: the other parts are monthly averages of the look-back.
 - terms: a mortgage's instalments end at its terms' maturity.
 - thin: the look-back holds under 6 months.
+
+On spending view=categories with vs_last_year, quality says what the comparison misses:
+- no_year_before: gold's lines start after the year before does.
+- in_progress: the bucket's part of the window has not ended.

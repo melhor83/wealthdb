@@ -2,12 +2,13 @@ package schwab
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
-	"fmt"
 	"strconv"
 	"time"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver"
 )
 
 // apiMaturity is a bond's maturity as the API stamps it, nil where it
@@ -63,32 +64,30 @@ type heldBond struct {
 }
 
 // readHeldBonds reads, per account, every bond its positions name at any
-// snapshot, the newest payload of each: a bond's last coupon comes with
+// snapshot, the newest row of each: a bond's last coupon comes with
 // its maturity, when it has left the positions. The maturity and the
 // coupon are the API's, else its description's.
 func (c *apiReader) readHeldBonds(ctx context.Context) (map[string][]heldBond, error) {
-	rows, err := c.db.QueryContext(ctx, `SELECT account_external_id, payload FROM positions
-	    ORDER BY snapshot_at DESC, account_external_id, instrument_key`)
-	if err != nil {
-		return nil, fmt.Errorf("schwab held bonds: %w", err)
-	}
-	defer rows.Close()
 	out := map[string][]heldBond{}
 	seen := map[[2]string]bool{}
-	for rows.Next() {
-		var acct, payload string
-		if err := rows.Scan(&acct, &payload); err != nil {
-			return nil, err
+	holding, err := c.holdingRead(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := silver.ScanRows(ctx, c.db, "schwab held bonds", `SELECT account_external_id, `+holding.selectList()+` FROM positions
+	    ORDER BY snapshot_at DESC, account_external_id, instrument_key`, func(rows *sql.Rows) error {
+		var acct string
+		h := holding.scan()
+		if err := rows.Scan(append([]any{&acct}, h.dest()...)...); err != nil {
+			return err
 		}
-		var p struct {
-			Instrument schwabInstrument `json:"instrument"`
-		}
-		if json.Unmarshal([]byte(payload), &p) != nil || isCashAssetType(p.Instrument.AssetType) {
-			continue
+		p, err := h.holding()
+		if err != nil || isCashAssetType(p.Instrument.AssetType) {
+			return nil
 		}
 		key := preferredInstrumentKey(p.Instrument)
 		if key == "" || seen[[2]string{acct, key}] {
-			continue
+			return nil
 		}
 		seen[[2]string{acct, key}] = true
 		terms := canonical.ReadBondTerms(p.Instrument.Description)
@@ -102,8 +101,11 @@ func (c *apiReader) readHeldBonds(ctx context.Context) (map[string][]heldBond, e
 		if coupon != nil && maturity != nil {
 			out[acct] = append(out[acct], heldBond{key: key, coupon: coupon, maturity: maturity})
 		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // bondPaying is the key of the one bond of bonds whose coupon an interest

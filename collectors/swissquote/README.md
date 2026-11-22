@@ -85,7 +85,7 @@ confirmations, statements, fee notes).
 ./swissquote download                    # last ~90 days (the fleet default)
 ./swissquote download --lookback 2y      # wider backfill
 ./swissquote load                        # parse new dumps into silver
-./swissquote load --force                # delete silver, rebuild from all bronze
+./swissquote load --force                # rebuild silver from all bronze; swapped in once complete
 ./swissquote prune --dry-run             # preview the bronze disk reclaim
 ```
 
@@ -109,8 +109,7 @@ with echo off. Each script's `--help` lists every flag.
 - **Skipped push.** Swissquote sometimes skips the push for a recently
   seen device fingerprint. `login` then completes at once.
 - **Session state.** The browser context (cookies and localStorage) goes
-  to `~/.secrets/swissquote-state.json`, chmod `0600`. A state file named
-  `swissquote_state.json` is read when the canonical one is absent.
+  to `~/.secrets/swissquote-state.json`, chmod `0600`.
 - **Lifetime.** Swissquote sets the session lifetime by policy. Expect a
   new sign-in at least once per working session. `download` has no
   refresh logic. When F5 bounces it to `/my.policy`, it exits and asks
@@ -179,7 +178,7 @@ there on each run.
 
 ## Silver
 
-The schema is `migrations/0001` to `0007`. Each dump loads in one
+The schema is `migrations/0001` to `0009`. Each dump loads in one
 transaction, and already-loaded dumps are skipped.
 
 - **Snapshots** (`accounts`, `positions`, `currency_balances`) are
@@ -196,18 +195,28 @@ transaction, and already-loaded dumps are skipped.
     Those PDFs are the year-end statements, and they give silver its
     historical snapshots. Re-parsing one replaces its rows. Cash lines in
     them are skipped; cash belongs in `currency_balances`.
+    `pp_parser.py` reads them. `document_derivations` records each PDF
+    parsed and the parser generation that parsed it: the fingerprint of
+    `pp_parser.py`, pypdf and the Python version. A load parses only new
+    PDFs. A change to any of them parses them all again.
 - **Transactions** load per account and CSV as a span replace. The span
   runs from the CSV's first row to its last, not over the requested
   window, because an export can hold fewer days than requested. A reload
   converges on Swissquote's current data.
+  `run_snapshot_at` names the dump that wrote each row, so gold's change
+  window reaches a restated row whatever its date. It is NULL on a row
+  written before migration 0009.
 - **Documents** are indexed in `documents` by content sha256 and
-  Swissquote's document id. The PDF stays on disk. The `payload` keeps
+  Swissquote's document id. A later copy of an indexed id with other
+  bytes is skipped with a warning; the first copy stays. The PDF stays
+  on disk. The `payload` keeps
   the file name, document type, contract number, date and target user
   from the download URL. Only Portfolio Performance PDFs are parsed;
   Account Statement PDFs are cash ledgers and are indexed only.
   `account_overview.pdf` changes every run and is not indexed.
 - **`manual/` files** are indexed with `source = 'manual'` when their
-  sha256 is new.
+  sha256 is new, first seen at the file's modification time. A dump PDF
+  with the same bytes takes over the row as an `auto` document.
 
 Every position and transaction carries its own `currency`. Transaction
 times are Europe/Zurich wall-clock in the CSV and stored as UTC epoch;

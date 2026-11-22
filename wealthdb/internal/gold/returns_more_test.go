@@ -70,16 +70,16 @@ func params(level string, from, to int64) ReturnParams {
 		Method: "both", Period: "total", Annualize: "auto", Netting: true, Inception: "full"}
 }
 
-// TestNetTransfers covers the heuristic internal-transfer matching directly
-// against netOwnedTransfers (the ownership-free case: untagged ownedFlow inputs).
-func TestNetTransfers(t *testing.T) {
+// TestNetMatch covers the heuristic internal-transfer matching directly
+// against netMatch (the ownership-free case: legs with no account).
+func TestNetMatch(t *testing.T) {
 	t.Parallel()
 	net := func(fs ...returns.Flow) (int, int) {
-		owned := make([]ownedFlow, len(fs))
+		legs := make([]flowLeg, len(fs))
 		for i, f := range fs {
-			owned[i] = ownedFlow{Flow: f}
+			legs[i] = flowLeg{Flow: f}
 		}
-		kept, unmatched := netOwnedTransfers(owned, newMovedLegs())
+		kept, unmatched := netMatch(legs, func(flowLeg, flowLeg) {}, nil)
 		return len(kept), unmatched
 	}
 	// Opposite pair, same magnitude, within ±3 days ⇒ netted (internal move).
@@ -160,7 +160,7 @@ func TestRunReturnsPortfolioNameResolved(t *testing.T) {
 
 // TestRunReturnsStaggeredOnboarding covers the aggregate path: synthetic
 // onboarding (the late constituent's full debut value, with its own debut-region
-// deposit subsumed — see flowSubsumed) and the staggered_inception flag.
+// deposit subsumed — see fateOf) and the staggered_inception flag.
 func TestRunReturnsStaggeredOnboarding(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)
@@ -235,22 +235,18 @@ func TestRunReturnsMWRFlags(t *testing.T) {
 	}
 }
 
-// TestRunReturnsRegimeFlags covers journal_present and
-// crypto_unclassified_transfers. (unknown_adapter_policy is unreachable through
-// the real pipeline — the silver_sources.silver_kind CHECK constraint admits
-// only known adapter kinds — so the policy default is unit-tested at the
-// ReturnsPolicyFor level instead; see RETURNS-NOTES.)
+// TestRunReturnsRegimeFlags covers journal_present. (unknown_adapter_policy
+// is unreachable through the real pipeline — the silver_sources.silver_kind
+// CHECK constraint admits only known adapter kinds — so the policy default is
+// unit-tested at the ReturnsPolicyFor level instead; see RETURNS-NOTES.)
 func TestRunReturnsRegimeFlags(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)
 	seedReturnsSource(t, db, ctx, "fid", "fidelity")
-	seedReturnsSource(t, db, ctx, "ct", "cointracking")
 	t0, tMid, t1 := dy(2024, time.January, 2), dy(2024, time.April, 1), dy(2024, time.July, 2)
 
 	seedAcct(t, db, ctx, "fid", "F", canonical.AccountKindBrokerage, nil,
 		[]snap{{t0, 1000}, {t1, 1100}}, []txn{{tMid, canonical.TxKindJournal, 50}})
-	seedAcct(t, db, ctx, "ct", "C", canonical.AccountKindCryptoSelfCustody, nil,
-		[]snap{{t0, 1000}, {t1, 1100}}, []txn{{tMid, canonical.TxKindTransferIn, 999}})
 
 	rows, err := RunReturns(ctx, db, params("accounts", 0, t1))
 	if err != nil {
@@ -263,7 +259,6 @@ func TestRunReturnsRegimeFlags(t *testing.T) {
 		}
 	}
 	check("F", "journal_present")
-	check("C", "crypto_unclassified_transfers")
 }
 
 // TestRunReturnsPartialWindowAndStrict covers the explicit-window clamp flag and

@@ -1,9 +1,8 @@
 # plaid adapter
 
 Adapter that projects a `plaid` silver SQLite database into the
-canonical gold schema. Implements the `silver.Adapter` /
-`silver.Connection` interface defined in
-[../DESIGN.md](../DESIGN.md) §6.
+canonical gold schema. Implements the `silver.Connection` interface
+defined in [../DESIGN.md](../DESIGN.md) §6.
 
 Plaid is a data aggregator. One login at one institution is one Plaid
 **Item**, and one silver database holds one Item. The collector
@@ -224,6 +223,12 @@ say what such an account holds.
   run, in its own currency. That figure may come from a run whose
   holdings failed. The payload says `"basis": "carried"` and the run it
   was stated at.
+- **Coverage.** Each run that carries snapshots covers each account it
+  states in full. An investment account is stated by its holdings.
+  Any other account is stated by a figure, stated or carried. Gold
+  ends a key of such an account no later than the first covering run
+  that leaves it out (DESIGN.md §10.7). An account listed with no
+  figure so far is not covered.
 - **Closure.** An account that held positions at the last run and
   holds none now gets its last positions replayed at zero
   (`silver.ClosureMarkerBatch`). It left the Item, or sold out. Without
@@ -301,11 +306,12 @@ settlement and states its trade date apart, as a time:
 - A buy or a sell books at the UTC day of its trade date, where Plaid
   states one no later than the posting date. Plaid's own `date` stays in
   the payload.
-- No trade books before the oldest date the investment ledger was read
-  from. A reload then always reaches it (§8).
+- A trade books at its trade date however far back it lies, since a
+  load re-emits the whole history (§8).
 
 **The bank and card ledger** (cash and card accounts). Silver holds it
-in the fleet's sign, and it still goes through `ApplyCanonicalSign`.
+in the fleet's sign, and each row keeps it. The kind is read off the
+sign.
 
 | Account | Row | Kind |
 | --- | --- | --- |
@@ -402,18 +408,14 @@ batch, seen over the dates those transactions book at.
 
 ## 8. Change number and the window
 
-The shared load clock (`silver.LoadClockStatusOver`): a loaded run is the
+The shared load clock (`silver.LoadClock`): a loaded run is the
 trigger, and a full re-emit is the response.
 
 - The change number is `MAX(dump_runs.snapshot_at)`.
-- The window spans every date the projection touches: the runs, both
-  ledgers' posting dates, the card statements' issue dates, and the
-  start of every ledger window a run read. Silver deletes the rows Plaid
-  stopped listing, and such a row can be the oldest one. Every row
-  silver held was stored by a run whose window reached its date, so
-  with every window in the span, a reload never leaves it standing in
-  gold. A trade books no earlier than the oldest window start, so the
-  span covers it too.
+- The window is the whole history (`Window.Full`): the load deletes the
+  source's rows whole before it re-inserts them. Silver deletes the rows
+  Plaid stopped listing, so such a row leaves gold on the next load. A
+  trade books at its trade date however far back it lies.
 - `Status` reports the transaction range over both ledgers, at the dates
   their rows book at. An Item linked for investments alone has no bank
   ledger.
@@ -421,7 +423,8 @@ trigger, and a full re-emit is the response.
 ## 9. Returns policy
 
 `DefaultReturnsPolicy(BankFlowPolicy())`, as for the synthetic kind:
-flow_complete on the shared bank sets, every other knob at its default.
+regime `flow_complete`, so every capital kind counts, and every other
+knob at its default.
 One Item may be a bank, a broker or a card issuer. The engine already
 treats each account by its kind:
 

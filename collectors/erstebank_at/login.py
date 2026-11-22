@@ -190,8 +190,7 @@ def probe(context, token: str | None) -> bool:
 # --- the sign-in page -----------------------------------------------------
 
 def load_username(env_file: Path) -> str:
-    if envfile.source_env_file(env_file):
-        log.info("env file: %s (sourced)", env_file)
+    envfile.load(None, candidates=(env_file,), logger=log)
     return os.environ.get(USER_ENV, "")
 
 
@@ -482,14 +481,14 @@ def main(argv: list[str]) -> int:
         if args.fresh:
             log.error("--fresh cannot be combined with --check "
                       "(a read-only probe never wipes the profile).")
-            return 2
+            return cli.EXIT_USAGE
         return run_check(args)
     if args.bronze_dir is None:
         # The sign-in serves the fetch (§F); one without a fetch could
         # cost a push for nothing.
         log.error("--bronze-dir is required to sign in: the sign-in serves "
                   "the fetch (the download verb passes /data).")
-        return 2
+        return cli.EXIT_USAGE
     return run_login_and_fetch(args)
 
 

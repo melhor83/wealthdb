@@ -3,132 +3,114 @@ package main
 import (
 	"context"
 	"database/sql"
-	"flag"
 	"fmt"
-	"io"
 	"strings"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/config"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/gold"
-	"github.com/smartpointer-com/wealthdb/wealthdb/internal/output"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/yield"
 )
 
 // `wealthdb income <view>` — the read surface for what the tracked
-// accounts received.
+// accounts received: cmd_spending.go read in the other direction.
 //
-// cmd_spending.go read in the other direction, and deliberately not a
-// generalisation of it: the two commands share the flag idiom, the
-// period vocabulary, the window default and the column machinery
-// (reportPeriods, periodLabel, parseTrailingYearWindow, the report
-// seam), and differ in the three
-// places a reader should be able to see at a glance — the views, the
-// registries, and the usage text.
-//
-// One default differs from spending's, and it is the one decision in
-// this file: `--level` is `detailed` rather than `primary`. The income
+// One default differs from spending's: `--level` is `detailed` rather
+// than `primary`. The income
 // vocabulary has ONE vendored primary, so at the primary level every
 // vendored type and extension folds into INCOME beside `gift`,
 // `inheritance` and `cash_deposit`. That view has a use — what was
 // earned or yielded, against what was given — but it is not the one a
 // reader opens the report for.
 func init() {
-	register("income", cmdIncome)
+	// The usage lists the family's columns, so it joins the family here.
+	incomeFamily.usage = incomeUsage
+	register("income", routeReport(incomeFamily))
 }
 
-// incomeViews are the grains `wealthdb income <view>` supports: what was
-// received, coarsest first, then the forward views, which take a window
-// that may reach into the future (cmd_income_projection.go).
-var incomeViews = []string{"summary", "types", "transactions", "projection", "calendar", "sources", "portfolios",
-	"accounts", "positions"}
-
-// cmdIncome routes `wealthdb income <view> ...` to the view's run.
-func cmdIncome(ctx context.Context, g globalFlags, subargs []string, _ io.Reader, stdout, stderr io.Writer) error {
-	view, rest, err := routeView("income", subargs, incomeViews, incomeUsage, stderr)
-	if err != nil {
+// incomeFamily are the grains `wealthdb income <view>` supports: what
+// was received, coarsest first, then the forward views, which take a
+// window that may reach into the future (cmd_income_projection.go).
+var incomeFamily = &family{
+	name: "income",
+	views: []view{
+		{name: "summary", total: flowTotal, principal: fixedColumn("net_income"), header: periodHeader,
+			build: func(_ *config.Config, req request) *report {
+				part := reportPeriods[req.period]
+				return newReport(buildIncomeSummaryColumnRegistry(req.currency, req.period), defaultIncomeSummaryColumns,
+					func(ctx context.Context, db *sql.DB) ([]gold.IncomeSummaryRow, error) {
+						return gold.IncomeSummary(ctx, db, req.from, req.to, req.currency, part)
+					})
+			}},
+		{name: "types", total: flowTotal, principal: fixedColumn("net_income"), header: periodLevelHeader,
+			build: func(_ *config.Config, req request) *report {
+				part := reportPeriods[req.period]
+				return newReport(buildIncomeTypeColumnRegistry(req.currency, req.period), defaultIncomeTypeColumns,
+					func(ctx context.Context, db *sql.DB) ([]gold.IncomeTypeRow, error) {
+						return gold.IncomeTypes(ctx, db, req.from, req.to, req.currency, part, req.level)
+					})
+			}},
+		// kind is income or principal on the calendar; on transactions
+		// the column is the booked kind.
+		{name: "transactions", total: flowTotal, principal: fixedColumn("value"), excludes: []string{"kind"},
+			build: func(_ *config.Config, req request) *report {
+				kindOf, loadKinds := sourceKinds()
+				return withLoads(newReport(buildIncomeTransactionColumnRegistry(req.currency, kindOf, req.categories),
+					defaultIncomeTransactionColumns,
+					func(ctx context.Context, db *sql.DB) ([]gold.IncomeTransactionRow, error) {
+						return gold.IncomeTransactions(ctx, db, req.from, req.to, req.currency)
+					}), loadKinds)
+			}},
+		{name: "projection", window: parseForwardWindow, total: flowTotal, principal: fixedColumn("total"),
+			header: func(req request) []string {
+				return append([]string{"period=" + req.period}, assumptionsHeader(req.assumptions)...)
+			},
+			build: incomeProjectionReport},
+		{name: "calendar", window: parseForwardWindow, total: flowTotal, principal: fixedColumn("value"),
+			header: forwardHeader, build: incomeCalendarReport},
+		incomeEntityView("sources", yield.GrainSources),
+		incomeEntityView("portfolios", yield.GrainPortfolios),
+		incomeEntityView("accounts", yield.GrainAccounts),
+		incomeEntityView("positions", yield.GrainPositions),
+	},
+	options: append([]option{
+		{name: "period", cli: []string{"period"}, choices: reportPeriodNames, def: [2]string{"monthly", "total"}},
+		{name: "level", cli: []string{"level"}, choices: categoryLevels, def: [2]string{"detailed", "detailed"}},
+	}, forwardOptions...),
+	window:      trailingYear,
+	currency:    true,
+	narrow:      "from/to or a filter",
+	configFirst: true,
+	settle: func(fam *family, in optionSource, req *request, _ *[]string) error {
+		period, err := choose(in, "income", "period")
+		if err != nil {
+			return err
+		}
+		if req.level, err = choose(in, "income", "level"); err != nil {
+			return err
+		}
+		forward := fam.view(req.view).forward()
+		if forward && !in.has("period") {
+			period = "monthly"
+		}
+		req.period = period
+		if err := checkForwardOptions(fam, req.view, period, in); err != nil {
+			return err
+		}
+		as, err := forwardAssumptions(in, "income")
+		if forward {
+			req.assumptions = as
+		}
 		return err
-	}
-	return runIncomeView(ctx, g, view, rest, stdout, stderr)
-}
-
-func runIncomeView(ctx context.Context, g globalFlags, view string, args []string, stdout, stderr io.Writer) error {
-	fs := flag.NewFlagSet("wealthdb income "+view, flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	period := fs.String("period", "monthly", strings.Join(reportPeriodNames, " | "))
-	level := fs.String("level", "detailed", "primary | detailed — the type vocabulary (types view)")
-	ff := registerForwardFlags(fs)
-	rf := registerReportFlags(fs, true)
-	fs.Usage = func() { fmt.Fprintln(stderr, incomeUsage()) }
-	if err := parseFlags(fs, args, "income"); err != nil {
-		return err
-	}
-	if err := checkChoice("income", "period", *period, reportPeriodNames...); err != nil {
-		return err
-	}
-	if err := checkChoice("income", "level", *level, categoryLevels...); err != nil {
-		return err
-	}
-	if err := ff.check(fs, view, *period); err != nil {
-		return err
-	}
-
-	fmtChoice, cfg, outCcy, err := rf.resolve(g, "income")
-	if err != nil {
-		return err
-	}
-	now := g.clock()
-	var window windowParser
-	if isForwardView(view) {
-		window = parseForwardWindow
-	}
-	fromEpoch, toEpoch, err := reportWindow(fs, "income", now, cfg.YieldHorizon(), window)
-	if err != nil {
-		return err
-	}
-
-	req := request{view: view, currency: outCcy, from: fromEpoch, to: toEpoch, period: *period, level: *level,
-		asOf: anchorToDay(now.UTC(), true).Unix(), assumptions: ff.assumptions(), categories: overrideCategories(cfg)}
-	rep := incomeReport(req)
-	open := func() (*sql.DB, error) { return openGoldForRead(g, cfg) }
-	return writeReport(ctx, rep, rf.output(fmtChoice, "income", incomeFamily, req, cfg, now), open, stdout)
-}
-
-// incomeReport is one view of the income family, the runner the CLI
-// and the MCP server share.
-func incomeReport(req request) *report {
-	part := reportPeriods[req.period]
-	if isForwardView(req.view) {
-		return incomeForwardReport(req)
-	}
-	switch req.view {
-	case "summary":
-		return newReport(buildIncomeSummaryColumnRegistry(req.currency, req.period), defaultIncomeSummaryColumns,
-			func(ctx context.Context, db *sql.DB) ([]gold.IncomeSummaryRow, error) {
-				return gold.IncomeSummary(ctx, db, req.from, req.to, req.currency, part)
-			})
-	case "types":
-		return newReport(buildIncomeTypeColumnRegistry(req.currency, req.period), defaultIncomeTypeColumns,
-			func(ctx context.Context, db *sql.DB) ([]gold.IncomeTypeRow, error) {
-				return gold.IncomeTypes(ctx, db, req.from, req.to, req.currency, part, req.level)
-			})
-	default:
-		kindOf, loadKinds := sourceKinds()
-		return withLoads(newReport(buildIncomeTransactionColumnRegistry(req.currency, kindOf, req.categories),
-			defaultIncomeTransactionColumns,
-			func(ctx context.Context, db *sql.DB) ([]gold.IncomeTransactionRow, error) {
-				return gold.IncomeTransactions(ctx, db, req.from, req.to, req.currency)
-			}), loadKinds)
-	}
+	},
 }
 
 // ---- column registries ---------------------------------------------------
 
 func buildIncomeSummaryColumnRegistry(outCcy, period string) []columnSpec[gold.IncomeSummaryRow] {
 	return []columnSpec[gold.IncomeSummaryRow]{
-		{Name: "period", Align: output.AlignLeft, Date: true,
-			Extract: func(r gold.IncomeSummaryRow) string { return periodLabel(r.PeriodStart, period) }},
-		{Name: "period_start", Align: output.AlignLeft, Date: true,
-			Extract: func(r gold.IncomeSummaryRow) string { return periodStart(r.PeriodStart) }},
+		asDate(strCol("period", func(r gold.IncomeSummaryRow) string { return periodLabel(r.PeriodStart, period) })),
+		asDate(strCol("period_start", func(r gold.IncomeSummaryRow) string { return periodStart(r.PeriodStart) })),
 		countCol("txn_count", func(r gold.IncomeSummaryRow) int64 { return r.TxnCount }),
 		outCcyCol("income", outCcy, func(r gold.IncomeSummaryRow) *string { return r.Income }),
 		outCcyCol("reversals", outCcy, func(r gold.IncomeSummaryRow) *string { return r.Reversals }),
@@ -147,17 +129,13 @@ var defaultIncomeSummaryColumns = []string{
 
 func buildIncomeTypeColumnRegistry(outCcy, period string) []columnSpec[gold.IncomeTypeRow] {
 	return []columnSpec[gold.IncomeTypeRow]{
-		{Name: "period", Align: output.AlignLeft, Date: true,
-			Extract: func(r gold.IncomeTypeRow) string { return periodLabel(r.PeriodStart, period) }},
-		{Name: "period_start", Align: output.AlignLeft, Date: true,
-			Extract: func(r gold.IncomeTypeRow) string { return periodStart(r.PeriodStart) }},
+		asDate(strCol("period", func(r gold.IncomeTypeRow) string { return periodLabel(r.PeriodStart, period) })),
+		asDate(strCol("period_start", func(r gold.IncomeTypeRow) string { return periodStart(r.PeriodStart) })),
 		// `type` is what a reader sees and `type_id` is the key they
 		// would group or join on — the same split the spending
 		// categories view makes between its label and its value.
-		{Name: "type", Align: output.AlignLeft,
-			Extract: func(r gold.IncomeTypeRow) string { return r.TypeLabel }},
-		{Name: "type_id", Align: output.AlignLeft,
-			Extract: func(r gold.IncomeTypeRow) string { return r.Type }},
+		strCol("type", func(r gold.IncomeTypeRow) string { return r.TypeLabel }),
+		strCol("type_id", func(r gold.IncomeTypeRow) string { return r.Type }),
 		countCol("txn_count", func(r gold.IncomeTypeRow) int64 { return r.TxnCount }),
 		outCcyCol("income", outCcy, func(r gold.IncomeTypeRow) *string { return r.Income }),
 		outCcyCol("reversals", outCcy, func(r gold.IncomeTypeRow) *string { return r.Reversals }),
@@ -172,61 +150,40 @@ var defaultIncomeTypeColumns = []string{
 
 func buildIncomeTransactionColumnRegistry(outCcy string, kindOf func(string) string,
 	categories typedCategories) []columnSpec[gold.IncomeTransactionRow] {
-	ref := func(r gold.IncomeTransactionRow) accountRef {
-		return accountRef{source: r.SilverSourceID, name: r.DisplayName, nickname: r.Nickname, id: r.AccountExternalID}
-	}
+	line := txnLineCols(outCcy, kindOf, categories,
+		func(r gold.IncomeTransactionRow) gold.TxnLine { return r.TxnLine },
+		func(r gold.IncomeTransactionRow) gold.TxnValue { return r.TxnValue })
 	return []columnSpec[gold.IncomeTransactionRow]{
-		{Name: "silver_source", Align: output.AlignLeft,
-			Extract: func(r gold.IncomeTransactionRow) string { return r.SilverSourceID }},
-		{Name: "date", Align: output.AlignLeft, Date: true,
-			Extract: func(r gold.IncomeTransactionRow) string { return formatDate(r.OccurredAt) }},
-		{Name: "datetime", Align: output.AlignLeft, Date: true,
-			Extract: func(r gold.IncomeTransactionRow) string { return formatDateTime(r.OccurredAt) }},
-		accountCol(kindOf, ref),
-		accountIDCol("account_id", kindOf, ref),
-		textCol("account_kind", func(r gold.IncomeTransactionRow) *string { return r.AccountKind }),
-		nicknameCol("account_nickname", func(r gold.IncomeTransactionRow) *string { return r.Nickname }),
-		accountCategoryCol(categories, func(r gold.IncomeTransactionRow) *string { return r.AccountCategory }),
-		{Name: "kind", Align: output.AlignLeft,
-			Extract: func(r gold.IncomeTransactionRow) string { return r.Kind }},
+		line("silver_source"), line("date"), line("datetime"), line("account"), line("account_id"),
+		line("account_kind"), line("account_nickname"), line("account_category"), line("kind"),
 		// The payer takes the FREE-TEXT class, and that most of the
 		// base fills it with an instrument name does not change it: a
 		// column takes the class of the worst thing it can hold. On a
 		// deposit the column is the payer store's name for the
 		// signature or, where the store has none, the fold of the
 		// narrative itself — which on an inbound wire is a person.
-		{Name: "payer", Align: output.AlignLeft, Privacy: PrivacyFreeText,
-			Extract: func(r gold.IncomeTransactionRow) string { return strOrEmpty(r.PayerName) }},
-		{Name: "payer_signature", Align: output.AlignLeft, Privacy: PrivacyFreeText,
-			Extract: func(r gold.IncomeTransactionRow) string { return strOrEmpty(r.PayerSignature) }},
+		privateCol("payer", PrivacyFreeText, func(r gold.IncomeTransactionRow) string { return strOrEmpty(r.PayerName) }),
+		privateCol("payer_signature", PrivacyFreeText, func(r gold.IncomeTransactionRow) string { return strOrEmpty(r.PayerSignature) }),
 		textCol("income_type", func(r gold.IncomeTransactionRow) *string { return r.IncomeLabel }),
 		textCol("income_type_id", func(r gold.IncomeTransactionRow) *string { return r.IncomeDetailed }),
 		textCol("income_primary", func(r gold.IncomeTransactionRow) *string { return r.IncomePrimaryLabel }),
 		textCol("income_primary_id", func(r gold.IncomeTransactionRow) *string { return r.IncomePrimary }),
 		textCol("provenance", func(r gold.IncomeTransactionRow) *string { return r.Provenance }),
-		// The source's own filing, beside ours and never summed with
-		// it.
+		// The source's own filing, beside the engine's and never summed
+		// with it.
 		textCol("provider_income_type", func(r gold.IncomeTransactionRow) *string { return r.ProviderIncomeLabel }),
 		textCol("provider_income_type_id", func(r gold.IncomeTransactionRow) *string { return r.ProviderIncomeDetailed }),
-		{Name: "currency", Align: output.AlignLeft,
-			Extract: func(r gold.IncomeTransactionRow) string { return r.Currency }},
-		moneyCol("net_amount", "", func(r gold.IncomeTransactionRow) *string { return r.NetAmount }),
-		outCcyCol("value", outCcy, func(r gold.IncomeTransactionRow) *string { return r.ValueOutCcy }),
+		line("currency"), line("net_amount"), line("value"),
 		// The raw narrative the signature was folded from. Free text on
 		// both counts: it is what a bank printed, and on a deposit that
 		// is whoever sent the money.
-		{Name: "counterparty", Align: output.AlignLeft, Privacy: PrivacyFreeText,
-			Extract: func(r gold.IncomeTransactionRow) string { return strOrEmpty(r.Counterparty) }},
-		{Name: "description", Align: output.AlignLeft, Privacy: PrivacyFreeText,
-			Extract: func(r gold.IncomeTransactionRow) string { return strOrEmpty(r.Description) }},
+		line("counterparty"), line("description"),
 		// The source's own id for the line. INCOME.md §8 sends a reader
 		// to `wealthdb transactions` to see both families on one row,
 		// and without this there is no key to join the two listings on.
 		// Spending's transactions view and `wealthdb transactions` both
 		// offer it.
-		typedIDCol("tx_id", kindOf, func(r gold.IncomeTransactionRow) (string, string) {
-			return r.SilverSourceID, r.TransactionExternalID
-		}),
+		line("tx_id"),
 	}
 }
 
@@ -236,6 +193,7 @@ var defaultIncomeTransactionColumns = []string{
 }
 
 func incomeUsage() string {
+	available, defaults := columnSets(incomeFamily, 13, incomeFamily.names(), request{currency: "CCY", period: "monthly"}, nil)
 	return "usage: wealthdb income <view> [FROM [TO]] [--period P] [--level L]\n" +
 		"                          [--rates R] [--maturing M] [--shift BP]\n" +
 		"                          [-f FORMAT] [-C COLS] [-F COND]... [-x CCY] [-p]\n" +
@@ -328,28 +286,10 @@ Notes
   guessed at; 'wealthdb categorize income' is what works that backlog
   down.
 
-Available columns (per view):
-  summary       ` + joinColumnNames(buildIncomeSummaryColumnRegistry("CCY", "monthly")) + `
-  types         ` + joinColumnNames(buildIncomeTypeColumnRegistry("CCY", "monthly")) + `
-  transactions  ` + joinColumnNames(buildIncomeTransactionColumnRegistry("CCY", nil, nil)) + `
-  projection    ` + joinColumnNames(buildProjectionColumns("CCY", "monthly")) + `
-  calendar      ` + joinColumnNames(buildCalendarColumns("CCY", nil)) + `
-  sources       ` + joinColumnNames(buildIncomeEntityColumns("CCY", yield.GrainSources, nil)) + `
-  portfolios    ` + joinColumnNames(buildIncomeEntityColumns("CCY", yield.GrainPortfolios, nil)) + `
-  accounts      ` + joinColumnNames(buildIncomeEntityColumns("CCY", yield.GrainAccounts, nil)) + `
-  positions     ` + joinColumnNames(buildIncomeEntityColumns("CCY", yield.GrainPositions, nil)) + `
+Available columns (per view):` + available + `
 
   (The money columns render as income_<CCY> / net_income_<CCY> /
    value_<CCY>, reflecting your -x/--currency choice.)
 
-Default column sets:
-  summary       ` + strings.Join(defaultIncomeSummaryColumns, ", ") + `
-  types         ` + strings.Join(defaultIncomeTypeColumns, ", ") + `
-  transactions  ` + strings.Join(defaultIncomeTransactionColumns, ", ") + `
-  projection    ` + strings.Join(defaultProjectionColumns, ", ") + `
-  calendar      ` + strings.Join(defaultCalendarColumns, ", ") + `
-  sources       ` + strings.Join(incomeEntityDefaults[yield.GrainSources], ", ") + `
-  portfolios    ` + strings.Join(incomeEntityDefaults[yield.GrainPortfolios], ", ") + `
-  accounts      ` + strings.Join(incomeEntityDefaults[yield.GrainAccounts], ", ") + `
-  positions     ` + strings.Join(incomeEntityDefaults[yield.GrainPositions], ", ")
+Default column sets:` + defaults
 }

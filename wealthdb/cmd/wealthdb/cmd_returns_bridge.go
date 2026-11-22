@@ -3,57 +3,17 @@ package main
 import (
 	"context"
 	"database/sql"
-	"flag"
 	"fmt"
-	"io"
 	"strings"
 	"time"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/config"
-	"github.com/smartpointer-com/wealthdb/wealthdb/internal/errs"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/gold"
 )
 
 // bridgeRefusedFlags are the returns flags that have no meaning on the
 // bridge: it has no return to compute, and one set of flows to read.
 var bridgeRefusedFlags = []string{"method", "annualize", "netting", "inception", "benchmark"}
-
-// `wealthdb returns bridge`: why net worth moved over each bucket. The
-// flags of the other views that do not apply are refused by name
-// (refuseFlags).
-func runReturnsBridge(ctx context.Context, g globalFlags, args []string, stdout, stderr io.Writer) error {
-	fs := flag.NewFlagSet("wealthdb returns bridge", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	period := fs.String("period", "quarterly", "monthly | quarterly | annual | total")
-	refused := refuseFlags(fs, "returns", "bridge", bridgeRefusedFlags)
-	rf := registerReportFlags(fs, true)
-	fs.Usage = func() { fmt.Fprintln(stderr, returnsBridgeUsage()) }
-	if err := parseFlags(fs, args, "returns"); err != nil {
-		return err
-	}
-	if err := refused(); err != nil {
-		return err
-	}
-	if err := checkChoice("returns", "period", *period, returnsPeriods...); err != nil {
-		return err
-	}
-	fromEpoch, toEpoch, err := parseReturnsWindow(fs.Args(), g.clock())
-	if err != nil {
-		fs.Usage()
-		return errs.Newf(errs.ExitUsage, "returns: %s", err.Error())
-	}
-	if err := checkBridgeWindow(fromEpoch, toEpoch, anchorToDay(g.clock().UTC(), true).Unix()); err != nil {
-		return err
-	}
-	fmtChoice, cfg, outCcy, err := rf.resolve(g, "returns")
-	if err != nil {
-		return err
-	}
-	req := request{view: "bridge", currency: outCcy, from: fromEpoch, to: toEpoch, period: *period}
-	rep := returnsBridgeReport(req, cfg)
-	open := func() (*sql.DB, error) { return openGoldForRead(g, cfg) }
-	return writeReport(ctx, rep, rf.output(fmtChoice, "returns", returnsFamily, req, cfg, g.clock()), open, stdout)
-}
 
 // checkBridgeWindow refuses a window the bridge's months cannot cut: its
 // start must be a month's first day and its end a month's last, or today
@@ -63,13 +23,11 @@ func runReturnsBridge(ctx context.Context, g globalFlags, args []string, stdout,
 func checkBridgeWindow(fromEpoch, toEpoch, today int64) error {
 	from, to := time.Unix(fromEpoch, 0).UTC(), time.Unix(toEpoch, 0).UTC()
 	if fromEpoch > 0 && from.Day() != 1 {
-		return errs.Newf(errs.ExitUsage, "returns: bridge reads whole months: from %s is no month's first day",
-			from.Format(time.DateOnly))
+		return fmt.Errorf("bridge reads whole months: from %s is no month's first day", from.Format(time.DateOnly))
 	}
 	lastOfMonth := to.AddDate(0, 0, 1).Day() == 1
 	if !lastOfMonth && toEpoch < today {
-		return errs.Newf(errs.ExitUsage, "returns: bridge reads whole months: to %s is no month's last day",
-			to.Format(time.DateOnly))
+		return fmt.Errorf("bridge reads whole months: to %s is no month's last day", to.Format(time.DateOnly))
 	}
 	return nil
 }

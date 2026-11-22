@@ -14,6 +14,32 @@ import (
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
 )
 
+func openScratch(t *testing.T, ddl string) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if _, err := db.Exec(ddl); err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+// TestHasWord pins the word match: a word is a run of letters and digits,
+// so a slug's segment matches and a longer word that starts with it does
+// not.
+func TestHasWord(t *testing.T) {
+	for s, want := range map[string]bool{
+		"MONTHLY FEE": true, "fees_bank": false, "FEES_BANK": true, "FEEDBACK LTD": false, "": false,
+	} {
+		if got := HasWord(s, "FEE", "FEES"); got != want {
+			t.Errorf("HasWord(%q) = %v, want %v", s, got, want)
+		}
+	}
+}
+
 // TestJoinText pins the transaction-text composition rule the adapters
 // share: trim each part, drop the empty ones, join the rest with "; ",
 // and yield "" — never a stray separator — when nothing is left.
@@ -136,16 +162,13 @@ func TestHasColumns(t *testing.T) {
 		{"b", []string{"x"}, false},
 		{"a", nil, true},
 	} {
-		got, err := HasColumns(context.Background(), db, c.table, c.columns...)
+		got, err := hasColumns(context.Background(), db, c.table, c.columns...)
 		if err != nil {
-			t.Fatalf("HasColumns(%s, %q): %v", c.table, c.columns, err)
+			t.Fatalf("hasColumns(%s, %q): %v", c.table, c.columns, err)
 		}
 		if got != c.want {
-			t.Errorf("HasColumns(%s, %q) = %v, want %v", c.table, c.columns, got, c.want)
+			t.Errorf("hasColumns(%s, %q) = %v, want %v", c.table, c.columns, got, c.want)
 		}
-	}
-	if ok, err := HasColumn(context.Background(), db, "a", "y"); err != nil || !ok {
-		t.Errorf("HasColumn(a, y) = %v, %v; want true", ok, err)
 	}
 }
 
@@ -181,94 +204,6 @@ func TestWithAccrued(t *testing.T) {
 	}
 	if WithAccrued(nil, &accrued) != nil {
 		t.Error("a nil value gained one")
-	}
-}
-
-// loadClockSchema is the least a load-clock silver holds: its dump runs, a
-// dated content table and a ledger.
-const loadClockSchema = `CREATE TABLE dump_runs (snapshot_at INTEGER);
-CREATE TABLE accounts (snapshot_at INTEGER);
-CREATE TABLE transactions (posted_at INTEGER);`
-
-const loadClockSpan = `
-SELECT MIN(t), MAX(t) FROM (
-    SELECT snapshot_at AS t FROM accounts
-    UNION ALL SELECT posted_at FROM transactions)`
-
-// TestLoadClock pins the shared load clock: the status reads the span, the
-// ledger and the newest dump; a dump past the watermark re-emits the whole
-// span up to that dump; an idle reload and an empty silver change nothing.
-func TestLoadClock(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("empty silver", func(t *testing.T) {
-		db := openScratch(t, loadClockSchema)
-		s, err := LoadClockStatus(ctx, db, "test", loadClockSpan)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if s != canonical.UnknownStatus() {
-			t.Errorf("Status = %+v, want the unknown status", s)
-		}
-		w, err := LoadClockChangeWindow(ctx, db, "test", loadClockSpan, -1)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !reflect.DeepEqual(w, canonical.Window{NewChangeNumber: -1}) {
-			t.Errorf("ChangeWindow(-1) = %+v, want no changes", w)
-		}
-	})
-
-	db := openScratch(t, loadClockSchema+`
-INSERT INTO dump_runs VALUES (500), (900);
-INSERT INTO accounts VALUES (500), (900);
-INSERT INTO transactions VALUES (100), (300);`)
-
-	s, err := LoadClockStatus(ctx, db, "test", loadClockSpan)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := canonical.Status{
-		OldestSnapshotAt: 100, LatestSnapshotAt: 900,
-		OldestTransactionAt: 100, LatestTransactionAt: 300,
-		LatestChangeNumber:       900,
-		ObservedSnapshotsThrough: 900, ObservedTransactionsThrough: 900,
-	}
-	if s != want {
-		t.Errorf("Status = %+v, want %+v", s, want)
-	}
-	s, err = LoadClockStatusOver(ctx, db, "test", loadClockSpan,
-		`SELECT MIN(snapshot_at), MAX(snapshot_at) FROM accounts`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if s.OldestTransactionAt != 500 || s.LatestTransactionAt != 900 {
-		t.Errorf("StatusOver ledger = [%d,%d], want the query's [500,900]",
-			s.OldestTransactionAt, s.LatestTransactionAt)
-	}
-
-	for _, c := range []struct {
-		since int64
-		want  canonical.Window
-	}{
-		{0, canonical.Window{HasChanges: true, Start: 100, End: 900, NewChangeNumber: 900}},
-		// A dump past the watermark still re-emits the full span.
-		{500, canonical.Window{HasChanges: true, Start: 100, End: 900, NewChangeNumber: 900}},
-		// The watermark at the newest dump is an idle reload.
-		{900, canonical.Window{NewChangeNumber: 900}},
-	} {
-		w, err := LoadClockChangeWindow(ctx, db, "test", loadClockSpan, c.since)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !reflect.DeepEqual(w, c.want) {
-			t.Errorf("ChangeWindow(%d) = %+v, want %+v", c.since, w, c.want)
-		}
-	}
-
-	if _, err := LoadClockStatus(ctx, db, "test", `SELECT nope FROM accounts`); err == nil ||
-		!strings.Contains(err.Error(), "test Status snapshot") {
-		t.Errorf("a failing span query = %v, want it named", err)
 	}
 }
 
@@ -320,6 +255,22 @@ INSERT INTO a VALUES (300), (700); INSERT INTO b VALUES (200), (500);`)
 	}
 }
 
+// TestSnapshotTimesMergesExtraInsideTheWindow pins the batch times: the
+// query's times and every extra time inside the window, once each, ascending.
+func TestSnapshotTimesMergesExtraInsideTheWindow(t *testing.T) {
+	db := openScratch(t, `CREATE TABLE p (t INTEGER);
+INSERT INTO p VALUES (30), (10), (30), (50);`)
+	w := canonical.Window{Start: 10, End: 40, HasChanges: true}
+	got, err := SnapshotTimes(context.Background(), db, w, []int64{5, 20, 30, 45},
+		`SELECT t FROM p WHERE t BETWEEN ? AND ?`, w.Start, w.End)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []int64{10, 20, 30}; !slices.Equal(got, want) {
+		t.Errorf("SnapshotTimes = %v, want %v", got, want)
+	}
+}
+
 // TestSnapshotTimesOfUnionsTheTables pins the generated union: every
 // snapshot_at of each table inside the window, with the extra times, once
 // each and ascending.
@@ -357,7 +308,7 @@ func TestScanRows(t *testing.T) {
 	}
 	collect := func(stopAt int64) ([]int64, error) {
 		var seen []int64
-		err := ScanRows(ctx, db, `SELECT x FROM a WHERE x >= ? ORDER BY x`, func(rows *sql.Rows) error {
+		err := ScanRows(ctx, db, "", `SELECT x FROM a WHERE x >= ? ORDER BY x`, func(rows *sql.Rows) error {
 			var x int64
 			if err := rows.Scan(&x); err != nil {
 				return err
@@ -376,11 +327,131 @@ func TestScanRows(t *testing.T) {
 	if seen, err := collect(2); err != errStop || !slices.Equal(seen, []int64{1, 2}) {
 		t.Errorf("stop at 2: %v (%v), want [1 2] and the scan's error", seen, err)
 	}
-	if err := ScanRows(ctx, db, `SELECT nope FROM a`, func(*sql.Rows) error { return nil }); err == nil {
+	if err := ScanRows(ctx, db, "", `SELECT nope FROM a`, func(*sql.Rows) error { return nil }); err == nil {
 		t.Error("a query that does not run returned no error")
 	}
 	var n int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM a`).Scan(&n); err != nil || n != 3 {
 		t.Errorf("after the scans: %d rows (%v), want the connection free", n, err)
+	}
+}
+
+// TestQueryCollectsAndLabels pins Query: the records in the query's order,
+// a label on the errors of the query but not on a scan's own error.
+func TestQueryCollectsAndLabels(t *testing.T) {
+	ctx := context.Background()
+	db := openScratch(t, `CREATE TABLE a (x INTEGER); INSERT INTO a VALUES (3), (1), (2);`)
+	scan := func(rows *sql.Rows) (int64, error) {
+		var x int64
+		err := rows.Scan(&x)
+		return x, err
+	}
+	got, err := Query(ctx, db, "a read", `SELECT x FROM a ORDER BY x`, scan)
+	if err != nil || !slices.Equal(got, []int64{1, 2, 3}) {
+		t.Errorf("Query = %v (%v), want [1 2 3]", got, err)
+	}
+	if _, err := Query(ctx, db, "a read", `SELECT nope FROM a`, scan); err == nil ||
+		!strings.HasPrefix(err.Error(), "a read: ") {
+		t.Errorf("a failing query = %v, want it labelled", err)
+	}
+	errScan := errors.New("bad row")
+	_, err = Query(ctx, db, "a read", `SELECT x FROM a`, func(*sql.Rows) (int64, error) { return 0, errScan })
+	if err != errScan {
+		t.Errorf("a failing scan = %v, want its error as it is", err)
+	}
+}
+
+// TestDecKeepsEachPath pins the decimal scan target: NULL is nil on both
+// paths, the text path parses the text and reads blank text as nil, and
+// the float path converts the float.
+func TestDecKeepsEachPath(t *testing.T) {
+	db := openScratch(t, `CREATE TABLE m (v REAL, s TEXT); INSERT INTO m VALUES (0.1, '0.10'), (NULL, ''), (NULL, NULL);`)
+	rows, err := db.Query(`SELECT v, CAST(v AS VARCHAR), s FROM m ORDER BY rowid`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var f, cast, text *canonical.Decimal
+		if err := rows.Scan(Dec(&f, DecFloat), Dec(&cast, DecText), Dec(&text, DecText)); err != nil {
+			t.Fatal(err)
+		}
+		show := func(d *canonical.Decimal) string {
+			if d == nil {
+				return "nil"
+			}
+			return d.String()
+		}
+		got = append(got, show(f)+" "+show(cast)+" "+show(text))
+	}
+	if want := []string{"0.1 0.1 0.1", "nil nil nil", "nil nil nil"}; !slices.Equal(got, want) {
+		t.Errorf("Dec = %q, want %q", got, want)
+	}
+}
+
+// TestProbeOptional pins the schema probe: a table, a column set present
+// whole, and a column set one of whose columns is missing.
+func TestProbeOptional(t *testing.T) {
+	db := openScratch(t, `CREATE TABLE a (x INTEGER, y INTEGER);`)
+	var table, missing, cols, partial bool
+	if _, err := ProbeOptional(context.Background(), db, "test",
+		Optional{Table: "a", Has: &table},
+		Optional{Table: "b", Has: &missing},
+		Optional{Table: "a", Columns: []string{"x", "y"}, Has: &cols},
+		Optional{Table: "a", Columns: []string{"x", "z"}, Has: &partial},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !table || missing || !cols || partial {
+		t.Errorf("probed %v %v %v %v, want true false true false", table, missing, cols, partial)
+	}
+}
+
+// TestProbeOptionalNotesAnOlderSilver pins the advice: a part absent from
+// a silver whose schema version predates it is noted, by name, with both
+// versions; a part the version already holds, or a part of version 0,
+// is not; a current silver notes nothing.
+func TestProbeOptionalNotesAnOlderSilver(t *testing.T) {
+	ctx := context.Background()
+	db := openScratch(t, `CREATE TABLE schema_meta (silver_schema_version INTEGER, applied_at INTEGER);
+INSERT INTO schema_meta VALUES (1, 0), (3, 0);
+CREATE TABLE a (x INTEGER);`)
+	var has [4]bool
+	parts := []Optional{
+		{Table: "a", Columns: []string{"y"}, Version: 4, Has: &has[0]},
+		{Table: "b", Version: 5, Has: &has[1]},
+		{Table: "c", Version: 2, Has: &has[2]},
+		{Table: "d", Has: &has[3]},
+	}
+	n, err := ProbeOptional(ctx, db, "kind", parts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := SchemaNote{Silver: "kind", Version: 3, Reads: 5, Missing: []string{"a.y", "b"}}
+	if !reflect.DeepEqual(n, want) {
+		t.Errorf("note = %+v, want %+v", n, want)
+	}
+	if got := n.String(); got != "kind is at silver schema 3 and the adapter reads 5; a.y and b load empty until its collector's load applies the migrations" {
+		t.Errorf("advice = %q", got)
+	}
+	var a Advice
+	a.Note(n)
+	a.Note(SchemaNote{})
+	a.Note(SchemaNote{Silver: "kind", Version: 3, Reads: 6, Missing: []string{"e"}})
+	want.Reads, want.Missing = 6, []string{"a.y", "b", "e"}
+	if got := a.SchemaAdvice(); len(got) != 1 || !reflect.DeepEqual(got[0], want) {
+		t.Errorf("advice kept %+v, want the one joined note %+v", got, want)
+	}
+	current := openScratch(t, `CREATE TABLE schema_meta (silver_schema_version INTEGER, applied_at INTEGER);
+INSERT INTO schema_meta VALUES (5, 0); CREATE TABLE b (x INTEGER);`)
+	if n, err := ProbeOptional(ctx, current, "kind", parts[1]); err != nil || len(n.Missing) != 0 {
+		t.Errorf("a current silver noted %+v (%v)", n, err)
+	}
+	if got := ColumnOr(false, "p", "q"); got != "NULL, NULL" {
+		t.Errorf("ColumnOr(false) = %q", got)
+	}
+	if got := ColumnOr(true, "p", "q"); got != "p, q" {
+		t.Errorf("ColumnOr(true) = %q", got)
 	}
 }

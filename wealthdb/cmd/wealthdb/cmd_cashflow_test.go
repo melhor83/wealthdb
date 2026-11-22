@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/enrichtest"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/gold"
 )
 
@@ -94,20 +95,21 @@ func setupCashflowGold(t *testing.T) string {
 		       ('bank', 'T-DIV',    NULL,      1, NULL,            'signature-only', 1),
 		       ('bank', 'T-PLANDIV', NULL,     1, NULL,            'signature-only', 1);
 
-		INSERT INTO spend_txn_enrichment(silver_source_id, transaction_external_id,
-			merchant_signature, signature_version, spend_detailed, provenance,
-			far_silver_source_id, far_account_external_id, far_class, assigned_at)
-		VALUES ('bank', 'T-SHOP', 'CORNER MARKET', 1, 'FOOD_AND_DRINK_GROCERIES', 'signature-only', NULL, NULL, NULL, 1),
-		       ('bank', 'T-TAX',  NULL,            1, 'GOVERNMENT_AND_NON_PROFIT_TAX_PAYMENT', 'rule', NULL, NULL, NULL, 1),
-		       ('bank', 'T-MORT', 'MORTGAGE',      1, 'internal_transfer', 'rule', NULL, NULL, 'mortgage', 1),
-		       ('bank', 'T-RET',  'PLAN',          1, 'retirement_transfer', 'rule', NULL, NULL, NULL, 1);
-
 		INSERT INTO spend_merchant_categories(merchant_signature, merchant_name, spend_detailed,
 			signature_version, assigned_at, model_name)
 		VALUES ('CORNER MARKET', 'Corner Market', 'FOOD_AND_DRINK_GROCERIES', 1, 1, 'test-model');
 	`); err != nil {
 		t.Fatalf("seed the overlays: %v", err)
 	}
+	enrichtest.SeedSpend(t, db,
+		enrichtest.Spend{Source: "bank", Txn: "T-SHOP", Signature: "CORNER MARKET",
+			Detailed: "FOOD_AND_DRINK_GROCERIES", Provenance: "signature-only", At: 1},
+		enrichtest.Spend{Source: "bank", Txn: "T-TAX", Detailed: "GOVERNMENT_AND_NON_PROFIT_TAX_PAYMENT",
+			Provenance: "rule", At: 1},
+		enrichtest.Spend{Source: "bank", Txn: "T-MORT", Signature: "MORTGAGE", Detailed: "mortgage_transfer",
+			Provenance: "rule", At: 1},
+		enrichtest.Spend{Source: "bank", Txn: "T-RET", Signature: "PLAN", Detailed: "retirement_transfer",
+			Provenance: "rule", At: 1})
 	if err := db.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -381,7 +383,7 @@ func TestCashflowUsageNamesEveryView(t *testing.T) {
 			t.Errorf("the usage text does not mention %q", want)
 		}
 	}
-	for _, view := range cashflowViews {
+	for _, view := range cashflowFamily.names() {
 		if !strings.Contains(usage, view) {
 			t.Errorf("the usage text does not name the %q view", view)
 		}
@@ -417,7 +419,7 @@ func TestCashflowHelpEntryNamesEveryView(t *testing.T) {
 	if entry.name == "" {
 		t.Fatal("no cashflow entry in commandHelps")
 	}
-	for _, view := range cashflowViews {
+	for _, view := range cashflowFamily.names() {
 		if !strings.Contains(entry.detail(), view) {
 			t.Errorf("`wealthdb help cashflow` does not name the %q view", view)
 		}

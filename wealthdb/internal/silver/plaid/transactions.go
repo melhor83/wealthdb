@@ -20,11 +20,11 @@ import (
 // left out; its payments are booked on the account they were paid from.
 //
 // SIGNS. Silver holds both ledgers in the fleet's sign already (money into
-// the account is positive), the collector having negated Plaid's own. The
-// bank and card ledger still goes through ApplyCanonicalSign, so a kind with
-// a fixed direction comes out signed that way. The investment ledger keeps
-// each row's own sign: a row that disagrees with its kind is a correction,
-// and forcing the sign would book it a second time.
+// the account is positive), the collector having negated Plaid's own, and
+// each row keeps its sign. A bank or card row's kind is read off that sign
+// (bankTxKind), so the two always agree. An investment row that disagrees
+// with its kind is a correction, and forcing the sign would book it a
+// second time.
 //
 // PENDING rows are emitted like any other, with Plaid's `pending` in the
 // payload. A pending charge that posts gets a new id. Every read of the
@@ -35,11 +35,11 @@ func (c *Connection) Transactions(ctx context.Context, w canonical.Window) (silv
 	if !w.HasChanges {
 		return silver.NewTransactionStream(canonical.TransactionBatch{}), nil
 	}
-	accounts, err := c.latestAccounts(ctx)
+	accounts, err := c.accounts(ctx)
 	if err != nil {
 		return nil, err
 	}
-	secs, err := c.readSecurities(ctx)
+	secs, err := c.securities(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -57,6 +57,18 @@ func (c *Connection) Transactions(ctx context.Context, w canonical.Window) (silv
 	return silver.NewTransactionStream(out), nil
 }
 
+// accounts and securities are the reads that Snapshots and Transactions
+// both need, read once per connection (silver.Lazy): each account as last
+// described, and the securities. The connection opens one silver
+// read-only for one load.
+func (c *Connection) accounts(ctx context.Context) (map[string]account, error) {
+	return c.latest.Get(func() (map[string]account, error) { return c.latestAccounts(ctx) })
+}
+
+func (c *Connection) securities(ctx context.Context) (map[string]security, error) {
+	return c.secs.Get(func() (map[string]security, error) { return c.readSecurities(ctx) })
+}
+
 // appendBankLedger adds the bank and card ledger of every cash and card
 // account.
 //
@@ -67,19 +79,14 @@ func (c *Connection) Transactions(ctx context.Context, w canonical.Window) (silv
 // verbatim, for the spending and income provider tiers.
 func (c *Connection) appendBankLedger(ctx context.Context, w canonical.Window,
 	accounts map[string]account, out *canonical.TransactionBatch) error {
-	rows, err := c.db.QueryContext(ctx, `
+	return silver.ScanRows(ctx, c.db, "plaid Transactions", `
 SELECT transaction_id, account_id, posted_at, amount, COALESCE(currency, ''),
        COALESCE(name, ''), COALESCE(original_description, ''),
        COALESCE(merchant_name, ''), COALESCE(category_primary, ''),
        COALESCE(category_detailed, ''), COALESCE(check_number, ''),
        COALESCE(json_extract(payload, '$.category_id'), ''), payload
   FROM transactions
- WHERE posted_at BETWEEN ? AND ?`, w.Start, w.End)
-	if err != nil {
-		return fmt.Errorf("plaid Transactions: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
+ WHERE posted_at BETWEEN ? AND ?`, func(rows *sql.Rows) error {
 		var (
 			id, accountID, rawAmount, currency, name, original  string
 			merchant, primary, detailed, check, legacy, payload string
@@ -91,14 +98,14 @@ SELECT transaction_id, account_id, posted_at, amount, COALESCE(currency, ''),
 		}
 		a, ok := accounts[accountID]
 		if !ok || !bankLedgerKind(a.kind) {
-			continue
+			return nil
 		}
 		amount, err := canonical.NewDecimalFromString(rawAmount)
 		if err != nil {
 			return fmt.Errorf("plaid Transactions: %s: amount %q: %w", id, rawAmount, err)
 		}
 		kind := bankTxKind(a.kind, amount, primary, detailed, legacy)
-		net := canonical.ApplyCanonicalSign(kind, &amount)
+		net := &amount
 		out.Transactions = append(out.Transactions, canonical.TransactionChange{
 			TransactionExternalID: id,
 			OccurredAt:            posted,
@@ -113,8 +120,8 @@ SELECT transaction_id, account_id, posted_at, amount, COALESCE(currency, ''),
 			CheckNumber:           silver.CheckNumberOnOutflow(check, net),
 			Payload:               json.RawMessage(payload),
 		})
-	}
-	return rows.Err()
+		return nil
+	}, w.Start, w.End)
 }
 
 // investmentRow is one row of silver's `investment_transactions` table,
@@ -396,17 +403,12 @@ func (m measured) inward() bool {
 // dates a trade at its settlement and states its trade date apart, as a
 // time. A buy or a sell books at the UTC day of its trade date, where Plaid
 // states one no later than the posting date. Every other row books at its
-// posting date.
-//
-// A trade never books before the oldest date the investment ledger was
-// read from. A reload clears gold from the oldest date silver holds
-// (spanExtrema). A trade Plaid stops listing leaves no date of its own in
-// silver, but that window start stays in the span.
+// posting date. A load re-emits the whole history and deletes the
+// source's rows whole first (silver.FullSpan), so a trade books at its
+// trade date however far back it lies.
 const investmentDate = `(CASE
     WHEN LOWER(TRIM(type)) IN ('buy', 'sell') AND transaction_at / 86400 * 86400 <= posted_at
-    THEN MAX(transaction_at / 86400 * 86400,
-             COALESCE((SELECT MIN(window_start) FROM run_products
-                        WHERE product = 'investment_transactions'), 0))
+    THEN transaction_at / 86400 * 86400
     ELSE posted_at END)`
 
 const investmentColumns = `investment_transaction_id, account_id, COALESCE(security_id, ''),
@@ -415,23 +417,14 @@ const investmentColumns = `investment_transaction_id, account_id, COALESCE(secur
        quantity, price, fees, posted_at, ` + investmentDate + `, payload`
 
 func (c *Connection) readInvestmentRows(ctx context.Context, where string, args ...any) ([]investmentRow, error) {
-	rows, err := c.db.QueryContext(ctx, `SELECT `+investmentColumns+`
-  FROM investment_transactions `+where, args...)
-	if err != nil {
-		return nil, fmt.Errorf("plaid Transactions: %w", err)
-	}
-	defer rows.Close()
-	var out []investmentRow
-	for rows.Next() {
+	return silver.Query(ctx, c.db, "plaid Transactions", `SELECT `+investmentColumns+`
+  FROM investment_transactions `+where, func(rows *sql.Rows) (investmentRow, error) {
 		var r investmentRow
-		if err := rows.Scan(&r.id, &r.accountID, &r.securityID, &r.typ, &r.subtype, &r.name,
+		err := rows.Scan(&r.id, &r.accountID, &r.securityID, &r.typ, &r.subtype, &r.name,
 			&r.currency, &r.cancels, &r.rawAmount, &r.quantity, &r.price, &r.fees, &r.posted,
-			&r.occurred, &r.payload); err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
+			&r.occurred, &r.payload)
+		return r, err
+	}, args...)
 }
 
 // cancelledRows are the rows a `cancel` row names, by id, wherever they are

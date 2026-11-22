@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/csv"
 	"maps"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/enrichtest"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/gold"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/lots"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/output"
@@ -470,9 +472,10 @@ func TestTypedHoldingNameColumns(t *testing.T) {
 		t.Fatal(err)
 	}
 	tx := []gold.TransactionRow{
-		{SilverSourceID: "hand", InstrumentExternalID: strp("example-flat"), Name: strp("Example Flat")},
-		{SilverSourceID: "hand", InstrumentExternalID: strp("example-flat"), Description: strp("SAMPLE PAYEE REF")},
-		{SilverSourceID: "bank", Description: strp("SAMPLE PAYEE REF")},
+		{TxnLine: gold.TxnLine{SilverSourceID: "hand"}, InstrumentExternalID: strp("example-flat"), Name: strp("Example Flat")},
+		{TxnLine: gold.TxnLine{SilverSourceID: "hand"}, InstrumentExternalID: strp("example-flat"),
+			TxnValue: gold.TxnValue{Description: strp("SAMPLE PAYEE REF")}},
+		{TxnLine: gold.TxnLine{SilverSourceID: "bank"}, TxnValue: gold.TxnValue{Description: strp("SAMPLE PAYEE REF")}},
 	}
 	table := rowsToTable(tx, txCols, true, output.FormatCSV, nil)
 	if got, want := cell(table.Columns, table.Rows, "name"), []string{"Example Flat", "***", "***"}; !slices.Equal(got, want) {
@@ -483,9 +486,9 @@ func TestTypedHoldingNameColumns(t *testing.T) {
 		t.Fatal(err)
 	}
 	cf := []gold.CashflowTransactionRow{
-		{SilverSourceID: "hand", Name: strp("Example Flat")},
-		{SilverSourceID: "bank", Name: strp("Sample Payer")},
-		{SilverSourceID: "hand"},
+		{TxnLine: gold.TxnLine{SilverSourceID: "hand"}, Name: strp("Example Flat")},
+		{TxnLine: gold.TxnLine{SilverSourceID: "bank"}, Name: strp("Sample Payer")},
+		{TxnLine: gold.TxnLine{SilverSourceID: "hand"}},
 	}
 	table = rowsToTable(cf, cfCols, true, output.FormatCSV, nil)
 	if got, want := cell(table.Columns, table.Rows, "name"), []string{"Example Flat", "***", ""}; !slices.Equal(got, want) {
@@ -893,8 +896,8 @@ func setupTypedLabelGold(t *testing.T) string {
 		 ('wallets', $t1, ` + wallet + `, 'USD', 'current', 100, NULL),
 		 ('bank', $t0, 'BRK000001234', 'USD', 'current', 500, NULL),
 		 ('bank', $t1, 'BRK000001234', 'USD', 'current', 500, NULL),
-		 ('bank', $t0, 'CHK000005678', 'USD', 'current', 5000, '{"CdtIntrstRate1": "1.5", "CdtLmtAmt1": "0"}'),
-		 ('bank', $t1, 'CHK000005678', 'USD', 'current', 5000, '{"CdtIntrstRate1": "1.5", "CdtLmtAmt1": "0"}'),
+		 ('bank', $t0, 'CHK000005678', 'USD', 'current', 5000, '{"interest_rate": "1.5"}'),
+		 ('bank', $t1, 'CHK000005678', 'USD', 'current', 5000, '{"interest_rate": "1.5"}'),
 		 ('deposits', $t0, 'SAV000009999', 'USD', 'current', 700, NULL),
 		 ('deposits', $t1, 'SAV000009999', 'USD', 'current', 700, NULL),
 		 ('venture', $t0, 'example-holder', 'USD', 'current', 50, NULL),
@@ -923,11 +926,6 @@ func setupTypedLabelGold(t *testing.T) string {
 		 ('bank', 'B-DIV', NULL, 1, NULL, 'signature-only', 1),
 		 ('bank', 'C-INT', NULL, 1, NULL, 'signature-only', 1),
 		 ('wallets', 'W-INT', NULL, 1, NULL, 'signature-only', 1)`,
-		`INSERT INTO spend_txn_enrichment (silver_source_id, transaction_external_id, merchant_signature, signature_version,
-		 spend_detailed, provenance, far_silver_source_id, far_account_external_id, far_class, assigned_at) VALUES
-		 ('bank', 'C-SHOP', 'CORNER MARKET', 1, 'FOOD_AND_DRINK_GROCERIES', 'signature-only', NULL, NULL, NULL, 1),
-		 ('wallets', 'W-SHOP', 'CORNER MARKET', 1, 'FOOD_AND_DRINK_GROCERIES', 'signature-only', NULL, NULL, NULL, 1),
-		 ('linked', 'P-SHOP', 'CORNER MARKET', 1, 'FOOD_AND_DRINK_GROCERIES', 'signature-only', NULL, NULL, NULL, 1)`,
 		`INSERT INTO stated_periods (silver_source_id, account_external_id, as_of, period_start, currency,
 		 ending_value, net_additions, source_sha256) VALUES
 		 ('bank', 'BRK000001234', $t1, $jun01, 'USD', 12000, 0, 'doc'),
@@ -936,6 +934,10 @@ func setupTypedLabelGold(t *testing.T) string {
 		if _, err := db.ExecContext(ctx, at.Replace(q)); err != nil {
 			t.Fatalf("%s: %v", q, err)
 		}
+	}
+	for _, src := range []struct{ source, txn string }{{"bank", "C-SHOP"}, {"wallets", "W-SHOP"}, {"linked", "P-SHOP"}} {
+		enrichtest.SeedSpend(t, db, enrichtest.Spend{Source: src.source, Txn: src.txn, Signature: "CORNER MARKET",
+			Detailed: "FOOD_AND_DRINK_GROCERIES", Provenance: "signature-only", At: 1})
 	}
 	if _, err := gold.RebuildLots(ctx, db, gold.LotsOptions{Config: lots.Config{}}); err != nil {
 		t.Fatal(err)
@@ -978,11 +980,7 @@ func typedLabelCalls(s *mcpServer, today time.Time) []typedLabelCall {
 		if fam == nil {
 			continue
 		}
-		views := fam.views
-		if views == nil {
-			views = []string{""}
-		}
-		for _, view := range views {
+		for _, view := range fam.viewsOrOne() {
 			c := typedLabelCall{name: strings.TrimSpace(spec.name + " " + view),
 				args: map[string]any{"format": "csv", "columns": "all", "max_chars": maxIntegerParam}, cli: []string{spec.name}}
 			if view != "" {
@@ -990,17 +988,20 @@ func typedLabelCalls(s *mcpServer, today time.Time) []typedLabelCall {
 				c.cli = append(c.cli, view)
 			}
 			window := [2]string{"2026-04-01", "2026-06-30"}
-			if fam.forward != nil && fam.forward(view) {
+			if fam.view(view).forward() {
 				window = fwd
 			}
 			if spec.name == "cashflow" && view == "projection" {
 				window = [2]string{fwdFrom.AddDate(0, 1, 0).Format(time.DateOnly), fwd[1]}
 			}
-			switch fam.window {
-			case asOfDate:
+			// returns private takes no window. Every other view runs on the
+			// fixture's, so one that refuses it fails its call.
+			switch {
+			case spec.name == "returns" && view == "private":
+			case fam.window == asOfDate:
 				c.args["as_of"] = "2026-06-30"
 				c.cli = append(c.cli, "-d", "2026-06-30")
-			case noWindow:
+			case fam.window == noWindow:
 			default:
 				c.args["from"], c.args["to"] = window[0], window[1]
 				c.cli = append(c.cli, window[0], window[1])
@@ -1108,8 +1109,11 @@ func TestPrivacyHidesTypedAccountNames(t *testing.T) {
 			t.Run(c.name, func(t *testing.T) {
 				t.Parallel()
 				cfg := copyFixture(t, cfg)
-				full, priv := onFixtureToday(newTestMCP(cfg, false)), onFixtureToday(newTestMCP(cfg, true))
 				tool, _, _ := strings.Cut(c.name, " ")
+				if tool == "returns" && c.args["view"] == "private" {
+					withPrivateLegs(t, cfg)
+				}
+				full, priv := onFixtureToday(newTestMCP(cfg, false)), onFixtureToday(newTestMCP(cfg, true))
 				plain, err := callTool(t, full, tool, c.args)
 				if err != nil {
 					t.Fatalf("%s: %v", c.name, err)
@@ -1310,8 +1314,8 @@ func TestTypedHoldingNamesMaskTheirIDs(t *testing.T) {
 			issuers[strings.ToUpper(c.name)] = true
 		}
 		issuerRows = append(issuerRows, gold.ExposureIssuerRow{Issuer: c.name})
-		flows = append(flows, gold.CashflowTransactionRow{SilverSourceID: c.source, Name: &c.name})
-		lines = append(lines, gold.TransactionRow{SilverSourceID: c.source, Name: &c.name})
+		flows = append(flows, gold.CashflowTransactionRow{TxnLine: gold.TxnLine{SilverSourceID: c.source}, Name: &c.name})
+		lines = append(lines, gold.TransactionRow{TxnLine: gold.TxnLine{SilverSourceID: c.source}, Name: &c.name})
 	}
 	pick := func(t *testing.T, name string, cols []string) int {
 		t.Helper()
@@ -1471,5 +1475,36 @@ func TestPrivacyPseudonymsHoldWithinARun(t *testing.T) {
 				t.Errorf("sorted, at offset %d: %s reads %q, want %q as unpaged", offset, source, name, names[source])
 			}
 		}
+	}
+}
+
+// TestPseudonymsNumberAsTheDefaultOutput: a CLI run and an MCP call
+// number pseudonyms alike (numberedCells): the default columns first,
+// over every row, then the rest. So a value a default column prints
+// takes the first number even where a column the defaults leave out
+// comes before it in the registry, as it does in the CLI's output.
+func TestPseudonymsNumberAsTheDefaultOutput(t *testing.T) {
+	t.Parallel()
+	type row struct{ alias, label string }
+	typed := func(name string, get func(row) string) columnSpec[row] {
+		return columnSpec[row]{Name: name, Privacy: PrivacyPseudonym, Extract: get,
+			Pseudonym: func(row) (string, string) { return "manual", "" }}
+	}
+	registry := []columnSpec[row]{typed("alias", func(r row) string { return r.alias }),
+		typed("label", func(r row) string { return r.label })}
+	rows := []row{{"Example Alias", "Example Label"}, {"Other Alias", "Example Alias"}}
+	rep := newReport(registry, []string{"label"}, func(context.Context, *sql.DB) ([]row, error) { return rows, nil })
+	fetched, err := rep.fetch(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := newResultSet(rep, fetched, true)
+	want := [][]string{{"manual-2", "manual-1"}, {"manual-3", "manual-2"}}
+	if !slices.EqualFunc(rs.cells, want, slices.Equal) {
+		t.Errorf("cells = %q, want %q", rs.cells, want)
+	}
+	if got := fetched.table(nil, []int{1}, true, output.FormatTable, rs.names).Rows; got[0][0] != "manual-1" ||
+		got[1][0] != "manual-2" {
+		t.Errorf("the default output reads %q, want manual-1 and manual-2", got)
 	}
 }

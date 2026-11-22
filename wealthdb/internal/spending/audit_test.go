@@ -52,6 +52,37 @@ func TestMatchedPairsListsBothLegs(t *testing.T) {
 	}
 }
 
+// TestMatchedPairsListsACoinsDust: the audit reads the amount the
+// matcher compares. A coin's dust pair is listed by its debit, and a
+// dust leg left unpaired carries its quantity, not net_amount's zero.
+func TestMatchedPairsListsACoinsDust(t *testing.T) {
+	db, ctx := openGold(t)
+	if _, err := db.ExecContext(ctx, `
+        INSERT INTO transactions (silver_source_id, transaction_external_id, occurred_at, account_external_id,
+                                  instrument_external_id, kind, currency, quantity, net_amount) VALUES
+            ('bank', 'dust:out', ?, 'CUST1', 'ETH', 'withdrawal', 'ETH', -0.00000913, 0),
+            ('other-bank', 'dust:in', ?, 'CUST2', 'ETH', 'deposit', 'ETH', 0.00000913, 0),
+            ('bank', 'dust:lone', ?, 'CUST1', 'ETH', 'withdrawal', 'ETH', -0.00000377, 0)`,
+		day(10), day(10), day(40)); err != nil {
+		t.Fatal(err)
+	}
+
+	runPass(t, db, ctx, Options{})
+	pairs, unmatched, err := MatchedPairs(ctx, db)
+	if err != nil {
+		t.Fatalf("MatchedPairs: %v", err)
+	}
+	if len(pairs) != 1 || pairs[0].Debit.TxID != "dust:out" || pairs[0].Credit.TxID != "dust:in" {
+		t.Fatalf("pairs = %+v, want (dust:out, dust:in)", pairs)
+	}
+	if p := pairs[0]; p.Debit.Amount != -0.00000913 || p.Credit.Amount != 0.00000913 {
+		t.Errorf("pair amounts = (%g, %g), want the quantities", p.Debit.Amount, p.Credit.Amount)
+	}
+	if len(unmatched) != 1 || unmatched[0].TxID != "dust:lone" || unmatched[0].Amount != -0.00000377 {
+		t.Errorf("unmatched = %+v, want dust:lone at its quantity", unmatched)
+	}
+}
+
 // TestMatchedPairsSortsUnmatchedByMagnitude pins the ordering the run
 // report relies on: it prints the head of this slice, and the legs
 // worth a human's attention are the big ones.
@@ -234,8 +265,7 @@ func linkRows(t *testing.T, db *sql.DB, ctx context.Context) []string {
         SELECT silver_source_id, transaction_external_id,
                COALESCE(far_silver_source_id, '(null)'),
                COALESCE(far_account_external_id, '(null)'),
-               COALESCE(far_transaction_external_id, '(null)'),
-               COALESCE(far_class, '(null)'), evidence, measure
+               COALESCE(far_transaction_external_id, '(null)'), evidence, measure
           FROM transfer_links
          ORDER BY silver_source_id, transaction_external_id`)
 	if err != nil {
@@ -244,12 +274,12 @@ func linkRows(t *testing.T, db *sql.DB, ctx context.Context) []string {
 	defer rows.Close()
 	var out []string
 	for rows.Next() {
-		var src, id, farSrc, farAcct, farTx, farClass, evidence, measure string
-		if err := rows.Scan(&src, &id, &farSrc, &farAcct, &farTx, &farClass, &evidence, &measure); err != nil {
+		var src, id, farSrc, farAcct, farTx, evidence, measure string
+		if err := rows.Scan(&src, &id, &farSrc, &farAcct, &farTx, &evidence, &measure); err != nil {
 			t.Fatalf("scan transfer links: %v", err)
 		}
-		out = append(out, fmt.Sprintf("%s/%s far=%s/%s tx=%s class=%s by=%s measure=%s",
-			src, id, farSrc, farAcct, farTx, farClass, evidence, measure))
+		out = append(out, fmt.Sprintf("%s/%s far=%s/%s tx=%s by=%s measure=%s",
+			src, id, farSrc, farAcct, farTx, evidence, measure))
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterate transfer links: %v", err)

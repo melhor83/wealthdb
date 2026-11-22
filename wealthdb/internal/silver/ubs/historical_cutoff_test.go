@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
-	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver"
 )
 
 // TestHistoricalCutoffDropsPSNOverlap locks in the fix for the
@@ -73,7 +72,7 @@ func TestHistoricalCutoffDropsPSNOverlap(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rels := []silver.RelationshipPair{{WebID: "0999 AAAAAAAA", PSNID: "SFTPCH01"}}
+	rels := []RelationshipPair{{WebID: "0999 AAAAAAAA", PSNID: "SFTPCH01"}}
 	psn := &psnReader{db: psnDB}
 	cutoffByWebRel := map[string]int64{"0999 AAAAAAAA": 1500}
 
@@ -89,11 +88,7 @@ func TestHistoricalCutoffDropsPSNOverlap(t *testing.T) {
 	}
 
 	w := canonical.Window{Start: 0, End: 3000, HasChanges: true}
-	stream, err := web.snapshotsHistorical(ctx, w, nil, portfolioCutoff, accountCutoff, inferredForwards{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stream.Close()
+	stream := connSnapshots(t, &Connection{web: web, psn: psn, relationships: rels}, w)
 
 	posBySnap := map[int64]int{}
 	cashBySnap := map[int64]int{}

@@ -191,8 +191,7 @@ def _probe_authenticated(context, watch: _Watch) -> bool:
 # --- login-form driving ---------------------------------------------------
 
 def _load_credentials(env_file: Path) -> tuple[str, str, str]:
-    if envfile.source_env_file(env_file):
-        log.info("env file: %s (sourced)", env_file)
+    envfile.load(None, candidates=(env_file,), logger=log)
     username = os.environ.get(USER_ENV, "")
     password = os.environ.get(PASS_ENV, "")
     region = os.environ.get(REGION_ENV, "")
@@ -569,14 +568,14 @@ def main(argv: list[str]) -> int:
         if args.fresh:
             log.error("--fresh cannot be combined with --check "
                       "(a read-only probe never wipes the profile).")
-            return 2
+            return cli.EXIT_USAGE
         return run_check(args)
     if args.bronze_dir is None:
         # The session does not persist (§F), so a sign-in without a fetch
         # would cost a pushTAN for nothing.
         log.error("--bronze-dir is required to sign in: the sign-in serves "
                   "the fetch (the download verb passes /data).")
-        return 2
+        return cli.EXIT_USAGE
     return run_login_and_fetch(args)
 
 

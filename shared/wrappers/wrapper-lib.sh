@@ -10,52 +10,55 @@
 #   4. calls `wrapper_main "$@"`, which dispatches build and prune and
 #      runs every other verb on the common docker-run path.
 #
+# Every verb mounts $HERE over /app, so a run uses the checkout's source
+# and a code edit needs no rebuild. The image holds no source: its
+# Dockerfile copies requirements.txt alone, and a direct `docker run`
+# mounts the checkout too.
+#
 # Caller must SET (before sourcing):
 #   HERE         absolute path to the wrapper's own directory. Convention:
 #                HERE="$(cd "$(dirname "$0")" && pwd)" at the top of each
 #                wrapper.
 #   NAME         short collector name, e.g. "fidelity-web".
-#   ENV_PREFIX   upper-cased env-var prefix, e.g. "FIDELITY_WEB". Used to
-#                derive both override knobs (${ENV_PREFIX}_SECRETS_DIR
-#                etc.) and the force-replace switch
-#                (${ENV_PREFIX}_FORCE_REPLACE).
 #   ENV_VARS     Bash array of env-var names to forward into the container
 #                via `-e VAR` (e.g. (FIDELITY_USERNAME FIDELITY_PASSWORD)).
+#
+# Caller MAY SET (before sourcing):
+#   ENV_PREFIX   upper-cased env-var prefix. Used to derive both override
+#                knobs (${ENV_PREFIX}_SECRETS_DIR etc.) and the
+#                force-replace switch (${ENV_PREFIX}_FORCE_REPLACE).
+#                wrapper_init derives it from NAME when unset (see
+#                paths-lib.sh): "fidelity-web" gives "FIDELITY_WEB".
 #
 # Caller MAY SET (before sourcing) to opt in to features:
 #   HAS_DEBUG=1       Mount $HOST_DEBUG → /debug. Required for collectors
 #                     whose --screenshot-dir / --trace flags write under
 #                     /debug.
-#   HAS_APP_MOUNT=1   Mount $HERE over /app on every verb, so a run uses
-#                     the checkout's source and a code edit needs no
-#                     rebuild. The image then holds no source (its
-#                     Dockerfile copies requirements.txt alone), and a
-#                     direct `docker run` mounts the checkout too.
 #   HAS_SAFETY=1      Refuse to clobber a RUNNING container with the same
 #                     name. Required where a docker rm -f mid-MFA would
 #                     burn a 2FA prompt or evict a VNC handoff. Override
 #                     with ${ENV_PREFIX}_FORCE_REPLACE=1 when the live
 #                     container is known-stuck.
-#   HAS_VNC=1         Forward a host-side VNC port for the `vnc-login`
-#                     subcommand. Walks 5900-6000 for a free port (defends
-#                     against macOS Screen Sharing, prior crashed runs,
-#                     other VNC servers) and passes the chosen port as
-#                     VNC_HOST_PORT inside the container.
-#   VNC_SUBCOMMANDS   Bash array of the subcommands that get the VNC port
-#                     under HAS_VNC=1. Replaces the default (vnc-login).
+#   VNC_SUBCOMMANDS   Bash array of the subcommands that get a forwarded
+#                     host-side VNC port. Walks 5900-6000 for a free port
+#                     (defends against macOS Screen Sharing, prior crashed
+#                     runs, other VNC servers) and passes the chosen port
+#                     as VNC_HOST_PORT inside the container. Unset or
+#                     empty, no verb gets one.
 #   SILVER_SUBCOMMANDS
 #                     Bash array of the subcommands that read --silver-db.
-#                     Replaces the default (load).
+#                     Replaces the default (load); see paths-lib.sh.
 #   HAS_ENV_FILE=1    Source the credentials env file host-side before
 #                     `docker run`, so the ENV_VARS it sets are forwarded
 #                     (see wrapper_source_env_file).
 #
 # A wrapper with a config file calls `wrapper_source_cfg PREFIX DEFAULT`
-# before wrapper_init.
+# before wrapper_init. A wrapper whose `login` folds into `download`
+# calls `wrapper_login_folds` before wrapper_main.
 #
 # wrapper_init POPULATES (for the caller and the helpers below):
 #   HOST_SECRETS, HOST_DATA, HOST_DEBUG (when HAS_DEBUG=1),
-#   HOST_STARTUPCACHE, CONTAINER_NAME, IMAGE.
+#   HOST_STARTUPCACHE, HOST_CACHE, CONTAINER_NAME, IMAGE.
 #
 # bash 3.2 compatibility: this lib avoids namerefs and associative
 # arrays so it runs on Apple's /bin/bash. Indirect expansion (${!var})
@@ -65,20 +68,15 @@
 # Internals
 # ----------------------------------------------------------------------
 
-# The repository root, from this file's place in it, and the image-tag
-# and env-file helpers beside this file.
+# The repository root, from this file's place in it, and the image-tag,
+# env-file and path helpers beside this file.
 _WRAPPER_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/image-tag.sh"
 # shellcheck disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/envfile-lib.sh"
-
-# _envvar SUFFIX DEFAULT — echo the value of ${ENV_PREFIX}_${SUFFIX},
-# or DEFAULT if unset/empty.
-_envvar() {
-    local var="${ENV_PREFIX}_$1"
-    echo "${!var:-$2}"
-}
+# shellcheck disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/paths-lib.sh"
 
 # _abs_dir DIR — echo the existing directory DIR as an absolute path.
 # `docker run -v` reads a bare relative source such as `mydata` as a
@@ -112,32 +110,21 @@ wrapper_source_cfg() {
     fi
 }
 
-# Directory resolution precedence (highest first):
-#   1. a --secrets-dir / --data-dir / --silver-db CLI flag (parsed later,
-#      in wrapper_resolve_dir_args, so it overrides everything here)
-#   2. the per-collector ${ENV_PREFIX}_SECRETS_DIR / _DATA_DIR env var
-#   3. the fleet-wide WEALTHDB_SECRETS_DIR / WEALTHDB_DATA_ROOT env var
-#      (lets an orchestrator set one knob for all)
-#   4. the ~/.secrets and ${XDG_DATA_HOME:-~/.local/share}/wealthdb/<name>
-#      defaults
+# The mount sources follow the precedence of paths-lib.sh. A
+# --secrets-dir / --data-dir / --silver-db flag is parsed later, in
+# wrapper_resolve_dir_args, so it overrides everything here.
 wrapper_init() {
+    collector_default_paths
     wealthdb_export_image_tag "$_WRAPPER_ROOT" || exit 2
-    IMAGE="$(_envvar IMAGE "wealthdb/${NAME}:${WEALTHDB_IMAGE_TAG}")"
-    CONTAINER_NAME="$(_envvar CONTAINER "$NAME")"
+    IMAGE="$(_collector_envvar IMAGE "wealthdb/${NAME}:${WEALTHDB_IMAGE_TAG}")"
+    CONTAINER_NAME="$(_collector_envvar CONTAINER "$NAME")"
 
-    local secrets_default="${WEALTHDB_SECRETS_DIR:-$HOME/.secrets}"
-    HOST_SECRETS="$(_envvar SECRETS_DIR "$secrets_default")"
-
-    # Default data root follows the XDG Base Directory spec
-    # ($XDG_DATA_HOME, falling back to ~/.local/share).
-    local data_default="${XDG_DATA_HOME:-$HOME/.local/share}/wealthdb/$NAME"
-    [[ -n "${WEALTHDB_DATA_ROOT:-}" ]] && data_default="${WEALTHDB_DATA_ROOT%/}/$NAME"
-    HOST_DATA="$(_envvar DATA_DIR "$data_default")"
-
+    HOST_SECRETS="$SECRETS_DIR"
+    HOST_DATA="$DATA_DIR"
     if [[ "${HAS_DEBUG:-0}" == "1" ]]; then
         # Debug/trace cache under the XDG cache dir, namespaced per
         # collector like the startupCache below.
-        HOST_DEBUG="$(_envvar DEBUG_DIR "${XDG_CACHE_HOME:-$HOME/.cache}/wealthdb/debug/$NAME")"
+        HOST_DEBUG="$DEBUG_DIR"
     fi
 
     # Host cache dir for the browsers' relocated startupCache (see
@@ -147,78 +134,39 @@ wrapper_init() {
     # (keeping launches fast) yet is plainly non-sensitive; one generic dir,
     # not per-profile — the container keys per-profile subdirs itself.
     HOST_STARTUPCACHE="${XDG_CACHE_HOME:-$HOME/.cache}/wealthdb/startupcache"
+
+    # The collector's own cache dir (collectorkit.extract.cache_root): the
+    # parse and extraction caches a load replays. The container runs with
+    # HOME=/tmp, so without this mount the cache would end with the
+    # container.
+    HOST_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/wealthdb/$NAME"
 }
 
-# wrapper_verb_takes_silver — is `$1` a subcommand that consumes the silver
-# DB? The set defaults to just `load`. A wrapper with another
-# silver-consuming verb sets SILVER_SUBCOMMANDS to REPLACE that default —
-# e.g. SILVER_SUBCOMMANDS=(load fetch-prices) for cointracking. Mirrors the
-# VNC_SUBCOMMANDS convention below.
-wrapper_verb_takes_silver() {
-    local want="$1" v
-    local -a verbs
-    if [[ -n "${SILVER_SUBCOMMANDS+x}" ]]; then
-        verbs=(${SILVER_SUBCOMMANDS[@]+"${SILVER_SUBCOMMANDS[@]}"})
-    else
-        verbs=(load)
-    fi
-    for v in ${verbs[@]+"${verbs[@]}"}; do
-        [[ "$want" == "$v" ]] && return 0
-    done
-    return 1
-}
-
-# Parse the uniform directory-override flags out of the forwarded args:
-#   --secrets-dir DIR   override HOST_SECRETS (the /secrets mount source)
-#   --data-dir    DIR   override HOST_DATA    (the /data mount source —
+# wrapper_resolve_dir_args ARGS... — consume the uniform directory-override
+# flags (collector_parse_dir_flags) and map them onto the mounts:
+#   --secrets-dir DIR   overrides HOST_SECRETS (the /secrets mount source)
+#   --data-dir    DIR   overrides HOST_DATA    (the /data mount source —
 #                       holds both the bronze dumps and the silver DB)
-#   --silver-db   PATH  put the silver DB at an explicit HOST path outside
+#   --silver-db   PATH  puts the silver DB at an explicit HOST path outside
 #                       the data dir: bind-mounts its parent to /silver and
 #                       rewrites the flag to the in-container path (the inner
 #                       load.py accepts --silver-db, default /data/<name>.db)
-# Both `--flag VALUE` and `--flag=VALUE` forms are accepted. Recognised
-# flags are CONSUMED; everything else is collected into FORWARD_ARGS for the
-# container. SILVER_MOUNT holds the extra `-v` args (empty unless a silver
-# path is in play).
-#
-# --silver-db only means something on a verb that builds the silver DB, so
-# on any other verb it is rejected here rather than forwarded into a parser
-# that would reject it naming an in-container path the caller never typed.
-# The ${PREFIX}_SILVER_DB env var is different: it is ambient config naming
-# where silver lives, so a non-silver verb ignores it rather than failing
-# every `login` in a shell that exports it.
-# bash 3.2 safe (no namerefs / associative arrays).
+# Everything else is left in FORWARD_ARGS for the container. SILVER_MOUNT
+# holds the extra `-v` args (empty unless a silver path is in play), and
+# only a verb that reads the silver DB gets one.
 wrapper_resolve_dir_args() {
-    FORWARD_ARGS=()
+    SECRETS_DIR="$HOST_SECRETS"
+    DATA_DIR="$HOST_DATA"
+    collector_parse_dir_flags "$@"
+    HOST_SECRETS="$SECRETS_DIR"
+    HOST_DATA="$DATA_DIR"
     SILVER_MOUNT=()
-    local silver silver_from_flag=0
-    silver="$(_envvar SILVER_DB "")"
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --secrets-dir)   HOST_SECRETS="$2"; shift 2 ;;
-            --secrets-dir=*) HOST_SECRETS="${1#*=}"; shift ;;
-            --data-dir)      HOST_DATA="$2"; shift 2 ;;
-            --data-dir=*)    HOST_DATA="${1#*=}"; shift ;;
-            --silver-db)     silver="$2"; silver_from_flag=1; shift 2 ;;
-            --silver-db=*)   silver="${1#*=}"; silver_from_flag=1; shift ;;
-            *)               FORWARD_ARGS+=("$1"); shift ;;
-        esac
-    done
-    # The subcommand is the first arg that isn't one of the dir flags.
-    local sub="${FORWARD_ARGS[0]:-}"
-    if ! wrapper_verb_takes_silver "$sub"; then
-        if [[ $silver_from_flag == 1 ]]; then
-            echo "$NAME: --silver-db does not apply to '${sub:-<no subcommand>}'" \
-                 "— it is only read by: $(wrapper_silver_verbs_str)." >&2
-            exit 2
-        fi
-        return
-    fi
-    if [[ -n "$silver" ]]; then
+    collector_verb_takes_silver "${FORWARD_ARGS[0]:-}" || return 0
+    if [[ -n "$SILVER_DB" ]]; then
         local d b
-        mkdir -p "$(dirname "$silver")"
-        d="$(_abs_dir "$(dirname "$silver")")"
-        b="$(basename "$silver")"
+        mkdir -p "$(dirname "$SILVER_DB")"
+        d="$(_abs_dir "$(dirname "$SILVER_DB")")"
+        b="$(basename "$SILVER_DB")"
         SILVER_MOUNT=(-v "$d:/silver")
         FORWARD_ARGS+=(--silver-db "/silver/$b")
     fi
@@ -236,19 +184,10 @@ wrapper_resolve_dir_args() {
 wrapper_source_env_file() {
     [[ "${HAS_ENV_FILE:-0}" == "1" ]] || return 0
     local f
-    f="$(_envvar ENV_FILE "$HOST_SECRETS/$NAME.env")"
+    f="$(_collector_envvar ENV_FILE "$HOST_SECRETS/$NAME.env")"
     [[ -f "$f" ]] || return 0
     wealthdb_source_bash "$f" ||
         echo "${NAME}: env file $f has a bash syntax error; not sourcing it" >&2
-}
-
-# The silver-consuming verbs as a display string, for the reject message.
-wrapper_silver_verbs_str() {
-    if [[ -n "${SILVER_SUBCOMMANDS+x}" ]]; then
-        echo "${SILVER_SUBCOMMANDS[*]}"
-    else
-        echo "load"
-    fi
 }
 
 # The mount lines for the "Mounted into the container:" block in usage().
@@ -257,9 +196,11 @@ wrapper_mounts_help() {
     echo "  $HOST_SECRETS  ->  /secrets"
     echo "  $HOST_DATA     ->  /data"
     echo "  $HOST_STARTUPCACHE  ->  /cache/startupcache"
+    echo "  $HOST_CACHE  ->  /cache/collector"
     if [[ "${HAS_DEBUG:-0}" == "1" ]]; then
         echo "  $HOST_DEBUG    ->  /debug"
     fi
+    echo "  $HERE  ->  /app"
 }
 
 # ----------------------------------------------------------------------
@@ -268,10 +209,9 @@ wrapper_mounts_help() {
 
 # Implement `./<wrapper> build [extra args]`. When the image's label
 # matches a hash of its inputs and of its base image, print that it is
-# unchanged and exit. The inputs are this directory; with HAS_APP_MOUNT=1
-# they are the Dockerfile and requirements.txt alone, since such an
-# image holds no source and an edit to the code or the docs leaves it
-# as it is. Returning would fall through into docker run. Extra
+# unchanged and exit. The inputs are the Dockerfile and requirements.txt
+# alone: the image holds no source, so an edit to the code or the docs
+# leaves it as it is. Returning would fall through into docker run. Extra
 # arguments are passed through, and the image is built. A hash that
 # fails (no python3 on the host) builds an unlabeled image, which is
 # never skipped.
@@ -285,14 +225,10 @@ wrapper_mounts_help() {
 wrapper_build() {
     shift  # drop "build"
     # The base image's id is part of the inputs: a rebuilt base is a
-    # different image even when this directory did not change.
+    # different image even when its own inputs did not change.
     _wfrom="$(wealthdb_from_id "$HERE/Dockerfile")"
-    if [[ "${HAS_APP_MOUNT:-0}" == "1" ]]; then
-        _winputs=("$HERE/Dockerfile" "$HERE/requirements.txt")
-    else
-        _winputs=("$HERE")
-    fi
-    _whash="$(wealthdb_inputs_hash "${_winputs[@]}" -- "$_wfrom")" || _whash=
+    _whash="$(wealthdb_inputs_hash "$HERE/Dockerfile" "$HERE/requirements.txt" \
+        -- "$_wfrom")" || _whash=
     if wealthdb_build_unchanged "$IMAGE" "$_whash" "$#"; then
         exit 0
     fi
@@ -326,25 +262,11 @@ wrapper_build() {
 # dispatcher promises them on every verb): --data-dir retargets the
 # bronze root, and --secrets-dir, meaningless to a bronze file-walk, is
 # absorbed rather than forwarded. --silver-db is rejected, as on every
-# other verb that does not read it. Both `--flag VALUE` and
-# `--flag=VALUE`; everything else forwards to prune.py.
+# other verb that does not read it. Everything else forwards to prune.py.
 wrapper_host_prune() {
-    shift  # drop "prune"
-    local bronze="$HOST_DATA"
-    local -a rest=()
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --data-dir)      bronze="$2"; shift 2 ;;
-            --data-dir=*)    bronze="${1#*=}"; shift ;;
-            --secrets-dir)   shift 2 ;;
-            --secrets-dir=*) shift ;;
-            --silver-db|--silver-db=*)
-                echo "$NAME: --silver-db does not apply to 'prune'" \
-                     "— it is only read by: $(wrapper_silver_verbs_str)." >&2
-                exit 2 ;;
-            *)               rest+=("$1"); shift ;;
-        esac
-    done
+    DATA_DIR="$HOST_DATA"
+    collector_parse_dir_flags "$@"
+    local -a rest=("${FORWARD_ARGS[@]:1}")
     # Before "$rest" so an explicit --debug-dir in the forwarded args wins
     # (argparse last-wins), matching --bronze-dir's treatment.
     local -a debug_args=()
@@ -352,7 +274,7 @@ wrapper_host_prune() {
         debug_args=(--debug-dir "$HOST_DEBUG")
     fi
     exec env PYTHONPATH="$HERE/../../shared/collectorkit:${PYTHONPATH:-}" \
-        python3 "$HERE/prune.py" --bronze-dir "$bronze" \
+        python3 "$HERE/prune.py" --bronze-dir "$DATA_DIR" \
         ${debug_args[@]+"${debug_args[@]}"} \
         ${rest[@]+"${rest[@]}"}
 }
@@ -378,6 +300,11 @@ wrapper_check_mounts() {
     mkdir -p "$HOST_STARTUPCACHE"
     chmod 700 "$HOST_STARTUPCACHE"
     HOST_STARTUPCACHE="$(_abs_dir "$HOST_STARTUPCACHE")"
+    # The collector cache holds extracted statement text and parsed rows,
+    # so it is kept 0700 like the data dir, whoever created it.
+    mkdir -p "$HOST_CACHE"
+    chmod 700 "$HOST_CACHE"
+    HOST_CACHE="$(_abs_dir "$HOST_CACHE")"
     if [[ "${HAS_DEBUG:-0}" == "1" ]]; then
         mkdir -p "$HOST_DEBUG"
         HOST_DEBUG="$(_abs_dir "$HOST_DEBUG")"
@@ -457,6 +384,30 @@ wrapper_safety_guard() {
 # Common dispatch
 # ----------------------------------------------------------------------
 
+# wrapper_login_folds [PASS_FLAG...] -- ARGS... — is this the bare
+# `login` of a collector whose sign-in folds into `download`? True when
+# ARGS name the `login` verb and hold none of the PASS_FLAGs. The caller
+# then prints its notice and exits 0 without starting a container. That
+# keeps an orchestrator's login -> download -> load from tripping and
+# saves a container start. A PASS_FLAG, such as a session probe's
+# `--check` or a help flag, takes `login` to the container.
+wrapper_login_folds() {
+    local -a pass=()
+    while [[ $# -gt 0 && "$1" != -- ]]; do
+        pass+=("$1")
+        shift
+    done
+    shift
+    [[ "${1:-}" == login ]] || return 1
+    local a p
+    for a in "$@"; do
+        for p in ${pass[@]+"${pass[@]}"}; do
+            [[ "$a" == "$p" ]] && return 1
+        done
+    done
+    return 0
+}
+
 # wrapper_wants_help [args...] — are the args a request for the
 # wrapper's help: none at all, or help / --help / -h as the verb?
 wrapper_wants_help() {
@@ -484,31 +435,17 @@ wrapper_main() {
     wrapper_check_mounts
     wrapper_tty_args
 
+    # A verb of VNC_SUBCOMMANDS gets a forwarded VNC port.
     local -a extra_args=()
-    if [[ "${HAS_VNC:-0}" == "1" ]]; then
-        local sub="${1:-}" need_vnc=0 v
-        # The set of subcommands that get a forwarded VNC port. When unset it
-        # defaults to just `vnc-login` (the collectors that implement that
-        # verb). A wrapper whose VNC surface is different sets VNC_SUBCOMMANDS
-        # to REPLACE that default — e.g. VNC_SUBCOMMANDS=(explore login) for a
-        # collector whose VNC verbs are explore/login and which has NO
-        # vnc-login — so it never allocates a port for (nor advertises) a
-        # vnc-login it doesn't implement.
-        local -a vnc_set
-        if [[ -n "${VNC_SUBCOMMANDS+x}" ]]; then
-            vnc_set=(${VNC_SUBCOMMANDS[@]+"${VNC_SUBCOMMANDS[@]}"})
-        else
-            vnc_set=(vnc-login)
-        fi
-        for v in ${vnc_set[@]+"${vnc_set[@]}"}; do
-            [[ "$sub" == "$v" ]] && { need_vnc=1; break; }
-        done
-        if [[ $need_vnc == 1 ]]; then
+    local v
+    for v in ${VNC_SUBCOMMANDS[@]+"${VNC_SUBCOMMANDS[@]}"}; do
+        if [[ "${1:-}" == "$v" ]]; then
             wrapper_vnc_port
             extra_args+=(-p "127.0.0.1:${vnc_host_port}:5900"
                          -e "VNC_HOST_PORT=${vnc_host_port}")
+            break
         fi
-    fi
+    done
 
     if [[ "${HAS_SAFETY:-0}" == "1" ]]; then
         wrapper_safety_guard "$@"
@@ -521,7 +458,6 @@ wrapper_main() {
         --user "$(id -u):$(id -g)"
         -e HOME=/tmp
     )
-    local v
     for v in ${ENV_VARS[@]+"${ENV_VARS[@]}"}; do
         docker_args+=(-e "$v")
     done
@@ -536,14 +472,15 @@ wrapper_main() {
         # — a pointer, not data (see collectorkit.launch.redirect_startup_cache).
         -v "$HOST_STARTUPCACHE:/cache/startupcache"
         -e "WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache"
+        # The collector's cache root, kept on the host across runs.
+        -v "$HOST_CACHE:/cache/collector"
+        -e "WEALTHDB_CACHE_DIR=/cache/collector"
         ${SILVER_MOUNT[@]+"${SILVER_MOUNT[@]}"}
     )
     if [[ "${HAS_DEBUG:-0}" == "1" ]]; then
         docker_args+=(-v "$HOST_DEBUG:/debug")
     fi
-    if [[ "${HAS_APP_MOUNT:-0}" == "1" ]]; then
-        docker_args+=(-v "$HERE:/app")
-    fi
+    docker_args+=(-v "$HERE:/app")
 
     exec docker run "${docker_args[@]}" "$IMAGE" "$@"
 }

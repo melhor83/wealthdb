@@ -48,7 +48,6 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NAME=schwab-api
-ENV_PREFIX=SCHWAB_API
 
 cmd="${1:-help}"
 
@@ -72,7 +71,7 @@ case "$cmd" in
         # VNC port (wrapper-lib forwards it only for the 'vnc-login' sub).
         ENV_VARS=(SCHWAB_CLIENT_ID SCHWAB_CLIENT_SECRET \
                   SCHWAB_LOGIN_ID SCHWAB_PASSWORD)
-        HAS_VNC=1           # vnc-login → forward a free 5900-6000 port
+        VNC_SUBCOMMANDS=(vnc-login)   # forward a free 5900-6000 port
         HAS_DEBUG=1         # /debug for the trace + page captures
         HAS_SAFETY=1        # don't evict a live VNC / 2FA session
         # shellcheck disable=SC1091
@@ -88,38 +87,26 @@ case "$cmd" in
         # hack). `recompress` is the manual sweep converting plain-JSON
         # dumps to the .json.zst form download writes. `prune` walks the
         # bronze tree plus the trace cache the containerised `login`
-        # writes — DEBUG_DIR resolves the same there as it does in
-        # wrapper-lib, so both halves name one dir. The
-        # default dir flags come first so an explicit flag in the
-        # forwarded args overrides them (argparse last-wins); in-flight
-        # dumps and captures are protected by the verb's own age guard.
+        # writes. Both halves take DEBUG_DIR from collector_default_paths,
+        # so they name one dir. The default dir flags come first so an
+        # explicit flag in the forwarded args overrides them (argparse
+        # last-wins); in-flight dumps and captures are protected by the
+        # verb's own age guard.
         # shellcheck disable=SC1091
         source "$HERE/../../shared/wrappers/host-lib.sh"
         shift
         host_resolve_dirs "$cmd" "$@"
         host_source_env_file
-        py="$(host_python)"
         token="$SECRETS_DIR/schwab-api-token.json"
         case "$cmd" in
             download)
-                exec "$py" "$HERE/download.py" --token-path "$token" \
-                    --bronze-dir "$DATA_DIR" \
-                    ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
-                ;;
+                host_run download.py --token-path "$token" --bronze-dir "$DATA_DIR" ;;
             load)
-                exec "$py" "$HERE/load.py" --silver-db "$SILVER_DB" \
-                    --bronze-dir "$DATA_DIR" \
-                    ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
-                ;;
+                host_run load.py --silver-db "$SILVER_DB" --bronze-dir "$DATA_DIR" ;;
             prune)
-                exec "$py" "$HERE/prune.py" --bronze-dir "$DATA_DIR" \
-                    --debug-dir "$DEBUG_DIR" \
-                    ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
-                ;;
+                host_run prune.py --bronze-dir "$DATA_DIR" --debug-dir "$DEBUG_DIR" ;;
             recompress)
-                exec "$py" "$HERE/recompress.py" --bronze-dir "$DATA_DIR" \
-                    ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
-                ;;
+                host_run recompress.py --bronze-dir "$DATA_DIR" ;;
         esac
         ;;
     *)

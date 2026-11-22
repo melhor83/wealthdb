@@ -1,8 +1,8 @@
 # Swissquote adapter
 
 The adapter projects the `swissquote` silver SQLite into the canonical
-gold schema. It implements the `silver.Adapter` / `silver.Connection`
-interface of [../DESIGN.md](../DESIGN.md) §6.
+gold schema. It implements the `silver.Connection` interface of
+[../DESIGN.md](../DESIGN.md) §6.
 
 ## 1. Silver source
 
@@ -17,7 +17,7 @@ interface of [../DESIGN.md](../DESIGN.md) §6.
 | --- | --- | --- |
 | `account_external_id` | Swissquote customer ID | Numeric string from silver's `accounts.account_external_id`. |
 | `instrument_external_id` | ISIN when any row of the silver states one for the `(symbol, currency)` pair, else `symbol + '@' + currency` | §8 says why. A silver that states no ISIN still loads. |
-| `transaction_external_id` | synthetic | Silver has no stable per-event id: the order number is shared across partial fills, and cash rows carry `00000000`. The adapter hashes `(account, occurred_at, transaction_type, symbol or '', currency, net_amount)` (`syntheticTxID`). The hash is the same on every reload. |
+| `transaction_external_id` | synthetic | Silver has no stable per-event id: the order number is shared across partial fills, and cash rows carry `00000000`. The adapter hashes `(account, occurred_at, transaction_type, symbol or '', currency, net_amount)` (`syntheticTxID`). The hash is the same on every reload. Two rows can agree on all six: an export may list one movement twice. Then the first copy keeps the hash, and each later one takes `-2`, `-3`, … in the order of its payload (`distinctTxIDs`). |
 
 ## 3. Coverage matrix
 
@@ -102,10 +102,15 @@ Any other value lands as `other`, with the raw type in the payload
   (`MIN` and `MAX` of `positions.snapshot_at`). So the loader's
   window-DELETE covers the historical gold rows before they are
   re-inserted.
+- The window also spans the transactions a dump past the watermark
+  wrote (`transactions.run_snapshot_at`, silver v9). A dump's export
+  restates its span of the ledger, and that span can lie before every
+  position snapshot. A row from before v9 names no dump and opens no
+  window.
 - Historical dates never move the change number, so an idle reload is a
   no-op. They do widen `Status`'s snapshot range.
 - Each run reads the holdings and the ledger, so both observed
-  watermarks are the latest run (`silver.ObserveByRuns`).
+  watermarks are the latest run (`silver.Observed`).
 
 ## 8. Instrument identity: name, ISIN and historical positions
 
@@ -122,7 +127,7 @@ A live XLS row is `'live'`. A row reconstructed from a Portfolio
 Performance PDF is `'pp:<doc_id>'`, with `snapshot_at` the PDF's as-of
 date.
 
-A column an older silver lacks reads as NULL (`silver.HasColumn`), so
+A column an older silver lacks reads as NULL (`silver.ProbeOptional`), so
 that silver still loads.
 
 ### Why `instrument_external_id` is ISIN-keyed when possible

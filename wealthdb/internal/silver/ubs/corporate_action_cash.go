@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -42,10 +43,11 @@ import (
 // only the two whose kind is settled by the event indicator: DVCA is a
 // dividend, INTR is interest. A capital call confirmed as OTHR, an
 // optional dividend taken in shares, an exchange — anything else — is
-// left to the rails that already carry it. The cash option's own
-// confirmation block (CACONF) states the movement and the rates; another
-// option's block, such as the shares a choice of dividend delivered,
-// says nothing about the cash.
+// left to the rails that already carry it; on a private-equity fund, the
+// line that carries it takes the fund (private_funds.go). The cash
+// option's own confirmation block (CACONF) states the movement and the
+// rates; another option's block, such as the shares a choice of dividend
+// delivered, says nothing about the cash.
 //
 // A confirmation's message function (`:23G:`) says whether its statement
 // holds. NEWM is a new confirmation. CANC cancels one the bank sent
@@ -104,19 +106,12 @@ type caMessage struct {
 	move                 caCashMove
 }
 
-// swiftMoney splits a `:QUAL//CCYamount` value into its currency and
-// figure. The figure keeps SWIFT's spelling; parseSwiftDecimal reads it.
+// swiftMoney splits a `:QUAL//[N]CCYamount` value into its currency and
+// figure, as the holdings' 19A amounts read (read19A): a leading N, ISO
+// 15022's sign for a negative amount, makes it negative.
 func swiftMoney(value string) (currency string, amount canonical.Decimal, ok bool) {
-	_, rest, found := strings.Cut(value, "//")
-	if !found || len(rest) < 4 {
-		return "", canonical.Decimal{}, false
-	}
-	currency, figure := rest[:3], rest[3:]
-	amount, err := parseSwiftDecimal(figure)
-	if err != nil {
-		return "", canonical.Decimal{}, false
-	}
-	return currency, amount, true
+	m, ok := read19A(value)
+	return m.Currency, m.Amount, ok
 }
 
 // swiftRate reads a `:QUAL//rate` value. A negative rate (`N` before the
@@ -148,15 +143,16 @@ func swiftExchange(value string) *caExchange {
 	return &caExchange{from: parts[0], to: parts[1], rate: rate}
 }
 
-// swiftUnits reads a `:QUAL//UNIT/quantity` value: a number of units. A
-// face amount (FAMT) or an amortised value is no number of shares.
+// swiftUnits reads a `:QUAL//UNIT/[N]quantity` value: a number of units,
+// negative after the N (parseSwiftSigned). A face amount (FAMT) or an
+// amortised value is no number of shares.
 func swiftUnits(value string) *canonical.Decimal {
 	_, rest, _ := strings.Cut(value, "//")
 	kind, figure, found := strings.Cut(rest, "/")
 	if !found || kind != "UNIT" {
 		return nil
 	}
-	units, err := parseSwiftDecimal(figure)
+	units, err := parseSwiftSigned(figure)
 	if err != nil {
 		return nil
 	}
@@ -505,37 +501,53 @@ func (r *psnReader) cashConfirmations(ctx context.Context) ([]cashConfirmation, 
 	if r == nil || r.db == nil {
 		return nil, nil
 	}
-	if r.confirmations != nil {
-		return r.confirmations, nil
+	return r.confirmations.Get(func() ([]cashConfirmation, error) { return r.readCashConfirmations(ctx) })
+}
+
+// corporateActions are the silver's corporate-action confirmations, each
+// parsed, in id order, and what a cancellation or a reversal withdraws
+// (withdrawals). A payload that does not decode is left out.
+type corporateActions struct {
+	all  []caRow
+	gone map[string]string
+}
+
+// corporateActions reads them once per connection, from the feed: the
+// whole silver, unwindowed. None for a nil reader.
+func (r *psnReader) corporateActions(ctx context.Context) (corporateActions, error) {
+	if r == nil || r.db == nil {
+		return corporateActions{}, nil
 	}
-	rows, err := r.db.QueryContext(ctx, `
-SELECT event_external_id, timestamp, payload
-  FROM events
- WHERE kind = 'corporate_action_confirmation'
- ORDER BY event_external_id`)
+	return r.actions.Get(func() (corporateActions, error) {
+		f, err := r.feed(ctx)
+		if err != nil {
+			return corporateActions{}, err
+		}
+		var all []caRow
+		for i := range f.events {
+			ev := &f.events[i]
+			if ev.kind != "corporate_action_confirmation" {
+				continue
+			}
+			row := caRow{eventID: ev.eventID, at: ev.at}
+			if json.Unmarshal([]byte(ev.payload), &row.f) != nil {
+				continue
+			}
+			row.m = parseCorporateAction(row.f)
+			all = append(all, row)
+		}
+		slices.SortFunc(all, func(a, b caRow) int { return strings.Compare(a.eventID, b.eventID) })
+		return corporateActions{all: all, gone: withdrawals(all)}, nil
+	})
+}
+
+// readCashConfirmations is cashConfirmations' read.
+func (r *psnReader) readCashConfirmations(ctx context.Context) ([]cashConfirmation, error) {
+	actions, err := r.corporateActions(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("ubs cashConfirmations: %w", err)
-	}
-	defer rows.Close()
-	var all []caRow
-	for rows.Next() {
-		var (
-			row     caRow
-			payload string
-		)
-		if err := rows.Scan(&row.eventID, &row.at, &payload); err != nil {
-			return nil, fmt.Errorf("ubs cashConfirmations scan: %w", err)
-		}
-		if err := json.Unmarshal([]byte(payload), &row.f); err != nil {
-			continue
-		}
-		row.m = parseCorporateAction(row.f)
-		all = append(all, row)
-	}
-	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	gone := withdrawals(all)
+	all, gone := actions.all, actions.gone
 	stated := map[statementKey]bool{}
 	out := []cashConfirmation{}
 	for _, row := range all {
@@ -562,7 +574,6 @@ SELECT event_external_id, timestamp, payload
 		}
 		out = append(out, c)
 	}
-	r.confirmations = out
 	return out, nil
 }
 
@@ -584,7 +595,7 @@ func (c cashConfirmation) legOf(coverage psnCashCoverage, ibans map[string]strin
 // account the feed does not speak for (cashLeg), on a payment day in the
 // window: a leg occurs on that day, and a load replaces the window's rows
 // by the day they occur. withheld names the legs an export row records
-// instead (buildEraFold); they are not booked.
+// instead (reconcile.go); they are not booked.
 func (r *psnReader) corporateActionCashLegs(ctx context.Context, w canonical.Window, coverage psnCashCoverage, ibans map[string]string, withheld map[string]bool) ([]canonical.TransactionChange, error) {
 	confirmations, err := r.cashConfirmations(ctx)
 	if err != nil {
@@ -605,44 +616,6 @@ func (r *psnReader) corporateActionCashLegs(ctx context.Context, w canonical.Win
 		out = append(out, tx)
 		if taxed {
 			out = append(out, tax)
-		}
-	}
-	return out, nil
-}
-
-// cashLegRef is a cash leg a confirmation books, as the era fold reads
-// it: its id, and whether it reads a gross.
-type cashLegRef struct {
-	id      string
-	grossed bool
-}
-
-// cashLegKeys maps, over the whole silver, the booking key of each cash
-// leg the confirmations book (legOf) onto the legs. The key holds the
-// amount posted: what moved, and what any other record of the payment
-// states, not the gross the leg reads. The era fold folds such a record
-// into its leg (buildEraFold).
-func (r *psnReader) cashLegKeys(ctx context.Context, coverage psnCashCoverage) (map[bookingKey][]cashLegRef, error) {
-	ibans, err := r.cashAccountIBANs(ctx)
-	if err != nil {
-		return nil, err
-	}
-	confirmations, err := r.cashConfirmations(ctx)
-	if err != nil {
-		return nil, err
-	}
-	out := map[bookingKey][]cashLegRef{}
-	for _, c := range confirmations {
-		tx, _, _, ok, err := c.cashLeg(coverage, ibans)
-		if err != nil {
-			return nil, err
-		}
-		if !ok {
-			continue
-		}
-		posted := c.move.posted
-		if k, ok := newBookingKey(tx.AccountExternalID, c.move.paymentDay, &posted, c.move.postedCcy); ok {
-			out[k] = append(out[k], cashLegRef{id: tx.TransactionExternalID, grossed: tx.GrossAmount != nil})
 		}
 	}
 	return out, nil

@@ -1,9 +1,8 @@
 # cointracking adapter
 
 Adapter that projects the `cointracking` silver DuckDB into the
-canonical gold schema. Implements the `silver.Adapter` /
-`silver.Connection` interface defined in
-[../DESIGN.md](../DESIGN.md) §6.
+canonical gold schema. Implements the `silver.Connection` interface
+defined in [../DESIGN.md](../DESIGN.md) §6.
 
 cointracking.info is the aggregator-of-record for crypto holdings
 across centralised exchanges and on-chain wallets; the silver
@@ -92,10 +91,10 @@ dimensions-only batch at the window's end.
 
 - **`asset_class`** is `crypto` and **`vehicle`** is `physical` for
   every position: coins and tokens held directly in a wallet or
-  exchange account. The pair is one constant (`taxonomy` in
-  [`classmap.go`](../../internal/silver/cointracking/classmap.go)),
-  since CT only describes digital assets held directly
-  ([../TAXONOMY.md](../TAXONOMY.md)).
+  exchange account ([../TAXONOMY.md](../TAXONOMY.md)). The instrument
+  of a fiat ticker is `cash` × `demand_deposit`, as its balance is
+  cash. Both come from `taxonomy` in
+  [`classmap.go`](../../internal/silver/cointracking/classmap.go).
 
 ## 6. Instruments
 
@@ -119,10 +118,10 @@ two canonical rows (`transactions.go`):
   a `sell` + `buy` pair whose ±V base-currency net amounts cancel,
   so SUM-derived cash balances are unaffected by the trade.
 - **Non-Trade CT types** (Deposit, Withdrawal, Staking, Income,
-  Airdrop, Gift, Spend, Lost, Stolen, …) → 1 row via the CT-type →
-  `TxKind` map in `kindmap.go`. Currency is the asset that
-  actually moved; non-base assets also carry instrument + quantity
-  so instrument-keyed rollups work.
+  Airdrop, Gift, Spend, Lost, Stolen, …) → 1 row via the CT-type
+  table in `kindmap.go`, which gives the row its `TxKind` and its
+  action. Currency is the asset that actually moved; non-base assets
+  also carry instrument + quantity so instrument-keyed rollups work.
 
 The closing-balance invariant `balance(C) = SUM(quantity WHERE
 instrument = C) + SUM(net_amount WHERE currency = C)` ties the
@@ -132,11 +131,17 @@ it gets no row of its own, which would double-count it. A fee in a
 third currency rides the payload. Only the standalone "Other Fee" type
 produces a `fee` row.
 
-Every row's payload carries the CT fields the lot engine reads, under
-their silver column names, each only when set: `type`, `comment`,
-`buy_currency`, `sell_currency`, `fee_amount` and `fee_currency`. The
-kind alone cannot tell a deposit from an airdrop or a dust sweep; the
-type can. [../LOTS.md](../LOTS.md) §6 says how the lot engine reads them.
+A row states its action, what it does to the coin's lots, where its
+kind cannot say it. The kind alone cannot tell a deposit from an airdrop
+or a dust sweep; the type and the comment can. A trade whose fee is in a third currency states
+`third_currency_fee` on the row that buys, or on the one row of a trade
+with the base currency on one side. [../LOTS.md](../LOTS.md) §6 lists the
+actions.
+
+Every row's payload carries the row's CT fields under their silver
+column names, each only when set: `type`, `comment`, `buy_currency`,
+`sell_currency`, `fee_amount` and `fee_currency`. The lot engine reads
+the fee to value a third-currency fee.
 
 ## 8. Change number
 
@@ -144,6 +149,6 @@ type can. [../LOTS.md](../LOTS.md) §6 says how the lot engine reads them.
 `dump_runs` is empty. `ChangeWindow` triggers on any new `dump_run`
 past the watermark. A trade's `occurred_at` is no trigger: the silver
 load replays the full trade history, so a new trade can appear at any
-old date. Once triggered, the window spans every transaction, every
-`dump_run` and every `coin_prices` date, so the FX rates the adapter
-emits fall inside it too.
+old date. Once triggered, the window is the whole history
+(`Window.Full`): the load deletes the source's rows whole before it
+re-inserts them, the FX rates included.

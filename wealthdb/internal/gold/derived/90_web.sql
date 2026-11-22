@@ -39,7 +39,7 @@ CREATE MACRO account_label(nm, ext_id, src, kind) AS
 CREATE VIEW holdings_lines_latest AS
     WITH l AS (
         SELECT p.silver_source_id,
-               COALESCE(a.tax_wrapper, 'taxable_personal') AS tax_wrapper,
+               account_wrapper(a.tax_wrapper) AS tax_wrapper,
                'position' AS line_kind, p.asset_class,
                p.value_usd, p.value_chf, p.value_eur, p.value_gbp
           FROM serving_positions_latest p
@@ -72,6 +72,18 @@ CREATE VIEW web_sources_latest AS
       FROM holdings_lines_latest
      GROUP BY 1, 2, 3, 4;
 
+-- web_sources_observed: each source at its latest snapshot
+-- (serving_sources_latest) with observed_at, the instant a run last
+-- read it (source_observed): unknown reads as its newest snapshot, and
+-- it is never before that snapshot. is_feed is false for the declared
+-- accounts' reserved source (canonical.DeclaredSourceID), which has no
+-- feed and no snapshot.
+CREATE VIEW web_sources_observed AS
+    SELECT r.*, GREATEST(COALESCE(o.observed_snapshots_through, r.snapshot_at), r.snapshot_at) AS observed_at,
+           r.silver_source_id <> 'declared' AS is_feed
+      FROM serving_sources_latest r
+      LEFT JOIN source_observed o USING (silver_source_id);
+
 CREATE VIEW web_card_balances_history AS
     SELECT epoch_ms(as_of_day * 1000) AS as_of_day,
            silver_source_id, account_external_id,
@@ -82,6 +94,9 @@ CREATE VIEW web_card_balances_history AS
            balance, balance_usd, balance_chf, balance_eur, balance_gbp
       FROM serving_card_balances_history;
 
+-- web_income: every income line. income_class is its operating-in class
+-- (income_line_class), NULL for a type the projection projects, and
+-- projected_types the projection's types it can be.
 CREATE VIEW web_income AS
     SELECT epoch_ms(i.occurred_at * 1000) AS occurred_at,
            i.silver_source_id, i.account_external_id,
@@ -89,13 +104,15 @@ CREATE VIEW web_income AS
            account_label(i.display_name, i.account_external_id,
                          i.silver_source_id, i.account_kind) AS account_label,
            i.account_kind,
-           COALESCE(a.tax_wrapper, 'taxable_personal') AS tax_wrapper,
+           account_wrapper(a.tax_wrapper) AS tax_wrapper,
            i.payer_name,
            COALESCE(i.income_primary,  '(uncategorized)') AS income_primary,
            COALESCE(i.income_detailed, '(uncategorized)') AS income_detailed,
            COALESCE(i.income_primary_label, '(uncategorized)') AS income_primary_label,
            COALESCE(i.income_label,         '(uncategorized)') AS income_label,
            i.provider_income_label,
+           income_line_class(i.income_detailed) AS income_class,
+           income_projected_types(i.income_detailed) AS projected_types,
            i.value_usd, i.value_chf, i.value_eur, i.value_gbp
       FROM serving_income_transactions i
       LEFT JOIN accounts a ON a.silver_source_id = i.silver_source_id
@@ -116,6 +133,14 @@ CREATE VIEW web_spending AS
            provider_spend_label,
            value_usd, value_chf, value_eur, value_gbp
       FROM serving_spending_transactions;
+
+-- web_spending_vs_year: each month and primary category beside the same
+-- month a year earlier. The time range lands on month, so a picked
+-- window takes each month whose first day falls inside it.
+CREATE VIEW web_spending_vs_year AS
+    SELECT epoch_ms(month * 1000) AS month, currency, category,
+           net_spend, net_spend_year_before, quality
+      FROM serving_spending_vs_year;
 
 CREATE VIEW web_cashflow AS
     WITH lines AS (
@@ -151,18 +176,15 @@ CREATE VIEW web_exposure AS
 SELECT CAST(epoch_ms(r.as_of * 1000) AS DATE) AS as_of_day,
        r.currency,
        r.silver_source_id,
-       COALESCE(r.tax_wrapper, 'taxable_personal') AS tax_wrapper,
+       account_wrapper(r.tax_wrapper) AS tax_wrapper,
        r.asset_class,
        COALESCE(r.sector, 'unknown') AS sector,
-       CASE WHEN r.country IS NOT NULL THEN r.country
-            WHEN r.asset_class IN ('metal', 'crypto') THEN '(none)' ELSE 'unknown' END AS country,
+       exposure_place_bucket(r.country, r.asset_class) AS country,
        co.name AS country_name,
-       COALESCE(r.region, CASE WHEN r.asset_class IN ('metal', 'crypto') THEN '(none)' ELSE 'unknown' END)
-           AS region,
+       exposure_place_bucket(r.region, r.asset_class) AS region,
        COALESCE(r.exposure_currency, 'unknown') AS exposure_currency,
        r.currency_kind,
-       CASE WHEN r.asset_class <> 'public_equity' THEN '(none)' ELSE COALESCE(r.size, 'unknown') END
-           AS size,
+       exposure_size_bucket(r.size, r.asset_class) AS size,
        CASE WHEN r.via_funds THEN 'via funds' ELSE 'direct' END AS held,
        r.how,
        COALESCE(r.situs, 'unknown') AS situs,
@@ -176,23 +198,31 @@ SELECT CAST(epoch_ms(r.as_of * 1000) AS DATE) AS as_of_day,
 -- pension: `income:<type>:<CCY>`) reads its account's. A day is a DATE; a rate
 -- prints as `_pct`; money is in the holding's currency with fx_<ccy> to
 -- each reporting currency, or a row filter on `currency`.
+--
+-- web_yield's is_cash says a holding is cash, as `wealthdb yield cash`
+-- lists it: a balance, a term deposit or a money-market holding.
+-- rate_sensitive says its value moves with rates: a bond, a bill, a
+-- floating note, or a bond, multi-asset or money-market fund
+-- (docs/YIELD.md §3).
 CREATE VIEW web_yield AS
 SELECT CAST(epoch_ms(p.as_of * 1000) AS DATE) AS as_of_day, p.as_of = (SELECT max(as_of) FROM report_yield_positions)
            AS today,
        p.currency, p.silver_source_id, p.account_external_id, p.position_key,
        account_label(a.display_name, p.account_external_id, p.silver_source_id, a.account_kind) AS account_label,
-       COALESCE(p.tax_wrapper, 'taxable_personal') AS tax_wrapper,
+       account_wrapper(p.tax_wrapper) AS tax_wrapper,
        COALESCE(p.asset_class, 'unknown') AS asset_class, p.vehicle, p.kind, p.symbol, p.name, p.holding_currency,
        p.quantity, p.price, p.value, p.coupon_pct, p.maturity_date, p.rating, p.stated_pct, p.current_yield_pct,
        p.implied_pct, p.implied_annual_pct, p.realized_pct, p.received_12m, p.mean_value, p.earnings_yield_pct,
        p.dividend_yield_pct, p.payout_pct, p.benchmark_pct, p.gap_pct, p.duration, p.convexity, p.maturity_years,
-       p.dv01, p.income_12m, p.income_100bp, p.weighs, p.tags
+       p.dv01, p.income_12m, p.income_100bp, p.weighs, p.tags,
+       p.kind IN ('deposit', 'term_deposit', 'money_market') AS is_cash,
+       p.kind IN ('bond', 'bill', 'floating_note', 'bond_fund', 'multi_asset', 'money_market') AS rate_sensitive
   FROM report_yield_positions p
   LEFT JOIN accounts a ON a.silver_source_id = p.silver_source_id AND a.account_external_id = p.account_external_id;
 
 CREATE VIEW web_yield_curve AS
 SELECT CAST(epoch_ms(b.as_of * 1000) AS DATE) AS as_of_day, b.currency, b.silver_source_id,
-       COALESCE(p.tax_wrapper, 'taxable_personal') AS tax_wrapper, COALESCE(p.asset_class, 'unknown') AS asset_class,
+       account_wrapper(p.tax_wrapper) AS tax_wrapper, COALESCE(p.asset_class, 'unknown') AS asset_class,
        b.curve_currency, b.tenor, b.tenor_order,
        -- 'funds', 'bonds', 'cash' or 'liabilities'
        b.held_in, b.dv01
@@ -206,7 +236,7 @@ SELECT CAST(epoch_ms(b.as_of * 1000) AS DATE) AS as_of_day, b.currency, b.silver
 CREATE VIEW web_yield_holdings AS
 SELECT p.silver_source_id, p.account_external_id, p.position_key,
        account_label(a.display_name, p.account_external_id, p.silver_source_id, a.account_kind) AS account_label,
-       COALESCE(p.tax_wrapper, 'taxable_personal') AS tax_wrapper,
+       account_wrapper(p.tax_wrapper) AS tax_wrapper,
        COALESCE(p.asset_class, 'unknown') AS asset_class, p.vehicle, p.kind, p.symbol, p.name, p.quantity, p.price
   FROM report_yield_positions p
   LEFT JOIN accounts a ON a.silver_source_id = p.silver_source_id AND a.account_external_id = p.account_external_id
@@ -218,7 +248,7 @@ CREATE VIEW web_yield_parts AS
 SELECT x.*, COALESCE(h.account_label,
                      account_label(a.display_name, x.account_external_id, x.silver_source_id, a.account_kind))
            AS account_label,
-       COALESCE(h.tax_wrapper, a.tax_wrapper, 'taxable_personal') AS tax_wrapper,
+       account_wrapper(COALESCE(h.tax_wrapper, a.tax_wrapper)) AS tax_wrapper,
        COALESCE(h.asset_class, 'income') AS asset_class, h.vehicle, h.kind, h.symbol, h.name
   FROM report_yield_parts x
   LEFT JOIN web_yield_holdings h ON h.silver_source_id = x.silver_source_id
@@ -226,7 +256,7 @@ SELECT x.*, COALESCE(h.account_label,
   LEFT JOIN accounts a ON a.silver_source_id = x.silver_source_id AND a.account_external_id = x.account_external_id;
 
 CREATE VIEW web_yield_events AS
-SELECT x.*, h.account_label, COALESCE(h.tax_wrapper, 'taxable_personal') AS tax_wrapper,
+SELECT x.*, h.account_label, account_wrapper(h.tax_wrapper) AS tax_wrapper,
        COALESCE(h.asset_class, 'unknown') AS asset_class, h.vehicle, h.symbol, h.name
   FROM report_yield_events x
   LEFT JOIN web_yield_holdings h ON h.silver_source_id = x.silver_source_id
@@ -239,7 +269,7 @@ SELECT x.currency, x.silver_source_id, x.account_external_id, x.position_key, x.
        COALESCE(h.account_label,
                 account_label(a.display_name, x.account_external_id, x.silver_source_id, a.account_kind))
            AS account_label,
-       COALESCE(h.tax_wrapper, a.tax_wrapper, 'taxable_personal') AS tax_wrapper,
+       account_wrapper(COALESCE(h.tax_wrapper, a.tax_wrapper)) AS tax_wrapper,
        COALESCE(h.asset_class, CASE WHEN starts_with(x.position_key, 'income:') THEN 'income' ELSE 'unknown' END)
            AS asset_class, h.vehicle, h.symbol, h.name
   FROM report_yield_received x
@@ -247,9 +277,13 @@ SELECT x.currency, x.silver_source_id, x.account_external_id, x.position_key, x.
        AND h.account_external_id = x.account_external_id AND h.position_key = x.position_key
   LEFT JOIN accounts a ON a.silver_source_id = x.silver_source_id AND a.account_external_id = x.account_external_id;
 
+-- web_exposure_debt: the debt and equity buckets, each with its credit
+-- grade and its place in its dimension's order, as the exposure reports
+-- give them.
 CREATE VIEW web_exposure_debt AS
 SELECT CAST(epoch_ms(as_of * 1000) AS DATE) AS as_of_day, currency, silver_source_id,
-       COALESCE(tax_wrapper, 'taxable_personal') AS tax_wrapper, dimension, bucket, unknown, value
+       account_wrapper(tax_wrapper) AS tax_wrapper, dimension, bucket, unknown, value,
+       exposure_credit_grade(bucket) AS grade, exposure_bucket_order(dimension, bucket) AS bucket_order
   FROM report_exposure_debt;
 
 CREATE VIEW web_exposure_issuers AS
@@ -343,7 +377,7 @@ CREATE VIEW web_position_sizes AS
 
 CREATE VIEW web_exposure_securities AS
 SELECT CAST(epoch_ms(as_of * 1000) AS DATE) AS as_of_day, currency, silver_source_id,
-       COALESCE(tax_wrapper, 'taxable_personal') AS tax_wrapper, asset_class, security, name, ticker,
+       account_wrapper(tax_wrapper) AS tax_wrapper, asset_class, security, name, ticker,
        sector, country, class_weight, sector_weight, country_weight, market_cap, size,
        value, direct_value, via_funds_value, funds
   FROM report_exposure_security_slices;
@@ -377,8 +411,13 @@ CREATE VIEW web_history_calendar AS
     SELECT epoch_ms(d.day * 1000) AS as_of_day, epoch_ms(h.as_of_day * 1000) AS history_day
       FROM d ASOF JOIN h ON d.day >= h.as_of_day;
 
+-- income_today: the day of the yield report's latest instant, the last
+-- day web_income_days lists.
+CREATE MACRO income_today() AS
+    (SELECT CAST(epoch_ms(max(as_of) * 1000) AS DATE) FROM report_yield_positions);
+
 CREATE VIEW web_income_days AS
-WITH t AS (SELECT CAST(epoch_ms(max(as_of) * 1000) AS DATE) AS today FROM report_yield_positions),
+WITH t AS (SELECT income_today() AS today),
 s AS (SELECT least(make_date(year(today) - 1, 1, 1), (SELECT min(day) FROM report_yield_received),
                    (SELECT min(day) FROM web_income_withheld),
                    (SELECT CAST(min(occurred_at) AS DATE) FROM web_income)) AS first, today
@@ -404,7 +443,7 @@ CREATE VIEW web_gains AS
            g.silver_source_id, g.account_external_id,
            account_label(a.display_name, g.account_external_id,
                          g.silver_source_id, a.account_kind) AS account,
-           a.account_kind, COALESCE(a.tax_wrapper, 'taxable_personal') AS tax_wrapper,
+           a.account_kind, account_wrapper(a.tax_wrapper) AS tax_wrapper,
            g.k AS instrument_key, g.symbol, g.name, COALESCE(g.asset_class, 'unknown') AS asset_class, g.vehicle,
            g.book_x AS cost_basis, g.value_x AS value,
            g.unrealized_start_x AS unrealized_start, g.unrealized_end_x AS unrealized_end,
@@ -431,8 +470,8 @@ CREATE VIEW web_gains AS
 -- the serving histories, the cash arm per currency.
 CREATE VIEW holdings_lines_history AS
     SELECT p.as_of_day, p.silver_source_id, p.account_external_id,
-           COALESCE(a.tax_wrapper, 'taxable_personal') AS tax_wrapper,
-           COALESCE(a.management_style, 'self_directed') AS management_style,
+           account_wrapper(a.tax_wrapper) AS tax_wrapper,
+           account_style(a.management_style) AS management_style,
            'position' AS line_kind, p.asset_class, p.vehicle, p.currency, p.symbol, p.name,
            p.value_usd, p.value_chf, p.value_eur, p.value_gbp
       FROM serving_positions_history p
@@ -553,6 +592,50 @@ CREATE VIEW web_marks AS
       FROM serving_marks
      WHERE currency = 'USD';
 
+-- web_private: the Private Markets tiles read `wealthdb returns private`'s
+-- rows, one set per reporting currency and as-of instant (a quarter end
+-- or the day of the refresh), each holding with its account's label, the
+-- instant's total last. gain is what came back and is still marked less
+-- what was paid in, none where the NAV or the cost is none. commitment
+-- and unfunded are the holding's capital account's, with its stated
+-- multiples and day.
+CREATE VIEW web_private AS
+    SELECT epoch_ms(p.as_of * 1000) AS as_of, p.currency, p.is_total, p.silver_source_id, p.account_external_id,
+           CASE WHEN NOT p.is_total THEN account_label(a.display_name, p.account_external_id,
+                                                      p.silver_source_id, a.account_kind) END AS account_label,
+           p.instrument_external_id, p.holding, p.asset_class, p.vehicle, p.status,
+           epoch_ms(p.first_call * 1000) AS first_call, p.paid_in, p.commitment, p.unfunded, p.distributed, p.nav,
+           epoch_ms(p.marked_at * 1000) AS marked_at, p.dpi, p.tvpi, 100 * p.irr AS irr_pct,
+           p.stated_tvpi, p.stated_dpi, epoch_ms(p.stated_as_of * 1000) AS stated_as_of, p.quality,
+           p.distributed + p.nav - p.paid_in AS gain
+      FROM report_private_markets p
+      LEFT JOIN accounts a ON a.silver_source_id = p.silver_source_id
+           AND a.account_external_id = p.account_external_id;
+
+-- web_private_calendar: the as-of instant the Private Markets cards read
+-- for a chosen day. as_of_day is every day from the first stored
+-- instant's through the later of the last's and tomorrow, UTC; as_of is
+-- the latest stored instant on or before the day's end. A day before
+-- the first instant has no row.
+CREATE VIEW web_private_calendar AS
+    WITH s AS (SELECT DISTINCT as_of FROM report_private_markets),
+    b AS (
+        SELECT min(as_of) // 86400 * 86400 AS lo,
+               greatest(max(as_of) // 86400 * 86400, CAST(epoch(now()) AS BIGINT) // 86400 * 86400 + 86400) AS hi
+          FROM s),
+    d AS (SELECT unnest(range(lo, hi + 1, 86400)) AS day FROM b WHERE lo IS NOT NULL)
+    SELECT epoch_ms(d.day * 1000) AS as_of_day, epoch_ms(s.as_of * 1000) AS as_of
+      FROM d ASOF JOIN s ON d.day + 86399 >= s.as_of;
+
+-- web_private_flows: the private holdings' cash flows per holding and
+-- quarter, one row set per reporting currency, the quarter as a
+-- timestamp. A row marked unattributed holds the exits in kind out of an
+-- account that name no holding.
+CREATE VIEW web_private_flows AS
+    SELECT currency, epoch_ms(quarter * 1000) AS quarter, silver_source_id, account_external_id,
+           instrument_external_id, holding, asset_class, vehicle, unattributed, called, distributed, net, quality
+      FROM serving_private_flows;
+
 -- ============================================================
 -- A portfolio's fee base leaves out its debts (docs/SPENDING.md §7).
 --
@@ -560,6 +643,19 @@ CREATE VIEW web_marks AS
 --     no card. Its fee rate is fees over its assets' mean value, the
 --     base its return reads, as `wealthdb spending fees` reads it.
 -- ============================================================
+
+-- fee_rate_pct: the yearly fee rate in percent of `fees` paid over a
+-- span of `days` days held whose daily values sum to `value_days`, on
+-- 365 days; none where the mean over the days held is not above the
+-- engine's value tolerance, 1e-6 (gold's feeRate).
+CREATE MACRO fee_rate_pct(fees, value_days, days) AS
+    CASE WHEN days > 0 AND value_days / days > 1e-6 THEN 100 * fees * 365 / value_days END;
+
+-- chain_returns: the monthly returns `twr` compounded, a month with no
+-- return or one that lost everything left out; none with nothing to
+-- chain (gold's chainMonths).
+CREATE MACRO chain_returns(twr) AS
+    exp(sum(ln(1 + CASE WHEN twr > -1 THEN twr END))) - 1;
 
 -- web_fees: what the fee tiles read, at day grain, so a picked window
 -- cuts it where it cuts the other Spending tiles.
@@ -607,7 +703,7 @@ CREATE VIEW web_fees AS
       FROM serving_accounts_history h
       JOIN entity e ON e.silver_source_id = h.silver_source_id
        AND e.account_external_id = h.account_external_id
-     WHERE e.entity_kind = 'account' OR e.account_kind NOT IN ('mortgage', 'card')
+     WHERE e.entity_kind = 'account' OR NOT account_is_debt(e.account_kind)
     UNION ALL
     SELECT epoch_ms(r.end_day * 1000), 'return',
            e.silver_source_id, e.account_label, e.entity_key, e.entity_kind, e.entity,
@@ -617,3 +713,214 @@ CREATE VIEW web_fees AS
        AND ((r.grain = 'portfolios' AND r.entity_id = e.portfolio)
          OR (r.grain = 'accounts' AND e.portfolio IS NULL AND r.entity_id = e.account_external_id))
      WHERE r.granularity = 'monthly' AND r.window_from_year = 0 AND NOT r.is_summary;
+
+-- ============================================================
+-- The Income dashboard's income in the window, and the cash flow
+-- projection (web/DESIGN.md §6, docs/INCOME.md §12, docs/CASHFLOW.md
+-- §12).
+--
+-- Both read today's projection under its four assumptions: the
+-- currency, the rate path, what a maturing principal earns and a
+-- parallel shift in basis points, over a horizon of months.
+-- ============================================================
+
+-- reporting_pick: of the four figures in the reporting currencies, the
+-- one in currency p_ccy; none for another currency.
+CREATE MACRO reporting_pick(p_ccy, usd, chf, eur, gbp) AS
+    CASE p_ccy WHEN 'USD' THEN usd WHEN 'CHF' THEN chf WHEN 'EUR' THEN eur WHEN 'GBP' THEN gbp END;
+
+-- income_class_band: the band an income line of operating-in class
+-- `class` (income_line_class) draws in on the Income dashboard.
+CREATE MACRO income_class_band(class) AS
+    CASE class WHEN 'earnings' THEN 'salary and earnings' WHEN 'yield' THEN 'other yield'
+               WHEN 'benefits' THEN 'benefits' WHEN 'other_receipts' THEN 'other receipts'
+               WHEN '(uncategorized)' THEN 'uncategorized' END;
+
+-- The income in the window, in currency p_ccy, a row per amount, in
+-- four arms (`arm`), one macro each. The cards read the arms, each card
+-- those it shows, and income_window is their union for any other reader:
+--
+--   * income_expected: what today's holdings are expected to pay, each
+--     part of the projection (web_yield_parts) under the path, the rule
+--     and the shift, months 0 to the horizon, with what the withholding
+--     table withholds from it (`withheld`) and its rate to p_ccy (`fx`).
+--     A payment of an estimated day reads its month;
+--   * income_received: the income of the six types the holdings
+--     received (web_yield_received) to today, the last day
+--     web_income_days lists;
+--   * income_other: every other income line (web_income), by its
+--     operating-in class (`type`) under its account;
+--   * income_run_rate: the other income's run-rate (web_cashflow_plan's
+--     pool_income and outside_income), by class and account, over the
+--     horizon's months after this one. A salary arrives on a pay day, so
+--     the current month (m 0) expects the monthly figure less what its
+--     class and account received so far, never below 0.
+--
+-- A class row's key is `class:<class>` and its name the class's band.
+-- `label` is an other line's income label. `tax_wrapper` is a row's
+-- own, a run-rate's its account's, NULL where accounts lacks it. A
+-- card keeps the rows its pickers select by these columns, and the
+-- received ones by their day.
+CREATE MACRO income_expected(p_ccy, p_rates, p_maturing, p_shift, p_horizon) AS TABLE (
+    WITH ex AS (
+        SELECT p.type, p.month_start, p.month AS m, CASE WHEN NOT p.month_only THEN p.day END AS day,
+               p.holding_currency,
+               yield_part_income(p.fixed, p.principal, p.spread, COALESCE(rt.rate_pct, 0), p.roll_constant,
+                                 p.roll_forward, p.roll_principal, p_rates, p_shift) AS amount,
+               reporting_pick(p_ccy, p.fx_usd, p.fx_chf, p.fx_eur, p.fx_gbp) AS fx,
+               p.withholding_pct, p.basis, p.reinvested, p.silver_source_id, p.account_external_id,
+               p.position_key, p.account_label, p.tax_wrapper, p.vehicle, p.symbol, p.name
+          FROM web_yield_parts p
+          LEFT JOIN web_yield_rates rt ON rt.currency = p.holding_currency AND rt.month = p.month
+               AND rt.path = p_rates
+         WHERE p.rule = p_maturing
+           AND p.month <= p_horizon)
+    SELECT 'expected' AS arm, 'expected' AS status, type, month_start, m, day, holding_currency, amount,
+           amount * fx AS value, amount * fx * withholding_pct / 100 AS withheld, fx, basis, reinvested,
+           NULL::VARCHAR AS label, tax_wrapper,
+           silver_source_id, account_external_id, position_key, account_label, vehicle, symbol, name
+      FROM ex
+);
+
+CREATE MACRO income_received(p_ccy) AS TABLE (
+    SELECT 'received' AS arm, 'received' AS status, type, CAST(date_trunc('month', day) AS DATE) AS month_start,
+           NULL::INTEGER AS m, day, NULL::VARCHAR AS holding_currency, NULL::DOUBLE AS amount, value,
+           NULL::DOUBLE AS withheld, NULL::DOUBLE AS fx,
+           NULL::VARCHAR AS basis, NULL::VARCHAR AS reinvested, NULL::VARCHAR AS label, tax_wrapper,
+           silver_source_id, account_external_id, position_key, account_label, vehicle, symbol, name
+      FROM web_yield_received
+     WHERE currency = p_ccy
+       AND day <= income_today()
+);
+
+CREATE MACRO income_other(p_ccy) AS TABLE (
+    SELECT 'other' AS arm, 'received' AS status, income_class AS type,
+           CAST(date_trunc('month', CAST(occurred_at AS DATE)) AS DATE) AS month_start, NULL::INTEGER AS m,
+           CAST(occurred_at AS DATE) AS day, NULL::VARCHAR AS holding_currency, NULL::DOUBLE AS amount,
+           reporting_pick(p_ccy, value_usd, value_chf, value_eur, value_gbp) AS value,
+           NULL::DOUBLE AS withheld, NULL::DOUBLE AS fx, NULL::VARCHAR AS basis, NULL::VARCHAR AS reinvested,
+           income_label AS label, tax_wrapper,
+           silver_source_id, account_external_id, 'class:' || income_class AS position_key, account_label,
+           NULL::VARCHAR AS vehicle, NULL::VARCHAR AS symbol, income_class_band(income_class) AS name
+      FROM web_income
+     WHERE income_class IS NOT NULL
+);
+
+CREATE MACRO income_run_rate(p_ccy, p_horizon) AS TABLE (
+    -- An account whose wrapper changed in the look-back holds a row of
+    -- each part: one figure per class, account and month.
+    WITH pl AS (
+        SELECT c.month, c.class, c.silver_source_id, c.account_external_id,
+               any_value(c.month_start) AS month_start, sum(c.value) AS value,
+               account_label(ac.display_name, c.account_external_id, c.silver_source_id, ac.account_kind)
+                   AS account_label,
+               CASE WHEN ac.silver_source_id IS NOT NULL THEN account_wrapper(ac.tax_wrapper) END AS tax_wrapper
+          FROM web_cashflow_plan c
+          LEFT JOIN accounts ac ON ac.silver_source_id = c.silver_source_id
+               AND ac.account_external_id = c.account_external_id
+         WHERE c.part IN ('pool_income', 'outside_income')
+           AND c.currency = p_ccy
+         GROUP BY ALL),
+    -- The lines no holding pays received from the current month's first
+    -- day to today, by class and account.
+    mg AS (
+        SELECT income_class AS class, silver_source_id, account_external_id,
+               sum(reporting_pick(p_ccy, value_usd, value_chf, value_eur, value_gbp)) AS got
+          FROM web_income
+         WHERE CAST(occurred_at AS DATE) >= CAST(date_trunc('month', income_today()) AS DATE)
+           AND CAST(occurred_at AS DATE) <= income_today()
+           AND income_class IS NOT NULL
+         GROUP BY ALL),
+    px AS (
+        SELECT month AS m, month_start, class, silver_source_id, account_external_id, account_label, tax_wrapper,
+               value
+          FROM pl
+         WHERE month BETWEEN 1 AND p_horizon
+        UNION ALL
+        SELECT 0, CAST(date_trunc('month', income_today()) AS DATE), class,
+               silver_source_id, account_external_id, account_label, tax_wrapper,
+               GREATEST(0, value - coalesce(mg.got, 0))
+          FROM pl
+          LEFT JOIN mg USING (class, silver_source_id, account_external_id)
+         WHERE month = 1
+           AND income_today() IS NOT NULL)
+    SELECT 'run_rate' AS arm, 'expected' AS status, class AS type, month_start, m, NULL::DATE AS day,
+           NULL::VARCHAR AS holding_currency, NULL::DOUBLE AS amount, value, NULL::DOUBLE AS withheld,
+           NULL::DOUBLE AS fx, NULL::VARCHAR AS basis,
+           NULL::VARCHAR AS reinvested, NULL::VARCHAR AS label, tax_wrapper,
+           silver_source_id, account_external_id, 'class:' || class AS position_key, account_label,
+           NULL::VARCHAR AS vehicle, NULL::VARCHAR AS symbol, income_class_band(class) AS name
+      FROM px
+);
+
+-- income_window: the four arms' union, the one entry point for a reader
+-- that takes the window whole. No card reads it.
+CREATE MACRO income_window(p_ccy, p_rates, p_maturing, p_shift, p_horizon) AS TABLE (
+    SELECT * FROM income_received(p_ccy)
+    UNION ALL
+    SELECT * FROM income_other(p_ccy)
+    UNION ALL
+    SELECT * FROM income_expected(p_ccy, p_rates, p_maturing, p_shift, p_horizon)
+    UNION ALL
+    SELECT * FROM income_run_rate(p_ccy, p_horizon)
+);
+
+-- cashflow_projection: the cash flow projection month by month over the
+-- horizon's months after this one, in currency p_ccy (docs/CASHFLOW.md
+-- §12): the income projection's investment income and the principal
+-- its maturities return under the path, the rule and the shift, on the
+-- cash pool's accounts (web_cashflow_pool), the rest the vehicles'
+-- income; beside the look-back's monthly averages (web_cashflow_plan).
+-- The principal counts towards the net unless it rolls, buying its
+-- successor; the vehicles' income never does. `expected` is all the
+-- income the projection expects, on every account.
+CREATE MACRO cashflow_projection(p_ccy, p_rates, p_maturing, p_shift, p_horizon) AS TABLE (
+    WITH ex AS (
+        SELECT p.month AS m, pl.silver_source_id IS NOT NULL AS pool,
+               sum((yield_part_income(p.fixed, p.principal, p.spread, COALESCE(rt.rate_pct, 0), p.roll_constant,
+                                      p.roll_forward, p.roll_principal, p_rates, p_shift))
+                   * reporting_pick(p_ccy, p.fx_usd, p.fx_chf, p.fx_eur, p.fx_gbp)) AS v
+          FROM web_yield_parts p
+          LEFT JOIN web_yield_rates rt ON rt.currency = p.holding_currency AND rt.month = p.month
+               AND rt.path = p_rates
+          LEFT JOIN web_cashflow_pool pl ON pl.silver_source_id = p.silver_source_id
+               AND pl.account_external_id = p.account_external_id
+         WHERE p.rule = p_maturing
+           AND p.month BETWEEN 1 AND p_horizon
+         GROUP BY 1, 2),
+    pr AS (
+        SELECT e.month AS m, pl.silver_source_id IS NOT NULL AS pool,
+               sum(e.amount * reporting_pick(p_ccy, e.fx_usd, e.fx_chf, e.fx_eur, e.fx_gbp)) AS v
+          FROM web_yield_events e
+          LEFT JOIN web_cashflow_pool pl ON pl.silver_source_id = e.silver_source_id
+               AND pl.account_external_id = e.account_external_id
+         WHERE e.rule = p_maturing
+           AND e.month BETWEEN 1 AND p_horizon
+         GROUP BY 1, 2),
+    lb AS (
+        SELECT month AS m, any_value(month_start) AS month_start,
+               coalesce(sum(value) FILTER (WHERE part = 'other_income'), 0) AS other_income,
+               coalesce(sum(value) FILTER (WHERE part = 'operating_out'), 0) AS operating_out,
+               coalesce(sum(value) FILTER (WHERE part = 'debt_service'), 0) AS debt_service,
+               coalesce(sum(value) FILTER (WHERE part = 'vehicles'), 0) AS vehicles,
+               any_value(quality) AS quality
+          FROM web_cashflow_plan
+         WHERE currency = p_ccy
+           AND month BETWEEN 1 AND p_horizon
+         GROUP BY 1),
+    j AS (
+        SELECT CAST(lb.month_start AS TIMESTAMP) AS month, coalesce(ex.v, 0) AS investment_income,
+               coalesce(pr.v, 0) AS principal_returned,
+               CASE WHEN p_maturing = 'roll' THEN 0 ELSE coalesce(pr.v, 0) END AS principal_counted,
+               coalesce(xv.v, 0) + coalesce(rv.v, 0) AS vehicles_income,
+               coalesce(ex.v, 0) + coalesce(xv.v, 0) AS expected,
+               lb.other_income, lb.operating_out, lb.debt_service, lb.vehicles,
+               trim('projected ' || lb.quality) AS quality
+          FROM lb
+          LEFT JOIN ex ON ex.m = lb.m AND ex.pool
+          LEFT JOIN pr ON pr.m = lb.m AND pr.pool
+          LEFT JOIN ex xv ON xv.m = lb.m AND NOT xv.pool
+          LEFT JOIN pr rv ON rv.m = lb.m AND NOT rv.pool)
+    SELECT *, investment_income + principal_counted + other_income - operating_out - debt_service + vehicles AS net
+      FROM j
+);

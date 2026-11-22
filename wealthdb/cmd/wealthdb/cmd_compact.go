@@ -12,7 +12,6 @@ import (
 
 	_ "github.com/duckdb/duckdb-go/v2"
 
-	"github.com/smartpointer-com/wealthdb/wealthdb/internal/config"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/errs"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/gold"
 )
@@ -26,7 +25,7 @@ func init() {
 // between the live DB and the freshly rewritten temp aborts the swap.
 var compactParityTables = []string{
 	"positions", "transactions", "fx_rates", "cash_balances", "accounts",
-	"position_lots", "realized_lots",
+	"position_lots", "realized_lots", "snapshot_coverage",
 }
 
 // cmdCompact rewrites the live gold DB into a fresh, compact file and
@@ -60,7 +59,7 @@ then discards it without touching the live DB.`)
 		return err
 	}
 
-	cfg, err := config.Load(g.ConfigPath)
+	cfg, err := g.loadConfig()
 	if err != nil {
 		return err
 	}

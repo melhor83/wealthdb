@@ -6,8 +6,8 @@
 # one disagrees with this file. chrome-major is the major of the Chromium
 # this tag bundles. Build context is shared/:
 #   docker build -f images/base-playwright.Dockerfile -t wealthdb/base-playwright:latest .
-# chrome-major: 158
-FROM mcr.microsoft.com/playwright/python:v1.65.1-noble
+# chrome-major: 159
+FROM mcr.microsoft.com/playwright/python:v1.65.2-noble
 
 # Fetch Ubuntu's archives over HTTPS instead of the image default of HTTP.
 # Port 80 to the Ubuntu archive hosts is unreachable from some networks —
@@ -55,7 +55,6 @@ WORKDIR /app
 COPY collectorkit /opt/collectorkit
 RUN pip install /opt/collectorkit
 
-# Shared Xvfb / x11vnc / browser-cache bootstrap, sourced by the entrypoint
-# of every collector that runs a browser headed. One copy here rather than
-# the same ~50 lines pasted into each entrypoint.
+# The entrypoint engine (verb dispatch, Xvfb / x11vnc and the
+# browser-cache link), sourced by every collector's entrypoint.
 COPY images/entrypoint-lib.sh /opt/entrypoint-lib.sh

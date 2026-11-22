@@ -5,12 +5,16 @@ import (
 	"testing"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/silvertest"
 )
 
-// newWebFixture builds an in-memory ubs-web silver with just the
-// historical tables snapshotsHistorical reads. Same "sqlite"
-// driver the PSN fixture uses.
+// newWebFixture builds an in-memory ubs-web silver of an older shape:
+// just the historical tables snapshotsHistorical reads, with no live
+// table, no cost_basis column (ubs-web migration 0013) and no
+// statement_overview_totals (0018). The tests that read an older silver
+// use it, and so do the ones whose rows any shape reads alike; the
+// current shape is webSilverSchemaSQL (TestPreciousMetalsTotalsOfTheCurrentShape).
 func newWebFixture(t *testing.T) *webReader {
 	t.Helper()
 	const schema = `
@@ -30,6 +34,39 @@ CREATE TABLE historical_mortgages (
     collateral_description TEXT, source_doc_token TEXT, payload TEXT);`
 	_, db := silvertest.NewDB(t, schema)
 	return &webReader{db: db}
+}
+
+// liveWebTables are the live tables of the web silver that a
+// connection's snapshot stream reads beside the statement tables, made
+// empty where a fixture does not hold them.
+const liveWebTables = `
+CREATE TABLE IF NOT EXISTS dump_runs (snapshot_at INTEGER PRIMARY KEY, run_dir TEXT);
+CREATE TABLE IF NOT EXISTS portfolios (
+    snapshot_at INTEGER, portfolio_external_id TEXT, banking_relationship_id TEXT,
+    description TEXT, payload TEXT);
+CREATE TABLE IF NOT EXISTS accounts (
+    snapshot_at INTEGER, account_external_id TEXT, kind TEXT, currency_iso TEXT,
+    banking_relationship_id TEXT, portfolio_external_id TEXT, description TEXT, payload TEXT);
+CREATE TABLE IF NOT EXISTS positions (
+    snapshot_at INTEGER, instrument_isin TEXT, currency_iso TEXT, description TEXT, payload TEXT);
+CREATE TABLE IF NOT EXISTS transactions (
+    transaction_external_id TEXT, account_external_id TEXT, value_date INTEGER,
+    booking_date INTEGER, currency_iso TEXT, amount_debit REAL, amount_credit REAL,
+    counterparty TEXT, description_kind TEXT, payload TEXT);`
+
+// connSnapshots is the snapshot stream of the connection over w, its
+// web silver given the live tables it lacks (liveWebTables).
+func connSnapshots(t *testing.T, conn *Connection, w canonical.Window) silver.SnapshotStream {
+	t.Helper()
+	if _, err := conn.web.db.Exec(liveWebTables); err != nil {
+		t.Fatal(err)
+	}
+	stream, err := conn.Snapshots(context.Background(), w)
+	if err != nil {
+		t.Fatalf("Snapshots: %v", err)
+	}
+	t.Cleanup(func() { stream.Close() })
+	return stream
 }
 
 // TestHistoricalMortgageAnchoring: a historical mortgage row is
@@ -65,11 +102,7 @@ func TestHistoricalMortgageAnchoring(t *testing.T) {
 	}
 
 	w := canonical.Window{Start: 0, End: 100000, HasChanges: true}
-	stream, err := r.snapshotsHistorical(ctx, w, nil, nil, nil, inferredForwards{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stream.Close()
+	stream := connSnapshots(t, &Connection{web: r}, w)
 
 	// Collect every position keyed by snapshot_at.
 	posBySnap := map[int64][]canonical.PositionChange{}
@@ -139,15 +172,16 @@ func TestHistoricalSecuritiesSafekeepingRepointing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Only portfolio …02 has a 1:1 safekeeping mapping; …09 does not.
-	mapping := map[string]string{"0999AAAAAAAA02": "0999 AAAAAAAA.MMM SK1"}
-
-	w := canonical.Window{Start: 0, End: 100000, HasChanges: true}
-	stream, err := r.snapshotsHistorical(ctx, w, mapping, nil, nil, inferredForwards{})
-	if err != nil {
+	// Only portfolio …02 has a 1:1 safekeeping account; …09 does not.
+	_, psnDB := newFixtureSilver(t)
+	if _, err := psnDB.Exec(`
+        INSERT INTO safekeeping_accounts(snapshot_at, relationship_id, account_external_id, payload)
+        VALUES (1, 'R1', '0999 AAAAAAAA.MMM SK1', '{"PrtflId":"0999AAAAAAAA02"}')`); err != nil {
 		t.Fatal(err)
 	}
-	defer stream.Close()
+
+	w := canonical.Window{Start: 0, End: 100000, HasChanges: true}
+	stream := connSnapshots(t, &Connection{web: r, psn: &psnReader{db: psnDB}}, w)
 
 	var positions []canonical.PositionChange
 	var accounts []canonical.AccountChange
@@ -231,11 +265,7 @@ func TestHistoricalSyntheticISIN(t *testing.T) {
 	}
 
 	w := canonical.Window{Start: 0, End: 100000, HasChanges: true}
-	stream, err := r.snapshotsHistorical(ctx, w, nil, nil, nil, inferredForwards{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stream.Close()
+	stream := connSnapshots(t, &Connection{web: r}, w)
 
 	var positions []canonical.PositionChange
 	var instruments []canonical.InstrumentChange
@@ -313,11 +343,7 @@ func TestHistoricalPreciousMetalsDedup(t *testing.T) {
 	}
 
 	w := canonical.Window{Start: 0, End: 100000, HasChanges: true}
-	stream, err := r.snapshotsHistorical(ctx, w, nil, nil, nil, inferredForwards{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stream.Close()
+	stream := connSnapshots(t, &Connection{web: r}, w)
 
 	mvByKey := map[string]*canonical.Decimal{}
 	for {
@@ -374,10 +400,13 @@ func TestHistoricalRangeSpansEveryTable(t *testing.T) {
 	if lo, hi, err := r.historicalRange(ctx); err != nil || lo != 100 || hi != 400 {
 		t.Errorf("span = (%d, %d, %v), want (100, 400, nil)", lo, hi, err)
 	}
-	if _, err := r.db.Exec(`DROP TABLE historical_cash_balances`); err != nil {
+	// The schema is probed once per reader, so the older silver is a
+	// fresh one.
+	old := newWebFixture(t)
+	if _, err := old.db.Exec(`DROP TABLE historical_cash_balances`); err != nil {
 		t.Fatal(err)
 	}
-	if lo, hi, err := r.historicalRange(ctx); err != nil || lo != -1 || hi != -1 {
+	if lo, hi, err := old.historicalRange(ctx); err != nil || lo != -1 || hi != -1 {
 		t.Errorf("pre-migration silver: (%d, %d, %v), want (-1, -1, nil)", lo, hi, err)
 	}
 }
@@ -391,9 +420,9 @@ func TestStatusChangeNumberIgnoresHistoricalDates(t *testing.T) {
 	r := newWebFixture(t)
 	for _, q := range []string{
 		`CREATE TABLE dump_runs (snapshot_at INTEGER)`,
-		`CREATE TABLE transactions (value_date INTEGER)`,
+		`CREATE TABLE transactions (snapshot_at INTEGER, value_date INTEGER)`,
 		`INSERT INTO dump_runs VALUES (1000)`,
-		`INSERT INTO transactions VALUES (900)`,
+		`INSERT INTO transactions VALUES (1000, 900)`,
 		`INSERT INTO historical_mortgages (as_of_date) VALUES (5000)`,
 	} {
 		if _, err := r.db.Exec(q); err != nil {
@@ -416,5 +445,60 @@ func TestStatusChangeNumberIgnoresHistoricalDates(t *testing.T) {
 	}
 	if w.NewChangeNumber != s.LatestChangeNumber {
 		t.Errorf("ChangeWindow advances to %d, Status reports %d", w.NewChangeNumber, s.LatestChangeNumber)
+	}
+}
+
+// TestPreciousMetalsTotalsOfTheCurrentShape reads the overview totals a
+// current silver holds in statement_overview_totals. Of two USD copies of
+// one (date, portfolio) total the last the document walk wrote is the
+// position; the total suppresses the year-end gold-bar detail line of its
+// portfolio; and a total dated past every other historical row widens the
+// historical span.
+func TestPreciousMetalsTotalsOfTheCurrentShape(t *testing.T) {
+	ctx := context.Background()
+	_, db := silvertest.NewDB(t, webSilverSchemaSQL)
+	silvertest.Exec(t, db, `
+INSERT INTO historical_position_snapshots(as_of_date, portfolio_external_id, account_external_id,
+    instrument_isin, currency_iso, units, market_value, market_value_currency,
+    description, source_doc_token, payload) VALUES
+    (1000, '0999AAAAAAAA01', '', 'CH0000000001', 'USD', 1000, 50000, 'CHF',
+     'Gold bar(s) fine weight', 'tok-ye', '{"headline":"1 000 Gold bar(s) fine weight USD ..."}'),
+    (1000, '0999AAAAAAAA01', '', 'CH0000000003', 'CHF', 100, 50000, 'CHF',
+     'Example Money Market Fund CHF', 'tok-ye', '{}');
+INSERT INTO statement_overview_totals(source_doc_token, portfolio_external_id, asset_class, as_of_date,
+    currency_iso, market_value, payload) VALUES
+    ('tok-a', '0999AAAAAAAA01', 'precious_metals', 1000, 'USD', 111111, '{}'),
+    ('tok-b', '0999AAAAAAAA01', 'precious_metals', 1000, 'USD', 222222, '{}'),
+    ('tok-c', '0999AAAAAAAA01', 'precious_metals', 5000, 'USD', 333333, '{}');`)
+	r := &webReader{db: db}
+
+	w := canonical.Window{Start: 0, End: 100000, HasChanges: true}
+	stream := connSnapshots(t, &Connection{web: r}, w)
+	mv := map[string]string{}
+	for {
+		batch, more, err := stream.Next(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range batch.Positions {
+			if p.SnapshotAt == 1000 && p.MarketValue != nil {
+				mv[p.PositionKey] = p.MarketValue.String()
+			}
+		}
+		if !more {
+			break
+		}
+	}
+	if got := mv["PM-0999AAAAAAAA01"]; got != "222222" {
+		t.Errorf("precious-metals position = %q, want the last USD copy's 222222", got)
+	}
+	if _, ok := mv["CH0000000001"]; ok {
+		t.Error("the year-end gold-bar detail line reached gold beside the overview total")
+	}
+	if _, ok := mv["CH0000000003"]; !ok {
+		t.Error("a non-metal security in the portfolio was suppressed")
+	}
+	if lo, hi, err := r.historicalRange(ctx); err != nil || lo != 1000 || hi != 5000 {
+		t.Errorf("span = (%d, %d, %v), want (1000, 5000, nil)", lo, hi, err)
 	}
 }

@@ -52,12 +52,47 @@ func TestTransactionSpendColumns(t *testing.T) {
 	}
 }
 
-// TestTransactionPrivacyClasses pins the transactions registry against
-// the spending one: the same gold column must take the same class on
-// both surfaces. `description` is the case that matters — it holds the
-// statement narrative verbatim, so it redacts as free text (the cell
-// masks whole), and `merchant` goes with it, being a name taken off
-// such a narrative; the taxonomy columns beside them stay legible.
+// txnLineClasses are the privacy classes of the columns every
+// transaction-grain view shares (txnLineCols), by name. `description`
+// and `counterparty` are the cases that matter: they hold the statement
+// narrative and its merchant field verbatim, so they redact as free text
+// (the cell masks whole).
+var txnLineClasses = map[string]PrivacyClass{
+	"silver_source":    PrivacyNone,
+	"date":             PrivacyNone,
+	"datetime":         PrivacyNone,
+	"account":          PrivacyAccountID,
+	"account_id":       PrivacyAccountID,
+	"account_kind":     PrivacyNone,
+	"account_nickname": PrivacyPseudonym,
+	"account_category": PrivacyNone,
+	"kind":             PrivacyNone,
+	"currency":         PrivacyNone,
+	"net_amount":       PrivacyMoney,
+	"value":            PrivacyMoney,
+	"counterparty":     PrivacyFreeText,
+	"description":      PrivacyFreeText,
+	"tx_id":            PrivacyAccountID,
+}
+
+// TestTxnLinePrivacyClasses pins the class of each shared transaction
+// line column, which every transaction-grain registry takes as it is.
+func TestTxnLinePrivacyClasses(t *testing.T) {
+	t.Parallel()
+	line := txnLineCols("USD", noKinds, nil,
+		func(r gold.TransactionRow) gold.TxnLine { return r.TxnLine },
+		func(r gold.TransactionRow) gold.TxnValue { return r.TxnValue })
+	for name, class := range txnLineClasses {
+		if got := line(name).class(); got != class {
+			t.Errorf("column %q privacy = %v, want %v", name, got, class)
+		}
+	}
+}
+
+// TestTransactionPrivacyClasses pins the privacy class of the columns
+// the ledger adds to the shared transaction line: `merchant` redacts as
+// free text, being a name taken off a narrative; the taxonomy columns
+// beside it stay legible.
 func TestTransactionPrivacyClasses(t *testing.T) {
 	t.Parallel()
 	cols, err := resolveColumns("all", defaultTransactionColumns, buildTransactionColumnRegistry("USD", noKinds, nil))
@@ -69,19 +104,11 @@ func TestTransactionPrivacyClasses(t *testing.T) {
 		byName[c.Name] = c
 	}
 	want := map[string]PrivacyClass{
-		"description":      PrivacyFreeText,
-		"merchant":         PrivacyFreeText,
-		"spend_primary":    PrivacyNone,
-		"spend_detailed":   PrivacyNone,
-		"asset_class":      PrivacyNone,
-		"kind":             PrivacyNone,
-		"account":          PrivacyAccountID,
-		"account_id":       PrivacyAccountID,
-		"account_nickname": PrivacyPseudonym,
-		"tx_id":            PrivacyAccountID,
-		"net_amount":       PrivacyMoney,
-		"value":            PrivacyMoney,
-		"quantity":         PrivacyQuantity,
+		"merchant":       PrivacyFreeText,
+		"spend_primary":  PrivacyNone,
+		"spend_detailed": PrivacyNone,
+		"asset_class":    PrivacyNone,
+		"quantity":       PrivacyQuantity,
 	}
 	for name, class := range want {
 		c, ok := byName[name]
@@ -89,8 +116,8 @@ func TestTransactionPrivacyClasses(t *testing.T) {
 			t.Errorf("column %q is not registered", name)
 			continue
 		}
-		if c.Privacy != class {
-			t.Errorf("column %q privacy = %v, want %v", name, c.Privacy, class)
+		if c.class() != class {
+			t.Errorf("column %q privacy = %v, want %v", name, c.class(), class)
 		}
 	}
 }
@@ -109,8 +136,8 @@ func TestTransactionNamePrivacyFollowsFallback(t *testing.T) {
 	instrument := "Example Total Market Index ETF"
 	narrative := "PAYMENT SAMPLE PAYEE ZZ EXAMPLETOWN REF 000000"
 
-	joined := gold.TransactionRow{Name: &instrument, Description: &narrative}
-	fallback := gold.TransactionRow{Description: &narrative}
+	joined := gold.TransactionRow{Name: &instrument, TxnValue: gold.TxnValue{Description: &narrative}}
+	fallback := gold.TransactionRow{TxnValue: gold.TxnValue{Description: &narrative}}
 
 	on := rowsToTable([]gold.TransactionRow{joined, fallback}, cols, true, output.FormatTable, nil)
 	if on.Rows[0][0] != instrument {
@@ -149,8 +176,8 @@ func TestTransactionsCarriesTheIncomeTrio(t *testing.T) {
 	for _, c := range all {
 		if class, ok := want[c.Name]; ok {
 			seen[c.Name] = true
-			if c.Privacy != class {
-				t.Errorf("%s: privacy = %v, want %v", c.Name, c.Privacy, class)
+			if c.class() != class {
+				t.Errorf("%s: privacy = %v, want %v", c.Name, c.class(), class)
 			}
 		}
 	}
@@ -203,11 +230,11 @@ func TestTransactionCheckNumberColumn(t *testing.T) {
 	if spec == nil {
 		t.Fatal("check_no did not resolve")
 	}
-	if spec.Privacy != PrivacyAccountID {
-		t.Errorf("check_no privacy = %v, want PrivacyAccountID", spec.Privacy)
+	if spec.class() != PrivacyAccountID {
+		t.Errorf("check_no privacy = %v, want PrivacyAccountID", spec.class())
 	}
-	if spec.Align != output.AlignLeft {
-		t.Errorf("check_no align = %v, want AlignLeft — it is an identifier, not a number", spec.Align)
+	if spec.Kind != TextColumn {
+		t.Errorf("check_no kind = %v, want text — it is an identifier, not a number", spec.Kind)
 	}
 
 	number := "9042"

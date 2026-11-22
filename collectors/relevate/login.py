@@ -312,7 +312,7 @@ def do_check(state_path: Path) -> int:
     state = ck_session.load_state(state_path)
     if state is None:
         print("MISSING", flush=True)
-        return 1
+        return cli.EXIT_NEEDS_PERSON
     session = new_session()
     state_into_jar(state.get("cookies", []), session.cookies)
     minted = state.get("minted_at", "?")
@@ -325,7 +325,7 @@ def do_check(state_path: Path) -> int:
         print("ALIVE", flush=True)
         return 0
     print("DEAD", flush=True)
-    return 2
+    return cli.EXIT_NEEDS_PERSON
 
 
 def do_login(args: argparse.Namespace) -> int:

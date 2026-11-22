@@ -255,7 +255,8 @@ login.py [--state-path PATH] [--check] [--max-otp-attempts N]
 - `--check` — **no credentials submitted, no mTAN push.** Loads
   the existing state file, restores the cookie jar, hits the
   landmark probe, and prints `ALIVE` / `DEAD` / `MISSING` on stdout.
-  Exit codes: 0 (ALIVE), 1 (MISSING), 2 (DEAD).
+  Exit codes: 0 (ALIVE), and 6 for MISSING and DEAD (a login is
+  needed, `collectorkit.cli.EXIT_NEEDS_PERSON`).
 - `--max-otp-attempts` — how many OTP submissions before giving up
   (default 3). The prompt has no deadline: `input()` blocks on stdin
   until a code arrives.
@@ -300,12 +301,12 @@ like a browser's:
 ### 4.1 Flow
 
 1. Load `/secrets/relevate-state.json` and restore the cookie
-   jar into a `requests.Session`. Missing file → exit `64` with
+   jar into a `requests.Session`. Missing file → exit 6 with
    "run `./relevate login` first".
 2. Set the session headers listed in §3.4. No `X-CSRFT759` on GETs:
    Airlock enforces double-submit only on POSTs.
 3. Probe `/auth/rest/protected/self-service/ui/configuration/portal`.
-   Non-200 → exit 1 and report that the session is dead. `download`
+   Non-200 → exit 6 and report that the session is dead. `download`
    never signs in.
 4. Create the run dir `/data/<UTC-ts>/` and open the `Manifest`
    (the `run.json` writer). It is born `status: "in-progress"` and
@@ -459,10 +460,10 @@ cheaply while iterating on the loader or on one portfolio's response
 shape.
 
 `--dry-run` reuses the stored session; it never signs in and never
-sends an mTAN. With no state file it exits 64, and with a dead session
-it exits 1, as a real run does. With a live session it calls only the
-two master listings (`investment-overview` and `documents`) and logs
-how many portfolios and in-window documents a real run would fetch.
+sends an mTAN. With no state file or a dead session it exits 6, as a
+real run does. With a live session it calls only the two master
+listings (`investment-overview` and `documents`) and logs how many
+portfolios and in-window documents a real run would fetch.
 Its manifest goes to a throwaway temp dir that is removed on exit, so
 nothing lands under `--bronze-dir`. `--debug` captures nothing on a
 dry run.
@@ -500,7 +501,8 @@ There is no retry loop. A failed request is logged and recorded in
 
 ## 5. `load.py` (silver loader)
 
-`load` applies the migrations on each invocation, then projects bronze
+`load` runs in the shared load frame (`collectorkit.loader`). It
+applies the migrations on each invocation, then projects bronze
 JSON into the silver schema (§7). It loads each pending dump, oldest
 first, in one transaction (`accounts`, `cash_balances`, `positions`,
 `instruments`, `performance_points`, `documents`). The `dump_runs` row
@@ -511,23 +513,38 @@ follows the fleet `run.json` status rule
 `load` does not read the `deposits-YYYY.json`, `fees.json` or
 `investment-allocation.json` files (§7.3).
 
-Two PDF passes then run over every document silver indexes, each in
-its own transaction:
+Two PDF passes then run over the documents silver indexes, in one
+transaction:
 
 - `load_historical_snapshots` parses the quarterly reports into
   `historical_position_snapshots` and `historical_cash_balances`.
 - `load_credit_note_transactions` parses the credit notes into
   `transactions` with `source='credit_note_pdf'`. Each row takes the
-  latest `dump_runs.snapshot_at`, since a PDF carries no dump time.
+  latest `dump_runs.snapshot_at`, since a PDF carries no dump time,
+  and moves with it at every load.
 
-A PDF that fails to parse is logged and skipped. Both passes re-read
-the whole archive on every load. When the `pdf_parsers` fingerprint
-changes (`parser_generations`, migration 0003), `load` first drops the
-rows both passes wrote, so a re-parse replaces them. If the re-parse
-yields fewer rows than before, the new generation is not stamped and
-the next load tries again.
+Each pass derives only the documents the current `pdf_parsers`
+generation has not derived (`document_derivations`, migration 0004,
+through `collectorkit.derivations`). So a load with no new document
+parses nothing, and a new document is parsed once. A document derived
+again first loses the rows it derived before, so a restated report
+leaves nothing of its older content. A PDF that fails to parse is
+logged and recorded with no rows, so only a parser change reads it
+again. A PDF missing on disk is not recorded, so the next load tries
+it again. A parse result is also cached per document and parser
+generation (`collectorkit.parsecache`, under the collector's cache
+root), so a `load --force` parses nothing it parsed before. A failed
+parse is not cached.
 
-`load --force` deletes the silver DB and rebuilds it from all bronze.
+The generation is the fingerprint of `pdf_parsers`, pypdf and the
+Python version. When it changes, `load` first drops the rows both
+passes wrote and derives every document again, so a re-parse replaces
+them. If the re-parse yields fewer rows than before, the new
+generation is recorded one load later, after one more re-parse.
+
+`load --force` builds a fresh silver from all bronze beside the old
+one and puts it in place once every dump is in. A failed rebuild
+leaves the old silver as it was.
 
 ## 6. Bronze layout
 
@@ -613,11 +630,11 @@ Storage conventions:
 | `positions` | `(snapshot_at, account_external_id, instrument_external_id)` | One row per (snapshot, account, modelportfolio position). **TARGET allocation**, not actual unit holdings. Promotes isin, asset_class, country_code, allocation, trading_price. |
 | `instruments` | `instrument_external_id` | Slow-changing master data; an upsert advances `last_seen_at`. Keyed on `security.id`, shared across portfolios. |
 | `performance_points` | `(snapshot_at, account_external_id, value_date)` | Daily time series from `/portfolio/{id}/performance`. One point per calendar day since the portfolio's inception. `value_date` is Unix seconds at the day's midnight UTC. |
-| `transactions` | `transaction_external_id` | Contribution events parsed from the credit-note PDFs (`source='credit_note_pdf'`, id `credit_note:<doc id>`). The loader does not read `/deposits`, which returns no rows for vested-benefits portfolios. |
+| `transactions` | `transaction_external_id` | Contribution events parsed from the credit-note PDFs (`source='credit_note_pdf'`, id `credit_note:<doc id>`). `run_snapshot_at` (migration 0005) is the dump that first indexed the PDF, so gold's change window reaches a credit note dated before every snapshot; NULL on a row written before the migration. The loader does not read `/deposits`, which returns no rows for vested-benefits portfolios. |
 | `documents` | `content_sha256` | Content-deduped index of the PDFs on disk. `relevate_doc_id` is unique: new content under a known id is a re-issue and replaces the earlier row. `first_seen_at` is the earliest dump that captured the content; `last_seen_at` advances on later dumps. Promotes the numeric `document_type_code` and `category_code`. `doc_kind` comes from `fileName` needles (`DOC_KIND_PATTERNS`), `'other'` only for unrecognised names. |
 | `historical_position_snapshots` | `(snapshot_at, account_external_id, isin)` | Per-quarter holdings parsed from the quarterly-report PDFs (migration 0002). |
 | `historical_cash_balances` | `(snapshot_at, account_external_id, currency, balance_kind)` | Per-quarter cash and valuation figures from the same reports (migration 0002). |
-| `parser_generations` | `scope` | Which generation of the PDF parsing logic produced the rows a pass holds (`collectorkit.srcfp` fingerprint, migration 0003). A moved generation drops those rows before the pass re-derives them, so a re-parse replaces rather than accumulates. |
+| `document_derivations` | `(content_sha256, scope)` | Which generation of the PDF parsing logic (`collectorkit.srcfp` fingerprint) derived each report and credit note, and how many rows it wrote (migration 0004). A load derives the documents without a row under the current generation. A moved generation drops both passes' rows before they are derived again, so a re-parse replaces rather than accumulates. |
 
 #### 7.1.1 `accounts.product_key` is forensic, not behavioural
 

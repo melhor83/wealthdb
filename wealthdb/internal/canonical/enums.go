@@ -10,106 +10,23 @@ import "slices"
 // what moves a holding's value. The recognised exposure values and
 // the Valid method live in taxonomy.go (docs/TAXONOMY.md §2).
 //
-// The consts below are the intermediate 1-D classification labels
-// the silver adapters use inside their classmaps (equity, etf, bond,
-// fund, money_market, spv, private_fund, …). These labels are never
-// written to gold: each adapter translates them to an
-// (exposure, vehicle) pair at the emit boundary, so they need not be
-// members of the exposure set (ValidCoarse tests membership in this
-// intermediate vocabulary; Valid, in taxonomy.go, tests the exposure
-// set). A subset — private_equity, real_estate, metal, crypto, other
-// — double as exposure values and keep the same meaning in both
-// roles. Unrecognised source codes fall through to AssetClassOther
+// A source's own class words (equity, bond, fund, …) are mapped to an
+// (exposure, vehicle) pair at the emit boundary (TAXONOMY.md §4).
+// Unrecognised source codes fall through to AssetClassOther
 // (docs/DESIGN.md §6.8).
 type AssetClass string
 
 const (
-	AssetClassEquity AssetClass = "equity"
-	// Exchange-traded funds. AssetClassETF is the equity-exposure
-	// default of the coarse vocabulary; an ETF whose underlying is
-	// another asset class is characterised by what it holds, not the
-	// wrapper: crypto ETFs/ETPs → AssetClassCrypto, physical-metal
-	// ETFs/ETPs → AssetClassMetal, bond / fixed-income ETFs →
-	// AssetClassBondETF. The bond case gets its own class (rather
-	// than folding into AssetClassBond) because a bond ETF has no
-	// maturity and rolls its duration forever — aggregating it with
-	// directly-held bonds would poison maturity-aware views of the
-	// `bond` bucket.
-	AssetClassETF           AssetClass = "etf"
-	AssetClassBondETF       AssetClass = "bond_etf"
-	AssetClassFund          AssetClass = "fund"
-	AssetClassBond          AssetClass = "bond"
-	AssetClassOption        AssetClass = "option"
-	AssetClassFuture        AssetClass = "future"
-	AssetClassFxForward     AssetClass = "fx_forward"
-	AssetClassFxOption      AssetClass = "fx_option"
-	AssetClassMoneyMarket   AssetClass = "money_market"
-	AssetClassOTCDerivative AssetClass = "otc_derivative"
-	AssetClassMetal         AssetClass = "metal"
-	AssetClassCrypto        AssetClass = "crypto"
-	// Private-market classes. Distinct from the public-market
-	// AssetClassEquity / AssetClassFund so portfolio queries can
-	// separate illiquid, non-quotable private holdings (Carta
-	// cap-table stakes, AngelList SPV / fund LP interests) from
-	// listed securities. AssetClassPrivateEquity covers direct
-	// private-company equity and equity-comp (shares, options,
-	// RSUs/RSAs, warrants); AssetClassSPV covers an LP
-	// interest in a single-company special-purpose vehicle;
-	// AssetClassPrivateFund covers an LP interest in a multi-company
-	// venture/PE fund.
+	AssetClassMetal  AssetClass = "metal"
+	AssetClassCrypto AssetClass = "crypto"
+	// AssetClassPrivateEquity covers direct private-company equity and
+	// equity-comp (shares, options, RSUs/RSAs, warrants): illiquid,
+	// non-quotable holdings apart from listed securities.
 	AssetClassPrivateEquity AssetClass = "private_equity"
-	AssetClassSPV           AssetClass = "spv"
-	AssetClassPrivateFund   AssetClass = "private_fund"
-	// Further private classes (mostly manual, hand-maintained, no
-	// source UI — see collectors/manual). AssetClassRealEstate is a
-	// directly-held property. AssetClassConvertibleNote is an early-stage
-	// convertible loan / note or SAFE (typically 0% interest, expected to
-	// convert to equity at the next round or be written to zero); kept
-	// distinct from the public-market `bond` and from `private_equity` until
-	// it converts. Emitted by the manual collector and by Carta (a
-	// pre-conversion SAFE / convertible holding). Other manual kinds reuse
-	// existing classes (private_equity / private_fund / spv) or fall through
-	// to `other`.
-	AssetClassRealEstate      AssetClass = "real_estate"
-	AssetClassConvertibleNote AssetClass = "convertible_note"
-	// AssetClassMortgage is a real-property-backed liability:
-	// the outstanding principal sits as a negative MarketValue on
-	// a synthetic per-mortgage Position. Paired 1:1 with
-	// AccountKindMortgage because UBS (and most banks) expose
-	// each mortgage as its own account.
-	AssetClassMortgage AssetClass = "mortgage"
-	AssetClassOther    AssetClass = "other"
+	// AssetClassRealEstate is a directly-held property.
+	AssetClassRealEstate AssetClass = "real_estate"
+	AssetClassOther      AssetClass = "other"
 )
-
-// assetClassCoarseValues is the intermediate 1-D classification
-// vocabulary the silver adapters use inside their classmaps before
-// mapping to an (exposure, vehicle) pair. It is NOT the set written to
-// gold — that is the exposure set in taxonomy.go (AssetClass.Valid).
-// The two overlap only on the shared strings (private_equity,
-// real_estate, metal, crypto, other).
-var assetClassCoarseValues = map[AssetClass]struct{}{
-	AssetClassEquity: {}, AssetClassETF: {}, AssetClassBondETF: {},
-	AssetClassFund: {},
-	AssetClassBond: {}, AssetClassOption: {}, AssetClassFuture: {},
-	AssetClassFxForward: {}, AssetClassFxOption: {},
-	AssetClassMoneyMarket: {}, AssetClassOTCDerivative: {},
-	AssetClassMetal: {}, AssetClassCrypto: {},
-	AssetClassPrivateEquity: {}, AssetClassSPV: {}, AssetClassPrivateFund: {},
-	AssetClassRealEstate: {}, AssetClassConvertibleNote: {},
-	AssetClassMortgage: {},
-	AssetClassOther:    {},
-}
-
-// ValidCoarse reports whether the receiver is a recognised coarse 1-D
-// classification label (the adapters' intermediate vocabulary above).
-// Distinct from Valid (taxonomy.go), which checks the exposure set
-// written to gold: an adapter uses ValidCoarse to canonicalise a raw
-// silver class — falling back to AssetClassOther for an unrecognised
-// label — before mapping it to an (exposure, vehicle) pair.
-func (a AssetClass) ValidCoarse() bool {
-	_, ok := assetClassCoarseValues[a]
-	return ok
-}
 
 // AccountKind discriminates `accounts.account_kind`. This is the
 // "technical container" dimension — what the bank's UI calls the
@@ -142,7 +59,7 @@ const (
 	AccountKindCryptoSelfCustody AccountKind = "crypto_self_custody"
 	// AccountKindMortgage is a real-property-backed liability
 	// account. Outstanding principal lives as a negative-value
-	// position (AssetClassMortgage) on this account; interest /
+	// position (real_estate × mortgage) on this account; interest /
 	// principal payments flow in as transactions debited from a
 	// regular cash account with counterparty "Maturity".
 	AccountKindMortgage AccountKind = "mortgage"
@@ -166,30 +83,19 @@ const (
 	AccountKindOther            AccountKind = "other"
 )
 
-var accountKindValues = map[AccountKind]struct{}{
-	AccountKindBrokerage: {}, AccountKindCash: {},
-	AccountKindSafekeeping: {}, AccountKindCustody: {},
-	AccountKindOverlay:        {},
-	AccountKindCrypto:         {},
-	AccountKindCryptoExchange: {}, AccountKindCryptoSelfCustody: {},
-	AccountKindMortgage:         {},
-	AccountKindCard:             {},
-	AccountKindDonorAdvisedFund: {},
-	AccountKindOther:            {},
-}
+// accountKindValues are the kinds of the account kind table
+// (kindroles.go).
+var accountKindValues = func() map[AccountKind]struct{} {
+	m := make(map[AccountKind]struct{}, len(accountKinds))
+	for _, r := range accountKinds {
+		m[r.Kind] = struct{}{}
+	}
+	return m
+}()
 
 func (a AccountKind) Valid() bool {
 	_, ok := accountKindValues[a]
 	return ok
-}
-
-// FollowsSource reports whether an account of the kind keeps the kind
-// its adapter states, whatever an override says: an adapter signs a
-// card's balance and books a mortgage's principal by its own kind, so a
-// restated liability would read a debt as an asset, and an overlay is
-// synthetic.
-func (a AccountKind) FollowsSource() bool {
-	return a == AccountKindCard || a == AccountKindMortgage || a == AccountKindOverlay
 }
 
 // TaxWrapper discriminates `accounts.tax_wrapper` — the tax /
@@ -360,16 +266,15 @@ const (
 	TxKindOther           TxKind = "other"
 )
 
-var txKindValues = map[TxKind]struct{}{
-	TxKindBuy: {}, TxKindSell: {}, TxKindDividend: {}, TxKindCoupon: {},
-	TxKindCapitalGain: {}, TxKindInterest: {}, TxKindStaking: {},
-	TxKindContribution: {}, TxKindDistribution: {}, TxKindFee: {}, TxKindTax: {},
-	TxKindDeposit: {}, TxKindWithdrawal: {},
-	TxKindPurchase: {}, TxKindRefund: {}, TxKindCardPayment: {}, TxKindReward: {},
-	TxKindFx: {}, TxKindFxForward: {}, TxKindFxSwap: {},
-	TxKindCorporateAction: {}, TxKindTransferIn: {},
-	TxKindTransferOut: {}, TxKindJournal: {}, TxKindOther: {},
-}
+// txKindValues are the kinds of the transaction kind table
+// (kindroles.go).
+var txKindValues = func() map[TxKind]struct{} {
+	m := make(map[TxKind]struct{}, len(txKindRows))
+	for _, r := range txKindRows {
+		m[r.Kind] = struct{}{}
+	}
+	return m
+}()
 
 func (t TxKind) Valid() bool {
 	_, ok := txKindValues[t]
@@ -379,9 +284,9 @@ func (t TxKind) Valid() bool {
 // TxKinds returns every kind, sorted, so a test walking them meets a
 // new kind with no edit.
 func TxKinds() []TxKind {
-	out := make([]TxKind, 0, len(txKindValues))
-	for k := range txKindValues {
-		out = append(out, k)
+	out := make([]TxKind, 0, len(txKindRows))
+	for _, r := range txKindRows {
+		out = append(out, r.Kind)
 	}
 	slices.Sort(out)
 	return out

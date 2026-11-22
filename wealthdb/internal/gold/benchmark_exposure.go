@@ -7,8 +7,8 @@ import (
 	"strings"
 )
 
-// The dimensions of benchmark_exposure. Each names the card or view that
-// reads it (docs/EXPOSURE.md, "Benchmarks").
+// The dimensions of benchmark_exposure (docs/EXPOSURE.md §14). Each names
+// the card or view that reads it (web/DESIGN.md §8, "Benchmarks").
 const (
 	BenchmarkDimClass        = "asset_class"
 	BenchmarkDimSector       = "sector"
@@ -42,9 +42,18 @@ const benchmarkSource = "(benchmark)"
 
 // benchmarkExposureSQL is every benchmark's look-through at the instant
 // $1, on the serving views' definitions: web_exposure's buckets, the
-// debt buckets of exposureDebtSQL, and a security and an issuer as the
-// dashboard's tables name them. A leaf's value is its share of the
-// benchmark in percent, the weights summing to 100.
+// debt buckets of exposure_debt_buckets, and a security and an issuer as
+// the dashboard's tables name them. A leaf's value is its share of the
+// benchmark in percent, the weights summing to 100. The shares are exact
+// sums of the leaves (exposure_sum).
+//
+// The place buckets call exposure_place_bucket, as
+// exposure_labeled_leaves does; the size leaves out the (none) of every
+// class but public equity. The security CASE mirrors
+// exposure_labeled_leaves' with no arm for a holding no key names: every
+// virtual holding has its fund's key. It stays written out because one
+// walk, exposure_yield_leaves, serves every dimension here; reading
+// exposure_labeled_leaves beside it would walk the leaves again.
 var benchmarkExposureSQL = `INSERT INTO benchmark_exposure BY NAME
 WITH l AS MATERIALIZED (SELECT * FROM exposure_yield_leaves(CAST($1 AS BIGINT), 'USD')),
 d AS (
@@ -55,10 +64,10 @@ d AS (
     SELECT acct, '` + BenchmarkDimClassSector + `', asset_class || '|' || COALESCE(sector, 'unknown'), value FROM l
     UNION ALL
     SELECT acct, '` + BenchmarkDimRegion + `',
-           COALESCE(region, CASE WHEN asset_class IN ('metal', 'crypto') THEN '(none)' ELSE 'unknown' END), value FROM l
+           exposure_place_bucket(region, asset_class), value FROM l
     UNION ALL
     SELECT acct, '` + BenchmarkDimCountry + `',
-           COALESCE(country, CASE WHEN asset_class IN ('metal', 'crypto') THEN '(none)' ELSE 'unknown' END), value FROM l
+           exposure_place_bucket(country, asset_class), value FROM l
     UNION ALL
     SELECT acct, '` + BenchmarkDimCurrency + `', COALESCE(currency, 'unknown'), value FROM l
     UNION ALL
@@ -85,26 +94,59 @@ named AS (
                 WHEN asset_class = 'cash' AND NOT declared AND (key IS NULL OR key LIKE 'name:%') THEN 'cash:' || currency
                 WHEN key IS NOT NULL THEN key
                 ELSE 'line:' || fund_ref || ':' || COALESCE(name, asset_type_raw, '') END AS bucket,
-           MAX(name) AS label, CAST(NULL AS VARCHAR) AS lei, SUM(value) AS value
+           MAX(name) AS label, CAST(NULL AS VARCHAR) AS lei, exposure_sum(value) AS value
       FROM l GROUP BY 1, 2, 3
     UNION ALL
     SELECT acct, '` + BenchmarkDimIssuer + `', COALESCE(issuer_key, '(none)'),
-           first(issuer_name ORDER BY name_rank DESC, abs(value) DESC, issuer_name), MIN(lei), SUM(value)
+           first(issuer_name ORDER BY name_rank DESC, abs(value) DESC, issuer_name), MIN(lei), exposure_sum(value)
       FROM l GROUP BY 1, 2, 3)
 SELECT CAST($2 AS BIGINT) AS computed_at, benchmark, dimension, bucket, CAST(NULL AS VARCHAR) AS label,
-       CAST(NULL AS VARCHAR) AS lei, SUM(value) AS share_pct
+       CAST(NULL AS VARCHAR) AS lei, exposure_sum(value) AS share_pct
   FROM d WHERE bucket IS NOT NULL
  GROUP BY 2, 3, 4
 UNION ALL
 SELECT CAST($2 AS BIGINT), benchmark, dimension, bucket, label, lei, value FROM named`
 
+// BenchmarkKey is the row's bucket in its view's dimension of
+// benchmark_exposure, as benchmarkExposureSQL writes it: a benchmark's
+// weight of the row is the share stored under this key. Each exposure
+// row type a benchmark compares with has one.
+func (r ExposureClassRow) BenchmarkKey() string { return r.AssetClass }
+
+// BenchmarkKey is the row's class_sector bucket.
+func (r ExposureSectorRow) BenchmarkKey() string { return r.AssetClass + "|" + r.Sector }
+
+// BenchmarkKey is the row's size bucket.
+func (r ExposureSizeRow) BenchmarkKey() string { return r.Size }
+
+// BenchmarkKey is the row's country bucket.
+func (r ExposureCountryRow) BenchmarkKey() string { return r.Country }
+
+// BenchmarkKey is the row's currency_kind bucket.
+func (r ExposureCurrencyRow) BenchmarkKey() string { return r.Currency + "|" + r.Kind }
+
+// BenchmarkKey is the row's bucket of its debt or equity dimension.
+func (r ExposureBucketRow) BenchmarkKey() string { return r.Bucket }
+
+// BenchmarkKey is the row's security bucket.
+func (r ExposureSecurityRow) BenchmarkKey() string { return r.Security }
+
+// BenchmarkKey is the row's issuer bucket: by its LEI where it has
+// one, else by its name.
+func (r ExposureIssuerRow) BenchmarkKey() string {
+	if r.LEI != nil {
+		return "lei:" + *r.LEI
+	}
+	return strings.ToUpper(r.Issuer)
+}
+
 // benchmarkFundCurrencySQL is each benchmark by the currency its funds
 // are priced in: Allocation's reading of a currency, which looks through
 // no fund. A fund with no composition counts in dollars, the currency
 // N-PORT states a fund in.
-const benchmarkFundCurrencySQL = `INSERT INTO benchmark_exposure BY NAME
+var benchmarkFundCurrencySQL = `INSERT INTO benchmark_exposure BY NAME
 SELECT CAST($2 AS BIGINT) AS computed_at, b.benchmark, '` + BenchmarkDimFundCurrency + `' AS dimension,
-       COALESCE(f.currency, '` + benchmarkFundCurrency + `') AS bucket, SUM(b.weight_pct) AS share_pct
+       COALESCE(f.currency, '` + benchmarkFundCurrency + `') AS bucket, exposure_sum(b.weight_pct) AS share_pct
   FROM benchmark_funds b
   LEFT JOIN exposure_funds_at(CAST($1 AS BIGINT)) f ON f.fund_ref = exposure_key(b.fund_ref)
  GROUP BY 1, 2, 3, 4`

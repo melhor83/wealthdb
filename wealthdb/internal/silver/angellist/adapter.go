@@ -29,14 +29,26 @@
 //     the adapter emits each position's latest snapshot on/before it,
 //     dropping the is_open=0 (exited) ones — a COMPLETE portfolio per
 //     date, which is what gold's as-of query reads. market_value =
-//     `market_value_minor` (the collector's mark: current FMV, else the
-//     annual K-1 tax-basis NAV, else cost — never blended within a
-//     snapshot). Money is minor units (cents); the adapter scales by
-//     10^-2. quantity = NULL (LP interests have no unit quantity).
+//     `market_value_minor` where the latest mark states it (current FMV,
+//     else a fund statement's fair value, else the annual K-1 tax-basis
+//     NAV — never blended within a snapshot), plus what the funding
+//     ledger moved into the position since at cost; before any mark the
+//     position is at that cost alone (carry.go). Each ledger movement is
+//     a snapshot day. A position is held from its first payment where
+//     that comes first, and a deal only the ledger names while what the
+//     ledger moved into it is above zero. The position is valued at its
+//     last mark's day, or with none at its first payment's, and its
+//     payload's valuation_basis says `cost` or `mark_plus_cost`. A mark
+//     worth exactly its nonzero book value says `cost` too: the portal
+//     may carry a deal at cost without stating a basis.
+//     Money is minor units (cents); the adapter scales by 10^-2.
+//     quantity = NULL (LP interests have no unit quantity).
 //
 //   - book_value is the capital paid in (docs/DESIGN.md §7.4): the
 //     portal's `contributed_minor`, gross of cash paid back, stamped
-//     stated / paid_in / included. A K-1 that states a Line 19(c)
+//     stated / paid_in / included. Where the portal states none, it is
+//     the capital the funding ledger paid in less its refunds, stamped
+//     derived / paid_in / included. A K-1 that states a Line 19(c)
 //     property distribution (`k1_capital_accounts`, silver migration
 //     0008) moves that basis out with the asset: from the K-1's period
 //     end (Dec 31 of its tax year) the book value is the paid-in figure
@@ -53,38 +65,79 @@
 //     bank ↔ account), investment→contribution and refund→contribution
 //     (a positive reversal), disbursement→sell on an SPV and distribution
 //     on a fund, transfer→withdrawal — using the source-signed amount (it
-//     reconciles to the balance). The
-//     account's current uninvested cash is one CashBalanceChange
-//     (BalanceKind=current), so account value = positions + cash.
+//     reconciles to the balance). The wallet's uninvested cash is a
+//     CashBalanceChange (BalanceKind=current) at the end of every ledger
+//     day, read from the ledger (cash.go), so account value = positions +
+//     cash on every day.
 package angellist
 
 import (
 	"context"
 	"database/sql"
+	"path/filepath"
 
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/lots"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver"
 )
 
 const kindName = "angellist"
 
+// init registers the kind (silver.Source).
+//
+// Lots: the cost basis of its SPV stakes and fund interests is what
+// the source states, capital paid in, and no lot book describes it
+// (docs/LOTS.md §6). The engine builds none and realizes a sale against
+// the stated basis. An account id is the holder's portal slug.
 func init() {
-	silver.Register(&Adapter{})
+	lp := lots.StatedPolicy()
+	silver.Register(silver.Source{
+		Kind:    kindName,
+		Open:    (&Adapter{}).Open,
+		Returns: returnsPolicy(),
+		Lots:    &lp,
+		Labels:  silver.LabelTraits{TypedAccountIDs: true},
+	})
 }
 
 type Adapter struct{}
 
-func (*Adapter) Kind() string { return kindName }
-
-func (*Adapter) Open(_ context.Context, spec silver.OpenSpec) (silver.Connection, error) {
+func (*Adapter) Open(ctx context.Context, spec silver.OpenSpec) (silver.Connection, error) {
 	db, err := silver.OpenReadOnlySQLite(spec.Path, "angellist silver")
 	if err != nil {
 		return nil, err
 	}
-	return &Connection{db: db}, nil
+	c := &Connection{db: db}
+	note, err := silver.ProbeOptional(ctx, c.db, filepath.Base(spec.Path), c.schema.optional()...)
+	if err != nil {
+		c.db.Close()
+		return nil, err
+	}
+	c.Note(note)
+	return c, nil
 }
 
 type Connection struct {
-	db *sql.DB
+	db     *sql.DB
+	schema schema
+	silver.Advice
 }
 
 func (c *Connection) Close() error { return silver.CloseDB(&c.db) }
+
+// schema is which optional parts of the silver schema a file holds,
+// probed once at open.
+type schema struct {
+	propertyMinor       bool // k1_capital_accounts.property_distributions_minor
+	fundingAccounts     bool // the funding_accounts table
+	fundingTransactions bool // the funding_transactions table
+	fundingLinks        bool // funding_transactions.position_external_id
+}
+
+func (s *schema) optional() []silver.Optional {
+	return []silver.Optional{
+		{Table: "k1_capital_accounts", Columns: []string{"property_distributions_minor"}, Version: 8, Has: &s.propertyMinor},
+		{Table: "funding_accounts", Version: 6, Has: &s.fundingAccounts},
+		{Table: "funding_transactions", Version: 6, Has: &s.fundingTransactions},
+		{Table: "funding_transactions", Columns: []string{"position_external_id"}, Version: 7, Has: &s.fundingLinks},
+	}
+}

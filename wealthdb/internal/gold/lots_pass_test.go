@@ -12,6 +12,24 @@ import (
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/lots"
 )
 
+// Every action an adapter may state has a reading in lotActions, but the
+// third-currency fee, which reads by the kind with the fee. An action
+// added to canonical without an entry would otherwise read by the kind
+// alone, silently.
+func TestEveryActionHasALotReading(t *testing.T) {
+	for _, a := range canonical.TxActions {
+		if _, ok := lotActions[a]; ok == (a == canonical.TxActionThirdCurrencyFee) {
+			t.Errorf("action %q: in lotActions = %v", a, ok)
+		}
+	}
+	if len(lotActions) != len(canonical.TxActions)-1 {
+		t.Errorf("lotActions holds %d actions, canonical states %d but the fee", len(lotActions), len(canonical.TxActions)-1)
+	}
+	if got := lotClassify("buy", 1, canonical.TxActionThirdCurrencyFee); got != (lots.Classified{Action: lots.Buy, Fee: true}) {
+		t.Errorf("a third-currency fee on a buy = %+v, want the buy with the fee", got)
+	}
+}
+
 // Every id and figure below is invented. Days are Unix days; a
 // snapshot stamped at midnight states the day's close.
 
@@ -296,6 +314,38 @@ func TestLotPassCorporateActions(t *testing.T) {
 	}
 }
 
+// The feed reads what a row does to the lots from its action, and from
+// its kind where it states none: a return of capital lowers the cost,
+// an option leg booked on the stock moves no lot, a coin that arrives
+// as income opens a lot at market value rather than one of unknown
+// cost, and a third-currency fee goes on the cost of its buy.
+func TestLotPassReadsTheStatedAction(t *testing.T) {
+	t.Parallel()
+	db, ctx := lotFixture(t, `
+        INSERT INTO fx_rates (silver_source_id, snapshot_at, base_currency, quote_currency, mid_rate) VALUES
+            ('lot-src', 3*86400, 'USD', 'COIN', 40),
+            ('lot-src', 3*86400, 'USD', 'FEE', 2);
+        INSERT INTO transactions (silver_source_id, transaction_external_id, occurred_at, account_external_id,
+                                  instrument_external_id, kind, currency, quantity, net_amount, action, payload) VALUES
+            ('lot-src', 'b1', 1*86400,  'A', 'XYZ',  'buy',              'USD',  10, -100, NULL, NULL),
+            ('lot-src', 'o1', 2*86400,  'A', 'XYZ',  'buy',              'USD',   1,   -5, 'ignore', NULL),
+            ('lot-src', 'r1', 5*86400,  'A', 'XYZ',  'corporate_action', 'USD',   0,   20, 'return_of_capital', NULL),
+            ('lot-src', 'i1', 3*86400,  'A', 'COIN', 'transfer_in',      'COIN',  2,    2, 'income', NULL),
+            ('lot-src', 'f1', 3*86400,  'A', 'COIN', 'buy',              'USD',   1,  -40, 'third_currency_fee',
+             '{"fee_amount": 3, "fee_currency": "FEE"}');
+        INSERT INTO positions (silver_source_id, snapshot_at, account_external_id, position_key,
+                               instrument_external_id, asset_class, currency, quantity, market_value) VALUES
+            ('lot-src', 20*86400, 'A', 'XYZ',  'XYZ',  'public_equity', 'USD', 10, 150),
+            ('lot-src', 20*86400, 'A', 'COIN', 'COIN', 'crypto',        'USD',  3, 120);`)
+	rebuild(t, db, ctx, fillCfg(lots.FIFO), false)
+	if got := queryFloat(t, db, `SELECT book_value FROM positions WHERE position_key = 'XYZ'`); !closeEnough(got, 80) {
+		t.Errorf("XYZ basis %v, want 80: the option leg moves no lot, the return of capital lowers the cost", got)
+	}
+	if got := queryFloat(t, db, `SELECT book_value FROM positions WHERE position_key = 'COIN'`); !closeEnough(got, 126) {
+		t.Errorf("COIN basis %v, want 126: the income at market value, the buy with its fee", got)
+	}
+}
+
 func TestLotPassObservesZeroOnlyForAPresentAccount(t *testing.T) {
 	t.Parallel()
 	// XYZ leaves A's snapshot while A shows other rows: an implied
@@ -324,8 +374,11 @@ func TestLotPassPoolsAPortfolio(t *testing.T) {
 	t.Parallel()
 	// Two wallets of one portfolio: a coin bought in W1 sweeps to W2
 	// minus a network fee; the pool's basis is shared by quantity, the
-	// fee is a disposal at market value, and nothing moves.
+	// fee is a disposal at market value, and nothing moves. The
+	// instrument is a coin, so it pairs short of the quantity sent.
 	db, ctx := lotFixture(t, `
+        INSERT INTO instruments (silver_source_id, instrument_external_id, asset_class, vehicle, first_seen_at, last_seen_at)
+            VALUES ('lot-src', 'COIN', 'crypto', 'physical', 1, 1);
         INSERT INTO portfolios (silver_source_id, portfolio_external_id, display_name, first_seen_at, last_seen_at)
             VALUES ('lot-src', 'P', 'Pool', 1, 1);
         INSERT INTO accounts (silver_source_id, account_external_id, account_kind, portfolio_external_id, first_seen_at, last_seen_at) VALUES
@@ -444,6 +497,81 @@ func TestLotPassTakesALedgerReceiptsStatedBasis(t *testing.T) {
 	}
 	if co := queryString(t, db, `SELECT cost_origin FROM lots`); co != "stated" {
 		t.Errorf("cost origin %q", co)
+	}
+}
+
+// The source books the shares a ledger row states as a transfer in of
+// its own, at no value: one arrival, so one lot, at the ledger's cost,
+// and the sale realizes against it. A collected receipt with a value of
+// its own, another quantity or account, a link, or more than 7 days away
+// is a receipt of its own, and opens its own lot. Of two candidates the
+// nearest is the twin, the earlier on a tie, and one ledger row has one
+// twin; kept names the collected receipts that open a lot, "none" for
+// none.
+func TestLotPassTakesALedgerReceiptForItsTwin(t *testing.T) {
+	t.Parallel()
+	const second = `,
+                ('lot-src', 'xfer:2', 10*86400, 'A', 'XYZ', 'transfer_in', 'USD', 10, 900,
+                 '{"equity_transfer_ledger":true,"cost_basis":140,"instrument":"XYZ"}')`
+	for _, c := range []struct {
+		name, twin, links string
+		wantLots          float64
+		ledger, kept      string
+	}{
+		{"same day", `('lot-src', 'r1', 10*86400 + 3600, 'A', 'XYZ', 'transfer_in', 'USD', 10, 0)`, "", 1, "", ""},
+		{"a day before, no amount", `('lot-src', 'r1', 9*86400, 'A', 'XYZ', 'transfer_in', 'USD', 10, NULL)`, "", 1, "", ""},
+		{"a journal", `('lot-src', 'r1', 12*86400, 'A', 'XYZ', 'journal', 'USD', 10, 0)`, "", 1, "", ""},
+		{"valued", `('lot-src', 'r1', 10*86400, 'A', 'XYZ', 'transfer_in', 'USD', 10, 900)`, "", 2, "", ""},
+		{"another quantity", `('lot-src', 'r1', 10*86400, 'A', 'XYZ', 'transfer_in', 'USD', 9, 0)`, "", 2, "", ""},
+		{"another account", `('lot-src', 'r1', 10*86400, 'B', 'XYZ', 'transfer_in', 'USD', 10, 0)`, "", 2, "", ""},
+		{"8 days before", `('lot-src', 'r1', 2*86400, 'A', 'XYZ', 'transfer_in', 'USD', 10, 0)`, "", 2, "", ""},
+		{"linked", `('lot-src', 'r1', 10*86400, 'A', 'XYZ', 'transfer_in', 'USD', 10, 0)`, `
+            INSERT INTO transfer_links (silver_source_id, transaction_external_id, far_silver_source_id,
+                                        far_account_external_id, far_transaction_external_id, evidence, measure) VALUES
+                ('lot-src', 'r1', 'lot-src', 'B', 'o9', 'equity-ledger', 'in_kind');`, 2, "", ""},
+		{"7 days before", `('lot-src', 'r1', 3*86400, 'A', 'XYZ', 'transfer_in', 'USD', 10, 0)`, "", 1, "", ""},
+		{"the nearer of two", `('lot-src', 'r1', 8*86400, 'A', 'XYZ', 'transfer_in', 'USD', 10, 0),
+                ('lot-src', 'r2', 11*86400, 'A', 'XYZ', 'transfer_in', 'USD', 10, 0)`, "", 2, "", "r1"},
+		{"the earlier on a tie", `('lot-src', 'r1', 9*86400, 'A', 'XYZ', 'transfer_in', 'USD', 10, 0),
+                ('lot-src', 'r2', 11*86400, 'A', 'XYZ', 'transfer_in', 'USD', 10, 0)`, "", 2, "", "r2"},
+		{"two twins", `('lot-src', 'r1', 10*86400 + 3600, 'A', 'XYZ', 'transfer_in', 'USD', 10, 0),
+                ('lot-src', 'r2', 10*86400 + 7200, 'A', 'XYZ', 'transfer_in', 'USD', 10, 0)`, "", 2, "", "r2"},
+		{"two ledger rows, one twin", `('lot-src', 'r1', 10*86400 + 3600, 'A', 'XYZ', 'transfer_in', 'USD', 10, 0)`,
+			"", 2, second, "none"},
+	} {
+		db, ctx := lotFixture(t, `
+            INSERT INTO transactions (silver_source_id, transaction_external_id, occurred_at, account_external_id,
+                                      instrument_external_id, kind, currency, quantity, net_amount) VALUES
+                `+c.twin+`,
+                ('lot-src', 's1', 30*86400 + 3600, 'A', 'XYZ', 'sell', 'USD', -10, 1000);
+            INSERT INTO transactions (silver_source_id, transaction_external_id, occurred_at, account_external_id,
+                                      instrument_external_id, kind, currency, quantity, net_amount, payload) VALUES
+                ('lot-src', 'xfer:1', 10*86400, 'A', 'XYZ', 'transfer_in', 'USD', 10, 900,
+                 '{"equity_transfer_ledger":true,"cost_basis":140,"instrument":"XYZ"}')`+c.ledger+`;
+            INSERT INTO positions (silver_source_id, snapshot_at, account_external_id, position_key,
+                                   instrument_external_id, asset_class, currency, quantity, market_value) VALUES
+                ('lot-src', 13*86400, 'A', 'XYZ', 'XYZ', 'public_equity', 'USD', 10, 900),
+                ('lot-src', 40*86400, 'A', 'XYZ', 'XYZ', 'public_equity', 'USD', 0, 0);`+c.links)
+		rebuild(t, db, ctx, fillCfg(lots.FIFO), false)
+		if n := queryFloat(t, db, `SELECT count(*) FROM lots WHERE origin = 'transfer_in'`); n != c.wantLots {
+			t.Errorf("%s: %v receipt lots, want %v", c.name, n, c.wantLots)
+		}
+		if c.kept != "" {
+			if got := queryString(t, db, `SELECT COALESCE(string_agg(origin_transaction_external_id, ','
+			        ORDER BY origin_transaction_external_id), 'none') FROM lots
+			         WHERE origin = 'transfer_in' AND origin_transaction_external_id NOT LIKE 'xfer:%'`); got != c.kept {
+				t.Errorf("%s: the receipts %q open a lot, want %q", c.name, got, c.kept)
+			}
+		}
+		if c.wantLots == 1 {
+			got := queryFloat(t, db, `SELECT sum(book_value) FROM lot_realized WHERE transaction_external_id = 's1'`)
+			if !closeEnough(got, 140) {
+				t.Errorf("%s: the sale's cost %v, want the ledger's 140", c.name, got)
+			}
+			if n := queryFloat(t, db, `SELECT count(*) FROM lot_findings WHERE finding IN ('seed', 'implied')`); n != 0 {
+				t.Errorf("%s: %v seeds or implied disposals", c.name, n)
+			}
+		}
 	}
 }
 

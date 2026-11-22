@@ -18,12 +18,9 @@
 set -euo pipefail
 
 NAME=erstebank_at
-ENV_PREFIX=ERSTEBANK_AT
 ENV_VARS=(ERSTEBANK_AT_USERNAME)
 HAS_DEBUG=1
-HAS_APP_MOUNT=1     # the checkout's source over /app on every verb
 HAS_SAFETY=1        # refuse to evict a live container mid-push / mid-VNC
-HAS_VNC=1           # forward a free 5900-6000 port
 VNC_SUBCOMMANDS=(explore vnc-login)   # the browser-over-VNC verbs
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -89,6 +86,17 @@ fi
 # prune runs host-side (wrapper_host_prune).
 if [[ "${1:-}" == "prune" ]]; then
     wrapper_host_prune "$@"
+fi
+
+# `login` folds into `download` (the push fires every sign-in, §F), so a
+# bare one is a host-side no-op. `login --check` is a read-only session
+# probe and passes through, as do the help flags.
+if wrapper_login_folds --check --help -h -- "$@"; then
+    cat >&2 <<'EOF'
+erstebank_at: 'login' folds into 'download' — nothing to persist (the push fires every sign-in; §F).
+  Run 'download' (one-shot login + fetch), or 'login --check' to probe a session.
+EOF
+    exit 0
 fi
 
 wrapper_main "$@"

@@ -12,10 +12,12 @@ import (
 // deposit on the receiving one — and left unpaired, the outgoing leg reads
 // as spending.
 //
-// What this caller decides differently from the returns engine, each
-// argued in docs/SPENDING.md §3 ("The matcher"):
+// The pass stores its pairs in transfer_links, which every family reads.
+// Returns reads them only when wealthdb.cfg sets
+// returns_transfer_matching.enabled (gold.TransferMatching). What this
+// caller decides, each argued in docs/SPENDING.md §3 ("The matcher"):
 //
-//   - same-source pairing is allowed (CrossGroupOnly=false);
+//   - legs pair across sources and inside one;
 //   - a leg no cross-account phase paired pairs with its reversal on its
 //     own account (SameAccountReversals, with TransferLeg.Signature and
 //     Reversal from reversalRe);
@@ -27,7 +29,10 @@ import (
 //     (`payload.$.bank_ref`, loadPassEvidence), the other leg a
 //     source describes (`payload.$.counter_currency` / `$.counter_amount`),
 //     the card rail (legRail) and the accounts a narrative names
-//     (legNames, from spending.internal_transfer_matching.names).
+//     (legNames, from spending.internal_transfer_matching.names);
+//   - a leg that moves a coin in the coin itself is a coin leg, with the
+//     coin's USD price on its day, and pairs by the coin rule
+//     (loadMatcherPool, gold.TransferLeg.Coin).
 //
 // Every pair records the phase that asserted it (gold.TransferMatchPhase):
 // a reference or described-counter pair legitimately disagrees in amount
@@ -94,7 +99,6 @@ func matchTransferPairs(legs []gold.TransferLeg, windowDays int, tolerancePct fl
 		WindowDays:            windowDays,
 		TolerancePct:          tolerancePct,
 		ToleranceMaxAbs:       gold.DefaultTransferFeeCap,
-		CrossGroupOnly:        false,
 		Overrides:             overrides,
 		SameAccountReversals:  true,
 		Rate:                  rates.Direct,
@@ -109,8 +113,6 @@ func matchTransferPairs(legs []gold.TransferLeg, windowDays int, tolerancePct fl
 const (
 	evidenceStatedAccount = "stated-account"
 	evidenceRule          = "rule"
-	// measureCash is a link's measure for a movement of money.
-	measureCash = "cash"
 )
 
 // phaseEvidence is the evidence each matcher phase writes, and

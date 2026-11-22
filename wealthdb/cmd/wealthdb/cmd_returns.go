@@ -3,28 +3,193 @@ package main
 import (
 	"context"
 	"database/sql"
-	"flag"
-	"fmt"
-	"io"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/config"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/errs"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/gold"
-	"github.com/smartpointer-com/wealthdb/wealthdb/internal/output"
 )
 
 func init() {
-	register("returns", cmdReturns)
+	register("returns", routeReport(returnsFamily))
 }
 
-// returnsViews are the views `wealthdb returns <view>` supports: the
-// four reconciling grains, coarsest first, then two side views, which
+// returnsOptions are the returns family's options.
+var returnsOptions = []option{
+	{name: "method", cli: []string{"method"}, choices: returnsMethods, def: [2]string{"twr", "both"}},
+	{name: "period", cli: []string{"period"}, choices: returnsPeriods, def: [2]string{"quarterly", "total"}},
+	{name: "annualize", cli: []string{"annualize"}, choices: returnsAnnualize, def: [2]string{"auto", "auto"}},
+	{name: "netting", cli: []string{"netting"}, kind: optOnOff, choices: []string{"on", "off"},
+		def: [2]string{"on", "true"}},
+	{name: "inception", cli: []string{"inception"}, choices: returnsInception, def: [2]string{"full", "full"}},
+	{name: "benchmark", cli: []string{"benchmark"}},
+	// The private view's as-of day; no other view takes it.
+	{name: "as_of", cli: []string{"d", "as-of"}, only: true},
+}
+
+// returnsOptionNames are the name of every returns option the grains
+// take: what the stated and private views refuse. The stated view's
+// document fixes the periods and computes no return of its own (-x is
+// refused beside them); the private view reads every leg since each
+// holding's first call, and its return is the money-weighted one.
+var returnsOptionNames = func() []string {
+	var names []string
+	for _, o := range returnsOptions {
+		if !o.only {
+			names = append(names, o.name)
+		}
+	}
+	return names
+}()
+
+// returnsFamily are the views `wealthdb returns <view>` supports: the
+// four reconciling grains, coarsest first, then three side views, which
 // are no grain of them: `stated`, the documents' stated periods beside
-// the accounts' figures, and `bridge`, why net worth moved. Per-position
+// the accounts' figures, `bridge`, why net worth moved, and `private`,
+// each private holding's calls, distributions and mark. Per-position
 // gains are the gains report's.
-var returnsViews = []string{"global", "sources", "portfolios", "accounts", "stated", "bridge"}
+var returnsFamily = &family{
+	name: "returns",
+	views: append(returnsGrainViews(),
+		// The stated view carries no return: "value" is the engine's
+		// ending value.
+		view{name: "stated", side: true, principal: fixedColumn("end_value"), usage: returnsStatedUsage,
+			refuses:     returnsOptionNames,
+			refuseWhy:   " — the periods and the currency are the document's",
+			ownCurrency: "each period in the currency its document states",
+			build: func(cfg *config.Config, req request) *report {
+				return returnsStatedReport(req, cfg)
+			}},
+		// On the bridge, "value" is the net worth it ends on.
+		view{name: "bridge", side: true, principal: fixedColumn("end_net_worth"), usage: returnsBridgeUsage,
+			refuses: bridgeRefusedFlags, checkWindow: checkBridgeWindow,
+			header: periodHeader,
+			build: func(cfg *config.Config, req request) *report {
+				return returnsBridgeReport(req, cfg)
+			}},
+		// On the private view, "value" is what each holding is marked at.
+		view{name: "private", side: true, principal: fixedColumn("nav"), usage: returnsPrivateUsage,
+			refuses: returnsOptionNames, checkWindow: checkPrivateWindow, takes: []string{"as_of"},
+			header: privateHeader,
+			build: func(_ *config.Config, req request) *report {
+				return returnsPrivateReport(req)
+			}},
+	),
+	options:  returnsOptions,
+	window:   sinceInception,
+	currency: true,
+	narrow:   "from/to or a filter",
+	usage:    returnsUsage,
+	settle: func(_ *family, in optionSource, req *request, _ *[]string) error {
+		switch req.view {
+		case "stated":
+			// The document fixes the periods and the currency. Both front
+			// ends refuse the return options before the settle, MCP the
+			// currency with them (refuseMCP); the CLI refuses -x here.
+			if in.cli() && in.has("currency") {
+				return errs.Newf(errs.ExitUsage, "returns: stated takes no -x/--currency — "+
+					"every amount is in the currency the document states")
+			}
+			return nil
+		case "bridge":
+			var err error
+			req.period, err = choose(in, "returns", "period")
+			return err
+		case "private":
+			return nil
+		}
+		for _, o := range []struct {
+			name string
+			to   *string
+		}{{"method", &req.method}, {"period", &req.period}, {"annualize", &req.annualize},
+			{"netting", nil}, {"inception", &req.inception}} {
+			v, err := choose(in, "returns", o.name)
+			if err != nil {
+				return err
+			}
+			if o.to != nil {
+				*o.to = v
+			}
+		}
+		req.netting = in.on("netting")
+		req.benchmark = in.str("benchmark")
+		return checkReturnsBenchmark(req.view, req.benchmark)
+	},
+}
+
+// buildReturns is a grain's report (returnsReport).
+func buildReturns(cfg *config.Config, req request) *report {
+	return returnsReport(req, cfg)
+}
+
+// returnsPrincipal is a grain's main column: on returns, "value" means
+// the return itself.
+func returnsPrincipal(req request) string {
+	if req.method == "mwr" {
+		return "mwr"
+	}
+	return "twr"
+}
+
+// returnsHeader names a grain's options in force.
+func returnsHeader(req request) []string {
+	h := []string{"method=" + req.method, "period=" + req.period}
+	if req.annualize != "auto" {
+		h = append(h, "annualize="+req.annualize)
+	}
+	if !req.netting {
+		h = append(h, "netting off")
+	}
+	if req.inception != "full" {
+		h = append(h, "inception="+req.inception)
+	}
+	if req.benchmark != "" {
+		h = append(h, "benchmark="+req.benchmark)
+	}
+	return h
+}
+
+// returnsGrainViews are the views of the engine's grains, coarsest first.
+func returnsGrainViews() []view {
+	var out []view
+	for _, g := range slices.Backward(gold.ReturnsGrains()) {
+		v := view{name: g.Name, build: buildReturns, principal: returnsPrincipal, header: returnsHeader}
+		switch {
+		case g.Whole:
+			// The whole's silver_source is the whole portfolio's, not one source.
+			v.excludes = []string{"source"}
+		case g.Entity == "account":
+			// On accounts the entity is the account.
+			v.keyAlias = map[string]string{"account": "entity"}
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+// returnsEntity is what an entity of the grain named level is: "account",
+// "portfolio", or "" for a source and the whole.
+func returnsEntity(level string) string {
+	for _, g := range gold.ReturnsGrains() {
+		if g.Name == level {
+			return g.Entity
+		}
+	}
+	return ""
+}
+
+// returnsWhole reports whether the view is the returns grain of the whole
+// portfolio.
+func returnsWhole(level string) bool {
+	for _, g := range gold.ReturnsGrains() {
+		if g.Name == level {
+			return g.Whole
+		}
+	}
+	return false
+}
 
 // The choices of the returns options the CLI and the MCP tool share.
 var (
@@ -33,71 +198,6 @@ var (
 	returnsAnnualize = []string{"auto", "always", "never"}
 	returnsInception = []string{"full", "strict"}
 )
-
-// cmdReturns routes `wealthdb returns <view> ...` to the view's run.
-func cmdReturns(ctx context.Context, g globalFlags, subargs []string, _ io.Reader, stdout, stderr io.Writer) error {
-	view, rest, err := routeView("returns", subargs, returnsViews, returnsUsage, stderr)
-	if err != nil {
-		return err
-	}
-	switch view {
-	case "stated":
-		return runReturnsStated(ctx, g, rest, stdout, stderr)
-	case "bridge":
-		return runReturnsBridge(ctx, g, rest, stdout, stderr)
-	}
-	return runReturnsView(ctx, g, view, rest, stdout, stderr)
-}
-
-func runReturnsView(ctx context.Context, g globalFlags, view string, args []string, stdout, stderr io.Writer) error {
-	fs := flag.NewFlagSet("wealthdb returns "+view, flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	method := fs.String("method", "twr", "twr | mwr | both")
-	period := fs.String("period", "quarterly", "monthly | quarterly | annual | total")
-	annualize := fs.String("annualize", "auto", "auto | always | never")
-	netting := fs.String("netting", "on", "on | off — net internal transfers at coarse grains (incl. cross-source matched pairs)")
-	inception := fs.String("inception", "full", "full | strict — aggregate since-inception handling")
-	benchmark := fs.String("benchmark", "", "a benchmark's name, beside the global view's rows ('wealthdb help benchmarks')")
-	rf := registerReportFlags(fs, true)
-	fs.Usage = func() { fmt.Fprintln(stderr, returnsUsage()) }
-	if err := parseFlags(fs, args, "returns"); err != nil {
-		return err
-	}
-	for _, c := range []struct {
-		flag, value string
-		allowed     []string
-	}{
-		{"method", *method, returnsMethods},
-		{"period", *period, returnsPeriods},
-		{"annualize", *annualize, returnsAnnualize},
-		{"netting", *netting, []string{"on", "off"}},
-		{"inception", *inception, returnsInception},
-	} {
-		if err := checkChoice("returns", c.flag, c.value, c.allowed...); err != nil {
-			return err
-		}
-	}
-	if err := checkReturnsBenchmark(view, *benchmark); err != nil {
-		return err
-	}
-	fromEpoch, toEpoch, err := parseReturnsWindow(fs.Args(), g.clock())
-	if err != nil {
-		fs.Usage()
-		return errs.Newf(errs.ExitUsage, "returns: %s", err.Error())
-	}
-
-	fmtChoice, cfg, outCcy, err := rf.resolve(g, "returns")
-	if err != nil {
-		return err
-	}
-
-	req := request{view: view, currency: outCcy, from: fromEpoch, to: toEpoch,
-		method: *method, period: *period, annualize: *annualize, netting: *netting == "on", inception: *inception,
-		benchmark: *benchmark}
-	rep := returnsReport(req, cfg)
-	open := func() (*sql.DB, error) { return openGoldForRead(g, cfg) }
-	return writeReport(ctx, rep, rf.output(fmtChoice, "returns", returnsFamily, req, cfg, g.clock()), open, stdout)
-}
 
 // returnsReport is one view of the returns family, the runner the CLI
 // and the MCP server share: RunReturns with the config's overrides, so
@@ -118,7 +218,7 @@ func returnsReport(req request, cfg *config.Config) *report {
 	}
 	loads := []func(context.Context, *sql.DB) error{loadKinds}
 	// Only an account's entity reads its nickname.
-	if req.view == "accounts" {
+	if returnsEntity(req.view) == "account" {
 		loads = append(loads, nicknames.load)
 	}
 	defaults := defaultReturnColumnsFor(req.method)
@@ -132,34 +232,16 @@ func returnsReport(req request, cfg *config.Config) *report {
 // checkReturnsBenchmark refuses a benchmark on a view other than global:
 // a benchmark stands beside the whole portfolio, as on the dashboard.
 func checkReturnsBenchmark(view, benchmark string) error {
-	if benchmark != "" && view != "global" {
+	if benchmark != "" && !returnsWhole(view) {
 		return errs.Newf(errs.ExitUsage, "returns: --benchmark belongs to the global view")
 	}
 	return nil
 }
 
-// returnsCfgFiles are the files returnsCfgSettings reads beside the
-// config. A refresh's input key hashes them with it.
-func returnsCfgFiles(cfg *config.Config) []string {
-	if m, ledger := transferMatching(cfg); m != nil {
-		return []string{ledger}
-	}
-	return nil
-}
-
-// transferMatching is the returns transfer-matching block and the
-// override ledger it reads, or nil when matching is off.
-func transferMatching(cfg *config.Config) (*config.ReturnsTransferMatching, string) {
-	if m := cfg.ReturnsTransferMatching; m != nil && m.Enabled {
-		return m, cfg.SpendTransferOverrides()
-	}
-	return nil, ""
-}
-
 // withReturnsCfg is p with the config's returns settings
 // (returnsCfgSettings), so every report runner applies the same ones.
 func withReturnsCfg(cfg *config.Config, p gold.ReturnParams) gold.ReturnParams {
-	p.InceptionOverrides, p.ReturnsExclude, p.ReturnsHide, p.PolicyOverrides, p.TransferMatching = returnsCfgSettings(cfg)
+	p.ReturnsSettings = returnsCfgSettings(cfg)
 	return p
 }
 
@@ -167,25 +249,22 @@ func withReturnsCfg(cfg *config.Config, p gold.ReturnParams) gold.ReturnParams {
 // hide, policy-override, and transfer-matching settings from wealthdb.cfg.
 // Shared by `returns` and the hidden `web-materialize` so a materialized
 // partition carries exactly the settings a CLI run applies.
-func returnsCfgSettings(cfg *config.Config) (*gold.InceptionOverrides, *gold.ReturnsExclude, *gold.ReturnsHide, map[string]gold.ReturnsPolicyOverride, *gold.TransferMatching) {
-	var inceptionOv *gold.InceptionOverrides
+func returnsCfgSettings(cfg *config.Config) gold.ReturnsSettings {
+	var s gold.ReturnsSettings
 	if cfg.InceptionOverrides != nil {
-		s, p, a := cfg.InceptionOverrides.Epochs()
-		inceptionOv = &gold.InceptionOverrides{Sources: s, Portfolios: p, Accounts: a}
+		src, pf, ac := cfg.InceptionOverrides.Epochs()
+		s.InceptionOverrides = &gold.InceptionOverrides{Sources: src, Portfolios: pf, Accounts: ac}
 	}
-	var exclude *gold.ReturnsExclude
 	if cfg.ReturnsExclude != nil {
 		pf, ac := cfg.ReturnsExclude.Sets()
-		exclude = &gold.ReturnsExclude{Portfolios: pf, Accounts: ac}
+		s.ReturnsExclude = &gold.ReturnsExclude{Portfolios: pf, Accounts: ac}
 	}
-	var hide *gold.ReturnsHide
 	if cfg.ReturnsHide != nil {
 		pf, ac := cfg.ReturnsHide.Sets()
-		hide = &gold.ReturnsHide{Portfolios: pf, Accounts: ac}
+		s.ReturnsHide = &gold.ReturnsHide{Portfolios: pf, Accounts: ac}
 	}
-	var policyOv map[string]gold.ReturnsPolicyOverride
 	if len(cfg.ReturnsPolicyOverrides) > 0 {
-		policyOv = make(map[string]gold.ReturnsPolicyOverride, len(cfg.ReturnsPolicyOverrides))
+		policyOv := make(map[string]gold.ReturnsPolicyOverride, len(cfg.ReturnsPolicyOverrides))
 		for id, ov := range cfg.ReturnsPolicyOverrides {
 			if ov == nil {
 				continue
@@ -199,19 +278,13 @@ func returnsCfgSettings(cfg *config.Config) (*gold.InceptionOverrides, *gold.Ret
 			}
 			policyOv[id] = g
 		}
+		s.PolicyOverrides = policyOv
 	}
-	var matching *gold.TransferMatching
-	if m, ledger := transferMatching(cfg); m != nil {
-		// A malformed ledger overrides nothing here rather than taking down
-		// a returns run: `load` and `categorize` both read the same file and
-		// both fail loudly on it, so the error is reported where it can be
-		// acted on, and this read cannot be the first to see it in practice.
-		overrideRules, _ := gold.ParseTransferOverrideLedger(ledger)
-		matching = &gold.TransferMatching{
-			WindowDays: m.Window(), TolerancePct: m.Tolerance(), Rules: overrideRules,
-		}
-	}
-	return inceptionOv, exclude, hide, policyOv, matching
+	// The pairs come from the links the load stored, which applied the
+	// override ledger when it paired, so returns reads no file of its own.
+	m := cfg.ReturnsTransferMatching
+	s.TransferMatching = m != nil && m.Enabled
+	return s
 }
 
 // parseReturnsWindow defaults a bare invocation to since-inception → today
@@ -232,67 +305,48 @@ func parseReturnsWindow(args []string, now time.Time) (int64, int64, error) {
 // Elsewhere it is a source, or the whole.
 func buildReturnColumnRegistry(outCcy, level string, kindOf func(string) string,
 	nicknames accountNicknames) []columnSpec[gold.ReturnRow] {
-	entity := columnSpec[gold.ReturnRow]{Name: "entity", Align: output.AlignLeft, Privacy: PrivacyAccountID,
-		Extract: func(r gold.ReturnRow) string { return r.EntityLabel }}
-	entityID := columnSpec[gold.ReturnRow]{Name: "entity_id", Align: output.AlignLeft, Privacy: PrivacyAccountID,
-		Extract: func(r gold.ReturnRow) string { return r.EntityID }}
+	entity := privateCol("entity", PrivacyAccountID, func(r gold.ReturnRow) string { return r.EntityLabel })
+	entityID := privateCol("entity_id", PrivacyAccountID, func(r gold.ReturnRow) string { return r.EntityID })
 	account, portfolio := entityCols(kindOf, nicknames, func(r gold.ReturnRow) (string, string, string) {
 		return r.SilverSourceID, r.EntityID, r.EntityLabel
 	})
-	switch level {
-	case "accounts":
+	switch returnsEntity(level) {
+	case "account":
 		entity, entityID = account[0], account[1]
-	case "portfolios":
+	case "portfolio":
 		entity, entityID = portfolio[0], portfolio[1]
 	}
 	return []columnSpec[gold.ReturnRow]{
-		{Name: "silver_source", Align: output.AlignLeft,
-			Extract: func(r gold.ReturnRow) string { return r.SilverSourceID }},
+		strCol("silver_source", func(r gold.ReturnRow) string { return r.SilverSourceID }),
 		entity,
 		entityID,
-		{Name: "period", Align: output.AlignLeft, Date: true,
-			Extract: func(r gold.ReturnRow) string { return r.Period }},
-		{Name: "start_date", Align: output.AlignLeft, Date: true,
-			Extract: func(r gold.ReturnRow) string { return formatEpochDay(r.StartDay) }},
-		{Name: "end_date", Align: output.AlignLeft, Date: true,
-			Extract: func(r gold.ReturnRow) string { return formatEpochDay(r.EndDay) }},
-		{Name: "start_value", Header: "start_" + outCcy, Align: output.AlignRight, Privacy: PrivacyMoney,
-			Extract: func(r gold.ReturnRow) string { return formatCents(r.StartValue) }},
-		{Name: "end_value", Header: "end_" + outCcy, Align: output.AlignRight, Privacy: PrivacyMoney,
-			Extract: func(r gold.ReturnRow) string { return formatCents(r.EndValue) }},
+		asDate(strCol("period", func(r gold.ReturnRow) string { return r.Period })),
+		asDate(strCol("start_date", func(r gold.ReturnRow) string { return formatEpochDay(r.StartDay) })),
+		asDate(strCol("end_date", func(r gold.ReturnRow) string { return formatEpochDay(r.EndDay) })),
+		outCcyColAs("start_value", "start_"+outCcy, outCcy, func(r gold.ReturnRow) *string { return r.StartValue }),
+		outCcyColAs("end_value", "end_"+outCcy, outCcy, func(r gold.ReturnRow) *string { return r.EndValue }),
 		outCcyCol("net_flow", outCcy, func(r gold.ReturnRow) *string { return r.NetFlow }),
-		{Name: "gain", Header: "gain_" + outCcy, Align: output.AlignRight, Privacy: PrivacyMoney,
-			Extract: func(r gold.ReturnRow) string { return formatCents(r.Gain()) }},
-		{Name: "twr", Header: "twr_pct", Align: output.AlignRight,
-			Extract: func(r gold.ReturnRow) string { return formatPct(r.TWR) }},
-		{Name: "twr_annualized", Header: "twr_ann_pct", Align: output.AlignRight,
-			Extract: func(r gold.ReturnRow) string { return formatPct(r.TWRAnnualized) }},
-		{Name: "mwr", Header: "mwr_pct", Align: output.AlignRight,
-			Extract: func(r gold.ReturnRow) string { return formatPct(r.MWR) }},
-		{Name: "mwr_annualized", Header: "mwr_ann_pct", Align: output.AlignRight,
-			Extract: func(r gold.ReturnRow) string { return formatPct(r.MWRAnnualized) }},
-		{Name: "benchmark_twr", Header: "benchmark_twr_pct", Align: output.AlignRight,
-			Extract: benchmarkFigure(func(b *gold.BenchmarkRow) *float64 { return b.TWR })},
-		{Name: "compared_twr", Header: "compared_twr_pct", Align: output.AlignRight,
-			Extract: benchmarkFigure(func(b *gold.BenchmarkRow) *float64 { return b.PortfolioTWR })},
-		{Name: "excess", Header: "excess_pct", Align: output.AlignRight,
-			Extract: benchmarkFigure(func(b *gold.BenchmarkRow) *float64 { return b.Excess })},
-		{Name: "benchmark_mwr", Header: "benchmark_mwr_pct", Align: output.AlignRight,
-			Extract: benchmarkFigure(func(b *gold.BenchmarkRow) *float64 { return b.MWR })},
-		{Name: "compared_mwr", Header: "compared_mwr_pct", Align: output.AlignRight,
-			Extract: benchmarkFigure(func(b *gold.BenchmarkRow) *float64 { return b.PortfolioMWR })},
-		{Name: "compared_from", Align: output.AlignLeft, Date: true,
-			Extract: benchmarkDay(func(b *gold.BenchmarkRow) int64 { return b.StartDay })},
-		{Name: "compared_to", Align: output.AlignLeft, Date: true,
-			Extract: benchmarkDay(func(b *gold.BenchmarkRow) int64 { return b.EndDay })},
-		{Name: "benchmark_quality", Align: output.AlignLeft, Extract: func(r gold.ReturnRow) string {
+		outCcyColAs("gain", "gain_"+outCcy, outCcy, func(r gold.ReturnRow) *string { return r.Gain() }),
+		ratioCol("twr", func(r gold.ReturnRow) *float64 { return r.TWR }),
+		percentCol("twr_annualized", "twr_ann_pct", func(r gold.ReturnRow) string { return formatPct(r.TWRAnnualized) }),
+		ratioCol("mwr", func(r gold.ReturnRow) *float64 { return r.MWR }),
+		percentCol("mwr_annualized", "mwr_ann_pct", func(r gold.ReturnRow) string { return formatPct(r.MWRAnnualized) }),
+		percentCol("benchmark_twr", "benchmark_twr_pct", benchmarkFigure(func(b *gold.BenchmarkRow) *float64 { return b.TWR })),
+		percentCol("compared_twr", "compared_twr_pct",
+			benchmarkFigure(func(b *gold.BenchmarkRow) *float64 { return b.PortfolioTWR })),
+		percentCol("excess", "excess_pct", benchmarkFigure(func(b *gold.BenchmarkRow) *float64 { return b.Excess })),
+		percentCol("benchmark_mwr", "benchmark_mwr_pct", benchmarkFigure(func(b *gold.BenchmarkRow) *float64 { return b.MWR })),
+		percentCol("compared_mwr", "compared_mwr_pct",
+			benchmarkFigure(func(b *gold.BenchmarkRow) *float64 { return b.PortfolioMWR })),
+		asDate(strCol("compared_from", benchmarkDay(func(b *gold.BenchmarkRow) int64 { return b.StartDay }))),
+		asDate(strCol("compared_to", benchmarkDay(func(b *gold.BenchmarkRow) int64 { return b.EndDay }))),
+		strCol("benchmark_quality", func(r gold.ReturnRow) string {
 			if r.Benchmark == nil {
 				return ""
 			}
 			return strings.Join(r.Benchmark.Quality, ";")
-		}},
-		{Name: "quality", Align: output.AlignLeft,
-			Extract: func(r gold.ReturnRow) string { return strings.Join(r.Quality, ";") }},
+		}),
+		strCol("quality", func(r gold.ReturnRow) string { return strings.Join(r.Quality, ";") }),
 	}
 }
 
@@ -345,26 +399,6 @@ func benchmarkReturnColumnsFor(method string) []string {
 	return append(out, "compared_from", "compared_to", "benchmark_quality", "quality")
 }
 
-// formatPct renders a return ratio as a percentage with two decimals, or "n/a"
-// when the figure is undefined (the reason is in the quality column).
-func formatPct(p *float64) string {
-	if p == nil {
-		return "n/a"
-	}
-	return formatPctOrBlank(p)
-}
-
-// formatPctOrBlank is formatPct for a ratio whose absence needs no
-// reason, such as an unrealized gain on a holding with no cost basis:
-// the cell stays empty.
-func formatPctOrBlank(p *float64) string {
-	if p == nil {
-		return ""
-	}
-	pct := *p * 100
-	return formatPercent(&pct)
-}
-
 func returnsUsage() string {
 	registry := buildReturnColumnRegistry("CCY", "", nil, nil)
 	return `usage: wealthdb returns <view> [FROM [TO]] [--method M] [--period P] [--annualize MODE]
@@ -387,6 +421,10 @@ Also:
                ('wealthdb returns stated -h')
   bridge       why net worth moved: saved, onboarded and gained
                ('wealthdb returns bridge -h')
+  private      each private fund, SPV, private stock or note: paid in,
+               commitment, distributed, NAV, DPI, TVPI and IRR, as of
+               a day (-d)
+               ('wealthdb returns private -h')
 
 Plumbing (cash accounts, deposit-bank sources, config returns_hide ids)
 emits no rows of its own at any view, and neither does a portfolio or
@@ -424,11 +462,18 @@ Flags:
                     (returns % stay visible)
 
 The quality column is load-bearing: n/a returns always carry a reason
-(nonpositive_base, mwr_no_flows, dietz_degenerate, empty_bucket, nav_only,
-staggered_inception, unmatched_transfers, …). Account-grain flow-complete
-returns are exact; everything else is best-effort. Returns are NOT additive
-across grains (global is a value identity over all accounts INCLUDING hidden
-plumbing, not a return identity).
+(nonpositive_base, mwr_no_flows, dietz_degenerate, loss_beyond_total,
+empty_bucket, nav_only, staggered_inception, unmatched_transfers, …).
+Account-grain flow-complete returns are exact; everything else is
+best-effort. Returns are NOT additive across grains (global is a value
+identity over all accounts INCLUDING hidden plumbing, not a return
+identity).
+
+An account joins at its first valuation, which books its value as
+capital, less what moved in from accounts already counted. A zero
+first value is no valuation where the account's legs up to its first
+nonzero value move money in on net. That value is then the account's
+debut, and every leg on or before it funds it.
 
 Available columns:
   ` + joinColumnNames(registry) + `

@@ -24,7 +24,9 @@ Mounted into the container:
   <TMP>/w-ubs-web/home/.secrets  ->  /secrets
   <TMP>/w-ubs-web/xdgdata/wealthdb/ubs-web     ->  /data
   <TMP>/w-ubs-web/xdgcache/wealthdb/startupcache  ->  /cache/startupcache
+  <TMP>/w-ubs-web/xdgcache/wealthdb/ubs-web  ->  /cache/collector
   <TMP>/w-ubs-web/xdgcache/wealthdb/debug/ubs-web    ->  /debug
+  <TMP>/w-ubs-web/tree/collectors/ubs-web  ->  /app
 
 Override mounts via env:
   UBS_WEB_SECRETS_DIR=/path/to/secrets
@@ -64,7 +66,9 @@ Mounted into the container:
   <TMP>/w-ubs-web/home/.secrets  ->  /secrets
   <TMP>/w-ubs-web/xdgdata/wealthdb/ubs-web     ->  /data
   <TMP>/w-ubs-web/xdgcache/wealthdb/startupcache  ->  /cache/startupcache
+  <TMP>/w-ubs-web/xdgcache/wealthdb/ubs-web  ->  /cache/collector
   <TMP>/w-ubs-web/xdgcache/wealthdb/debug/ubs-web    ->  /debug
+  <TMP>/w-ubs-web/tree/collectors/ubs-web  ->  /app
 
 Override mounts via env:
   UBS_WEB_SECRETS_DIR=/path/to/secrets
@@ -82,7 +86,8 @@ Credentials:
 --- calls
 python3
   -
-  <TMP>/w-ubs-web/tree/collectors/ubs-web
+  <TMP>/w-ubs-web/tree/collectors/ubs-web/Dockerfile
+  <TMP>/w-ubs-web/tree/collectors/ubs-web/requirements.txt
   --
   missing
 docker
@@ -124,7 +129,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-ubs-web/xdgcache/wealthdb/ubs-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-ubs-web/xdgcache/wealthdb/debug/ubs-web:/debug
+  -v
+  <TMP>/w-ubs-web/tree/collectors/ubs-web:/app
   wealthdb/ubs-web:latest
   login
   [env] UBS_CONTRACT_NUMBER=<unset>
@@ -153,7 +164,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-ubs-web/xdgcache/wealthdb/ubs-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-ubs-web/xdgcache/wealthdb/debug/ubs-web:/debug
+  -v
+  <TMP>/w-ubs-web/tree/collectors/ubs-web:/app
   wealthdb/ubs-web:latest
   download
   [env] UBS_CONTRACT_NUMBER=<unset>
@@ -182,7 +199,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-ubs-web/xdgcache/wealthdb/ubs-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-ubs-web/xdgcache/wealthdb/debug/ubs-web:/debug
+  -v
+  <TMP>/w-ubs-web/tree/collectors/ubs-web:/app
   wealthdb/ubs-web:latest
   load
   [env] UBS_CONTRACT_NUMBER=<unset>
@@ -219,7 +242,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-ubs-web/xdgcache/wealthdb/ubs-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-ubs-web/xdgcache/wealthdb/debug/ubs-web:/debug
+  -v
+  <TMP>/w-ubs-web/tree/collectors/ubs-web:/app
   wealthdb/ubs-web:latest
   explore
   [env] UBS_CONTRACT_NUMBER=<unset>
@@ -259,7 +288,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-ubs-web/xdgcache/wealthdb/ubs-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-ubs-web/xdgcache/wealthdb/debug/ubs-web:/debug
+  -v
+  <TMP>/w-ubs-web/tree/collectors/ubs-web:/app
   wealthdb/ubs-web:latest
   sh
   [env] UBS_CONTRACT_NUMBER=<unset>
@@ -288,7 +323,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-ubs-web/xdgcache/wealthdb/ubs-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-ubs-web/xdgcache/wealthdb/debug/ubs-web:/debug
+  -v
+  <TMP>/w-ubs-web/tree/collectors/ubs-web:/app
   wealthdb/ubs-web:latest
   bash
   [env] UBS_CONTRACT_NUMBER=<unset>
@@ -317,7 +358,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-ubs-web/xdgcache/wealthdb/ubs-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-ubs-web/xdgcache/wealthdb/debug/ubs-web:/debug
+  -v
+  <TMP>/w-ubs-web/tree/collectors/ubs-web:/app
   wealthdb/ubs-web:latest
   login
   --check
@@ -347,7 +394,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-ubs-web/xdgcache/wealthdb/ubs-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-ubs-web/xdgcache/wealthdb/debug/ubs-web:/debug
+  -v
+  <TMP>/w-ubs-web/tree/collectors/ubs-web:/app
   wealthdb/ubs-web:latest
   download
   --dry-run
@@ -379,9 +432,15 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-ubs-web/xdgcache/wealthdb/ubs-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-ubs-web/silver:/silver
   -v
   <TMP>/w-ubs-web/xdgcache/wealthdb/debug/ubs-web:/debug
+  -v
+  <TMP>/w-ubs-web/tree/collectors/ubs-web:/app
   wealthdb/ubs-web:latest
   load
   --silver-db
@@ -412,9 +471,15 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-ubs-web/xdgcache/wealthdb/ubs-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-ubs-web/silver:/silver
   -v
   <TMP>/w-ubs-web/xdgcache/wealthdb/debug/ubs-web:/debug
+  -v
+  <TMP>/w-ubs-web/tree/collectors/ubs-web:/app
   wealthdb/ubs-web:latest
   load
   --silver-db
@@ -445,7 +510,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-ubs-web/xdgcache/wealthdb/ubs-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-ubs-web/xdgcache/wealthdb/debug/ubs-web:/debug
+  -v
+  <TMP>/w-ubs-web/tree/collectors/ubs-web:/app
   wealthdb/ubs-web:latest
   load
   [env] UBS_CONTRACT_NUMBER=<unset>
@@ -474,7 +545,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-ubs-web/xdgcache/wealthdb/ubs-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-ubs-web/xdgcache/wealthdb/debug/ubs-web:/debug
+  -v
+  <TMP>/w-ubs-web/tree/collectors/ubs-web:/app
   wealthdb/ubs-web:latest
   load
   [env] UBS_CONTRACT_NUMBER=<unset>
@@ -503,7 +580,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-ubs-web/xdgcache/wealthdb/ubs-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-ubs-web/xdgcache/wealthdb/debug/ubs-web:/debug
+  -v
+  <TMP>/w-ubs-web/tree/collectors/ubs-web:/app
   wealthdb/ubs-web:latest
   download
   [env] UBS_CONTRACT_NUMBER=<unset>
@@ -532,7 +615,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-ubs-web/xdgcache/wealthdb/ubs-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-ubs-web/xdgcache/wealthdb/debug/ubs-web:/debug
+  -v
+  <TMP>/w-ubs-web/tree/collectors/ubs-web:/app
   wealthdb/ubs-web:latest
   download
   [env] UBS_CONTRACT_NUMBER=<unset>
@@ -561,7 +650,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-ubs-web/xdgcache/wealthdb/ubs-web:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-ubs-web/xdgcache/wealthdb/debug/ubs-web:/debug
+  -v
+  <TMP>/w-ubs-web/tree/collectors/ubs-web:/app
   wealthdb/ubs-web:latest
   bogus-verb
   [env] UBS_CONTRACT_NUMBER=<unset>

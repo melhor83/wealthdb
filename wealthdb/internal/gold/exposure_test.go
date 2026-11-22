@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -216,6 +215,41 @@ func defaultExposureSettings() canonical.ExposureSettings {
 		PartialPct: canonical.DefaultPartialPct}
 }
 
+// rebuildExposureThrough runs the exposure pass's steps up to and
+// including the step named last, for a test that reads the table that
+// step writes.
+func rebuildExposureThrough(t *testing.T, db *sql.DB, ctx context.Context, last string) {
+	t.Helper()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback() //nolint:errcheck — no-op after Commit
+	steps := exposureSteps(ctx, tx)
+	i := slices.IndexFunc(steps, func(s step) bool { return s.name == last })
+	if i < 0 {
+		t.Fatalf("no exposure step %q", last)
+	}
+	if err := runSteps("exposure pass", steps[:i+1]); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// materializeExposureAt rewrites the exposure tables at the one instant
+// at, for a test that reads that instant alone.
+func materializeExposureAt(t *testing.T, db *sql.DB, ctx context.Context, at, computedAt int64) {
+	t.Helper()
+	if _, err := rewriteTables(ctx, db, "MaterializeExposure", beginPinned, exposureMaterialized,
+		func(tx *sql.Tx) (int, error) {
+			return materializeExposure(ctx, tx, []int64{at}, []int64{at}, at, computedAt)
+		}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // rebuildExposureWithDefaults stamps an exposure block of the default
 // settings alone and rebuilds the exposure tables.
 func rebuildExposureWithDefaults(t *testing.T, db *sql.DB, ctx context.Context) {
@@ -304,18 +338,6 @@ func openExposureFixture(t *testing.T) (*sql.DB, context.Context) {
 	return db, context.Background()
 }
 
-func parse(t *testing.T, s *string) float64 {
-	t.Helper()
-	if s == nil {
-		return math.NaN()
-	}
-	v, err := strconv.ParseFloat(*s, 64)
-	if err != nil {
-		t.Fatalf("parse %q: %v", *s, err)
-	}
-	return v
-}
-
 // The invariant: every view sums to `holdings global`, in every output
 // currency.
 func TestExposureViewsSumToHoldingsGlobal(t *testing.T) {
@@ -326,7 +348,7 @@ func TestExposureViewsSumToHoldingsGlobal(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := parse(t, g.TotalValueOutCcy)
+		want := num(t, g.TotalValueOutCcy)
 		sum := func(name string, err error, n int, value func(i int) *string) {
 			t.Helper()
 			if err != nil {
@@ -334,7 +356,7 @@ func TestExposureViewsSumToHoldingsGlobal(t *testing.T) {
 			}
 			total := 0.0
 			for i := range n {
-				total += parse(t, value(i))
+				total += num(t, value(i))
 			}
 			if math.Abs(total-want) > 0.01 {
 				t.Errorf("%s %s sums to %.4f, holdings global is %.4f", ccy, name, total, want)
@@ -683,9 +705,7 @@ func TestExposureSICOfADepositaryGivesNoSector(t *testing.T) {
 	    ('refdata', 'symbol:QENG', 'sic', 0, 'sec-edgar', '8711', 'sic')`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := RebuildExposure(ctx, db); err != nil {
-		t.Fatal(err)
-	}
+	rebuildExposureThrough(t, db, ctx, "securities")
 	for k, want := range map[string]string{"symbol:QDEP": "", "symbol:QENG": "industrials"} {
 		var got sql.NullString
 		if err := db.QueryRowContext(ctx, `SELECT sector FROM securities WHERE security_key = ?`, k).Scan(&got); err != nil {
@@ -706,9 +726,7 @@ func TestExposureAliases(t *testing.T) {
 	    VALUES ('test-src', 'C1', 'public_equity', 'stock', '00000AA01', 0, 0)`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := RebuildExposure(ctx, db); err != nil {
-		t.Fatal(err)
-	}
+	rebuildExposureThrough(t, db, ctx, "aliases")
 	for alias, want := range map[string]string{
 		"symbol:AAA":      "isin:XX0000000001",
 		"cusip:00000AA01": "isin:US00000AA01" + string(rune('0'+canonical.ISINCheckDigit("US00000AA01"))),
@@ -758,9 +776,7 @@ func TestExposureAliasPrecedence(t *testing.T) {
 		`INSERT INTO security_identities (silver_source_id, security_key, as_of, provider, isin, ticker)
 		 VALUES ('test-src', 'symbol:QQZ', 0, 'p1', 'XX0000000022', 'QQZ'), ('test-src', 'symbol:QQZ', 0, 'p2', 'XX0000000022', 'QQZ')`,
 	)
-	if _, err := RebuildExposure(ctx, db); err != nil {
-		t.Fatal(err)
-	}
+	rebuildExposureThrough(t, db, ctx, "aliases")
 	var got string
 	if err := db.QueryRowContext(ctx, `SELECT security_key FROM security_aliases WHERE alias = 'symbol:QQZ'`).Scan(&got); err != nil {
 		t.Fatal(err)
@@ -815,9 +831,7 @@ func TestExposureABrokersSymbolAndCUSIPFillEachOther(t *testing.T) {
 		`INSERT INTO security_facts (silver_source_id, security_key, field, as_of, provider, value)
 		 VALUES ('test-src', 'symbol:QCS3', 'legal_country', 0, 'gleif', 'DE')`,
 	)
-	if _, err := RebuildExposure(ctx, db); err != nil {
-		t.Fatal(err)
-	}
+	rebuildExposureThrough(t, db, ctx, "securities")
 	for alias, want := range map[string]string{
 		"symbol:QCS1": "isin:" + isin("US00000AB02"), "cusip:00000AB02": "isin:" + isin("US00000AB02"),
 		"symbol:QCS2": "isin:XX0000000052", "cusip:00000AB03": "isin:XX0000000051",
@@ -888,9 +902,7 @@ func TestExposureEdgarCodesReadAsEdgarStatesThem(t *testing.T) {
 	           ('test-src', 'isin:XX0000000033', 'legal_country', 0, 'gleif', 'DE')`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := RebuildExposure(ctx, db); err != nil {
-		t.Fatal(err)
-	}
+	rebuildExposureThrough(t, db, ctx, "securities")
 	for key, want := range map[string]string{"isin:XX0000000031": "US|", "isin:XX0000000032": "KY|HK",
 		"isin:XX0000000033": "DE|"} {
 		var got string
@@ -921,9 +933,7 @@ func TestExposureLocalTickersAreNoUSSymbols(t *testing.T) {
 		exDay(5, 31), exDay(5, 31), exDay(5, 31), exDay(5, 31), exDay(5, 31), exDay(5, 31), exDay(5, 31)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := RebuildExposure(ctx, db); err != nil {
-		t.Fatal(err)
-	}
+	rebuildExposureThrough(t, db, ctx, "aliases")
 	for alias, want := range map[string]string{"symbol:QLOC": "", "symbol:QPAR": "", "symbol:QNYC": "isin:XX0000000043",
 		"symbol:QUSA": "isin:US0000000044", "symbol:QADR": "isin:XX0000000045", "symbol:QZRH": "", "symbol:QTOR": ""} {
 		var got sql.NullString

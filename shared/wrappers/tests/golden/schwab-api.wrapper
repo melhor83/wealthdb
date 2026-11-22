@@ -102,7 +102,8 @@ into the consent page come from <secrets-dir>/schwab-web.env.
 --- calls
 python3
   -
-  <TMP>/w-schwab-api/tree/collectors/schwab-api
+  <TMP>/w-schwab-api/tree/collectors/schwab-api/Dockerfile
+  <TMP>/w-schwab-api/tree/collectors/schwab-api/requirements.txt
   --
   missing
 docker
@@ -161,7 +162,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-schwab-api/xdgcache/wealthdb/schwab-api:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-schwab-api/xdgcache/wealthdb/debug/schwab-api:/debug
+  -v
+  <TMP>/w-schwab-api/tree/collectors/schwab-api:/app
   wealthdb/schwab-api:latest
   login
   [env] SCHWAB_CLIENT_ID=<unset>
@@ -218,7 +225,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-schwab-api/xdgcache/wealthdb/schwab-api:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-schwab-api/xdgcache/wealthdb/debug/schwab-api:/debug
+  -v
+  <TMP>/w-schwab-api/tree/collectors/schwab-api:/app
   wealthdb/schwab-api:latest
   vnc-login
   [env] SCHWAB_CLIENT_ID=<unset>
@@ -329,7 +342,13 @@ docker
   -e
   WEALTHDB_STARTUPCACHE_DIR=/cache/startupcache
   -v
+  <TMP>/w-schwab-api/xdgcache/wealthdb/schwab-api:/cache/collector
+  -e
+  WEALTHDB_CACHE_DIR=/cache/collector
+  -v
   <TMP>/w-schwab-api/xdgcache/wealthdb/debug/schwab-api:/debug
+  -v
+  <TMP>/w-schwab-api/tree/collectors/schwab-api:/app
   wealthdb/schwab-api:latest
   login
   --check

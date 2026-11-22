@@ -1,9 +1,8 @@
 # synthetic adapter
 
 Adapter that projects the `synthetic` silver SQLite database into the
-canonical gold schema. Implements the `silver.Adapter` /
-`silver.Connection` interface defined in
-[../DESIGN.md](../DESIGN.md) §6.
+canonical gold schema. Implements the `silver.Connection` interface
+defined in [../DESIGN.md](../DESIGN.md) §6.
 
 `synthetic` is the one generic silver kind. Every other kind reads a
 silver shaped by its source. This one reads a silver shaped by the
@@ -73,6 +72,7 @@ find its positions row in the same way.
 | `realized_lots` | `realized_lots` | Read whole on every load — see §11. |
 | `compositions`, `lines`, `attributes`, `counterparties`, `securities`, `security_facts`, `fund_risk`, `fund_returns`, `characteristics`, `period_facts` | the reference tables | After the snapshots, by `as_of` — see §12. |
 | `rates` | `rate_observations` | After the reference records, by `as_of` — see §12. |
+| `capital_accounts` | `capital_accounts` | After the rate observations, by `as_of` — see §12. |
 
 ## 4. Account taxonomy
 
@@ -296,13 +296,13 @@ synthetic silver may stand for a bank, the next for a broker, a crypto
 wallet or a book of private holdings.
 
 So the kind registers the bank-style default,
-`DefaultReturnsPolicy(BankFlowPolicy())`: regime `flow_complete` on the
-shared bank external and transfer-like sets, every other knob at its
-default. A deployment states each source's own regime with config
+`DefaultReturnsPolicy(BankFlowPolicy())`: regime `flow_complete`, so
+every capital kind counts, every other knob at its default. A
+deployment states each source's own regime with config
 `returns_policy_overrides` ([../DESIGN.md](../DESIGN.md) §5.6). Its
 keys are source ids, so two synthetic sources override independently.
-The demo household overrides two of its sources this way: one to
-`crypto_partial`, one to `nav_only`.
+The demo household overrides one of its sources this way, to
+`nav_only`.
 
 ## 10. Provider vocabulary
 
@@ -319,7 +319,7 @@ kind, not its sign:
   `distribution`, and `interest` when it is positive.
 
 The spending provider tier translates it by identity
-(`internal/spending/providermap.go`):
+(`internal/spending/vocab_synthetic.go`):
 
 - The spending map holds every spending value of
   `canonical.SpendCategories`, each mapped to itself.
@@ -370,7 +370,7 @@ A file without the table states no realized lots.
 Ten tables carry reference records. They describe what a fund holds,
 what a fund is, what a security is and what each pays. They repeat the
 refdata collector's silver shape column for column, so one reader
-serves both kinds (`silver.NewReferenceStream`; [refdata.md](refdata.md) §2 maps
+serves both kinds (`silver.ReferenceSchema.Stream`; [refdata.md](refdata.md) §2 maps
 each table to its gold table).
 
 - `compositions`, `lines`, `attributes`, `counterparties`, `fund_risk`,
@@ -391,9 +391,19 @@ collector's `rates` table column for column, so one reader serves both
 kinds (`silver.NewRateStream`). One row is one series on one day, in
 percent.
 
+The `capital_accounts` table carries a private holding's capital
+account as its manager states it, column for column of gold's
+`capital_accounts`. One row is one instrument on one day and one
+document (`source_ref`, '' where one document states it): the
+commitment, what was called and paid in, what remains unfunded, what
+came back, the value still held, and the manager's own multiples. A
+figure is NULL where the statement holds none. `account_id` is NULL
+where the row names the holding by its instrument alone.
+
 Every `as_of` must lie inside the window of the run that adds the row
 (§8). `Snapshots` emits the window's reference records after its
-snapshots, and its rate observations after those.
+snapshots, its rate observations after those, and its capital accounts
+last.
 
 A file can predate some of these tables:
 
@@ -405,3 +415,4 @@ A file can predate some of these tables:
   `coupon_kind` on; those fields are then absent.
 - A file without `dividend_events` states no distributions.
 - A file without `rates` states no rate observations.
+- A file without `capital_accounts` states no capital accounts.

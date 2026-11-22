@@ -27,29 +27,35 @@ func yieldInstants(toEpoch int64) []int64 {
 // MaterializeYield rewrites the Yield dashboard's tables (migration
 // 0138) and the cash flow projection's look-back parts (migration
 // 0149): every holding's figures and DV01 per tenor in every reporting
-// currency at yieldInstants, and at toEpoch the projection's parts, the
+// currency at yieldInstants, and at p.ToEpoch the projection's parts, the
 // rate table, the principals maturities return, every income line
 // received, and the cash flow projection's parts over a look-back of
-// lookback months (CashflowPlan); and at every instant each benchmark's
+// p.CashflowLookback months (CashflowPlan); and at every instant each benchmark's
 // yield and duration. Each figure is the yield report's
 // (yield.Compute over YieldInputs), so the dashboard and the CLI agree.
-// It returns the number of rows written.
-// One transaction, so a reader sees the old tables or the new ones.
-func MaterializeYield(ctx context.Context, db *sql.DB, toEpoch, computedAt int64, lookback int) (int, error) {
-	// Every instant reads the same endings and spans, through the
-	// transaction.
-	tx, commit, err := beginPinned(ctx, db)
-	if err != nil {
-		return 0, fmt.Errorf("MaterializeYield: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck — no-op after commit
-	for _, t := range []string{"report_yield_positions", "report_yield_buckets", "report_yield_parts",
-		"report_yield_rates", "report_yield_events", "report_yield_received", "report_cashflow_plan",
-		"benchmark_yield"} {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM `+t); err != nil {
-			return 0, fmt.Errorf("MaterializeYield %s: delete: %w", t, err)
-		}
-	}
+// It returns the number of rows written. Every instant reads the same
+// endings and spans, through the transaction (rewriteTables).
+func MaterializeYield(ctx context.Context, db *sql.DB, p MaterializeParams) (int, error) {
+	return rewriteTables(ctx, db, "MaterializeYield", beginPinned, yieldMaterialized, func(tx *sql.Tx) (int, error) {
+		return materializeYield(ctx, tx, yieldInstants(p.ToEpoch), materializeCurrencies, p.ComputedAt,
+			p.CashflowLookback)
+	})
+}
+
+// yieldMaterialized are the tables MaterializeYield rewrites.
+var yieldMaterialized = []string{"report_yield_positions", "report_yield_buckets", "report_yield_parts",
+	"report_yield_rates", "report_yield_events", "report_yield_received", "report_cashflow_plan",
+	"benchmark_yield"}
+
+// materializeYield writes MaterializeYield's rows for the books of each
+// instant of instants, oldest first, in each currency of currencies. The
+// last instant is today: its books give the projection, the income
+// received and the cash flow plan, and its inputs the benchmarks of
+// every instant. A test passes one instant or one currency to assert one
+// table.
+func materializeYield(ctx context.Context, tx *sql.Tx, instants []int64, currencies []string, computedAt int64,
+	lookback int) (int, error) {
+	toEpoch := instants[len(instants)-1]
 	m := yieldMaterializer{ctx: ctx, tx: tx, computedAt: computedAt}
 	mix, err := readBenchmarkMix(ctx, tx)
 	if err != nil {
@@ -57,20 +63,22 @@ func MaterializeYield(ctx context.Context, db *sql.DB, toEpoch, computedAt int64
 	}
 	today := map[string]*yield.Book{}
 	// What depends on neither the currency nor the instant is read once.
-	shared := &yieldShared{}
+	// The transactions' holders are stored where the yield pass has not
+	// placed them from the inputs gold holds.
+	placed, err := readPlacements(ctx, tx, tx)
+	if err != nil {
+		return 0, fmt.Errorf("MaterializeYield: %w", err)
+	}
+	shared := &yieldShared{placed: placed}
 	var now *yield.Inputs
-	for _, at := range yieldInstants(toEpoch) {
-		// What does not depend on the currency is read once an instant.
-		base, err := readYieldBase(ctx, tx, at, shared)
+	for _, at := range instants {
+		// The instant is read once, in every currency.
+		base, err := readYieldBase(ctx, tx, at, shared, currencies)
 		if err != nil {
 			return 0, fmt.Errorf("MaterializeYield: %w", err)
 		}
-		for _, ccy := range materializeCurrencies {
-			in, err := base.inputs(ctx, tx, ccy)
-			if err != nil {
-				return 0, fmt.Errorf("MaterializeYield: %w", err)
-			}
-			b := yield.Compute(in)
+		for _, ccy := range currencies {
+			b := yield.Compute(base.inputs(ccy))
 			if err := m.positions(b, at, ccy); err != nil {
 				return 0, err
 			}
@@ -82,7 +90,7 @@ func MaterializeYield(ctx context.Context, db *sql.DB, toEpoch, computedAt int64
 			now = base.in
 		}
 	}
-	if err := m.benchmarks(ctx, mix, now, toEpoch); err != nil {
+	if err := m.benchmarks(ctx, mix, now, instants); err != nil {
 		return 0, err
 	}
 	if err := m.projection(today); err != nil {
@@ -93,9 +101,6 @@ func MaterializeYield(ctx context.Context, db *sql.DB, toEpoch, computedAt int64
 	}
 	if err := m.plan(today, toEpoch, lookback); err != nil {
 		return 0, err
-	}
-	if err := commit(); err != nil {
-		return 0, fmt.Errorf("MaterializeYield: %w", err)
 	}
 	return m.rows, nil
 }
@@ -142,8 +147,14 @@ func (m *yieldMaterializer) positions(b *yield.Book, at int64, ccy string) error
 		if p.MaturityDate != nil {
 			maturity = p.MaturityDate.Format(time.DateOnly)
 		}
+		// The table keeps the wrapper gold states, NULL where none is:
+		// the web views read that NULL as the default.
+		wrapper := p.Account.TaxWrapper
+		if p.Account.DefaultWrapper {
+			wrapper = ""
+		}
 		args = append(args, m.computedAt, at, ccy, p.Source, p.HoldingKey.Account, p.PositionKey,
-			nullableEnumValue(p.Account.TaxWrapper), nullableEnumValue(p.Symbol), nullableEnumValue(p.Name),
+			nullableEnumValue(wrapper), nullableEnumValue(p.Symbol), nullableEnumValue(p.Name),
 			nullableEnumValue(p.AssetClass), nullableEnumValue(p.Vehicle), string(p.Kind), nullableEnumValue(p.Currency),
 			p.Quantity, p.Value, number(p.Price), p.Coupon, maturity, nullableEnumValue(p.Rating))
 		received, mean := p.RealizedParts()
@@ -313,7 +324,7 @@ func (m *yieldMaterializer) received(today map[string]*yield.Book, toEpoch int64
 		if b == nil {
 			continue
 		}
-		got, err := IncomeReceived(m.ctx, m.tx, b.In, math.MinInt64, toEpoch)
+		got, err := incomeReceived(m.ctx, m.tx, b.In, math.MinInt64, toEpoch)
 		if err != nil {
 			return fmt.Errorf("MaterializeYield: %w", err)
 		}

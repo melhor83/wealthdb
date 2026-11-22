@@ -6,17 +6,38 @@ import (
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/silvertest"
 )
 
-// TestCanonicalGolden holds every record the adapter yields over a PSN
-// silver to testdata/canonical.jsonl. The silver joins the rows of the
-// adapter tests: the roster and the instruments of every class, a
-// holding with and without its instrument, signed cash balances, a rate,
+// TestCanonicalGolden holds every record the adapter yields to a golden
+// file per case: a PSN silver (testdata/canonical.jsonl), a web silver
+// alone (webFixture), and both merged. The PSN silver joins the rows of
+// the adapter tests: the roster and the instruments of every class, a
+// holding with and without its instrument, signed cash balances, a book
+// balance whose account states tiered interest, a rate,
 // a forward, and trade confirmations and cash movements.
 func TestCanonicalGolden(t *testing.T) {
-	path, db := newFixtureSilver(t)
-	silvertest.Exec(t, db, `
+	t.Run("psn", func(t *testing.T) {
+		path, db := newFixtureSilver(t)
+		silvertest.Exec(t, db, psnGoldenFixture)
+		silvertest.Golden(t, openAdapter(t, path), "testdata/canonical.jsonl")
+	})
+	t.Run("web", func(t *testing.T) {
+		silvertest.Golden(t, openSubsources(t, "", newWebFixtureSilver(t)), "testdata/canonical_web.jsonl")
+	})
+	t.Run("merged", func(t *testing.T) {
+		path, db := newFixtureSilver(t)
+		silvertest.Exec(t, db, psnGoldenFixture)
+		silvertest.Golden(t, openSubsources(t, path, newWebFixtureSilver(t)), "testdata/canonical_merged.jsonl")
+	})
+}
+
+// psnGoldenFixture is the PSN silver of the golden cases.
+const psnGoldenFixture = `
         INSERT INTO dump_runs(snapshot_at, silver_schema_version, run_dir) VALUES (1000, 1, '/x/1');
         INSERT INTO cash_accounts(snapshot_at, relationship_id, account_external_id, payload) VALUES
-            (1000, 'SFTPCHxx', 'CH00CASH', '{"AcctCcyIsoCd":"CHF","AcctTpDesc":"Private"}');
+            (1000, 'SFTPCHxx', 'CH00CASH', '{"AcctCcyIsoCd":"CHF","AcctTpDesc":"Private"}'),
+            (1000, 'SFTPCHxx', 'CH00SAVE', '{"AcctCcyIsoCd":"CHF","AcctTpDesc":"Savings","BookBalAmt":2000.00,
+             "BookBalCcyIsoCd":"CHF","CdtIntrstRate1":"0.25","CdtLmtAmt1":"25000.00","CdtIntrstRate2":"0.10",
+             "CdtIntrstVldFrmDt":"2026-01-01","DbtIntrstRate1":"5.5","EndOfDurtn":"9999-12-31",
+             "CalIntrstBasisDesc":"act/360"}');
         INSERT INTO safekeeping_accounts(snapshot_at, relationship_id, account_external_id, payload) VALUES
             (1000, 'SFTPCHxx', 'CH00SAFE', '{"InvstmtCcyIsoCd":"CHF","AcctTpDesc":"Custody"}');
         INSERT INTO portfolios(snapshot_at, relationship_id, portfolio_external_id, payload) VALUES
@@ -68,6 +89,4 @@ func TestCanonicalGolden(t *testing.T) {
             ('CASH2', 1200, 'SFTPCHxx', 'CH00CASH', 'cash_movement', 'CHF',
              '{"amount":25.0,"credit_debit":"D","narrative":"FRAIS BANCAIRES","account":"CH00CASH","funds":"CHF"}'),
             ('CASH3', 1300, 'SFTPCHxx', 'CH00CASH', 'cash_movement', 'CHF',
-             '{"amount":1000.0,"credit_debit":"C","narrative":"Salary","account":"CH00CASH","funds":"CHF"}');`)
-	silvertest.Golden(t, openAdapter(t, path), "testdata/canonical.jsonl")
-}
+             '{"amount":1000.0,"credit_debit":"C","narrative":"Salary","account":"CH00CASH","funds":"CHF"}');`

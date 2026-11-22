@@ -85,11 +85,14 @@ func TestMCPMatchesCLI(t *testing.T) {
 		setup func(*testing.T) string
 		cases []goldenCase
 	}{
-		{"spending", func(t *testing.T) string { return withFeeLine(t, setupSpendingGold(t)) }, append(familyCases("spending", spendingFamily.views, "2026-05-01", "2026-06-30"),
+		{"spending", func(t *testing.T) string { return withFeeLine(t, setupSpendingGold(t)) }, append(familyCases("spending", spendingFamily.names(), "2026-05-01", "2026-06-30"),
 			goldenCase{"spending transactions filtered", []string{"spending", "transactions", "2026-05-01", "2026-06-30",
 				"-F", "date >= 2026-05-06", "-F", "category != Restaurant"}, "spending",
 				map[string]any{"view": "transactions", "from": "2026-05-01", "to": "2026-06-30",
-					"filter": []any{"date >= 2026-05-06", "category != Restaurant"}}})},
+					"filter": []any{"date >= 2026-05-06", "category != Restaurant"}}},
+			goldenCase{"spending categories against last year", []string{"spending", "categories", "2027-05-05", "2027-06-30",
+				"--period", "total", "--vs-last-year"}, "spending",
+				map[string]any{"view": "categories", "from": "2027-05-05", "to": "2027-06-30", "vs_last_year": true}})},
 		{"income", setupIncomeGold, familyCases("income", []string{"summary", "types", "transactions"}, "2026-05-01",
 			"2026-06-30")},
 		{"cashflow", func(t *testing.T) string { return withResolutions(t, setupCashflowGold(t)) }, append(cashflowCases(),
@@ -103,6 +106,7 @@ func TestMCPMatchesCLI(t *testing.T) {
 				"transactions", map[string]any{"from": "2026-05-01", "to": "2026-06-30", "filter": "kind != dividend"}},
 		)},
 		{"returns", setupReturnsGold, append(returnsCases(), holdingsCases()...)},
+		{"private", setupPrivateGold, privateCases()},
 		{"gains", setupGainsGold, gainsCases()},
 		{"exposure", func(t *testing.T) string { return setupExposureGold(t) }, exposureCases()},
 		{"yield", setupYieldGold, append(yieldCases(), forwardIncomeCases()...)},
@@ -276,14 +280,27 @@ func cashflowCases() []goldenCase {
 	}
 }
 
+// privateCases are the private view's: it reads since each first call,
+// with no window and no --method.
+func privateCases() []goldenCase {
+	return []goldenCase{
+		{"returns private", []string{"returns", "private"}, "returns", map[string]any{"view": "private"}},
+		{"returns private in CHF", []string{"returns", "private", "-x", "CHF"}, "returns",
+			map[string]any{"view": "private", "currency": "CHF"}},
+	}
+}
+
 func returnsCases() []goldenCase {
 	var out []goldenCase
-	for _, v := range returnsFamily.views {
+	for _, v := range returnsFamily.names() {
 		if v == "stated" {
 			// The document fixes the period: no --method, no --period.
 			out = append(out, goldenCase{"returns stated", []string{"returns", "stated"}, "returns",
 				map[string]any{"view": v}})
 			continue
+		}
+		if v == "private" {
+			continue // privateCases, over a fixture of its own
 		}
 		if v == "bridge" {
 			// The bridge computes no return: no --method.
@@ -312,7 +329,7 @@ func returnsCases() []goldenCase {
 
 func exposureCases() []goldenCase {
 	var out []goldenCase
-	for _, v := range exposureFamily.views {
+	for _, v := range exposureFamily.names() {
 		out = append(out, goldenCase{"exposure " + v, []string{"exposure", v, "-d", "2026-06-30"}, "exposure",
 			map[string]any{"view": v, "as_of": "2026-06-30"}})
 	}
@@ -329,7 +346,7 @@ func exposureCases() []goldenCase {
 
 func holdingsCases() []goldenCase {
 	var out []goldenCase
-	for _, v := range holdingsFamily.views {
+	for _, v := range holdingsFamily.names() {
 		out = append(out, goldenCase{"holdings " + v, []string{"holdings", v}, "holdings", map[string]any{"view": v}})
 	}
 	return append(out,
@@ -341,7 +358,7 @@ func holdingsCases() []goldenCase {
 // series.
 func yieldCases() []goldenCase {
 	var out []goldenCase
-	for _, v := range yieldViews {
+	for _, v := range yieldFamily.names() {
 		out = append(out, goldenCase{"yield " + v, []string{"yield", v, "-d", "2026-06-30"}, "yield",
 			map[string]any{"view": v, "as_of": "2026-06-30"}})
 	}
@@ -366,7 +383,7 @@ func forwardIncomeCases() []goldenCase {
 	next := strconv.Itoa(now.Year() + 1)
 	nextMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC).AddDate(0, 1, 0).Format(time.DateOnly)
 	var out []goldenCase
-	for _, v := range forwardViews {
+	for _, v := range incomeFamily.forwardViews() {
 		out = append(out, goldenCase{"income " + v, []string{"income", v, from, to, "--rates", "forward",
 			"--maturing", "roll", "--shift", "-50"}, "income",
 			map[string]any{"view": v, "from": from, "to": to, "rates": "forward", "maturing": "roll", "shift": -50}})

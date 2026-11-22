@@ -1,0 +1,760 @@
+package ubs
+
+import (
+	"database/sql"
+	"testing"
+
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
+)
+
+// The reconcile table across the records of the UBS cash ledger.
+// Statement reconstructions, the account-statement export, payment
+// advices and the MT940 feed record it over overlapping periods and with
+// disjoint id schemes, so an entry recorded by two of them reaches gold
+// twice unless something matches them on the booking itself. These tests
+// pin that match: what folds, what survives, whose identity the survivor
+// keeps, and what the dropped copy leaves behind.
+//
+// Every id, amount, payee and date below is invented.
+
+const (
+	foldStmtA = "stmt:00000000000000a1"
+	foldStmtB = "stmt:00000000000000a2"
+	foldStmtC = "stmt:00000000000000a3"
+	foldStmtD = "stmt:00000000000000a4"
+)
+
+// statementPayload is one Account-Statement reconstruction's payload: the
+// printed booking type plus the entry's continuation lines.
+func statementPayload(bookingType string, continuation ...string) string {
+	lines := ""
+	for i, c := range continuation {
+		if i > 0 {
+			lines += ","
+		}
+		lines += `"` + c + `"`
+	}
+	return `{"source":"account_statement_pdf","booking_type":"` + bookingType +
+		`","counter_account":null,"continuation":[` + lines + `]}`
+}
+
+// exportPayload is one account-statement-export row's payload: the CSV feed's
+// three description columns, with no source marker.
+func exportPayload(d1, d2, d3 string) string {
+	return `{"Description1":"` + d1 + `","Description2":"` + d2 + `","Description3":"` + d3 + `"}`
+}
+
+// seedPSNCashAmount inserts one MT940 cash movement with the amount and
+// direction given, so a booking key can be matched against it.
+func seedPSNCashAmount(t *testing.T, db *sql.DB, eventID, acct, amount, creditDebit, ccy, narrative string, day int64) {
+	t.Helper()
+	if _, err := db.Exec(`
+        INSERT INTO events (event_external_id, timestamp, relationship_id,
+            account_external_id, kind, currency_iso, payload)
+        VALUES (?, ?, 'R1', ?, 'cash_movement', ?,
+                json_object('amount', ?, 'credit_debit', ?, 'narrative', ?,
+                            'account', ?, 'funds', ?, 'txn_type', 'NDDT'))`,
+		eventID, day, acct, ccy, amount, creditDebit, narrative, acct, ccy); err != nil {
+		t.Fatalf("seed psn cash movement %s: %v", eventID, err)
+	}
+}
+
+// countOnDay reports how many emitted rows fall on one value day.
+func countOnDay(got map[string]canonical.TransactionChange, day int64) int {
+	n := 0
+	for _, tx := range got {
+		if tx.OccurredAt == day {
+			n++
+		}
+	}
+	return n
+}
+
+// TestStatementCopyExportKeepsTheBooking: a statement reconstruction and
+// the export's record of the same booking — one account, one value day,
+// one signed amount, one currency — project as ONE row, and it is the
+// export's: its id, its amount and its own narrative all stand.
+func TestStatementCopyExportKeepsTheBooking(t *testing.T) {
+	const day = 400 * 86400
+	r := newWebTxFixture(t)
+	seedWebAccount(t, r, textAcct)
+	seedRailEraAnchor(t, r)
+	seedWebTextRow(t, r, foldStmtA, day, 250.0, nil, "EXAMPLE PAYEE", "DIRECT DEBIT",
+		statementPayload("DIRECT DEBIT", "EXAMPLE PAYEE", "EXAMPLE CITY"))
+	seedWebTextRow(t, r, "E1", day, 250.0, nil, "EXAMPLE UTILITY AG", "direct debit",
+		exportPayload("EXAMPLE UTILITY AG; EXAMPLE STREET 1", "direct debit", ""))
+
+	got := drainTx(t, emitWebStream(t, r))
+	if _, ok := got[foldStmtA+"@"+textAcct]; ok {
+		t.Error("statement reconstruction emitted alongside the export's record of the same booking")
+	}
+	survivor, ok := got["E1@"+textAcct]
+	if !ok {
+		t.Fatal("the export's row must keep the booking")
+	}
+	if n := countOnDay(got, day); n != 1 {
+		t.Errorf("rows on the booking's value day = %d, want 1", n)
+	}
+	if survivor.NetAmount == nil || survivor.NetAmount.String() != "-250" {
+		t.Errorf("survivor NetAmount = %v, want -250", survivor.NetAmount)
+	}
+	// The survivor's own narrative says something, so nothing moves onto it.
+	checkText(t, got, map[string]textCase{
+		"E1@" + textAcct: {"EXAMPLE UTILITY AG; EXAMPLE STREET 1", "EXAMPLE UTILITY AG", "direct debit"},
+	})
+}
+
+// TestStatementCopyKeysOnTheEmittedAmount: an export row whose booking
+// type column holds no type is classified by the type its narrative leads
+// with, and that kind can sign the amount differently from the bare
+// direction. The fold keys on the amount the row is EMITTED with, or a
+// statement copy of the same booking finds no match and both reach gold.
+func TestStatementCopyKeysOnTheEmittedAmount(t *testing.T) {
+	const day = 405 * 86400
+	r := newWebTxFixture(t)
+	seedWebAccount(t, r, textAcct)
+	seedRailEraAnchor(t, r)
+	seedWebTextRow(t, r, foldStmtD, day, nil, 30.0, "EXAMPLE BANK", "CUSTODY PRICE",
+		statementPayload("CUSTODY PRICE", "EXAMPLE BANK"))
+	seedWebTextRow(t, r, "E4", day, nil, 30.0, "Custody Price; EXAMPLE PERIOD", "",
+		exportPayload("Custody Price; EXAMPLE PERIOD", "", ""))
+
+	got := drainTx(t, emitWebStream(t, r))
+	if _, ok := got[foldStmtD+"@"+textAcct]; ok {
+		t.Error("statement reconstruction emitted alongside the export's record of the same booking")
+	}
+	if _, ok := got["E4@"+textAcct]; !ok {
+		t.Fatal("the export's row must keep the booking")
+	}
+	if n := countOnDay(got, day); n != 1 {
+		t.Errorf("rows on the booking's value day = %d, want 1", n)
+	}
+}
+
+// TestStatementCopyFeedKeepsTheBooking: the same across the silver seam —
+// a statement reconstruction whose booking the MT940 feed also carries
+// projects once, as the feed's event.
+func TestStatementCopyFeedKeepsTheBooking(t *testing.T) {
+	const day = 410 * 86400
+	r := newWebTxFixture(t)
+	seedWebAccount(t, r, textAcct)
+	seedRailEraAnchor(t, r)
+	seedWebTextRow(t, r, foldStmtB, day, 175.5, nil, "EXAMPLE PAYEE", "DIRECT DEBIT",
+		statementPayload("DIRECT DEBIT", "EXAMPLE PAYEE", "EXAMPLE CITY"))
+
+	_, psnDB := newFixtureSilver(t)
+	seedPSNCashAmount(t, psnDB, "mt940:feed:1", textAcct, "175.50", "D", "CHF", "LSV", day)
+
+	got := mergedText(t, r, psnDB)
+	if _, ok := got[foldStmtB+"@"+textAcct]; ok {
+		t.Error("statement reconstruction emitted alongside the feed's record of the same booking")
+	}
+	if _, ok := got["mt940:feed:1"]; !ok {
+		t.Fatal("the feed's event must keep the booking")
+	}
+	if n := countOnDay(got, day); n != 1 {
+		t.Errorf("rows on the booking's value day = %d, want 1", n)
+	}
+	// The feed left every narrative column a bare code; the dropped
+	// statement's reading fills them.
+	checkText(t, got, map[string]textCase{
+		"mt940:feed:1": {"DIRECT DEBIT; EXAMPLE PAYEE; EXAMPLE CITY", "EXAMPLE PAYEE", "DIRECT DEBIT"},
+	})
+}
+
+// TestStatementCopyLeavesSameEraRepeatsAlone: two identical payments on
+// one day are an ordinary thing for a ledger to hold. Within one era they
+// carry distinct ids because they are distinct bookings, so neither pair
+// folds — not two export rows, not two statement rows. Pairing is 1:1 for
+// the same reason: a day holding two statement copies and one export row
+// folds exactly one of them and leaves the other standing.
+func TestStatementCopyLeavesSameEraRepeatsAlone(t *testing.T) {
+	const exportDay, statementDay, mixedDay = 420 * 86400, 421 * 86400, 422 * 86400
+	r := newWebTxFixture(t)
+	seedWebAccount(t, r, textAcct)
+	seedRailEraAnchor(t, r)
+	seedWebTextRow(t, r, "E1", exportDay, 90.0, nil, "EXAMPLE GROCER", "direct debit",
+		exportPayload("EXAMPLE GROCER", "direct debit", ""))
+	seedWebTextRow(t, r, "E2", exportDay, 90.0, nil, "EXAMPLE GROCER", "direct debit",
+		exportPayload("EXAMPLE GROCER", "direct debit", ""))
+	seedWebTextRow(t, r, foldStmtC, statementDay, 60.0, nil, "EXAMPLE FLORIST", "DIRECT DEBIT",
+		statementPayload("DIRECT DEBIT", "EXAMPLE FLORIST"))
+	seedWebTextRow(t, r, foldStmtD, statementDay, 60.0, nil, "EXAMPLE FLORIST", "DIRECT DEBIT",
+		statementPayload("DIRECT DEBIT", "EXAMPLE FLORIST"))
+	// Two statement copies, one export row: one fold, one survivor.
+	seedWebTextRow(t, r, foldStmtA, mixedDay, 55.0, nil, "EXAMPLE BAKER", "DIRECT DEBIT",
+		statementPayload("DIRECT DEBIT", "EXAMPLE BAKER"))
+	seedWebTextRow(t, r, foldStmtB, mixedDay, 55.0, nil, "EXAMPLE BAKER", "DIRECT DEBIT",
+		statementPayload("DIRECT DEBIT", "EXAMPLE BAKER"))
+	seedWebTextRow(t, r, "E3", mixedDay, 55.0, nil, "EXAMPLE BAKER AG", "direct debit",
+		exportPayload("EXAMPLE BAKER AG", "direct debit", ""))
+
+	got := drainTx(t, emitWebStream(t, r))
+	for _, id := range []string{"E1@" + textAcct, "E2@" + textAcct,
+		foldStmtC + "@" + textAcct, foldStmtD + "@" + textAcct} {
+		if _, ok := got[id]; !ok {
+			t.Errorf("%s: a same-era repeat must survive", id)
+		}
+	}
+	if n := countOnDay(got, exportDay); n != 2 {
+		t.Errorf("export-era repeats emitted = %d, want 2", n)
+	}
+	if n := countOnDay(got, statementDay); n != 2 {
+		t.Errorf("statement-era repeats emitted = %d, want 2", n)
+	}
+	// The export row plus exactly one of the two statement copies.
+	if n := countOnDay(got, mixedDay); n != 2 {
+		t.Errorf("rows emitted where two statement copies meet one export row = %d, want 2", n)
+	}
+	if _, ok := got["E3@"+textAcct]; !ok {
+		t.Error("the export's row must keep its booking")
+	}
+	_, keptA := got[foldStmtA+"@"+textAcct]
+	_, keptB := got[foldStmtB+"@"+textAcct]
+	if keptA == keptB {
+		t.Errorf("statement copies kept = (%v, %v), want exactly one (pairing is 1:1)", keptA, keptB)
+	}
+}
+
+// TestStatementCopyLeavesUnmatchedStatementAlone: a statement
+// reconstruction no other era records is the only account of its booking
+// and reaches gold exactly as it did — same id, amount, day and narrative.
+// Only an exact booking signature folds: same day and amount on ANOTHER
+// account, the same amount on another day, and the same figure in another
+// currency are each a different booking, and a row alongside them that
+// does match still folds.
+func TestStatementCopyLeavesUnmatchedStatementAlone(t *testing.T) {
+	const day = 430 * 86400
+	r := newWebTxFixture(t)
+	seedWebAccount(t, r, textAcct)
+	seedWebAccount(t, r, vetoAcctB)
+	seedRailEraAnchor(t, r)
+	seedWebTextRow(t, r, foldStmtA, day, 42.25, nil, "EXAMPLE FLORIST", "DIRECT DEBIT",
+		statementPayload("DIRECT DEBIT", "EXAMPLE FLORIST", "EXAMPLE CITY"))
+	// Same day and amount, other account.
+	seedWebTxRaw(t, r, "E1", vetoAcctB, day, "CHF", -42.25, "direct debit",
+		exportPayload("EXAMPLE GROCER", "direct debit", ""))
+	// Same account and amount, next day.
+	seedWebTxRaw(t, r, "E2", textAcct, day+86400, "CHF", -42.25, "direct debit",
+		exportPayload("EXAMPLE GROCER", "direct debit", ""))
+	// Same account, day and figure, other currency.
+	seedWebTxRaw(t, r, "E3", textAcct, day, "USD", -42.25, "direct debit",
+		exportPayload("EXAMPLE GROCER", "direct debit", ""))
+	// A second statement row on the same day whose signature the export DOES
+	// match: it folds, so the near misses above are read as near misses and
+	// not as a fold that never runs.
+	seedWebTextRow(t, r, foldStmtB, day, 88.0, nil, "EXAMPLE BAKER", "DIRECT DEBIT",
+		statementPayload("DIRECT DEBIT", "EXAMPLE BAKER"))
+	seedWebTxRaw(t, r, "E4", textAcct, day, "CHF", -88.0, "direct debit",
+		exportPayload("EXAMPLE BAKER AG", "direct debit", ""))
+
+	got := drainTx(t, emitWebStream(t, r))
+	survivor, ok := got[foldStmtA+"@"+textAcct]
+	if !ok {
+		t.Fatal("an unmatched statement reconstruction must survive")
+	}
+	if survivor.NetAmount == nil || survivor.NetAmount.String() != "-42.25" {
+		t.Errorf("NetAmount = %v, want -42.25", survivor.NetAmount)
+	}
+	if survivor.OccurredAt != day {
+		t.Errorf("OccurredAt = %d, want %d", survivor.OccurredAt, day)
+	}
+	checkText(t, got, map[string]textCase{
+		foldStmtA + "@" + textAcct: {"DIRECT DEBIT; EXAMPLE FLORIST; EXAMPLE CITY", "EXAMPLE FLORIST", "DIRECT DEBIT"},
+	})
+	for _, id := range []string{"E1@" + vetoAcctB, "E2@" + textAcct, "E3@" + textAcct, "E4@" + textAcct} {
+		if _, ok := got[id]; !ok {
+			t.Errorf("%s: a near miss must survive too", id)
+		}
+	}
+	if _, ok := got[foldStmtB+"@"+textAcct]; ok {
+		t.Error("a statement row the export matches exactly must fold")
+	}
+}
+
+// TestStatementCopyCarriesWhatTheSurvivorLacks: the fold drops a row,
+// never what it said. Where the export's record left a column empty or as
+// a bare code, the dropped statement's reading of the same booking fills
+// it — per column and only downward, so nothing the survivor already said
+// is overwritten.
+func TestStatementCopyCarriesWhatTheSurvivorLacks(t *testing.T) {
+	const day = 440 * 86400
+	r := newWebTxFixture(t)
+	seedWebAccount(t, r, textAcct)
+	seedRailEraAnchor(t, r)
+	seedWebTextRow(t, r, foldStmtA, day, 310.0, nil, "EXAMPLE PAYEE", "DIRECT DEBIT",
+		statementPayload("DIRECT DEBIT", "EXAMPLE PAYEE", "EXAMPLE CITY"))
+	// The export's row for the same booking: no payee at all and a bare
+	// booking code as its whole narrative.
+	seedWebTextRow(t, r, "E1", day, 310.0, nil, nil, "KH", exportPayload("", "KH", ""))
+
+	got := drainTx(t, emitWebStream(t, r))
+	survivor, ok := got["E1@"+textAcct]
+	if !ok {
+		t.Fatal("the export's row must keep the booking")
+	}
+	checkText(t, got, map[string]textCase{
+		"E1@" + textAcct: {"DIRECT DEBIT; EXAMPLE PAYEE; EXAMPLE CITY", "EXAMPLE PAYEE", "DIRECT DEBIT"},
+	})
+	// Only the narrative travels: the row of record does not move.
+	if survivor.TransactionExternalID != "E1@"+textAcct {
+		t.Errorf("id = %q, want the export row's", survivor.TransactionExternalID)
+	}
+	if survivor.NetAmount == nil || survivor.NetAmount.String() != "-310" {
+		t.Errorf("NetAmount = %v, want -310", survivor.NetAmount)
+	}
+	if survivor.OccurredAt != day {
+		t.Errorf("OccurredAt = %d, want %d", survivor.OccurredAt, day)
+	}
+}
+
+// TestStatementCopyPairsAcrossTheSignConventions is the fold's central
+// shape and the reason its key is built on the adapter's projection rather
+// than on the silver columns. The two web eras write the amount columns to
+// different conventions: a statement reconstruction carries the figure a
+// statement PRINTS, and a statement prints a debit as a positive figure in
+// its debit column, while the export carries the sheet's own cell, which
+// already states the direction in its sign. The raw column net therefore
+// comes out with opposite signs for one booking. Both eras nonetheless say
+// "debit" by putting the figure in the debit column, which is what decides
+// the kind and so the projected sign — so both project the same negative
+// amount, and the fold pairs them.
+func TestStatementCopyPairsAcrossTheSignConventions(t *testing.T) {
+	const day = 450 * 86400
+	r := newWebTxFixture(t)
+	seedWebAccount(t, r, textAcct)
+	seedRailEraAnchor(t, r)
+	// The statement's debit: printed, and so stored, positive.
+	seedWebTextRow(t, r, foldStmtA, day, 8317.40, nil, "EXAMPLE PAYEE", "DIRECT DEBIT",
+		statementPayload("DIRECT DEBIT", "EXAMPLE PAYEE", "EXAMPLE CITY"))
+	// The export's cell for the same booking: already signed, and negative.
+	seedWebTextRow(t, r, "E1", day, -8317.40, nil, "EXAMPLE UTILITY AG", "direct debit",
+		exportPayload("EXAMPLE UTILITY AG; EXAMPLE STREET 1", "direct debit", ""))
+
+	got := drainTx(t, emitWebStream(t, r))
+	if _, ok := got[foldStmtA+"@"+textAcct]; ok {
+		t.Error("opposite silver sign conventions must not stop one booking folding to one row")
+	}
+	survivor, ok := got["E1@"+textAcct]
+	if !ok {
+		t.Fatal("the export's row must keep the booking")
+	}
+	if n := countOnDay(got, day); n != 1 {
+		t.Errorf("rows on the booking's value day = %d, want 1", n)
+	}
+	// Both eras project the same negative amount; that is the key.
+	if survivor.NetAmount == nil || survivor.NetAmount.String() != "-8317.4" {
+		t.Errorf("survivor NetAmount = %v, want -8317.4", survivor.NetAmount)
+	}
+	if survivor.Kind != canonical.TxKindWithdrawal {
+		t.Errorf("survivor Kind = %q, want withdrawal", survivor.Kind)
+	}
+}
+
+// TestStatementCopyPairsAnUnsignedKind: interest pins no direction, so
+// each era's row keeps the sign it states. The statement's debit is a
+// printed figure and is subtracted; the export's debit cell is signed and
+// is added. Both land on one negative amount, and the pair folds.
+func TestStatementCopyPairsAnUnsignedKind(t *testing.T) {
+	const day = 455 * 86400
+	r := newWebTxFixture(t)
+	seedWebAccount(t, r, textAcct)
+	seedRailEraAnchor(t, r)
+	seedWebTextRow(t, r, foldStmtA, day, 100.0, nil, nil, "INTEREST",
+		statementPayload("INTEREST"))
+	seedWebTextRow(t, r, "E1", day, -100.0, nil, nil, "Interest",
+		exportPayload("", "Interest", ""))
+
+	got := drainTx(t, emitWebStream(t, r))
+	if _, ok := got[foldStmtA+"@"+textAcct]; ok {
+		t.Error("the statement's interest debit must fold into the export's")
+	}
+	survivor, ok := got["E1@"+textAcct]
+	if !ok {
+		t.Fatal("the export's row must keep the booking")
+	}
+	if n := countOnDay(got, day); n != 1 {
+		t.Errorf("rows on the booking's value day = %d, want 1", n)
+	}
+	if survivor.NetAmount == nil || survivor.NetAmount.String() != "-100" {
+		t.Errorf("survivor NetAmount = %v, want -100", survivor.NetAmount)
+	}
+}
+
+// TestStatementCopyKeepsABookingAndItsReversal: equal magnitude, opposite
+// direction, one day, one account is a booking and the bank's correction
+// of it — two real entries, not one recorded twice. The key is signed for
+// exactly this reason: a magnitude-only match would fold them and delete a
+// real booking. Both here are the export's own rows, so the same-era rule
+// forbids the fold too; the control pair on the same day proves the fold
+// is live in this fixture.
+func TestStatementCopyKeepsABookingAndItsReversal(t *testing.T) {
+	const day = 460 * 86400
+	r := newWebTxFixture(t)
+	seedWebAccount(t, r, textAcct)
+	seedRailEraAnchor(t, r)
+	// The dividend, and the bank clawing it back: the reversal states the
+	// correction in the sign of its own cell, and keeps it.
+	seedWebTextRow(t, r, "E1", day, nil, 12.50, "EXAMPLE FUND", "Dividend",
+		exportPayload("EXAMPLE FUND", "Dividend", ""))
+	seedWebTextRow(t, r, "E2", day, nil, -12.50, "EXAMPLE FUND", "Dividend;Reversal",
+		exportPayload("EXAMPLE FUND", "Dividend;Reversal", ""))
+	// Control: a genuine cross-era duplicate on the same day still folds.
+	seedWebTextRow(t, r, foldStmtA, day, 640.0, nil, "EXAMPLE PAYEE", "DIRECT DEBIT",
+		statementPayload("DIRECT DEBIT", "EXAMPLE PAYEE"))
+	seedWebTextRow(t, r, "E3", day, -640.0, nil, "EXAMPLE UTILITY AG", "direct debit",
+		exportPayload("EXAMPLE UTILITY AG", "direct debit", ""))
+
+	got := drainTx(t, emitWebStream(t, r))
+	for _, id := range []string{"E1@" + textAcct, "E2@" + textAcct} {
+		if _, ok := got[id]; !ok {
+			t.Errorf("%s: a booking and its reversal are two entries and must both survive", id)
+		}
+	}
+	if _, ok := got[foldStmtA+"@"+textAcct]; ok {
+		t.Error("control: a genuine cross-era duplicate must still fold")
+	}
+	if n := countOnDay(got, day); n != 3 {
+		t.Errorf("rows on the day = %d, want 3 (the pair, plus the folded booking)", n)
+	}
+}
+
+// TestStatementCopyKeepsACrossEraReversalApart: the same guard where the
+// booking and its correction reach gold from DIFFERENT eras. The reversal
+// keeps the sign its own record carries — a clawback is money out however
+// the era spells it — so it never keys onto the entry it corrects, and the
+// fold has no way to collapse the two.
+func TestStatementCopyKeepsACrossEraReversalApart(t *testing.T) {
+	const day = 470 * 86400
+	r := newWebTxFixture(t)
+	seedWebAccount(t, r, textAcct)
+	seedRailEraAnchor(t, r)
+	// The statement's record of the dividend: printed, and so stored,
+	// positive in the credit column.
+	seedWebTextRow(t, r, foldStmtA, day, nil, 12.50, "EXAMPLE FUND", "DIVIDEND",
+		statementPayload("DIVIDEND", "EXAMPLE FUND"))
+	// The export's record of the clawback: a negative credit cell.
+	seedWebTextRow(t, r, "E1", day, nil, -12.50, "EXAMPLE FUND", "Dividend;Reversal",
+		exportPayload("EXAMPLE FUND", "Dividend;Reversal", ""))
+	// Control: a genuine cross-era duplicate on the same day still folds.
+	seedWebTextRow(t, r, foldStmtB, day, 640.0, nil, "EXAMPLE PAYEE", "DIRECT DEBIT",
+		statementPayload("DIRECT DEBIT", "EXAMPLE PAYEE"))
+	seedWebTextRow(t, r, "E2", day, -640.0, nil, "EXAMPLE UTILITY AG", "direct debit",
+		exportPayload("EXAMPLE UTILITY AG", "direct debit", ""))
+
+	got := drainTx(t, emitWebStream(t, r))
+	if _, ok := got[foldStmtA+"@"+textAcct]; !ok {
+		t.Error("the statement's dividend must survive its cross-era reversal")
+	}
+	if _, ok := got["E1@"+textAcct]; !ok {
+		t.Error("the export's reversal must survive the entry it corrects")
+	}
+	if _, ok := got[foldStmtB+"@"+textAcct]; ok {
+		t.Error("control: a genuine cross-era duplicate must still fold")
+	}
+	if n := countOnDay(got, day); n != 3 {
+		t.Errorf("rows on the day = %d, want 3 (the pair, plus the folded booking)", n)
+	}
+}
+
+// TestStatementReversalKeepsItsSignEndToEnd is the same guard as
+// TestWebProjectedNetKeepsAStatementReversal, but taken through the emit
+// path — because the sign is pinned in TWO places and the projection helper
+// is only the first. The second runs after the returns verdict is stamped,
+// re-signing the row from the kind it ENDS with, and for a while it asked a
+// narrower question than the first: it exempted the export's `;Reversal`
+// booking type and nothing else, so a statement's negative figure was
+// signed correctly by the projection and then flipped straight back. Both
+// now ask webReversal, and this test fails if either stops.
+//
+// A cancelled withdrawal is money coming BACK, so the emitted amount is
+// positive while the kind stays the base kind — that is what lets the pair
+// net to zero when summed. Every value is synthetic.
+func TestStatementReversalKeepsItsSignEndToEnd(t *testing.T) {
+	const day = 480 * 86400
+	r := newWebTxFixture(t)
+	seedWebAccount(t, r, textAcct)
+	seedRailEraAnchor(t, r)
+	// The statement's booking, printed positive in the debit column.
+	seedWebTextRow(t, r, foldStmtA, day, 100.0, nil, "EXAMPLE PAYEE", "MATURITY",
+		statementPayload("MATURITY", "EXAMPLE PAYEE"))
+	// The statement's cancellation of it: a negative in that same column,
+	// which is the only way a statement can say so.
+	seedWebTextRow(t, r, foldStmtB, day, -100.0, nil, "EXAMPLE REFERENCE", "CANC.MAT.",
+		statementPayload("CANC.MAT.", "EXAMPLE REFERENCE"))
+
+	got := drainTx(t, emitWebStream(t, r))
+	booking, ok := got[foldStmtA+"@"+textAcct]
+	if !ok {
+		t.Fatal("the booking must survive")
+	}
+	cancellation, ok := got[foldStmtB+"@"+textAcct]
+	if !ok {
+		t.Fatal("the cancellation must survive: it is a second entry, not a duplicate")
+	}
+	if booking.NetAmount == nil || cancellation.NetAmount == nil {
+		t.Fatal("both rows must carry a net amount")
+	}
+	if !booking.NetAmount.IsNegative() {
+		t.Errorf("booking NetAmount = %s, want negative (money out)", booking.NetAmount)
+	}
+	if !cancellation.NetAmount.IsPositive() {
+		t.Errorf("cancellation NetAmount = %s, want positive — a cancelled withdrawal is money coming back, "+
+			"and forcing it back to the kind's direction makes it a second copy of the booking it cancels",
+			cancellation.NetAmount)
+	}
+	if sum := booking.NetAmount.Add(*cancellation.NetAmount); !sum.IsZero() {
+		t.Errorf("booking + cancellation = %s, want 0", sum)
+	}
+}
+
+// An advice states one movement: its account, its two dates, the column
+// its figure sits in and the figure. Where the ledger holds that movement
+// the ledger's row is the record; elsewhere the advice is.
+
+const advicePayload = `{"source":"payment_advice_pdf","document":"payment_advice_pdf","continuation":[]}`
+
+// seedDatedRow inserts one web row with both of its dates.
+func seedDatedRow(t *testing.T, r *webReader, id string, valued, booked int64, debit, credit any, descKind, payload string) {
+	t.Helper()
+	if _, err := r.db.Exec(`
+        INSERT INTO transactions (transaction_external_id, account_external_id,
+            snapshot_at, booking_date, value_date, currency_iso, amount_debit, amount_credit,
+            description_kind, payload)
+        VALUES (?, ?, 1000, ?, ?, 'CHF', ?, ?, ?, ?)`,
+		id, textAcct, booked, valued, debit, credit, descKind, payload); err != nil {
+		t.Fatalf("seed %s: %v", id, err)
+	}
+}
+
+func TestAnAdviceTheLedgerHoldsGivesWay(t *testing.T) {
+	const (
+		day    = 420 * 86400
+		booked = 418 * 86400
+	)
+	for _, tc := range []struct {
+		name           string
+		valued, booked int64
+		gone           bool
+	}{
+		{"on the value day", day, booked, true},
+		{"on the booking day alone", day + 2*86400, booked, true},
+		{"on neither day", day + 2*86400, booked + 86400, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newWebTxFixture(t)
+			seedWebAccount(t, r, textAcct)
+			seedRailEraAnchor(t, r)
+			seedDatedRow(t, r, foldStmtA, day, booked, 80.0, nil, "E-BANKING PAYMENT ORDER",
+				statementPayload("E-BANKING PAYMENT ORDER", "EXAMPLE PAYEE"))
+			seedDatedRow(t, r, "ADV0000001", tc.valued, tc.booked, 80.0, nil, "", advicePayload)
+			got := drainTx(t, emitWebStream(t, r))
+			if _, ok := got[foldStmtA+"@"+textAcct]; !ok {
+				t.Error("the statement's row was not emitted")
+			}
+			if _, ok := got["ADV0000001@"+textAcct]; ok == tc.gone {
+				t.Errorf("advice emitted = %v, want %v", ok, !tc.gone)
+			}
+		})
+	}
+}
+
+// One ledger row excuses one advice: two payments of one figure on one
+// day are two movements, and the second advice is the record of its own.
+func TestALedgerRowExcusesOneAdvice(t *testing.T) {
+	const day = 420 * 86400
+	r := newWebTxFixture(t)
+	seedWebAccount(t, r, textAcct)
+	seedRailEraAnchor(t, r)
+	seedDatedRow(t, r, foldStmtA, day, day, nil, 300.0, "CREDIT", statementPayload("CREDIT", "EXAMPLE PAYER"))
+	seedDatedRow(t, r, "ADV0000001", day, day, nil, 300.0, "", advicePayload)
+	seedDatedRow(t, r, "ADV0000002", day, day, nil, 300.0, "", advicePayload)
+	got := drainTx(t, emitWebStream(t, r))
+	_, first := got["ADV0000001@"+textAcct]
+	_, second := got["ADV0000002@"+textAcct]
+	if first || !second {
+		t.Errorf("advices emitted: first %v, second %v; want only the second, past the first by id", first, second)
+	}
+	if n := countOnDay(got, day); n != 2 {
+		t.Errorf("rows on the day = %d, want the statement row and one advice", n)
+	}
+}
+
+// A figure in the other column is another movement.
+func TestAnAdviceInTheOtherColumnStands(t *testing.T) {
+	const day = 420 * 86400
+	r := newWebTxFixture(t)
+	seedWebAccount(t, r, textAcct)
+	seedRailEraAnchor(t, r)
+	seedDatedRow(t, r, foldStmtA, day, day, 80.0, nil, "E-BANKING PAYMENT ORDER",
+		statementPayload("E-BANKING PAYMENT ORDER", "EXAMPLE PAYEE"))
+	seedDatedRow(t, r, "ADV0000001", day, day, nil, 80.0, "", advicePayload)
+	if _, ok := drainTx(t, emitWebStream(t, r))["ADV0000001@"+textAcct]; !ok {
+		t.Error("an advice crediting what the ledger debits was dropped")
+	}
+}
+
+// A statement can print a batch of payments as one movement where another
+// statement lists them. The parser splits the listed batch into legs under
+// the movement's id; the movement printed whole gives way to them.
+func TestABatchMovementGivesWayToItsLegs(t *testing.T) {
+	const day = 420 * 86400
+	r := newWebTxFixture(t)
+	seedWebAccount(t, r, textAcct)
+	seedRailEraAnchor(t, r)
+	seedDatedRow(t, r, foldStmtA, day, day, 300.0, nil, "E-BANKING PAYMENT ORDER",
+		statementPayload("E-BANKING PAYMENT ORDER", "2 TIMES E-BANKING"))
+	seedDatedRow(t, r, foldStmtA+"#1", day, day, 100.0, nil, "E-BANKING PAYMENT ORDER",
+		statementPayload("E-BANKING PAYMENT ORDER", "EXAMPLE PAYEE ONE"))
+	seedDatedRow(t, r, foldStmtA+"#2", day, day, 200.0, nil, "E-BANKING PAYMENT ORDER",
+		statementPayload("E-BANKING PAYMENT ORDER", "EXAMPLE PAYEE TWO"))
+	// Another movement on the day, printed whole, with no legs.
+	seedDatedRow(t, r, foldStmtB, day, day, 300.0, nil, "E-BANKING PAYMENT ORDER",
+		statementPayload("E-BANKING PAYMENT ORDER", "EXAMPLE PAYEE THREE"))
+	got := drainTx(t, emitWebStream(t, r))
+	for id, want := range map[string]bool{foldStmtA: false, foldStmtA + "#1": true, foldStmtA + "#2": true, foldStmtB: true} {
+		if _, ok := got[id+"@"+textAcct]; ok != want {
+			t.Errorf("%s emitted = %v, want %v", id, ok, want)
+		}
+	}
+}
+
+// The export signs its cells and an advice prints the figure: the
+// magnitude in the debit column is the same movement.
+func TestAnAdviceTheExportHoldsGivesWay(t *testing.T) {
+	const day = 420 * 86400
+	r := newWebTxFixture(t)
+	seedWebAccount(t, r, textAcct)
+	seedRailEraAnchor(t, r)
+	seedDatedRow(t, r, "EXP0000001", day, day, -80.0, nil, "e-banking payment order",
+		exportPayload("EXAMPLE PAYEE", "e-banking payment order", "Transaction no. EXP0000001"))
+	seedDatedRow(t, r, "ADV0000001", day, day, 80.0, nil, "", advicePayload)
+	got := drainTx(t, emitWebStream(t, r))
+	if _, ok := got["ADV0000001@"+textAcct]; ok {
+		t.Error("an advice the export holds was emitted beside it")
+	}
+	if _, ok := got["EXP0000001@"+textAcct]; !ok {
+		t.Error("the export's row was not emitted")
+	}
+}
+
+// A ledger row takes one advice whichever date it matched on. An advice
+// on the row's value date and another on its booking date are two
+// movements the row cannot both be: the first by id goes, the second
+// stands.
+func TestALedgerRowExcusesOneAdviceAcrossItsDates(t *testing.T) {
+	const (
+		day    = 420 * 86400
+		booked = 418 * 86400
+	)
+	r := newWebTxFixture(t)
+	seedWebAccount(t, r, textAcct)
+	seedRailEraAnchor(t, r)
+	seedDatedRow(t, r, foldStmtA, day, booked, 80.0, nil, "E-BANKING PAYMENT ORDER",
+		statementPayload("E-BANKING PAYMENT ORDER", "EXAMPLE PAYEE"))
+	seedDatedRow(t, r, "ADV0000001", day, booked-86400, 80.0, nil, "", advicePayload)
+	seedDatedRow(t, r, "ADV0000002", day+86400, booked, 80.0, nil, "", advicePayload)
+	got := drainTx(t, emitWebStream(t, r))
+	_, first := got["ADV0000001@"+textAcct]
+	_, second := got["ADV0000002@"+textAcct]
+	if first || !second {
+		t.Errorf("advices emitted: first %v, second %v; want only the second", first, second)
+	}
+}
+
+// adviceCandidate is an advice debiting figure on day, as the table
+// reads it.
+func adviceCandidate(id string, day int64, figure float64) *candidate {
+	row := newWebRow(webTxRow{txID: id, account: textAcct, currency: "CHF",
+		payload: advicePayload, valueDate: day, debit: sql.NullFloat64{Float64: figure, Valid: true}})
+	return &candidate{kind: webRecordKind(&row), id: row.emittedID(), web: &row}
+}
+
+// runReconcileRules runs the table over records, as reconcile does.
+func runReconcileRules(cut psnCut, records []*candidate) {
+	for _, rule := range reconcileRules(cut, nil, splitMovements(records)) {
+		rule.apply(records)
+	}
+}
+
+// An advice is a web row like the others to the cut and to the feed's
+// bank number: on a covered account from the PSN start it is the feed's,
+// and a feed line that repeats its number holds it.
+func TestAnAdviceGivesWayToTheFeed(t *testing.T) {
+	const day = 420 * 86400
+	t.Run("the cut", func(t *testing.T) {
+		cut := psnCut{
+			startByRel:   map[string]int64{"R1": day},
+			relOfAccount: map[string]string{textAcct: "R1"},
+			coverage:     psnCashCoverage{textAcct: day - 86400},
+		}
+		before, after := adviceCandidate("ADV0000001", day-86400, 80), adviceCandidate("ADV0000002", day, 80)
+		runReconcileRules(cut, []*candidate{before, after})
+		if before.kind != recAdvice {
+			t.Fatalf("kind = %v, want an advice", before.kind)
+		}
+		if before.lostTo != "" {
+			t.Errorf("an advice before the PSN start lost to %q", before.lostTo)
+		}
+		if after.lostTo != ruleCut {
+			t.Errorf("an advice from the PSN start lost to %q, want %q", after.lostTo, ruleCut)
+		}
+	})
+	t.Run("the bank number", func(t *testing.T) {
+		held, other := adviceCandidate("ADV0000001", day, 80), adviceCandidate("ADV0000002", day, 80)
+		feed := &candidate{kind: recFeed, id: "mt940:A1", feed: &feedRow{
+			eventID: "mt940:A1", account: textAcct, kind: "cash_movement", at: day, decoded: true,
+			pl: cashMovementPayload{Account: textAcct, BankRef: "ADV0000001"},
+		}}
+		runReconcileRules(psnCut{}, []*candidate{held, other, feed})
+		if held.lostTo != ruleFeedOverWebByRef {
+			t.Errorf("the advice the feed holds lost to %q, want %q", held.lostTo, ruleFeedOverWebByRef)
+		}
+		if other.lostTo != "" {
+			t.Errorf("an advice the feed does not hold lost to %q", other.lostTo)
+		}
+	})
+}
+
+// An export dividend books at its gross with the tax withheld beside it;
+// the statement prints the net credit, which is what the export row moved.
+func TestAStatementCopyOfANetDividendFoldsIntoTheExportPair(t *testing.T) {
+	const day = 420 * 86400
+	r := newWebTxFixture(t)
+	seedWebAccount(t, r, textAcct)
+	seedRailEraAnchor(t, r)
+	seedDatedRow(t, r, "EXP0000001", day, day, nil, 65.0, "Dividend",
+		exportPayload("Example Share; CH0000000001", "Dividend", "Number/Amt. 100 CHF; Transaction no. EXP0000001"))
+	seedDatedRow(t, r, foldStmtA, day, day, nil, 65.0, "DIVIDEND",
+		statementPayload("DIVIDEND", "VN 1234567", "EXAMPLE SHARE"))
+	got := drainTx(t, emitWebStream(t, r))
+	if _, ok := got[foldStmtA+"@"+textAcct]; ok {
+		t.Error("the statement's net credit was emitted beside the export pair")
+	}
+	div, tax := got["EXP0000001@"+textAcct], got["EXP0000001@"+textAcct+withholdingIDSuffix]
+	if derefDecimal(div.NetAmount) != "100" || derefDecimal(tax.NetAmount) != "-35" {
+		t.Errorf("export pair = %s, %s; want the gross 100 and the tax -35",
+			derefDecimal(div.NetAmount), derefDecimal(tax.NetAmount))
+	}
+}
+
+// A statement line of amount zero moves no money: it reaches no ledger,
+// whatever its booking type. The same type under an amount is a booking.
+func TestAZeroStatementLineIsNoBooking(t *testing.T) {
+	const day = 420 * 86400
+	r := newWebTxFixture(t)
+	seedWebAccount(t, r, textAcct)
+	seedRailEraAnchor(t, r)
+	seedDatedRow(t, r, foldStmtA, day, day, nil, 0.0, "LOW BOOKING AMOUNT",
+		statementPayload("LOW BOOKING AMOUNT", "EXAMPLE SHARE"))
+	seedDatedRow(t, r, foldStmtB, day, day, nil, 0.0, "BALANCE CLOSING OF SERVICE PRICES",
+		statementPayload("BALANCE CLOSING OF SERVICE PRICES", "Example service"))
+	seedDatedRow(t, r, foldStmtC, day+86400, day+86400, nil, 12.0, "BALANCE CLOSING OF SERVICE PRICES",
+		statementPayload("BALANCE CLOSING OF SERVICE PRICES", "Example service"))
+	got := drainTx(t, emitWebStream(t, r))
+	for id, want := range map[string]bool{foldStmtA: false, foldStmtB: false, foldStmtC: true} {
+		if _, ok := got[id+"@"+textAcct]; ok != want {
+			t.Errorf("%s emitted = %v, want %v", id, ok, want)
+		}
+	}
+}

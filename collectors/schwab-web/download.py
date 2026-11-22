@@ -41,7 +41,13 @@ import time
 from pathlib import Path
 
 import landmarks as schwab
-from collectorkit import bronze, debugcap
+# The walk's pure name rules; each name is bound here too.
+from names import (  # noqa: F401
+    _suffix_of,
+    _COUNT_RE,
+    _safe,
+)
+from collectorkit import bronze, debugcap, launch
 
 log = logging.getLogger("schwab-web.download")
 
@@ -79,29 +85,17 @@ RECOVERY_DEADLINE_S = 180
 def maybe_screenshot(page, screenshot_dir: Path | None, label: str) -> None:
     """Capture the scrubbed HTML and a viewport PNG at a navigation
     landmark into the `--screenshot-dir` host path (None captures
-    nothing). Never raises. Shared by login.py's sign-in landmarks.
+    nothing). The login credentials (landmarks' LOGIN_ID_ENV and
+    PASSWORD_ENV) and the session are masked out of the markup. Never
+    raises. Shared by login.py's sign-in landmarks.
     """
-    debugcap.capture_landmark(page, screenshot_dir, label, log=log)
+    debugcap.landmark_capturer(
+        screenshot_dir, user_env=schwab.LOGIN_ID_ENV,
+        pass_env=schwab.PASSWORD_ENV, session=True, log=log)(page, label)
 
 # ============================================================
 # Account enumeration
 # ============================================================
-
-# Account-suffix-only matcher for sanitising filenames / dir names.
-# Schwab renders the dropdown right-column as `<U+2026>NNN`
-# (Unicode ellipsis followed by the last-3-to-5 digits of the
-# account). Match both that form and the ASCII `...NNN` form
-# defensively — copy-paste of the live label can normalise either
-# way depending on the rendering path.
-_SUFFIX_RE = re.compile(r"(?:…|\.{3})(\d{3,5})")
-
-def _suffix_of(label: str) -> str:
-    m = _SUFFIX_RE.search(label)
-    if not m:
-        # Fall back to a stable hash of the label so there is still
-        # a per-account directory; not pretty, but never collides.
-        return "x" + hashlib.sha256(label.encode("utf-8")).hexdigest()[:8]
-    return m.group(1)
 
 def enumerate_accounts(page) -> list[dict]:
     """Open the account selector dropdown and read every entry.
@@ -352,11 +346,6 @@ def fill_custom_date_range(page, since, until) -> None:
 # Result-table walking
 # ============================================================
 
-# Result-count banner format:
-#   "123 document(s) found from 05/19/2016 to 05/19/2026"
-# Only the leading integer is read.
-_COUNT_RE = re.compile(r"^\s*(\d+)\s*document")
-
 def wait_for_results(page) -> int:
     """Wait for the search-result count to appear; return the count."""
     # The "X document(s) found" <p> sits inside
@@ -571,14 +560,6 @@ def _current_page_num(page) -> int | None:
 # ============================================================
 # Per-document download
 # ============================================================
-
-# Filename-safe replacement for the parts embedded in a file name.
-_FN_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
-
-def _safe(s: str, fallback: str = "x") -> str:
-    out = _FN_SAFE.sub("-", s).strip("-")
-    return out or fallback
-
 
 def _save_download(download, target_dir: Path, fallback: str) -> Path:
     """Save a Playwright download under its filename-safe suggested
@@ -1175,40 +1156,6 @@ def _extract_tx_row_cells(row) -> list[str] | None:
         texts[1],  # Action / Transaction Type
     ]
 
-def _parse_more_modal_text(text: str) -> dict:
-    """Parse Schwab's "More"-modal inner text into a flat
-    key→value dict. Lines look like::
-
-        Trade Date            05/25/2022
-        Settle Date           05/26/2022
-        Action                Sell to Open
-
-    i.e. a label column then a value column, separated by 2+
-    spaces. Section headers and the modal chrome are skipped.
-    """
-    skip = {
-        "Print",
-        "Transactions",
-        "Trade Details",
-        "Transactions Trade Details",
-        "Trade Transaction Details",
-        "Deposit Details",
-        "Check Details",
-        "Check Image Details",
-        "Money Market Activity Details",
-    }
-    fields: dict[str, str] = {}
-    for line in text.split("\n"):
-        line = line.strip()
-        if not line or line in skip:
-            continue
-        m = re.match(r"^(.+?)\s{2,}(.+)$", line)
-        if m:
-            key = m.group(1).strip()
-            val = m.group(2).strip()
-            if key:
-                fields[key] = val
-    return fields
 
 # Rows whose "More" opens the wire-details dialog. That modal
 # lazy-loads its content and ignores Escape, and its leaked overlay
@@ -1322,11 +1269,12 @@ def _scrape_more_details(page, account_suffix: str,
                         modal = page.locator('[role="dialog"]:visible').first
                         modal.wait_for(state="visible", timeout=5_000)
                         raw_text = modal.inner_text()
-                        fields = _parse_more_modal_text(raw_text)
+                        # `fields` stays empty: the loader parses
+                        # `raw_text` (more_detail.py).
                         details.append({
                             "row_key": row_key,
                             "row_cells": cells,
-                            "fields": fields,
+                            "fields": {},
                             "raw_text": raw_text,
                         })
                     except Exception as e:
@@ -1484,10 +1432,7 @@ def capture_transactions(page, account: dict, dest_dir: Path,
     tx_range = _STATEMENT_TO_TX_RANGE.get(date_range, date_range)
     _apply_tx_filter(page, account["suffix"], tx_range, exact_window)
 
-    try:
-        url = page.evaluate("() => location.href") or page.url
-    except Exception:
-        url = page.url
+    url = launch.live_url(page)
     title = page.title()
     log.info("tx-history …%s: url=%s title=%r",
              account["suffix"], url, title)

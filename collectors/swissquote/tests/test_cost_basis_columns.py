@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import load  # noqa: E402
+import pp_parser  # noqa: E402
 from tests.helpers import write_xls  # noqa: E402
 
 MIGRATIONS = ROOT / "migrations"
@@ -110,7 +111,7 @@ def _statement(_pdf_path: Path) -> dict:
     return {
         "snapshot_date": "2025-12-31",
         "account_external_id": ACCOUNT,
-        "positions": load._pp_parse_asset_allocation(
+        "positions": pp_parser._pp_parse_asset_allocation(
             STATEMENT_PAGE, Path("synthetic.pdf")),
     }
 
@@ -131,7 +132,7 @@ class _DbCase(unittest.TestCase):
         csv_path = self.tmp / "transactions.csv"
         csv_path.write_text("\n".join([CSV_HEADER, *TX_ROWS]) + "\n",
                             encoding="utf-8")
-        load.load_transactions_csv(self.conn, ACCOUNT, csv_path)
+        load.load_transactions_csv(self.conn, ACCOUNT, csv_path, SNAPSHOT_AT)
         xls_path = write_xls(self.tmp / "positions.xls",
                               [load.POSITIONS_EXPECTED_HEADER,
                                *POSITIONS_BODY])
@@ -144,6 +145,9 @@ class _DbCase(unittest.TestCase):
             " ?, 'run/documents/doc-0001.pdf', '{}');",
             (ACCOUNT, SNAPSHOT_AT),
         )
+        pdf = self.tmp / "run" / "documents" / "doc-0001.pdf"
+        pdf.parent.mkdir(parents=True)
+        pdf.write_bytes(b"%PDF- a statement the mock parse reads")
         with mock.patch.object(load, "parse_portfolio_performance",
                                _statement):
             load.load_portfolio_performance_docs(self.conn, self.tmp)
@@ -323,6 +327,30 @@ class BackfillTests(_DbCase):
             old.close()
 
 
+class GoneBronzeTests(_DbCase):
+    """A statement whose bronze file is gone is passed over: its rows stay,
+    and it is not recorded, so a later load parses it once it is back."""
+
+    def test_a_gone_file_is_skipped_and_its_rows_stay(self):
+        self.load_fixtures()
+        rows = self.conn.execute(
+            "SELECT COUNT(*) FROM positions WHERE source = 'pp:doc-0001';"
+        ).fetchone()[0]
+        self.assertGreater(rows, 0)
+        self.conn.execute("DELETE FROM document_derivations;")
+        (self.tmp / "run" / "documents" / "doc-0001.pdf").unlink()
+        parse = mock.Mock(side_effect=AssertionError("parsed a gone file"))
+        with mock.patch.object(load, "parse_portfolio_performance", parse), \
+                self.assertLogs(load.log, "WARNING") as logged:
+            self.assertEqual(
+                load.load_portfolio_performance_docs(self.conn, self.tmp), 0)
+        self.assertIn("run/documents/doc-0001.pdf", logged.output[0])
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM positions WHERE source = 'pp:doc-0001';"
+        ).fetchone()[0], rows)
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM document_derivations;").fetchone()[0], 0)
+
 
 class AccruedMigrationTests(_DbCase):
     """Migration 0007 drops the statement rows so the next load parses
@@ -332,10 +360,13 @@ class AccruedMigrationTests(_DbCase):
         self.load_fixtures()
         before = self.conn.execute(
             "SELECT COUNT(*) FROM positions WHERE source = 'live';").fetchone()[0]
+        # A silver that runs 0007 records no statement yet: 0008 creates
+        # document_derivations after it.
         self.conn.executescript(
             (MIGRATIONS / "0007_accrued_interest.sql").read_text()
             .replace("ALTER TABLE positions ADD COLUMN accrued_interest_chf REAL;", "")
-            .replace("VALUES (7,", "VALUES (70,"))
+            .replace("VALUES (7,", "VALUES (70,")
+            + "DELETE FROM document_derivations;")
         self.assertEqual(self.conn.execute(
             "SELECT COUNT(*) FROM positions WHERE source LIKE 'pp:%';").fetchone()[0], 0)
         self.assertEqual(self.conn.execute(

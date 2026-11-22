@@ -14,23 +14,23 @@ import (
 
 // Writer wraps a *sql.Tx and inserts/upserts canonical *Change
 // records into the gold tables. The insert-only fact tables
-// (positions, position_lots, cash_balances, fx_rates, transactions)
-// go in as multi-row VALUES chunks, and realized_lots column by column
-// (colInsert, whose row-wise form insertColumns feeds the yield
-// tables) — DuckDB's per-statement cost dwarfs its per-row cost, so
-// one statement per row is the slowest way to feed it. The dimension
-// tables upsert row-by-row (the §8.4 guard needs ON CONFLICT per row);
-// callers keep those batches small by folding duplicate emissions
-// first — see ChangeAccumulator.
+// (positions, position_lots, cash_balances, snapshot_coverage,
+// fx_rates, transactions) go in as multi-row VALUES chunks, and
+// realized_lots column by column (colInsert, whose row-wise form
+// insertColumns feeds the yield tables) — DuckDB's per-statement cost
+// dwarfs its per-row cost, so one statement per row is the slowest way
+// to feed it. The dimension tables upsert row-by-row (the §8.4 guard
+// needs ON CONFLICT per row); callers keep those batches small by
+// folding duplicate emissions first — see ChangeAccumulator.
 //
 // Caller owns the transaction lifecycle: BeginTx, call writer
 // methods, Commit or Rollback. A Writer is not goroutine-safe;
-// use one per active transaction, as it remembers the distributions
-// it replaced (insertDividendEvents).
+// use one per active transaction, as it remembers the groups of a
+// whole-read reference table it replaced (insertRefRows).
 type Writer struct {
 	tx *sql.Tx
-	// replaced are the source, ref and provider whose distributions
-	// the writer has replaced.
+	// replaced are the table, source and group (RefTable.WholeBy, its
+	// values joined) whose rows the writer has replaced.
 	replaced map[[3]string]bool
 }
 
@@ -545,6 +545,21 @@ INSERT INTO cash_balances (
 		})
 }
 
+// InsertCoverage inserts `snapshot_coverage` rows. A source may state
+// one account at one instant in more than one batch, and the row lands
+// once.
+func (w *Writer) InsertCoverage(ctx context.Context, batch []canonical.CoverageChange) error {
+	const head = `
+INSERT OR IGNORE INTO snapshot_coverage (
+    silver_source_id, snapshot_at, account_external_id
+) VALUES `
+	return InsertChunked(ctx, w.tx, "InsertCoverage", head, `(?, ?, ?)`, len(batch),
+		func(i int, args []any) []any {
+			r := &batch[i]
+			return append(args, r.SilverSourceID, r.SnapshotAt, r.AccountExternalID)
+		})
+}
+
 // InsertFxRates inserts `fx_rates` rows.
 func (w *Writer) InsertFxRates(ctx context.Context, batch []canonical.FxRateChange) error {
 	if len(batch) == 0 {
@@ -583,6 +598,9 @@ func (w *Writer) InsertTransactions(ctx context.Context, batch []canonical.Trans
 		if !batch[i].Kind.Valid() {
 			return fmt.Errorf("InsertTransactions row %d: invalid kind %q", i, batch[i].Kind)
 		}
+		if !batch[i].Action.Valid() {
+			return fmt.Errorf("InsertTransactions row %d: invalid action %q", i, batch[i].Action)
+		}
 		if err := validateOptionalTaxonomyPair("InsertTransactions", i,
 			batch[i].AssetClass, batch[i].Vehicle); err != nil {
 			return err
@@ -594,10 +612,10 @@ INSERT INTO transactions (
     account_external_id, instrument_external_id, asset_class, vehicle,
     instrument_hint, kind, currency,
     gross_amount, net_amount, quantity, price, description,
-    counterparty, provider_category, check_number, payload
+    counterparty, provider_category, check_number, action, payload
 ) VALUES `
 	return InsertChunked(ctx, w.tx, "InsertTransactions", head,
-		`(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, len(batch),
+		`(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, len(batch),
 		func(i int, args []any) []any {
 			r := &batch[i]
 			return append(args,
@@ -610,15 +628,16 @@ INSERT INTO transactions (
 				nullable(r.Quantity), nullable(r.Price),
 				storedDescription(r),
 				nullable(r.Counterparty), nullable(r.ProviderCategory),
-				nullable(r.CheckNumber),
+				nullable(r.CheckNumber), nullableEnumValue(r.Action),
 				nullableJSON(r.Payload))
 		})
 }
 
 // nullableEnumValue is nullableEnumString's by-value twin, for a
 // typed-string column whose "unset" is the empty string rather than a
-// nil pointer — a trade's own exposure, wrapper, or instrument hint,
-// all of which the adapter leaves empty where it has nothing to add.
+// nil pointer — a trade's own exposure, wrapper, instrument hint or
+// action, all of which the adapter leaves empty where it has nothing to
+// add.
 func nullableEnumValue[T ~string](v T) any {
 	if v == "" {
 		return nil

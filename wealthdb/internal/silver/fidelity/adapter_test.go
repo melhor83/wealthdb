@@ -27,12 +27,6 @@ func openAdapter(t *testing.T, path string) silver.Connection {
 	return silvertest.Open(t, &Adapter{}, path)
 }
 
-func TestKindIsFidelity(t *testing.T) {
-	if got := (&Adapter{}).Kind(); got != "fidelity" {
-		t.Errorf("Kind() = %q, want %q", got, "fidelity")
-	}
-}
-
 func TestStatusEmpty(t *testing.T) {
 	silvertest.AssertEmptyStatus(t, &Adapter{}, silverSchemaSQL)
 }
@@ -281,7 +275,7 @@ func TestAssetClassVehicleFor(t *testing.T) {
 		{"plan_fund", "STATE PLAN 2099 (FIDELITY BLEND)", canonical.AssetClassMultiAsset, canonical.VehicleFund},
 		{"bond", "PLACEHOLDER CORP NOTE 04.12500% 01/15/2042", canonical.AssetClassFixedIncome, canonical.VehicleBond},
 		// money_market never reaches the position build, but is mapped
-		// for parity with assetClassFor.
+		// for parity with assetClassVehicleFor.
 		{"money_market", "PLACEHOLDER GOVERNMENT MONEY MARKET", canonical.AssetClassCash, canonical.VehicleFund},
 		// Unknown class → (other, other).
 		{"widget", "PLACEHOLDER THING", canonical.AssetClassOther, canonical.VehicleOther},

@@ -7,72 +7,8 @@ import (
 	"testing"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/enrichtest"
 )
-
-// TestSpendCategoriesMatchGoTable is the generator-style pin between
-// the spend_categories dimension the migrations seed — 0040, and every
-// migration after it that adds, changes or retires a row — and
-// canonical.SpendCategories. The Go table is the source those seeds
-// were generated from; if either side is edited alone — a taxonomy
-// refresh that skips the migration, or a hand-edit of the SQL — this
-// fails rather than letting gold and the enrichment pass disagree about
-// what a valid category is.
-//
-// The family column is compared with the rest: it is what the two
-// vocabularies are told apart by, and a row seeded into the wrong one
-// would be admitted by the wrong rules, pins and conversation.
-func TestSpendCategoriesMatchGoTable(t *testing.T) {
-	t.Parallel()
-	db, ctx := openMigrated(t)
-	assertSpendCategoriesMatchGoTable(t, db, ctx)
-}
-
-// assertSpendCategoriesMatchGoTable compares db's dimension with the Go
-// table as sets: every row, and every column the table carries.
-func assertSpendCategoriesMatchGoTable(t *testing.T, db *sql.DB, ctx context.Context) {
-	t.Helper()
-	rows, err := db.QueryContext(ctx,
-		`SELECT spend_primary, spend_detailed, description, family FROM spend_categories`)
-	if err != nil {
-		t.Fatalf("read spend_categories: %v", err)
-	}
-	defer rows.Close()
-
-	seeded := map[string]canonical.SpendCategory{}
-	for rows.Next() {
-		var c canonical.SpendCategory
-		var family sql.NullString
-		if err := rows.Scan(&c.Primary, &c.Detailed, &c.Description, &family); err != nil {
-			t.Fatalf("scan spend_categories: %v", err)
-		}
-		if !family.Valid {
-			t.Errorf("%s has no family; it belongs to neither vocabulary", c.Detailed)
-		}
-		c.Family = canonical.Family(family.String)
-		seeded[c.Detailed] = c
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("iterate spend_categories: %v", err)
-	}
-
-	if len(seeded) != len(canonical.SpendCategories) {
-		t.Errorf("spend_categories rows = %d, want %d", len(seeded), len(canonical.SpendCategories))
-	}
-	for _, want := range canonical.SpendCategories {
-		got, ok := seeded[want.Detailed]
-		if !ok {
-			t.Errorf("spend_categories is missing %q", want.Detailed)
-			continue
-		}
-		if got != want {
-			t.Errorf("spend_categories[%q] = %+v, want %+v", want.Detailed, got, want)
-		}
-		delete(seeded, want.Detailed)
-	}
-	for detailed := range seeded {
-		t.Errorf("spend_categories has %q, which the Go table does not", detailed)
-	}
-}
 
 // TestSpendOverlayAnswers: each overlay table answers, and so does the
 // spending base.
@@ -237,13 +173,9 @@ func TestAStorePlacedLineReadsModel(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)
 	seedSpendingFixture(t, db, ctx)
-	if _, err := db.ExecContext(ctx, `
-        INSERT INTO spend_txn_enrichment (silver_source_id, transaction_external_id,
-                                          merchant_signature, signature_version,
-                                          spend_detailed, provenance, assigned_at)
-        VALUES ('test-src', 'T-BACKLOG', 'sig-unknown', 1, NULL, 'signature-only', 100)`); err != nil {
-		t.Fatalf("seed the backlog row: %v", err)
-	}
+	enrichtest.SeedSpend(t, db,
+		enrichtest.Spend{Source: "test-src", Txn: "T-BACKLOG", Signature: "sig-unknown", Provenance: "signature-only"},
+	)
 	want := map[string]string{
 		// The store answered a row the pass could not place.
 		"T-BY-MERCHANT": "model",
@@ -806,21 +738,17 @@ func TestProviderSpendColumns(t *testing.T) {
 func TestProviderViewRecordsWithoutDeciding(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)
-	if _, err := db.ExecContext(ctx, `
-        INSERT INTO spend_txn_enrichment (silver_source_id, transaction_external_id,
-              merchant_signature, signature_version, spend_detailed, provenance,
-              provider_spend_detailed, assigned_at) VALUES
-            -- the issuer said something specific, and it decided
-            ('s', 'T-SPECIFIC', 'SIG-A', 1, 'FOOD_AND_DRINK_GROCERIES', 'provider',
-             'FOOD_AND_DRINK_GROCERIES', 1),
-            -- the issuer said only "somewhere in general merchandise": recorded,
-            -- but the row is left for a tier that can read the merchant name
-            ('s', 'T-CATCHALL', 'SIG-B', 1, NULL, 'signature-only',
-             'GENERAL_MERCHANDISE_OTHER_GENERAL_MERCHANDISE', 1),
-            -- the issuer said nothing at all: NULL, which is not the same
-            ('s', 'T-SILENT', 'SIG-C', 1, NULL, 'signature-only', NULL, 1)`); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
+	enrichtest.SeedSpend(t, db,
+		// the issuer said something specific, and it decided
+		enrichtest.Spend{Source: "s", Txn: "T-SPECIFIC", Signature: "SIG-A", Detailed: "FOOD_AND_DRINK_GROCERIES",
+			Provenance: "provider", Provider: "FOOD_AND_DRINK_GROCERIES", At: 1},
+		// the issuer said only "somewhere in general merchandise": recorded,
+		// but the row is left for a tier that can read the merchant name
+		enrichtest.Spend{Source: "s", Txn: "T-CATCHALL", Signature: "SIG-B", Provenance: "signature-only",
+			Provider: "GENERAL_MERCHANDISE_OTHER_GENERAL_MERCHANDISE", At: 1},
+		// the issuer said nothing at all: NULL, which is not the same
+		enrichtest.Spend{Source: "s", Txn: "T-SILENT", Signature: "SIG-C", Provenance: "signature-only", At: 1},
+	)
 	type got struct{ ours, theirs, theirPrim sql.NullString }
 	for id, want := range map[string]got{
 		"T-SPECIFIC": {ours: sql.NullString{String: "FOOD_AND_DRINK_GROCERIES", Valid: true},
@@ -843,54 +771,6 @@ func TestProviderViewRecordsWithoutDeciding(t *testing.T) {
 	}
 }
 
-// TestSpendCategoryLabelsMatchGoTable pins the seeded display labels to
-// canonical.SpendLabel. The migration seeds them literally so one can be
-// corrected by hand; this is what stops a correction there from silently
-// disagreeing with the rule in Go, and what catches a new taxonomy value
-// seeded without a label at all.
-func TestSpendCategoryLabelsMatchGoTable(t *testing.T) {
-	t.Parallel()
-	db, ctx := openMigrated(t)
-	assertSpendCategoryLabelsMatchGoTable(t, db, ctx)
-}
-
-// assertSpendCategoryLabelsMatchGoTable reads every label in db's
-// dimension against the rule in Go.
-func assertSpendCategoryLabelsMatchGoTable(t *testing.T, db *sql.DB, ctx context.Context) {
-	t.Helper()
-	rows, err := db.QueryContext(ctx,
-		`SELECT spend_primary, spend_detailed, label, primary_label FROM spend_categories`)
-	if err != nil {
-		t.Fatalf("read labels: %v", err)
-	}
-	defer rows.Close()
-	n := 0
-	for rows.Next() {
-		var prim, det string
-		var label, primLabel sql.NullString
-		if err := rows.Scan(&prim, &det, &label, &primLabel); err != nil {
-			t.Fatalf("scan: %v", err)
-		}
-		n++
-		if !label.Valid || !primLabel.Valid {
-			t.Errorf("%s has no label; every value must read as something", det)
-			continue
-		}
-		if want := canonical.SpendLabel(det); label.String != want {
-			t.Errorf("%s label = %q, want %q", det, label.String, want)
-		}
-		if want := canonical.SpendPrimaryLabel(prim); primLabel.String != want {
-			t.Errorf("%s primary_label = %q, want %q", det, primLabel.String, want)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("iterate labels: %v", err)
-	}
-	if n != len(canonical.SpendCategories) {
-		t.Errorf("labelled %d rows, want %d", n, len(canonical.SpendCategories))
-	}
-}
-
 // TestTheATMFeesLabel: the dimension labels a seeded value by its
 // display label.
 func TestTheATMFeesLabel(t *testing.T) {
@@ -904,64 +784,6 @@ func TestTheATMFeesLabel(t *testing.T) {
 	}
 	if label != "ATM fees" {
 		t.Errorf("label = %q, want %q", label, "ATM fees")
-	}
-}
-
-// TestSpendCategoryCatchAllMatchesGoTable pins the seeded catch-all flag
-// to the Go predicates. The rule is expressed twice — once in Go for the
-// enrichment pass, once in SQL for the seed — and this is what stops the
-// two drifting.
-//
-// The seed reads a value's own spelling and knows nothing of families,
-// while Go asks the question inside one vocabulary: a row is a catch-all
-// if it is its own family's. That is the same rule read from two places,
-// and the OR below is where they meet — no value is a catch-all in one
-// family and an ordinary value in the other, because no value is in both
-// unless it is a delta, and a delta is never one.
-func TestSpendCategoryCatchAllMatchesGoTable(t *testing.T) {
-	t.Parallel()
-	db, ctx := openMigrated(t)
-	assertSpendCategoryCatchAllMatchesGoTable(t, db, ctx)
-}
-
-// assertSpendCategoryCatchAllMatchesGoTable reads every catch-all flag
-// in db's dimension against the Go predicates.
-func assertSpendCategoryCatchAllMatchesGoTable(t *testing.T, db *sql.DB, ctx context.Context) {
-	t.Helper()
-	rows, err := db.QueryContext(ctx,
-		`SELECT spend_detailed, catch_all FROM spend_categories`)
-	if err != nil {
-		t.Fatalf("read catch_all: %v", err)
-	}
-	defer rows.Close()
-	seen, flagged := 0, 0
-	for rows.Next() {
-		var det string
-		var flag sql.NullBool
-		if err := rows.Scan(&det, &flag); err != nil {
-			t.Fatalf("scan: %v", err)
-		}
-		seen++
-		if !flag.Valid {
-			t.Errorf("%s has no catch_all flag", det)
-			continue
-		}
-		if flag.Bool {
-			flagged++
-		}
-		want := canonical.CatchAllSpendDetailed(det) || canonical.CatchAllIncomeDetailed(det)
-		if flag.Bool != want {
-			t.Errorf("%s catch_all = %v, want %v", det, flag.Bool, want)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("iterate catch_all: %v", err)
-	}
-	if seen != len(canonical.SpendCategories) {
-		t.Errorf("checked %d rows, want %d", seen, len(canonical.SpendCategories))
-	}
-	if flagged == 0 {
-		t.Error("no value is a catch-all; the seed is not doing anything")
 	}
 }
 
@@ -1129,14 +951,10 @@ func TestMigration0111MovesEveryStoredVerdictToItsSuccessor(t *testing.T) {
 	}
 	// Two rows the renames must leave alone: a current value, and a row
 	// with neither column set.
-	if _, err := db.ExecContext(ctx, `
-        INSERT INTO income_txn_enrichment (silver_source_id, transaction_external_id,
-                payer_signature, signature_version, income_detailed, provenance,
-                provider_income_detailed, assigned_at) VALUES
-            ('s', 'T-KEEP', 'sig-keep', 1, 'INCOME_INTEREST_EARNED', 'rule', 'INCOME_INTEREST_EARNED', 100),
-            ('s', 'T-NONE', 'sig-none', 1, NULL, 'signature-only', NULL, 100)`); err != nil {
-		t.Fatalf("seed the controls: %v", err)
-	}
+	enrichtest.SeedIncome(t, db,
+		enrichtest.Income{Source: "s", Txn: "T-KEEP", Signature: "sig-keep", Detailed: "INCOME_INTEREST_EARNED", Provenance: "rule", Provider: "INCOME_INTEREST_EARNED"},
+		enrichtest.Income{Source: "s", Txn: "T-NONE", Signature: "sig-none", Provenance: "signature-only"},
+	)
 
 	verify := func(when string) {
 		t.Helper()
@@ -1220,10 +1038,11 @@ func TestMigration0111MovesEveryStoredVerdictToItsSuccessor(t *testing.T) {
 // which is finer than any floor, and a floor that outranked it would
 // quietly coarsen every such row.
 //
-// A fee's floor depends on its account (0103, 0110). On a card or on a
-// bank account it is a bank fee. A bank account here is a cash account in
-// no portfolio. Everywhere else it is an investment fee, the cash side of
-// an investment mandate included.
+// A fee's floor depends on its account (spend_kind_floor,
+// derived/40_flows.sql). On a card or on a bank account it is a bank
+// fee. A bank account here is a cash account in no portfolio. Everywhere
+// else it is an investment fee, the cash side of an investment mandate
+// included.
 func TestSpendKindFloorPlacesWhatNothingElseCould(t *testing.T) {
 	t.Parallel()
 	db, ctx := openMigrated(t)
@@ -1311,7 +1130,7 @@ func TestSpendKindFloorPlacesWhatNothingElseCould(t *testing.T) {
 		"T-FXFEE": {"BANK_FEES_FOREIGN_TRANSACTION_FEES", "model"},
 		// interest joins them, but only when it was CHARGED: the
 		// same macro is read at transaction grain, where credited
-		// interest reaches it and is income, not a fee (0067)
+		// interest reaches it and is income, not a fee (spend_kind_floor)
 		"T-MARGIN": {"BANK_FEES_INTEREST_CHARGE", "kind"},
 		"T-CREDIT": {"", "signature-only"},
 		// and the floor covers nothing beyond those three kinds

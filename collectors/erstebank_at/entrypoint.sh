@@ -12,69 +12,30 @@
 
 set -euo pipefail
 
+# The verb engine, baked into the base image (shared/images/entrypoint-lib.sh).
 # shellcheck source=/dev/null
 source /opt/entrypoint-lib.sh
 
-case "${1:-help}" in
-    explore)
-        # Discovery harness: Camoufox over VNC + HAR/network log/click log/
-        # DOM snapshots/response bodies under /debug.
-        shift
-        exec_if_help explore.py "$@"
-        start_xvfb
-        start_x11vnc explore
-        exec python3 /app/explore.py "$@"
-        ;;
-    download)
-        # One-shot: submit the user name → push approved on the phone →
-        # REST fetch. Headed Camoufox under Xvfb, no VNC (nothing to type).
-        shift
-        exec_if_help login.py "$@"
-        start_xvfb
-        exec python3 /app/login.py --cli-mfa --bronze-dir /data "$@"
-        ;;
-    vnc-login)
-        # Fallback: expose VNC and do the whole sign-in by hand, then fetch.
-        shift
-        exec_if_help login.py "$@"
-        start_xvfb
-        start_x11vnc vnc-login
-        exec python3 /app/login.py --no-cli-mfa --bronze-dir /data "$@"
-        ;;
+verb="${1:-help}"
+[[ $# -gt 0 ]] && shift
+
+case "$verb" in
+    explore)   run vnc:explore explore.py -- "$@" ;;
+    # One-shot: submit the user name, push approved on the phone, REST
+    # fetch. Headed Camoufox under Xvfb, no VNC (nothing to type).
+    download)  run xvfb login.py --cli-mfa --bronze-dir /data -- "$@" ;;
+    # Fallback: the whole sign-in by hand over VNC.
+    vnc-login) run vnc:vnc-login login.py --no-cli-mfa --bronze-dir /data -- "$@" ;;
     login)
-        # `login --check` is a read-only session probe (no push). A bare
-        # `login` folds into `download`, which signs in when needed, so it
-        # is a clean no-op an orchestrator's login → download → load can
-        # call without tripping.
-        shift
-        exec_if_help login.py "$@"
-        for a in "$@"; do
-            if [[ "$a" == "--check" ]]; then
-                start_xvfb
-                exec python3 /app/login.py "$@"
-            fi
-        done
-        echo "erstebank_at: 'login' folds into 'download', which signs in" \
-             "only when no session is alive (DESIGN.md §F)." >&2
-        echo "  Run 'download' (one-shot sign-in + fetch), or 'login --check'" \
-             "to probe a session." >&2
-        exit 0
+        # `login --check` is a read-only session probe under Xvfb.
+        login_folds xvfb login.py -- "$@"
+        cat >&2 <<'EOF'
+erstebank_at: 'login' folds into 'download' — nothing to persist (the push fires every sign-in; §F).
+  Run 'download' (one-shot login + fetch), or 'login --check' to probe a session.
+EOF
         ;;
-    load)
-        # Silver loader — pure SQLite + Python, no browser.
-        shift
-        exec python3 /app/load.py --bronze-dir /data "$@"
-        ;;
-    prune)
-        # Bronze reclaim — pure file walk. Also reachable host-side via the
-        # wrapper (the usual path).
-        shift
-        exec python3 /app/prune.py "$@"
-        ;;
-    sh|bash)
-        shift
-        exec /bin/bash "$@"
-        ;;
+    load)      run plain load.py --bronze-dir /data -- "$@" ;;
+    prune|sh|bash) entrypoint_common "$verb" "$@" ;;
     help|--help|-h)
         cat <<'EOF'
 erstebank_at container
@@ -108,7 +69,5 @@ Subcommands:
 Run "<wrapper> <subcommand> --help" for subcommand flags.
 EOF
         ;;
-    *)
-        exec "$@"
-        ;;
+    *) exec "$verb" "$@" ;;
 esac

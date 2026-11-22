@@ -18,9 +18,10 @@
 //     vehicle is not modelled; config overrides win).
 //
 //   - One instrument + position per offering (silver `offerings`, keyed by
-//     deal_external_id — the SPV/fund interest, never merged). asset_class
-//     from offerings.kind: single-company -> spv, multi-company fund ->
-//     private_fund. Instrument name = the underlying company / fund label;
+//     deal_external_id — the SPV/fund interest, never merged). The
+//     taxonomy pair from offerings.kind: exposure private_equity for both,
+//     vehicle spv for a single-company SPV and fund for a multi-company
+//     fund (classmap.go). Instrument name = the underlying company / fund label;
 //     a single-company SPV also carries EquityZen's per-company symbol (an
 //     EZ-internal ticker, surfaced so positions show a symbol like public
 //     equities) — funds have none. No ISIN/CUSIP (private, non-quotable).
@@ -56,18 +57,32 @@ import (
 	"context"
 	"database/sql"
 
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/lots"
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/returns"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver"
 )
 
 const kindName = "equityzen"
 
+// init registers the kind (silver.Source).
+//
+// Returns: see returns.PrivateMarketLedgerPolicy for the double-entry
+// custody-ledger rationale (transactions.go emits the pairs on the
+// custody account). Lots: the cost basis of its SPV units and fund
+// interests is what the source states, capital paid in, and no lot book
+// describes it (docs/LOTS.md §6). The engine builds none and realizes a
+// sale against the stated basis.
 func init() {
-	silver.Register(&Adapter{})
+	rp, lp := returns.PrivateMarketLedgerPolicy(), lots.StatedPolicy()
+	silver.Register(silver.Source{
+		Kind:    kindName,
+		Open:    (&Adapter{}).Open,
+		Returns: &rp,
+		Lots:    &lp,
+	})
 }
 
 type Adapter struct{}
-
-func (*Adapter) Kind() string { return kindName }
 
 func (*Adapter) Open(_ context.Context, spec silver.OpenSpec) (silver.Connection, error) {
 	db, err := silver.OpenReadOnlySQLite(spec.Path, "equityzen silver")

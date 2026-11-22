@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -90,10 +92,14 @@ func TestMCPToolList(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	notes := map[string]string{}
+	for _, spec := range toolSpecs {
+		notes[spec.name] = spec.notes
+	}
 	var names []string
 	for _, tool := range res.Tools {
 		names = append(names, tool.Name)
-		if tool.Name != "describe" && toolNotes[tool.Name] == "" {
+		if tool.Name != "describe" && notes[tool.Name] == "" {
 			t.Errorf("%s has no note for describe", tool.Name)
 		}
 		a := tool.Annotations
@@ -126,53 +132,15 @@ func TestMCPToolList(t *testing.T) {
 	}
 }
 
-// TestMCPCoversEveryCLIView holds the tools against the CLI's view
-// tables, the way TestUsageListsEverySubcommand holds the listing
-// against dispatch: a view the CLI gains cannot ship without its tool
-// counterpart.
-func TestMCPCoversEveryCLIView(t *testing.T) {
+// TestEveryDiagnosticToolHasACommand: each diagnostic the server serves
+// beside the reports is a CLI command too.
+func TestEveryDiagnosticToolHasACommand(t *testing.T) {
 	t.Parallel()
-	cli := map[string][]string{
-		"holdings": sorted(holdingsViews), "returns": sorted(returnsViews), "spending": sorted(spendingViews),
-		"income": sorted(incomeViews), "cashflow": sorted(cashflowViews), "gains": sorted(gainsViews),
-		"exposure": sorted(exposureViews), "yield": sorted(yieldViews),
-	}
-	s := newTestMCP("", false)
-	seen := map[string]bool{}
-	for _, tool := range s.tools() {
-		want, ok := cli[tool.name]
-		if !ok {
-			continue
-		}
-		seen[tool.name] = true
-		got := append([]string{}, tool.family.views...)
-		sort.Strings(got)
-		if strings.Join(got, ",") != strings.Join(want, ",") {
-			t.Errorf("%s views = %v, the CLI has %v", tool.name, got, want)
-		}
-		for _, p := range tool.params {
-			if p.name == "view" && strings.Join(p.enum, ",") != strings.Join(tool.family.views, ",") {
-				t.Errorf("%s: the view parameter offers %v, the family runs %v", tool.name, p.enum, tool.family.views)
-			}
-		}
-	}
-	for name := range cli {
-		if !seen[name] {
-			t.Errorf("no tool serves the CLI's %s", name)
-		}
-	}
-	// The diagnostics the CLI has beside the reports.
 	for _, name := range []string{"transactions", "status", "snapshots", "resolutions", "categorizations"} {
 		if _, ok := subcommands[name]; !ok {
 			t.Errorf("the CLI has no %s, yet the server serves it", name)
 		}
 	}
-}
-
-func sorted(views []string) []string {
-	out := append([]string{}, views...)
-	sort.Strings(out)
-	return out
 }
 
 // TestMCPCallShapes: a call answers with text and the header line; a
@@ -229,7 +197,7 @@ func TestMCPExposureRefusals(t *testing.T) {
 		{map[string]any{"view": "countries", "period": "monthly", "from": "2099"}, "the window starts after today"},
 		{map[string]any{"view": "countries", "period": "monthly", "from": "2026-06", "to": "2026-01"}, `exposure: from "2026-06" is after to "2026-01"`},
 		{map[string]any{"view": "classes", "period": "quarterly", "filter": "issuer contains a"},
-			"period belongs to the " + andList(exposureSeriesViews) + " views (view issuers chosen for the issuer condition)"},
+			"period belongs to the " + andList(exposureFamily.seriesViews()) + " views (view issuers chosen for the issuer condition)"},
 		{map[string]any{"view": "classes", "filter": "period >= 2026-05"}, "period is a series' column: give period=quarterly with from and to"},
 	} {
 		res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "exposure", Arguments: c.args})
@@ -321,6 +289,95 @@ func TestMCPCashflowPlanRefusals(t *testing.T) {
 		{map[string]any{"view": "projection", "period": "total"}, "projection takes period monthly"},
 		{map[string]any{"view": "summary", "rates": "forward"}, "rates, maturing and shift belong to the projection view"},
 	})
+}
+
+// paramDefault finds the default a parameter's doc states: "(default
+// both)", "full (default)", "(primary, default)".
+var paramDefault = regexp.MustCompile(`\(default ([a-z0-9_]+)|([a-z0-9_]+) \(default[);]|\(([a-z0-9_]+), default\)`)
+
+// TestMCPParamDocsStateTheDefault: a parameter doc that states its
+// option's default states the one MCP applies (option.def), on every
+// view the option is the family's or the view's own.
+func TestMCPParamDocsStateTheDefault(t *testing.T) {
+	t.Parallel()
+	checked := 0
+	for _, spec := range toolSpecs {
+		fam := spec.family
+		if fam == nil {
+			continue
+		}
+		for _, p := range spec.params {
+			m := paramDefault.FindStringSubmatch(p.doc)
+			if m == nil || !slices.ContainsFunc(fam.options, func(o option) bool { return o.name == p.name }) {
+				continue
+			}
+			stated := m[1] + m[2] + m[3]
+			for i := range fam.views {
+				o := optionOf(fam.optionsFor(&fam.views[i]), p.name)
+				def := o.def[1]
+				switch {
+				case def == "" && o.kind == optFlag:
+					def = "false"
+				case def == "" && o.kind == optInt:
+					def = "0"
+				}
+				if def != stated {
+					t.Errorf("%s %s on %q: the doc says default %s, the option %q", spec.name, p.name,
+						fam.views[i].name, stated, def)
+				}
+			}
+			checked++
+		}
+	}
+	if checked < 10 {
+		t.Errorf("only %d documented defaults checked; the pattern misses the docs", checked)
+	}
+}
+
+// TestMCPGainsHoldingsRefusals: an option of one view is refused on the
+// others, never ignored: realized's documents and order, the cost-basis
+// reading off the views that count a missing basis, and positions' cash
+// and cost-basis reading.
+func TestMCPGainsHoldingsRefusals(t *testing.T) {
+	t.Parallel()
+	cs := connect(t, newTestMCP(setupGainsGold(t), false), time.Now())
+	refusals(t, cs, "gains", []struct {
+		args map[string]any
+		want string
+	}{
+		{map[string]any{"view": "summary", "documents": "all"}, "gains: documents and newest_first belong to view=realized"},
+		{map[string]any{"view": "lots", "newest_first": true}, "gains: documents and newest_first belong to view=realized"},
+		{map[string]any{"view": "coverage", "missing_basis": "zero"}, "gains: missing_basis does not apply to view=coverage"},
+		{map[string]any{"view": "check", "missing_basis": "zero"}, "gains: missing_basis does not apply to view=check"},
+	})
+	refusals(t, cs, "holdings", []struct {
+		args map[string]any
+		want string
+	}{
+		{map[string]any{"view": "accounts", "missing_basis": "zero"}, "holdings: missing_basis belongs to view=positions"},
+		{map[string]any{"view": "accounts", "with_cash": true}, "holdings: with_cash belongs to view=positions"},
+		{map[string]any{"with_cash": false}, "holdings: with_cash belongs to view=positions"},
+	})
+}
+
+// TestMCPSpendingVsLastYear: vs_last_year belongs to categories and to
+// the periods that fall on the same days a year earlier, and the header
+// says a call set it.
+func TestMCPSpendingVsLastYear(t *testing.T) {
+	t.Parallel()
+	cs := connect(t, newTestMCP(setupSpendingGold(t), false), time.Now())
+	refusals(t, cs, "spending", []struct {
+		args map[string]any
+		want string
+	}{
+		{map[string]any{"view": "summary", "vs_last_year": true}, "spending: vs_last_year belongs to view=categories"},
+		{map[string]any{"view": "categories", "vs_last_year": true, "period": "weekly"},
+			"spending: vs_last_year takes a monthly, quarterly, annual or total period"},
+	})
+	if h := callHeader(t, cs, "spending", map[string]any{"view": "categories", "vs_last_year": true}); !strings.Contains(h,
+		"vs_last_year") {
+		t.Errorf("vs_last_year: header %q", h)
+	}
 }
 
 // TestMCPYieldRefusals: converted belongs to the aggregate views; a
@@ -676,20 +733,6 @@ func TestMCPPrivacyHidesConfigErrors(t *testing.T) {
 	if full == nil || priv == nil || !strings.Contains(full.Error(), "PF0012345678") ||
 		strings.Contains(priv.Error(), "PF0012345678") {
 		t.Errorf("full: %v\nprivacy: %v", full, priv)
-	}
-}
-
-// TestFilterOrderNamesEveryFilter: a filter missing from filterOrder is
-// parsed and then never applied.
-func TestFilterOrderNamesEveryFilter(t *testing.T) {
-	t.Parallel()
-	if len(filterOrder) != len(filterColumns) {
-		t.Fatalf("filterOrder has %d filters, filterColumns %d", len(filterOrder), len(filterColumns))
-	}
-	for _, f := range filterOrder {
-		if _, ok := filterColumns[f]; !ok {
-			t.Errorf("%s is in filterOrder but not filterColumns", f)
-		}
 	}
 }
 

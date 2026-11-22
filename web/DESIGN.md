@@ -28,16 +28,47 @@ read-only connection open continuously, which would make every
 up — a load does not queue behind the connection.
 
 So Metabase never touches the live file. `web start` copies the gold
-DB to `…/web/snapshot/wealthdb.db` and mounts *that* read-only.
-`web refresh` copies gold again when it is newer than the snapshot. It
-recreates the container when the running one does not serve the
-current snapshot. Where the file system can clone (APFS), the copy is
+DB to `…/web/snapshot/wealthdb.db` and mounts *that directory*
+read-only. `web refresh` copies gold again when it is newer than the
+snapshot. Where the file system can clone (APFS), the copy is
 a clone. Either way the copy keeps gold's mtime, so a gold write during
 the copy makes the next refresh copy again. Loads never contend with
 the server; dashboards show data as of the last refresh (run
 `web refresh` after `wealthdb load`). The copy is atomic
 (temp + `mv`) and refuses to run if a `.wal` sidecar is present (gold
 mid-write / not checkpointed), so a torn copy is never captured.
+
+A refresh keeps a running server. Metabase reads the snapshot under a
+serving name, `wealthdb-<inode>-<mtime>.db`, a hard link of the copy:
+
+- A new copy is a new inode, so its name is one the server never
+  opened. A file system may give a later copy a freed inode number.
+  That copy is newer, so its mtime still makes the name new.
+- The driver's DuckDB keeps one open database per path, so a path it
+  had open could hand back the old file.
+- Provisioning points the gold database at the new name. A change of
+  the database's settings makes Metabase close its connections, so the
+  next query opens the new file.
+- Provisioning then asks the server which file it reads
+  (`duckdb_databases()`). Only that answer counts as served.
+- A record beside the snapshot names the serving name the server reads.
+  Start writes the current snapshot's, and a refresh the one
+  provisioning confirms.
+- A refresh whose gold is unchanged and whose record matches keeps the
+  container and only provisions again.
+- Without that answer the container is recreated. A provisioning
+  failure, a changed admin password and provisioning turned off all
+  take this path. So does a container that mounts the snapshot file
+  rather than its directory: its record names no serving name, so it
+  never matches. Start links every serving name to the current
+  snapshot first, so a new container reads it under any name.
+- A serving name that cannot be linked keeps the running container,
+  which still reads the previous snapshot. Refresh fails, and the next
+  one tries again.
+- Once the server reads the new name, the other names are removed.
+  The file's space returns once the server closes it.
+- Start removes the spill directories that killed DuckDBs left (§7),
+  while no container runs.
 
 Start and refresh print each step's wall time on stderr
 (`web: timing: <step> <seconds>s`). Provisioning prints its wait for
@@ -98,7 +129,8 @@ A private loopback service should not require the "tell us about your
 company" wizard. Metabase's declarative config file
 (`MB_CONFIG_FILE_PATH`) can create users/databases — but that is a
 Pro/EE feature, a silent no-op on OSS. So `web start` provisions over
-the OSS **setup API** ([`provision.py`](provision.py), stdlib only):
+the OSS **setup API** ([`provision.py`](provision.py) and its sibling
+modules, stdlib only):
 create the admin (`POST /api/setup`, which also finishes the wizard),
 pre-add the gold DuckDB database (`POST /api/database`, `read_only`),
 and create the pre-defined report models (`POST /api/card`, `type:
@@ -113,8 +145,9 @@ data. They sit in a `wealthdb (pre-defined)` collection:
 - the `_latest` snapshot reports, and the all-time `report_transactions`;
 - the daily `_history` reports, for time-series charts;
 - the two taxonomy models over the `web_*` breakdown views;
-- cast-only shims over the materialized `report_returns` table (§8);
-- the spending models over `web_spending`;
+- the `report_returns` model, a cast-only shim over the materialized
+  `report_returns` table (§8);
+- the `report_spending` model over `web_spending`;
 - the income model over `web_income`;
 - the `report_cashflow` model over `web_cashflow`. It
   backs the Cash Flow dashboard's Section picker, not a card;
@@ -124,13 +157,12 @@ data. They sit in a `wealthdb (pre-defined)` collection:
   `web_yield_curve` carry. It backs the Yield Asset
   class picker alone;
 - the `report_benchmarks` model of `web_benchmarks`. It
-  backs the Benchmark picker alone;
-- two `_pct` privacy variants, `report_sources_latest_pct` and
-  `report_spending_pct`. They back the privacy twins' MBQL cards and
-  their drill-through.
+  backs the Benchmark picker alone.
+
+No card reads a model. Every card is native SQL over gold.
 
 On top of the models, provisioning creates pre-defined questions and
-ten dashboards. Their pickers:
+eleven dashboards. Their pickers:
 
 - **Wealth Overview**: a required currency, a time range, a source, a
   *Tax wrapper* picker, and an *Asset class* picker. Its own tiles are
@@ -212,16 +244,61 @@ ten dashboards. Their pickers:
   picker lists the classes `web_yield` and `web_yield_curve` carry,
   through the `report_yield_classes` model.
 - **Data Freshness**: no pickers.
+- **Private Markets**: a required currency and As of day, then Source,
+  Asset class, Vehicle and Holding, and a required *Fully funded*
+  picker. The day reads the latest stored instant on or before it,
+  through `web_private_calendar`. The Holding picker is "is not": it
+  leaves the holdings it holds out. Its class, vehicle and holding lists
+  come off the `report_private_holdings` model. Every card takes every
+  picker but Fully funded. That one reaches the Commitments chart alone
+  and sits on its tile. While the pickers keep every holding, the
+  table's total is `wealthdb returns private`'s, the IRR with it. With
+  holdings left out, it adds up what the rows shown state and pools
+  their DPI and TVPI as the CLI's total does, and its IRR is blank. The
+  twin carries every picker: a holding's name is no account's.
 
-All of them are definitions only (MBQL or SQL), with no data baked in.
+All of them are definitions only (SQL), with no data baked in.
+
+Each dashboard declares its cards in one function, `<name>_cards`, in
+`dashboards/<name>.py`. It
+runs once for the dashboard and once for its privacy twin, so a twin
+card sits beside its base card. One call declares a card with what its
+tiles need to know of it:
+
+- `exempt`: the card shows no money, so the twin shows it as it is;
+- `hide_empty`: the card reads a row only beside a picked benchmark;
+- `home`: the dashboard a Wealth Overview tile of it opens;
+- `cell_clicks`: the picker a click on a cell sets (`Link`).
+
+A name declared twice is an error at definition time.
+
+Each dashboard is one `Dashboard` record in `DASHBOARDS`
+(`dashboards/__init__.py`): its blurb,
+its twin's blurb, the slugs of its pickers, the pickers its twin drops,
+and its rows. `PICKERS` (`pickers.py`) holds one row per picker slug and family of
+dashboards: its id, label, kind, values and default. A row laid out as
+`Row(height, tiles)`, `Stack(width, cards)` or `Heading(text)` gets
+its place on the grid from the rows above it, so no tile states its
+row or column. `Twin(base, twin)` gives the twin rows of its own.
+Two mistakes are errors at definition time:
+
+- a dashboard names a picker that has no row in `PICKERS`;
+- a dashboard drops from its twin a picker it does not carry.
+
+A picker reaches a native card where the card has a template tag of
+the picker's slug. The returns cards name their Source tag
+`source_ff`, which answers the Source picker. A card declines a picker
+by declaring no tag of its slug, and the tile is mapped in the order
+of the dashboard's pickers.
 
 A tile that a picker of its dashboard does not reach says so. Its
 description ends with one sentence that names those pickers, for
 example "The Section picker does not reach it."
 Provisioning writes it from the mappings the tile is sent with, so the
 text follows the binding. Allocation's *Vehicle* picker sits on its
-one tile, not in the filter bar, so no note names it. Where a card
-declines a picker by design, its own description says why.
+one tile, not in the filter bar, so no note names it. Private Markets'
+*Fully funded* picker sits on the Commitments tile the same way. Where
+a card declines a picker by design, its own description says why.
 
 A tile that sums money in the chosen currency is native SQL over a gold
 `web_*` serving view. The views carry each reporting currency as a
@@ -236,8 +313,7 @@ Exposure tiles `{{currency}}` filters rows as well.
 Every Currency picker, and every card opened on its own, defaults to
 `default_currency` from wealthdb.cfg when that is a reporting currency,
 and to USD otherwise. A native card opened on its own runs at its
-template variables' defaults, an MBQL card over every row of its model.
-Its description does not say so. `web/web` passes it to
+template variables' defaults. Its description does not say so. `web/web` passes it to
 `provision.py` from `wealthdb config-env web`. The
 Wealth Overview's three headline figures read `web_sources_latest`
 (`derived/90_web.sql`), each account at its latest active
@@ -299,10 +375,8 @@ twin, read as a percent of the cost basis they are gains on. The
 twin redacts money columns: its shares are of the window's own net spend
 (the breakdowns, merchant and account lists) or of its biggest month
 (the trend and the monthly bands), and no card renders a merchant or
-account label — the merchant list ranks unnamed rows, the account
-breakdown regroups onto source × account kind, and `report_spending_pct`
-drops the merchant column so a scalar's drill-through cannot surface a
-counterparty either. The **Income** dashboard's cards of the income
+account label — the merchant list ranks unnamed rows, and the account
+breakdown regroups onto source × account kind. The **Income** dashboard's cards of the income
 lines are Spending read in the other direction, over the `web_income`
 serving view: the same pickers and the same native-over-the-view
 construction, for the same reason (the view carries a row per reporting
@@ -389,7 +463,8 @@ the latest of those instants in the window:
 - the cycles show the public equity.
 - each dimension's buckets add up to net worth, `(none)` holding what
   it does not describe. A card leaves that row out and plots each
-  bucket's share of the rest, the CLI's `class_share`. So its bars sum
+  bucket's share of the rest, the CLI's `class_share` (gold's
+  `exposure_class_share`). So its bars sum
   to 100. A card's title names the class it counts. The maturity card's
   names the debt alone, but it counts the debt and the cash, each by its
   term. Where the rest sums to zero or less, a loan outweighing it, no
@@ -412,7 +487,9 @@ security's slices in the selection:
 - each label is that of its heaviest slice, as the CLI takes the labels
   of a security's largest leaves;
 - a fund that reaches it in several slices counts once;
-- its share is of the selection, every security counted.
+- its share is of the selection, every security counted;
+- the value, the share and the benchmark's two columns come right after
+  the name, so a full-width tile shows them without a scroll.
 
 With nothing picked, its rows are those of `wealthdb exposure
 securities`. Its twin drops the three values for their shares. It shows
@@ -445,7 +522,10 @@ and the twelve month ends before, so a window that ends earlier shows
 nothing on those cards. A rate weighs the holdings that state it as
 `yield.summarize` does: over the assets, or over every holding where a
 group holds no asset. So a figure is `wealthdb yield global`'s over
-the same selection.
+the same selection. Gold's macros state these formulas once:
+`yield_rate`, `yield_earning_value` and `yield_part_income`, a part's
+income under the projection's pickers. The engine's tests hold each one
+to its Go function.
 
 The realized yield pools as the engine pools a row. It is the
 holdings' income of the twelve months over the sum of their mean daily
@@ -479,8 +559,10 @@ value it is earned on. The projected income would then repeat the
 income yield beside it, so its twin shows the horizon's monthly average
 as a share of its biggest month instead. The cash table ranks its rows,
 names no account, and gives each its share of the credit balances. The
-cards of rates, years and securities alone are exempt: the yields, the
-dividend scatter and the two charts over time.
+cards of rates, years and securities alone are exempt: the yields and
+the two charts over time. A scatter's tooltip names the holding and
+where it is held: the account on the base card, the source alone on the
+twin. So the dividend scatter has a twin.
 
 The **Cash Flow** dashboard's bridge tiles read `web_bridge`, the months
 of `wealthdb returns bridge` a refresh stores in `report_bridge` (§8).
@@ -505,11 +587,25 @@ source and kind, as an account does. On the twin an
 entity is its source, its kind and its rank. Rates and returns stay, and
 fees read as shares of the window's fees.
 
+Its two tiles against last year read `web_spending_vs_year`. Web
+refresh stores each month and primary category on one row with the same
+month a year earlier, so the Time range picks the months of both sides
+at once. A field filter has no date math, so a card could not shift a
+picked window itself. The rows stop at the last whole month. The tiles
+take Currency, the Time range and Category. The rows are the
+household's, so they take no Source and no Account. Every figure is
+`wealthdb spending categories --vs-last-year` by month. On the twin each
+side is a share of its own window, and the change stays.
+
 The **Income** dashboard also puts what was received beside what is
 expected, as `wealthdb income`'s forward views do
 ([wealthdb/docs/INCOME.md](../wealthdb/docs/INCOME.md) §12), but over
-every income line. A figure counts every line unless the Type picker
-leaves its type out:
+every income line. Gold's four macros state these figures, an arm each:
+`income_received`, `income_other`, `income_expected` and
+`income_run_rate`. A card reads the arms it shows and keeps the rows
+its pickers select. `income_window` is their union, for any other
+reader. A figure counts every line unless the Type picker leaves its
+type out:
 
 - received: the six types the holdings receive, each under its holding
   (`web_yield_received`), and every other line, wages and gifts among
@@ -534,8 +630,10 @@ interest received"), as is the twin's yield on their value ("Holdings'
 income yield").
 
 The by-month chart has a band per type and status. The six types keep
-their colours. The other lines band by their class (`INCOME_LINE_CLASSES`,
-held by a test to the statement's, `cashflow_txn_nodes`): salary and
+their colours. The other lines band by their class: `web_income`'s
+`income_class`, from gold's `income_line_class`, the statement's
+operating-in class (`cashflow_txn_nodes`). The cash flow projection
+keeps its other income by the same macro. The classes are salary and
 earnings, other yield, benefits, other receipts and uncategorized. The
 expected one is marked run-rate, in a lighter shade. A subtitle above
 the chart says so. The Rate path, Maturing and Shift do not move a
@@ -632,7 +730,7 @@ biggest month; what was received is a share of what was received. The
 holdings' income, and each position's, becomes a yield: per year, over
 the value it is earned on. A wage is no yield on a holding, so the
 twin's yield card reads the six types alone. A tile of the twin can
-show a card of another name than its base's (`TWIN_CARDS`). The
+show a card of another name than its base's. The
 withholding becomes the share it takes of the income it is set
 against, and the income after it the rest. A share
 or a yield of nothing reads 0. A position with no name reads
@@ -648,7 +746,8 @@ statement. It shows `wealthdb cashflow projection`
 ([wealthdb/docs/CASHFLOW.md](../wealthdb/docs/CASHFLOW.md) §12): the
 household's expected income against its expected outflows, month by
 month over the Horizon. It starts with the month after the current
-one. Two cards make it, both full width:
+one. Gold's `cashflow_projection` states each month's parts. Two cards
+make it, both full width:
 
 - *Cash flow projection by month*: stacked bars by month. What comes
   in sits above the axis: the investment income, the other income, the
@@ -683,7 +782,8 @@ Horizon expects none, the shares are blank. No amount reaches it.
 tiles. Its figures are shares, so the twin shows the card as it is.
 
 **Data Freshness** counts a source's age from its last read, not from
-its latest snapshot: gold's `source_observed` says
+its latest snapshot: `web_sources_observed` gives each source's
+`observed_at` from gold's `source_observed`, which says
 when a run last read each source, whether or not anything changed
 (wealthdb/docs/DESIGN.md §6.4). A portal that marks its holdings
 quarterly and was read today is current. The table shows the read,
@@ -693,6 +793,83 @@ quiet: read with nothing new. The mark is `valued_at` (migration
 snapshot at the read while the marks keep their dates. Both sources
 models carry the read as `observed_at` and the mark as `valued_at`, so
 the privacy twin's table reads them too.
+
+**Private Markets** shows what each private holding took, what it gave
+back and what it is marked at, since its first call, as of the picked
+day (`wealthdb returns private -d`, wealthdb/docs/RETURNS-NOTES.md,
+"Private markets"). It reads `web_private`, over the
+`report_private_markets` table (§8), one row set per reporting currency
+and stored instant: every quarter end and the day of the refresh. A
+holding's gain there is what it distributed plus its NAV, less what it
+paid in. It has none where it has no NAV or no cost.
+
+- *Private holdings*: a table with one row per holding, then the total.
+  It shows the class, vehicle, status, paid in, commitment, unfunded,
+  distributed, NAV, the mark's date, DPI, TVPI and IRR. It also shows
+  the multiples the holding's capital account states, their day, and
+  the quality. A total over fewer holdings than the day's says
+  `filtered`.
+- *Multiples by holding*: one bar per holding, DPI stacked under what
+  is still marked per unit paid in, so the bar's height is its TVPI.
+  A bar is labelled by the holding's name and source. Where a source
+  holds two of one name, such as one fund in two portfolios, a number
+  by their accounts tells them apart. The Holding picker reads the name,
+  so it leaves out every holding of that name.
+- *Gain against multiple*: one dot per holding, its gain against its
+  TVPI, sized by what it paid in. Each status has a colour: held,
+  partially exited and exited. The TVPI axis is logarithmic, so one
+  holding at many times its cost leaves the others readable. A TVPI of 0
+  has no place on it, so a holding written off is left out. It shows the
+  power law with the money: a high multiple on a small ticket weighs
+  little.
+- *By vintage year*: per year of the first call, what came back and
+  what is still marked as stacked bars, and what was paid in as a line.
+  The tooltip shows the vintage's TVPI and its number of holdings.
+- *Cash flows to date*: the capital called, the capital distributed and
+  their net, added up quarter by quarter, up to the picked day. The net
+  is the J-curve: it dips while the calls come in and climbs as money
+  comes back. It reads `web_private_flows`, over the
+  `serving_private_flows` table (§8): the legs the total counts, per
+  holding and quarter, at the latest snapshot. The exits in kind that
+  name no holding count while the pickers keep every holding, as the
+  total counts them. The last quarter's figures are the total's paid in
+  and distributed, but for the cents each row rounds.
+- *Commitments*: one bar per holding with a stated commitment and an
+  unfunded, stated or derived from what it paid in. The part called is stacked under the part still unfunded,
+  so the bar's height is the commitment. The bars run by first call,
+  and a vintage year's holdings stand together:
+  - The axis names the year once, under its first bar.
+  - An empty slot parts one year from the next.
+  - The tooltip names the year and the holding. A holding's name is too
+    long for the axis.
+  - Metabase draws no grouped axis, so every other bar and each slot is
+    a category of its own, named by zero-width spaces.
+
+  The *Fully funded* picker sits on the chart's tile. It offers Hide
+  and Show, and Hide is the default. Hide leaves out the holdings with
+  nothing unfunded, such as an SPV paid in whole. Show draws them. The
+  years and the slots follow the bars that remain.
+
+A chart's figure for many holdings adds their money and pools their
+multiples. No chart defines its own paid in or distributed. An exit in
+kind that names no holding belongs to no holding and no vintage. Only
+the total row and the cash flows count it.
+
+The twin's table keeps the multiples, the IRR, the stated multiples and
+the marks' dates and drops the money and the account, as the Returns
+twin drops its money columns. It shows the unfunded as a share of the
+commitment. On the total, the share counts only the commitments that
+state an unfunded. A holding's name stays. The multiples chart holds
+multiples only, so the twin shows it as it is. The other twin charts
+show each sum of money as a share of a total:
+
+- the cash flows: of all the capital called;
+- the commitments: of the commitments the chart draws, so under Hide
+  the fully funded ones are not in the total;
+- every other chart: of the total paid in.
+
+A multiple and a count show as they are, and a holding's source stands
+in for its account.
 
 The **Wealth Overview** charts net worth over time stacked by source.
 Below it, it charts the asset classes over time: each day's classes as
@@ -725,10 +902,9 @@ Each borrowed figure is the card its own dashboard shows. Four are
 built for the overview alone, from their dashboard's data: the asset
 classes over time (Allocation), the two returns year to date (Returns)
 and the projected net cash flow (Cash Flow). The overview's pickers
-land on a figure by slug: a picker reaches the card where the card has
-a template tag of that name, or, for an MBQL card, where its home
-dashboard maps a picker of that slug. Any other tag of the card runs
-at its default. So the flows take the currency, the time range and the
+land on a figure by slug. A native card takes a picker where it has a
+template tag of that name, as on every dashboard. Any other tag
+of the card runs at its default. So the flows take the currency, the time range and the
 source, the income the tax wrapper too, the gains the tax wrapper and
 the asset class too, and the returns and the projection the currency
 alone. As on every dashboard, a tile's description ends with the
@@ -781,9 +957,71 @@ A stale snapshot is caught before any of this is written. Provisioning
 probes the driver for the snapshot's schema version and for the serving
 views **by name**. It aborts with a "run `wealthdb web refresh`" message
 rather than converging the cards to a degraded shape. The version check
-holds the snapshot to `MIN_GOLD_SCHEMA`. A snapshot older than one of
-these schema versions falls short of the cards:
+holds the snapshot to `MIN_GOLD_SCHEMA`. That guard follows the newest
+derived version, so a version the list below leaves out changes nothing
+a card reads. A snapshot older than one of these schema versions falls
+short of the cards:
 
+- 0227: its private-markets rows read no `at_cost` on an AngelList
+  deal that states no valuation basis and is worth exactly its book
+  value;
+- 0226: its private-markets rows derive an unfunded from paid in at
+  each call's own rate, so a holding in another currency can read a
+  remainder it does not owe;
+- 0225: its exposure reports sum in the order the rows arrive, so a
+  last digit can differ from one run to the next;
+- 0224: its private-markets rows read no unfunded where a capital
+  account states a commitment and no call, so the Commitments chart
+  leaves such a holding out;
+- 0223: its private-markets rows carry no commitment, unfunded or
+  stated multiples, which the Private holdings and Commitments cards
+  read;
+- 0221: its private-markets rows hold one instant, list only the
+  holdings a contribution names and carry no class, vehicle or status,
+  and it lacks `web_private_calendar`, so the Private Markets pickers
+  reach nothing; its private cash flows carry no holding;
+- 0219: its private-markets rows count no exit in kind that names its
+  holding in the ledger's `holding` column, and their total counts no
+  exit that names none, so the Private Markets cards read such an SPV
+  as paying nothing back; and it lacks `web_private`'s `gain` and
+  `web_private_flows`, which the Private Markets charts read;
+- 0218: its private-markets rows do not say which NAV a source carries
+  at cost, which the Private holdings cards show in their quality;
+- 0217: its exposure quality texts sum in the order the rows arrive,
+  so a share on a rounding boundary can print one point apart;
+- 0216: it lacks `web_private` over `report_private_markets`, which the
+  Private Markets cards read;
+- 0213: it lacks `web_spending_vs_year` and `change_pct`, which the
+  Spending tiles against last year read, and its matcher pool reads a
+  coin's dust as zero, so the dust stays out of the transfer pairs the
+  flows read;
+- 0212: its key endings ignore the snapshot coverage a source states,
+  so an account a covering run leaves out stands past its end;
+- 0209: its `fee_rate_pct` takes no day count, which the Fee rate by
+  portfolio cards pass, and it lacks `reporting_pick` and the
+  `exposure_place_bucket`, `exposure_size_bucket` and size order the
+  exposure views use;
+- 0208: it lacks the Income window's arms (`income_expected` and the
+  others) and `cashflow_projection`, which the Income and Cash Flow
+  cards read;
+- 0207: its `fx_daily` can pick a reciprocal over a rate stored at the
+  same time, or one source over another of the same priority, by plan;
+- 0206: its exposure views sum in the order the rows arrive, so two
+  refreshes of one gold can differ in the last bits;
+- 0205: it lacks `web_sources_observed`, `web_income`'s class and
+  projected types, `web_yield`'s `is_cash` and `rate_sensitive`,
+  `web_exposure_debt`'s `grade` and `bucket_order`, and the yield and
+  fee macros the cards call;
+- 0204: it lacks `exposure_class_share` and `exposure_bucket_order`,
+  which the debt cards call;
+- 0203: its flow, income, fee, holdings, exposure and yield views
+  predate the vocabulary's roles (`spend_categories` columns,
+  `account_kinds`), the far side in `transfer_links`, the debt predicate
+  and the currency conversion macros they read;
+- 0191: its exposure and yield views read a fund line's coupon kind
+  from a list in the macro body, not from the label table;
+- 0187: its gains, exposure, income and yield views predate the
+  `account_wrapper` and `account_style` macros their bodies call;
 - 0179: its `web_fees` counts a portfolio's mortgages and cards in
   the value the fee rate divides by;
 - 0177: it lacks `web_bridge`, `web_fees` and `web_marks`, which the
@@ -812,8 +1050,9 @@ these schema versions falls short of the cards:
   the tax withheld on them;
 - 0138: it lacks the yield views and the exposure of the debt.
 
-The by-name probe finds each of these. An older one also reads wrong in
-ways no probe by name sees:
+The version check catches each of these. The by-name probe catches only
+the entries that lack a view. An older snapshot also reads wrong in ways
+no probe by name sees:
 
 - before 0132, it lacks the serving tables the models read and the tax
   wrapper and asset class columns the tiles filter on;
@@ -822,6 +1061,9 @@ ways no probe by name sees:
 
 On such a snapshot `provision.py` exits 3, where any other failure exits
 1. `web start`, `web restart` and `web refresh` then exit 3 as well.
+An admin login that fails after setup exits 4. Provisioning then
+changed nothing, so start and refresh take it as no failure, one that
+confirms no snapshot.
 They name `wealthdb web refresh` instead of the browser wizard and leave
 Metabase running with the cards it had. A Metabase listing that fails
 aborts the run too. Read as empty, it would create a second collection,
@@ -903,10 +1145,16 @@ Four settings work together, each load-bearing:
   per pooled connection, and DuckDB refuses to re-`SET` a used
   `temp_directory` — the second connection then poisons every query
   after it.
-- **A writable spill mount** — the driver hard-wires DuckDB's
+- **A writable spill mount** — the driver sets DuckDB's
   `temp_directory` to `<database_file>.tmp`, which sits on the read-only
-  snapshot mount. `web/web` mounts a host directory at exactly that path
-  so memory-capped queries spill to disk instead of failing.
+  snapshot mount. So `web/web` mounts a host directory at `/spill`, and
+  `provision.py` names `/spill/<serving name>.tmp` in the connection's
+  additional options, which the driver applies after its own path.
+  Memory-capped queries then spill to disk instead of failing. Each
+  file spills in a directory of its own. A DuckDB that closes deletes
+  the spill files in its directory, and during a swap the new file's
+  DuckDB may spill already. A killed DuckDB leaves its files, and
+  `web start` removes them before the server comes up.
 - **Container caps** (`--memory 8g`, `-Xmx2g`, `MALLOC_ARENA_MAX=2`) —
   the backstop: a runaway kills only this container, never the VM; the
   heap cannot auto-size against the container cap; glibc does not hoard
@@ -935,8 +1183,9 @@ inception overrides and exclusions, the transfer-netting heuristic,
 synthetic onboarding. A SQL re-implementation would be a second returns
 engine that drifts. So the existing engine computes and the result is
 **materialized** into `report_returns` (migration 0026). It,
-`report_bridge`, `report_gains`, the `report_exposure` tables, the
-`report_yield` tables and the serving tables (below) are gold's
+`report_bridge`, `report_private_markets`, `report_gains`, the
+`report_exposure` tables, the `report_yield` tables and the serving
+tables (below) are gold's
 *derived* tables;
 everything else is loader-written source of truth or computed on read.
 
@@ -957,6 +1206,13 @@ stay CLI-only.
 the rows of `wealthdb returns bridge --period monthly -x <CCY>`, off the
 same datasets and in the same transaction. Its money has two decimals,
 so a window's months sum in SQL to the CLI's bucket.
+
+`report_private_markets` (migrations 0215 and 0220) holds the rows of
+`wealthdb returns private -d <DAY> -x <CCY>` in each reporting currency,
+the total included, at every quarter end since the first call and at
+the end of the refresh's day, in the same transaction. Its IRR is the
+engine's solver, so a macro cannot hold it; a Go test holds the table to
+the CLI's rows.
 
 The 64 partitions are cheap because the loaded data depends only on the
 currency, never the grain or period: `RunReturns` is split into a load
@@ -982,8 +1238,8 @@ currency and year in the data's span, a *since-that-year* total summary
 Jan 1 Y` (the verbatim equivalent of `wealthdb returns <grain>
 <Y>-01-01 - -x <CCY>`). Only the since-X summary depends on the window,
 so windowed rows are `is_summary` totals only; the per-period buckets
-exist once at `window_from_year = 0`. The picker (`window_from_year` on
-the MBQL scalars/table) then rescopes the whole figure exactly, so a
+exist once at `window_from_year = 0`. The picker (`{{start_year}}` on
+the scalars and the table) then rescopes the whole figure exactly, so a
 later start makes the null a real number.
 
 The dashboard reads this as: rescopable **scalars** (TWR / MWR /
@@ -1009,8 +1265,19 @@ sources, even turning a gain into a spurious loss. The windowed TWRs
 use the engine's snapshot-aligned chain, so the chart is correct and is
 built from the same figures the scalars and table show — at the cost
 of annual granularity (a finer curve would need per-month windows).
-The last point is the start of the current year, so the stretch from
-then to today is not drawn.
+Each line ends on its windows' last day with `TWR_since_Y0` itself, the
+figure the Return tile shows, so the stretch since the current year
+began is drawn too.
+
+The scalars follow the Source picker as far as the stored rows reach.
+With nothing picked they read the global grain; with one source picked,
+that source's row. Returns are kept per source and for the whole
+portfolio only, so several picked sources read no figure. The benchmark
+tables are kept for the whole household alone. So the figures and lines
+that set the benchmark against the household (Benchmark return (MWR),
+the three Excess tiles, the money-weighted and value charts) read no row
+while a source is picked, and hide. The benchmark's own return and
+annualized return stay, as no source changes them.
 
 **Gains** are materialized too, into `report_gains` (migration 0117),
 for a different reason. The gains figures are SQL (`gains_windows`), so
@@ -1118,7 +1385,9 @@ rows verbatim, for the reason §7 gives. They are:
   position;
 - every transaction line: all of them, and the spending, income and
   cash flow lines;
-- each month end's marked share (`serving_marks`).
+- each month end's marked share (`serving_marks`);
+- the private holdings' cash flows per holding and quarter
+  (`serving_private_flows`).
 
 Each table is one macro's output. `web-materialize` rewrites them all
 in one transaction, so a reader sees all old or all new. A Go test
@@ -1183,6 +1452,9 @@ legend entry on Exposure's bars:
   value when the query is bound. This holds only for a card with one
   number: a chart whose saved breakout column is gone plots every number
   a run returns.
+- A tooltip column is set by its Metabase column key,
+  `["name","<column>"]` (`sqlkit.tooltip_viz`): a plain name matches
+  no column, and the tooltip then shows nothing more.
 - Exposure's bars carry a value for the tooltip, so they keep the
   `series` column under None, with `Portfolio` alone in it. Metabase
   colours a bar with no breakout by its metric's column. `series_settings`
@@ -1193,14 +1465,26 @@ legend entry on Exposure's bars:
   the Exposure class and currency cards are bars whatever is picked.
 - Yield's yield and duration charts add the benchmark as one more
   line: a column on the household's axis, in the card's own colours.
-  YIELD.md, "Benchmarks", says what it reads.
+  [YIELD.md §12](../wealthdb/docs/YIELD.md#12-benchmarks) says what it
+  reads.
 - A table's or a Yield line chart's benchmark columns go the same way
   (`_columns_with_benchmark`).
   `table.columns` names them, as a table otherwise shows only a saved
   question's columns.
-- A tile that exists only beside a benchmark (`BENCHMARK_CARDS`) reads no
+- A tile that exists only beside a benchmark (`hide_empty`) reads no
   row under None and hides (`card.hide_empty`). Metabase closes the gap
   a hidden tile leaves, so such a tile can sit anywhere on the grid.
+
+Exposure and Allocation show the benchmark's look-through
+([EXPOSURE.md §14](../wealthdb/docs/EXPOSURE.md#14-benchmarks)) this way:
+
+| Card | Benchmark |
+| --- | --- |
+| Allocation by asset class | a bar per class, the same total in the mix |
+| Allocation by currency | a bar per currency, by the currency its funds are priced in |
+| By asset class, sector, region, currency, size, rating, maturity | a second bar per bucket, on the same card |
+| By country | unchanged; a table of the twenty largest deviations |
+| Top securities, Top 100 issuers | `benchmark_pct` and `difference_pct` columns |
 
 A field filter binds one table's column, so the benchmark tables read
 the picked currency through it: `currency IN (SELECT currency FROM
@@ -1217,13 +1501,16 @@ A window past the benchmark's last month has no figure.
 The twins show returns and weights as they are. The value chart indexes
 both sides to 100 at the window's start. Allocation's base bars read
 the household's total held in the benchmark's mix, so both bars read in
-the picked currency, and the twin sets share beside share.
+the picked currency, and the twin sets share beside share. A benchmark
+is a whole allocation, so its bars stand only beside a whole one: none
+while the Asset class picker holds a value, and none when the total in
+view is not above zero, which no mix can be scaled to.
 
 The Cumulative return line starts on the first year the benchmark covers
 whole, at the `(all sources)` line's level that year.
 
-Wealth Overview, Spending, Income, Cash Flow, Gains and Data Freshness
-have no benchmark.
+Wealth Overview, Spending, Income, Cash Flow, Gains, Data Freshness and
+Private Markets have no benchmark.
 
 ## Testing
 
@@ -1235,14 +1522,18 @@ failed generation, and — against a stubbed engine — the `_materialize`
 invocation, the engine's own error line and status repeated on a
 failure, `web_refresh`'s materialize-then-snapshot ordering and the
 steps' timing lines. It checks the refresh skips too: an unchanged
-gold is not copied, a container that does not serve the
-snapshot's inode is restarted, and a failed copy keeps the old
-snapshot. Against a stubbed `provision.py`, it checks that a stale
+gold is not copied, and a failed copy keeps the old snapshot. A
+running container that does not serve the snapshot's serving name
+takes up the new one when provisioning confirms it, and is recreated
+when it does not, or kept when the name cannot be linked. Start links
+the serving names to the current snapshot and clears killed spill
+directories.
+Against a stubbed `provision.py`, it checks that a stale
 snapshot fails `web start` and `web refresh` without the browser hint.
 It then runs [`test_provision.py`](test_provision.py), which asserts
-everything `provision.py` builds *before* it talks to the API — the
-definitions are pure functions of module constants, so the filter
-registry, the model SQL, the card and dashboard defs, the parameter ids
+everything provisioning builds *before* it talks to the API. The
+definitions are pure functions of their declarations, so the filter
+columns, the model SQL, the card and dashboard defs, the parameter ids
 and the picker → template-tag wiring all check statically. Against a
 fake API it checks that an unchanged card or dashboard is not sent
 again and that a changed one is. Three behaviours are worth naming:
@@ -1255,8 +1546,9 @@ again and that a changed one is. Three behaviours are worth naming:
   aborts the run (exit 3 for the older one).
 
 The SQL of many cards also runs on an invented book under DuckDB: the
-projections, the bridge, the cash flow statement, the fee tiles and the
-Exposure and Allocation cards among them. So the tests need the
+projections, the bridge, the cash flow statement, the fee tiles, the
+tiles against last year and the Exposure and Allocation cards among
+them. So the tests need the
 `duckdb` Python module, and fail without it. `make
 test-web` runs them in a venv of its own, `web/.venv`, that holds it
 (`web/requirements-test.txt`). Whether Metabase *accepts* a payload

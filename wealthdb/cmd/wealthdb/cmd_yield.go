@@ -3,16 +3,12 @@ package main
 import (
 	"context"
 	"database/sql"
-	"flag"
-	"fmt"
-	"io"
-	"slices"
 	"strings"
 	"time"
 
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/config"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/errs"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/gold"
-	"github.com/smartpointer-com/wealthdb/wealthdb/internal/output"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/yield"
 )
 
@@ -28,79 +24,81 @@ import (
 // the aggregate views to one row per entity in the output currency. -f
 // ndjson is coverage's alone: the ledger's records still to write.
 func init() {
-	register("yield", cmdYield)
+	// The usage lists the family's columns, so it joins the family here.
+	yieldFamily.usage = yieldUsage
+	register("yield", routeReport(yieldFamily))
 }
 
-// yieldViews are the views: the grains coarse to fine, the lists, then
-// the rate sensitivity and the diagnostics.
-var yieldViews = []string{"global", "sources", "portfolios", "accounts", "positions", "securities", "funds", "cash",
-	"curve", "coverage"}
+// yieldFamily are the views: the grains coarse to fine, the lists, then
+// the rate sensitivity and the diagnostics. The aggregate views take
+// --converted and, with curve, --period.
+var yieldFamily = &family{
+	name: "yield",
+	views: []view{
+		yieldAggregateView("global", yield.GrainAll),
+		yieldAggregateView("sources", yield.GrainSources),
+		yieldAggregateView("portfolios", yield.GrainPortfolios),
+		yieldAggregateView("accounts", yield.GrainAccounts),
+		{name: "positions", total: balanceTotal, principal: fixedColumn("value"),
+			build: func(_ *config.Config, req request) *report {
+				kindOf, loadKinds := sourceKinds()
+				return withLoads(bookView(req, buildYieldPositionColumns(req.currency, kindOf), defaultYieldPositionColumns,
+					func(_ context.Context, _ *sql.DB, b *yield.Book) ([]yield.Position, error) {
+						return b.Positions, nil
+					}), loadKinds)
+			}},
+		{name: "securities", total: balanceTotal, principal: fixedColumn("value"), build: yieldSecuritiesReport},
+		{name: "funds", total: balanceTotal, principal: fixedColumn("value"), build: yieldFundsReport},
+		{name: "cash", total: balanceTotal, principal: fixedColumn("value"), build: yieldCashReport},
+		{name: "curve", series: true, principal: fixedColumn("dv01"), build: yieldCurveReport},
+		{name: "coverage", principal: fixedColumn("value"), build: yieldCoverageReport},
+	},
+	options: []option{
+		{name: "as_of", cli: []string{"d", "as-of"}},
+		{name: "period", cli: []string{"period"}},
+		{name: "converted", cli: []string{"converted"}, kind: optFlag},
+	},
+	window:    asOfDate,
+	currency:  true,
+	narrow:    "a coarser view",
+	skeletons: writeYieldSkeletons,
+	settle: func(fam *family, in optionSource, req *request, notes *[]string) error {
+		req.converted = in.on("converted")
+		if !fam.view(req.view).takesOption("converted") && req.converted {
+			return errConverted(fam, in.spell("converted"))
+		}
+		return in.series("yield", fam.seriesViews(), req, notes)
+	},
+	header: func(req request) []string {
+		if req.converted {
+			return []string{"converted"}
+		}
+		return nil
+	},
+}
 
-// yieldGrains maps the aggregate views to their grain.
-var yieldGrains = map[string]yield.Grain{"global": yield.GrainAll, "sources": yield.GrainSources,
-	"portfolios": yield.GrainPortfolios, "accounts": yield.GrainAccounts}
-
-// yieldSeriesViews are the views --period takes.
-var yieldSeriesViews = []string{"global", "sources", "portfolios", "accounts", "curve"}
-
-// yieldAggregateViews are the aggregate views, in yieldViews' order:
-// --converted's.
-var yieldAggregateViews = slices.DeleteFunc(slices.Clone(yieldViews), func(v string) bool {
-	_, ok := yieldGrains[v]
-	return !ok
-})
+// yieldAggregateView is an aggregate view at its grain: a series takes
+// it, and so does --converted. It carries a total row of its own.
+func yieldAggregateView(name string, grain yield.Grain) view {
+	return view{name: name, series: true, takes: []string{"converted"}, principal: fixedColumn("value"),
+		build: func(_ *config.Config, req request) *report {
+			ccy := req.currency
+			kindOf, loadKinds := sourceKinds()
+			return withLoads(seriesView(req, buildYieldRowColumns(ccy, grain, kindOf), yieldRowDefaults[grain],
+				func(ctx context.Context, db *sql.DB, at int64) ([]yield.Row, error) {
+					b, err := yieldBook(ctx, db, at, ccy)
+					if err != nil {
+						return nil, err
+					}
+					return b.Aggregate(grain, req.converted), nil
+				}), loadKinds)
+		}}
+}
 
 // errConverted refuses converted, by the name its front-end gives it,
-// off the aggregate views.
-func errConverted(name string) error {
-	return errs.Newf(errs.ExitUsage, "yield: %s belongs to the %s views", name, andList(yieldAggregateViews))
-}
-
-func cmdYield(ctx context.Context, g globalFlags, subargs []string, _ io.Reader, stdout, stderr io.Writer) error {
-	view, rest, err := routeView("yield", subargs, yieldViews, yieldUsage, stderr)
-	if err != nil {
-		return err
-	}
-	fs := flag.NewFlagSet("wealthdb yield "+view, flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	asOf := registerAsOf(fs)
-	period := fs.String("period", "", strings.Join(seriesPeriods, " | ")+" — a series over a window")
-	converted := fs.Bool("converted", false, "one row per entity in the output currency, rates across currencies")
-	rf := registerReportFlags(fs, true)
-	fs.Usage = func() { fmt.Fprintln(stderr, yieldUsage()) }
-	if err := parseFlags(fs, rest, "yield"); err != nil {
-		return err
-	}
-	skeletons := *rf.format == skeletonFormat
-	if skeletons {
-		if err := checkSkeletonFlags("yield", fs, view, *period, *rf.privacy); err != nil {
-			return err
-		}
-		*rf.format = string(output.FormatTable)
-	}
-	if _, ok := yieldGrains[view]; !ok && *converted {
-		return errConverted("--converted")
-	}
-	now := g.clock()
-	series, err := parseSeries("yield", fs, view, *period, yieldSeriesViews, now)
-	if err != nil {
-		return err
-	}
-	asOfEpoch, err := parseAsOf(*asOf, now)
-	if err != nil {
-		return errs.Newf(errs.ExitUsage, "yield: %s", err.Error())
-	}
-	fmtChoice, cfg, outCcy, err := rf.resolve(g, "yield")
-	if err != nil {
-		return err
-	}
-	open := func() (*sql.DB, error) { return openGoldForRead(g, cfg) }
-	if skeletons {
-		return writeYieldSkeletons(ctx, open, asOfEpoch, outCcy, stdout)
-	}
-	req := request{view: view, currency: outCcy, asOf: asOfEpoch, series: series, converted: *converted}
-	rep := yieldReport(req)
-	return writeReport(ctx, rep, rf.output(fmtChoice, "yield", yieldFamily, req, cfg, now), open, stdout)
+// off the aggregate views of fam.
+func errConverted(fam *family, name string) error {
+	return errs.Newf(errs.ExitUsage, "yield: %s belongs to the %s views", name, andList(fam.taking("converted")))
 }
 
 // yieldBook computes the book of one instant.
@@ -110,31 +108,6 @@ func yieldBook(ctx context.Context, db *sql.DB, at int64, ccy string) (*yield.Bo
 		return nil, err
 	}
 	return yield.Compute(in), nil
-}
-
-// yieldReport is one view of the yield family, the runner the CLI and the
-// MCP server share.
-func yieldReport(req request) *report {
-	ccy := req.currency
-	if grain, ok := yieldGrains[req.view]; ok {
-		kindOf, loadKinds := sourceKinds()
-		return withLoads(seriesView(req, buildYieldRowColumns(ccy, grain, kindOf), yieldRowDefaults[grain],
-			func(ctx context.Context, db *sql.DB, at int64) ([]yield.Row, error) {
-				b, err := yieldBook(ctx, db, at, ccy)
-				if err != nil {
-					return nil, err
-				}
-				return b.Aggregate(grain, req.converted), nil
-			}), loadKinds)
-	}
-	if req.view == "positions" {
-		kindOf, loadKinds := sourceKinds()
-		return withLoads(bookView(req, buildYieldPositionColumns(ccy, kindOf), defaultYieldPositionColumns,
-			func(_ context.Context, _ *sql.DB, b *yield.Book) ([]yield.Position, error) {
-				return b.Positions, nil
-			}), loadKinds)
-	}
-	return yieldDetailReport(req)
 }
 
 // ---- column registries ---------------------------------------------------
@@ -196,12 +169,12 @@ func buildYieldRowColumns(outCcy string, grain yield.Grain, kindOf func(string) 
 	type col = columnSpec[row]
 	var ids []col
 	if grain != yield.GrainAll {
-		ids = append(ids, col{Name: "silver_source", Align: output.AlignLeft, Extract: func(r row) string {
+		ids = append(ids, strCol("silver_source", func(r row) string {
 			if r.Total {
 				return "total"
 			}
 			return r.Source
-		}})
+		}))
 	}
 	switch grain {
 	case yield.GrainPortfolios:
@@ -230,12 +203,12 @@ func buildYieldRowColumns(outCcy string, grain yield.Grain, kindOf func(string) 
 		ids = append(ids,
 			accountCol(kindOf, ref),
 			accountIDCol("account_id", kindOf, ref),
-			col{Name: "account_kind", Align: output.AlignLeft, Extract: func(r row) string { return r.Account.Kind }},
-			col{Name: "tax_wrapper", Align: output.AlignLeft, Extract: func(r row) string { return r.Account.TaxWrapper }},
+			strCol("account_kind", func(r row) string { return r.Account.Kind }),
+			strCol("tax_wrapper", func(r row) string { return r.Account.TaxWrapper }),
 			nicknameCol("account_nickname", func(r row) *string { return &r.Account.Nickname }))
 	}
 	ids = append(ids,
-		col{Name: "currency", Align: output.AlignLeft, Extract: func(r row) string {
+		strCol("currency", func(r row) string {
 			switch {
 			case r.Total && grain == yield.GrainAll:
 				return "total"
@@ -243,7 +216,7 @@ func buildYieldRowColumns(outCcy string, grain yield.Grain, kindOf func(string) 
 				return "(all)"
 			}
 			return r.Currency
-		}},
+		}),
 		floatValCol("value", outCcy, func(r row) float64 { return r.Value }))
 	ids = append(ids, yieldRateCols(outCcy, rowFigures)...)
 	return append(ids, qualityCol(func(r row) string { return r.Quality }))
@@ -275,7 +248,7 @@ func buildYieldPositionColumns(outCcy string, kindOf func(string) string) []colu
 	key, name := holdingCols(kindOf, func(r row) string { return r.Source },
 		func(r row) string { return r.PositionKey }, func(r row) string { return r.Name })
 	ids := []col{
-		{Name: "silver_source", Align: output.AlignLeft, Extract: func(r row) string { return r.Source }},
+		strCol("silver_source", func(r row) string { return r.Source }),
 		accountCol(kindOf, ref),
 		accountIDCol("account_id", kindOf, ref),
 		strCol("tax_wrapper", func(r row) string { return r.Account.TaxWrapper }),
@@ -348,26 +321,7 @@ var yieldQualityTags = []tagNote{
 }
 
 func yieldUsage() string {
-	cols := map[string]string{
-		"positions":  joinColumnNames(buildYieldPositionColumns("CCY", nil)),
-		"securities": joinColumnNames(buildYieldSecurityColumns("CCY", nil)),
-		"funds":      joinColumnNames(buildYieldFundColumns("CCY", nil)),
-		"cash":       joinColumnNames(buildYieldCashColumns("CCY", nil)),
-		"curve":      joinColumnNames(buildYieldCurveColumns("CCY")),
-		"coverage":   joinColumnNames(buildYieldCoverageColumns("CCY", nil)),
-	}
-	defaults := map[string][]string{"positions": defaultYieldPositionColumns,
-		"securities": defaultYieldSecurityColumns, "funds": defaultYieldFundColumns, "cash": defaultYieldCashColumns,
-		"curve": defaultYieldCurveColumns, "coverage": defaultYieldCoverageColumns}
-	for view, grain := range yieldGrains {
-		cols[view] = joinColumnNames(buildYieldRowColumns("CCY", grain, nil))
-		defaults[view] = yieldRowDefaults[grain]
-	}
-	var available, defaultSets strings.Builder
-	for _, v := range yieldViews {
-		fmt.Fprintf(&available, "\n  %-12s %s", v, cols[v])
-		fmt.Fprintf(&defaultSets, "\n  %-12s %s", v, strings.Join(defaults[v], ", "))
-	}
+	available, defaultSets := columnSets(yieldFamily, 12, yieldFamily.names(), request{currency: "CCY"}, nil)
 	return `usage: wealthdb yield <view> [-d DATE] [--converted] [-f FORMAT] [-C COLS] [-F COND]... [-x CCY] [-p]
        wealthdb yield <view> --period ` + strings.Join(seriesPeriods, "|") + ` [FROM [TO]]
 
@@ -393,9 +347,9 @@ Flags
   -d, --as-of DATE   the day (default today UTC)
   --period P         ` + flagDescription(strings.Join(seriesPeriods, " | ")+": the view at the end of every period "+
 		"of the window FROM..TO (default the last twelve months; never past today), a period column first; on "+
-		andList(yieldSeriesViews)) + `
+		andList(yieldFamily.seriesViews())) + `
   --converted        ` + flagDescription("one row per entity in the output currency, every rate across "+
-		"currencies; on "+andList(yieldAggregateViews)) + `
+		"currencies; on "+andList(yieldFamily.taking("converted"))) + `
   -f FORMAT          table | csv | csv_plain | json; on coverage also
                      ndjson: the ledger's records still to write
   -C COLS            comma-separated names, 'default', 'all', or a
@@ -429,7 +383,7 @@ Notes
   dropped counts those the record window drops. A US common stock reads
   the lag unless its filings tag the dates.
 
-Available columns (per view):` + available.String() + `
+Available columns (per view):` + available + `
 
-Default column sets:` + defaultSets.String()
+Default column sets:` + defaultSets
 }

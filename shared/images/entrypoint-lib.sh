@@ -1,18 +1,31 @@
 # shellcheck shell=bash
-# Shared browser bootstrap for the containerised collector entrypoints.
+# Shared dispatch and browser bootstrap for the containerised collector
+# entrypoints.
 #
-# Baked into wealthdb/base-playwright at /opt/entrypoint-lib.sh — and so
-# inherited by base-camoufox above it — and SOURCED (not executed) from
-# each collector's /app/entrypoint.sh, so every browser collector shares
-# one copy of the Xvfb + x11vnc + browser-cache setup instead of pasting
-# it into each entrypoint. The caller runs under `set -euo pipefail`;
-# keep this file source-safe.
+# Baked into every base image at /opt/entrypoint-lib.sh and SOURCED (not
+# executed) from each collector's /app/entrypoint.sh, so every collector
+# shares one copy of the verb dispatch and the Xvfb + x11vnc +
+# browser-cache setup. An entrypoint is then one line per verb:
+#
+#   verb="${1:-help}"; [[ $# -gt 0 ]] && shift
+#   case "$verb" in
+#       download)      run xvfb login.py --cli-mfa --bronze-dir /data -- "$@" ;;
+#       load)          run plain load.py --bronze-dir /data -- "$@" ;;
+#       prune|sh|bash) entrypoint_common "$verb" "$@" ;;
+#       help|--help|-h) cat <<'EOF' ... EOF ;;
+#       *)             exec "$verb" "$@" ;;
+#   esac
+#
+# The pass-through stays in each entrypoint, so bash names that file
+# when the command is not found. The caller runs under
+# `set -euo pipefail`; keep this file source-safe.
 
 VFB_DISPLAY=99
 
-# Symlink the pre-staged camoufox cache (fetched at image build time by
-# fetch-camoufox.py and copied to /opt) into the runtime user's
-# $HOME/.cache/camoufox so camoufox skips its first-run download. HOME is
+# Symlink the pre-staged camoufox cache (staged in /opt at image build
+# time, see base-camoufox.Dockerfile) into the runtime user's
+# $HOME/.cache/camoufox so camoufox skips its first-run download. An
+# image built without the browser has no cache to link. HOME is
 # /tmp inside the container (set by the wrapper for the non-root user). The
 # symlink is always replaced, so a stale /tmp/.cache/camoufox from a
 # previous container with a different runtime uid doesn't shadow it.
@@ -86,4 +99,71 @@ start_x11vnc() {
     echo "$label:   ssh -L ${host_port}:127.0.0.1:${host_port} <host>" >&2
     echo "$label: then on the laptop:" >&2
     echo "$label:   open vnc://localhost:${host_port}" >&2
+}
+
+# run DISPLAY SCRIPT [FIXED...] -- [ARGS...] — exec /app/SCRIPT with the
+# FIXED flags, then ARGS. DISPLAY names what the verb needs first:
+#   plain        nothing
+#   xvfb         the virtual display (start_xvfb)
+#   vnc:LABEL    the virtual display, served over VNC (start_x11vnc LABEL)
+# A display verb asked for help execs SCRIPT with ARGS alone and starts
+# nothing (exec_if_help).
+run() {
+    local display="$1" script="$2"
+    shift 2
+    local -a fixed=()
+    while [[ "$1" != -- ]]; do
+        fixed+=("$1")
+        shift
+    done
+    shift
+    case "$display" in
+        plain) ;;
+        xvfb)
+            exec_if_help "$script" "$@"
+            start_xvfb
+            ;;
+        vnc:*)
+            exec_if_help "$script" "$@"
+            start_xvfb
+            start_x11vnc "${display#vnc:}"
+            ;;
+        *)
+            echo "entrypoint: unknown display '$display'" >&2
+            exit 2
+            ;;
+    esac
+    exec python3 "/app/$script" ${fixed[@]+"${fixed[@]}"} "$@"
+}
+
+# login_folds DISPLAY SCRIPT -- [ARGS...] — the session probe in the
+# `login` of a collector whose sign-in folds into `download`. A help flag
+# among ARGS execs SCRIPT, and so does `--check`, after starting DISPLAY
+# (as `run` does). Returns otherwise, and the caller prints its notice.
+# The notice is never this call's stdin, so SCRIPT reads the
+# entrypoint's own.
+login_folds() {
+    local display="$1" script="$2"
+    shift 3
+    exec_if_help "$script" "$@"
+    local a
+    for a in "$@"; do
+        if [[ "$a" == --check ]]; then
+            run "$display" "$script" -- "$@"
+        fi
+    done
+}
+
+# entrypoint_common VERB [ARGS...] — the verbs every image answers
+# alike: `prune`, the bronze reclaim (usually run host-side by the
+# wrapper), and `sh` / `bash`, an interactive shell.
+entrypoint_common() {
+    local verb="$1"
+    shift
+    case "$verb" in
+        prune)   exec python3 /app/prune.py "$@" ;;
+        sh|bash) exec /bin/bash "$@" ;;
+    esac
+    echo "entrypoint: '$verb' is not a common verb" >&2
+    exit 2
 }

@@ -1,4 +1,5 @@
-"""Tests for pdf_parsers.
+"""Tests for the document readers (pdf_parsers.py and the reader
+modules beside it).
 
 Tests work at the regex / text-assembly layer using synthetic
 labels and synthetic pre-extracted text fixtures, so they don't
@@ -10,20 +11,23 @@ from __future__ import annotations
 import json
 
 import pytest
+from collectorkit.words import Extracted, Page, Word, params_key
 
-from pdf_parsers import (
+import account_statement
+import pdf_parsers
+import soa_positions
+from account_statement import (
     _stmt_security,
-    _advice_trx_no,
-    _stmt_is_internal_transfer,
     _stmt_split_multi,
     parse_account_statement_text,
-    parse_account_statement_transactions_pages,
-    parse_capital_call_text,
-    parse_contract_note_text,
+)
+from maturity_notice import parse_maturity_notice_text
+from pdf_common import iban_in
+from payment_advice import _advice_trx_no, parse_payment_advice_text
+from quarterly_report import parse_quarterly_report_text
+from securities_advice import parse_capital_call_text, parse_contract_note_text
+from soa_positions import (
     parse_label_statement_of_assets,
-    parse_maturity_notice_text,
-    parse_payment_advice_text,
-    parse_quarterly_report_text,
     parse_statement_of_assets_text,
     statement_of_assets_body_meta,
 )
@@ -35,15 +39,26 @@ from pdf_parsers import (
 #
 # The movement parser is WORD-based: it disambiguates the Debits vs
 # Credits column purely from x-position, so a text fixture isn't
-# enough — we build a fake pdfplumber document whose pages return
-# synthetic `extract_words()` output at the SAME column geometry the
-# real UBS statements use (Debits right-edge ~329, Credits ~414,
-# Value date x0 ~432, Balance right-edge ~553). All amounts / dates /
-# the IBAN are synthetic placeholders per AGENTS.md §4.
+# enough. The fixture is an extracted document whose pages carry
+# synthetic words at the SAME column geometry the real UBS statements
+# use (Debits right-edge ~329, Credits ~414, Value date x0 ~432,
+# Balance right-edge ~553). All amounts / dates / the IBAN are
+# synthetic placeholders per AGENTS.md §4.
 
 # Synthetic IBAN (all-zero placeholder, valid CH-IBAN shape).
 _SYN_IBAN = "CH00 0000 0000 0000 0000 1"
 _SYN_COUNTER_IBAN = "CH00 0000 0000 0000 0000 2"
+
+
+@pytest.mark.parametrize(("text", "iban"), [
+    (f"IBAN {_SYN_IBAN}", "CH0000000000000000001"),
+    ("Herr Example IBAN CH0000000000000000002 more", "CH0000000000000000002"),
+    (f"{_SYN_IBAN} then {_SYN_COUNTER_IBAN}", "CH0000000000000000001"),
+    ("no account here", None),
+])
+def test_an_iban_is_read_without_its_spaces(text, iban):
+    assert iban_in(text) == iban
+
 
 # Ledger column anchor bands (x0, x1) mirroring the real layout.
 _BAND = {
@@ -55,16 +70,16 @@ _BAND = {
 _HEADER_TOP = 100.0
 
 
-def _w(text: str, x0: float, x1: float, top: float) -> dict:
-    return {"text": text, "x0": x0, "x1": x1, "top": top}
+def _w(text: str, x0: float, x1: float, top: float) -> Word:
+    return Word(text, x0, x1, top, top + 8.0)
 
 
-def _band_word(text: str, band: str, top: float) -> dict:
+def _band_word(text: str, band: str, top: float) -> Word:
     x0, x1 = _BAND[band]
     return _w(text, x0, x1, top)
 
 
-def _header_row(top: float = _HEADER_TOP) -> list[dict]:
+def _header_row(top: float = _HEADER_TOP) -> list[Word]:
     return [
         _w("Date", 42, 62, top), _w("Information", 85, 135, top),
         _w("Debits", 302, 329, top), _w("Credits", 384, 414, top),
@@ -73,7 +88,7 @@ def _header_row(top: float = _HEADER_TOP) -> list[dict]:
     ]
 
 
-def _info_words(info: str, top: float) -> list[dict]:
+def _info_words(info: str, top: float) -> list[Word]:
     ws, x = [], 85.0
     for tok in info.split():
         wdt = len(tok) * 6
@@ -82,28 +97,27 @@ def _info_words(info: str, top: float) -> list[dict]:
     return ws
 
 
-class _FakePage:
-    def __init__(self, words: list[dict], text: str):
-        self._words = words
-        self._text = text
-
-    def extract_words(self, **_kw) -> list[dict]:
-        return list(self._words)
-
-    def extract_text(self, **_kw) -> str:
-        return self._text
+# The word sets the extraction reads (pdf_parsers.EXTRACTOR): the
+# transaction list's and the ledger's. A test page carries its words in
+# both.
+_WORD_SETS = tuple(params_key(params) for params
+                   in pdf_parsers.EXTRACTOR.keywords["word_params"])
 
 
-class _FakePDF:
-    def __init__(self, pages: list[_FakePage]):
-        self.pages = pages
+def _page(words: list[Word], text: str) -> Page:
+    words = tuple(words)
+    return Page(text, tuple((key, words) for key in _WORD_SETS))
+
+
+def _doc(*pages: Page) -> Extracted:
+    return Extracted("pdfplumber", pages)
 
 
 # Page-header text used only for IBAN + currency detection.
 _PAGE_TEXT = f"UBS personal account CHF\nIBAN {_SYN_IBAN}\n"
 
 
-def _build_statement_pdf() -> _FakePDF:
+def _build_statement_pdf() -> Extracted:
     """A synthetic 2-page CHF statement exercising: credit deposit
     (+ counterparty + counter-IBAN continuation), a debit
     e-banking order, a space-separated debit that drives the balance
@@ -146,12 +160,12 @@ def _build_statement_pdf() -> _FakePDF:
            _w("02.11.21", 432, 468, 220),
            _band_word("4983.95", "bal", 220)]
 
-    return _FakePDF([_FakePage(p1, _PAGE_TEXT), _FakePage(p2, _PAGE_TEXT)])
+    return _doc(_page(p1, _PAGE_TEXT), _page(p2, _PAGE_TEXT))
 
 
 class TestAccountStatementTransactions:
     def _rows(self):
-        return parse_account_statement_transactions_pages(
+        return account_statement.movements(
             _build_statement_pdf(), "synthetic-token")
 
     def test_extracts_all_movements(self):
@@ -205,34 +219,6 @@ class TestAccountStatementTransactions:
                       if r["description_kind"] == "CREDIT" and not r["post_closing"])
         d = datetime.fromtimestamp(credit["booking_date"], timezone.utc)
         assert (d.year, d.month, d.day) == (2021, 10, 4)
-
-
-class TestInternalTransferDetection:
-    """Intra-portfolio reshuffles (mandate funding/reduction, book
-    transfers) are re-tagged so gold nets them instead of counting
-    them as external deposits/withdrawals. Genuine external credits
-    keep their booking type."""
-
-    def test_mandate_funding_is_internal(self):
-        assert _stmt_is_internal_transfer(
-            "CREDIT", ["INCREAS US EQUITY PORTFOLIO", "P. HOLDER"])
-        assert _stmt_is_internal_transfer(
-            "PAYMENT ORDER BY TELEPHONE",
-            ["UEBERTRAG", "REDUKTION US EQUITY MANDAT"])
-        assert _stmt_is_internal_transfer(
-            "SPECIAL PAYMENT ORDER", ["REDUCTION INVESTMENT PORTFOLIO"])
-
-    def test_external_credit_stays_external(self):
-        # Incoming external bank transfer — no internal marker.
-        assert not _stmt_is_internal_transfer(
-            "CREDIT", ["SOME EXTERNAL BANK", "1 times Incoming SIC-payment"])
-        assert not _stmt_is_internal_transfer("CREDIT", ["SALARY PAYER LTD"])
-
-    def test_only_cash_flow_types_eligible(self):
-        # A securities settlement referencing a portfolio must NOT be
-        # re-tagged (it is already excluded from flows as a buy/sell).
-        assert not _stmt_is_internal_transfer("SHARE", ["MANAGE US EQ PORTFOLIO"])
-        assert not _stmt_is_internal_transfer("DIVIDEND", ["MANAGE PORTFOLIO"])
 
 
 # ============================================================
@@ -341,7 +327,7 @@ class TestSplitBundledOrder:
         ), 936.37) is None
 
 
-def _bundle_pdf() -> _FakePDF:
+def _bundle_pdf() -> Extracted:
     """A one-page statement whose only movement is a two-payment batch."""
     p1 = _header_row()
     p1 += [_w("01.10.21", 42, 77, 120), *_info_words("Opening balance", 120),
@@ -363,12 +349,12 @@ def _bundle_pdf() -> _FakePDF:
            _w("domestic", 192, 235, 208)]
     p1 += [_w("31.10.21", 42, 77, 230), *_info_words("Closing balance", 230),
            _band_word("700.00", "bal", 230)]
-    return _FakePDF([_FakePage(p1, _PAGE_TEXT)])
+    return _doc(_page(p1, _PAGE_TEXT))
 
 
 class TestBundledOrderReachesTheLoaderSplit:
     def _rows(self):
-        return parse_account_statement_transactions_pages(
+        return account_statement.movements(
             _bundle_pdf(), "synthetic-token")
 
     def test_the_batch_row_is_replaced_by_its_payments(self):
@@ -574,7 +560,7 @@ class TestPortfolioExternalId:
             "portfolio_number": "NNNNN",  # 5 digits, will push total to 17
         }
         monkeypatch.setattr(
-            "pdf_parsers.parse_label_statement_of_assets",
+            "soa_positions.parse_label_statement_of_assets",
             lambda label: bad_meta,
         )
         with pytest.raises(ValueError, match=r"length != 16"):
@@ -684,34 +670,32 @@ class TestStatementOfAssetsSecurities:
             self._soa_text(), "<doc-token>", self.LABEL)
         assert "XX0000000044" not in self._by_isin(rows)
 
-    def test_overview_precious_metals_synthesised_for_usd(self):
-        """The precious-metals portfolio has no Detailed-positions
-        page; its overview asset-class total is recovered as a
-        synthetic position with a non-ISIN-shaped key, attributed to
-        portfolio 01."""
+    def test_the_overview_total_is_no_position(self):
         rows = parse_statement_of_assets_text(
             self._soa_text("USD"), "<doc-token>", self.LABEL)
-        pm = [r for r in rows
-              if r["description"] == "Precious metals & commodities"]
-        assert len(pm) == 1
-        row = pm[0]
+        assert not [r for r in rows
+                    if r["description"] == "Precious metals & commodities"]
+
+    def test_the_overview_precious_metals_total_is_read_as_printed(self):
+        """The precious-metals portfolio has no Detailed-positions
+        page; its overview asset-class total is one row, attributed to
+        portfolio 01, in the currency the copy is valued in."""
+        (row,) = soa_positions.overview_totals(
+            self._soa_text("USD"), "<doc-token>", self.LABEL)
         # Only the Market value column — NOT the doubled mv+total run.
         assert row["market_value"] == pytest.approx(987654.0)
         assert row["market_value"] != pytest.approx(987654987654.0)
         assert row["currency_iso"] == "USD"
+        assert row["asset_class"] == "precious_metals"
         assert row["portfolio_external_id"].endswith("0001")
-        # Synthetic key must not look like a real ISIN (len != 12).
-        assert len(row["instrument_isin"]) != 12
-        assert row["instrument_isin"].startswith("PM-")
+        assert json.loads(row["payload"])["market_value"] == "987 654"
 
-    def test_overview_precious_metals_skipped_for_non_usd(self):
-        """Only the USD-valued copy emits the synthetic, so the same
-        holding (printed once per portfolio currency) collapses to a
-        single deterministic row across the relationship's PDFs."""
-        rows = parse_statement_of_assets_text(
+    def test_every_copy_states_its_overview_total(self):
+        """The overview prints the same total once per portfolio-currency
+        copy; each copy's is kept, in its own currency."""
+        (row,) = soa_positions.overview_totals(
             self._soa_text("CHF"), "<doc-token>", self.LABEL)
-        assert not [r for r in rows
-                    if r["description"] == "Precious metals & commodities"]
+        assert row["currency_iso"] == "CHF"
 
 
 class TestStatementOfAssetsHoldingDetail:
@@ -810,15 +794,27 @@ class TestStatementOfAssetsHoldingDetail:
         assert row["cost_basis"] is None
         assert row["acquisition_fx_rate"] is None
 
-    def test_a_cash_line_keeps_its_rate_as_the_current_one(self):
-        rows = parse_statement_of_assets_text("\n".join([
+    def _cash_rows(self, iban_line: str) -> list[dict]:
+        """The fixture's cash rows, its IBAN line being `iban_line`."""
+        text = "\n".join([
             "Valued in USD", "Detailed positions",
             "GBP 1 000.00 Example Cash Account GBP 0.00 1.3000 1 300 0.10",
-            "CH00 0000 0000 0000 0000 A",
-            "Additional information Abbreviations",
-        ]), "<doc-token>", self.LABEL)
+            iban_line, "Additional information Abbreviations"])
+        return parse_statement_of_assets_text(text, "<doc-token>", self.LABEL)
+
+    def test_a_cash_line_keeps_its_rate_as_the_current_one(self):
+        rows = self._cash_rows("CH00 0000 0000 0000 0000 A")
         assert rows[0]["current_fx_rate"] == pytest.approx(1.3)
         assert rows[0]["acquisition_fx_rate"] is None
+
+    @pytest.mark.parametrize(("printed", "iban"), [
+        ("CH00 0000 0000 0000 0000 A", "CH000000000000000000A"),
+        ("CH00 0000 0000 0000 0000 1", "CH0000000000000000001"),
+        ("CH000000000000000000A", "CH000000000000000000A"),
+    ])
+    def test_a_cash_line_takes_the_iban_below_it(self, printed, iban):
+        rows = self._cash_rows(f"    {printed}")
+        assert [r["account_external_id"] for r in rows] == [iban]
 
     def test_a_holding_whose_headline_does_not_parse_takes_no_other(self):
         # The second headline prints an integer cost price, and its market
@@ -986,7 +982,7 @@ _TL_RIGHT = {"B": 266, "D": 527, "E": 598, "F": 682, "G": 782}
 _TL_LEFT = {"A": 39, "text": 96, "C": 271}
 
 
-def _tl_cell(col: str, text: str, top: float) -> list[dict]:
+def _tl_cell(col: str, text: str, top: float) -> list[Word]:
     """Words of one cell: left-aligned in A, C and the booking text,
     right-aligned in the figure columns. 5pt per character, 3pt gaps."""
     toks = text.split()
@@ -1000,12 +996,12 @@ def _tl_cell(col: str, text: str, top: float) -> list[dict]:
     return out
 
 
-def _tl_header() -> list[dict]:
+def _tl_header() -> list[Word]:
     return [_w(t, x0, x1, _TL_TOP + 10 * i)
             for i, row in enumerate(_TL_HEADER_ROWS) for t, x0, x1 in row]
 
 
-def _tl_booking(start: float, rows: dict[int, dict[str, str]]) -> list[dict]:
+def _tl_booking(start: float, rows: dict[int, dict[str, str]]) -> list[Word]:
     """A booking's words: {row number: {column: text}}."""
     return [w for k, cells in rows.items() for col, text in cells.items()
             for w in _tl_cell(col, text, start + 10 * k)]
@@ -1070,20 +1066,19 @@ _TL_WRAPPED = {
 }
 
 
-def _tl_pdf(*pages: list[dict]) -> _FakePDF:
-    return _FakePDF([_FakePage(words, _TL_PAGE_TEXT) for words in pages])
+def _tl_pdf(*pages: list[Word]) -> Extracted:
+    return _doc(*(_page(words, _TL_PAGE_TEXT) for words in pages))
 
 
 class TestTransactionList:
     LABEL = TestStatementOfAssetsSecurities.LABEL
 
-    def _trades(self, *pages: list[dict]) -> list[dict]:
-        from pdf_parsers import parse_statement_of_assets_pages
-        _positions, trades = parse_statement_of_assets_pages(
+    def _trades(self, *pages: list[Word]) -> list[dict]:
+        _positions, trades, _totals = soa_positions.parse(
             _tl_pdf(*pages), "<doc-token>", self.LABEL)
         return trades
 
-    def _page(self) -> list[dict]:
+    def _tl_words(self) -> list[Word]:
         return (_tl_header()
                 + _tl_booking(217, _TL_PURCHASE)
                 + _tl_booking(298, _TL_SALE)
@@ -1093,7 +1088,7 @@ class TestTransactionList:
                 + _tl_cell("A", "AAAA0000/000000/XXXXXXXXXXXX", 555))
 
     def test_each_booking_is_one_row_in_list_order(self):
-        trades = self._trades(self._page())
+        trades = self._trades(self._tl_words())
         assert [t["seq"] for t in trades] == [1, 2, 3]
         assert [t["isin"] for t in trades] == [
             "XX0000000055", "XX0000000066", "XX0000000077"]
@@ -1103,7 +1098,7 @@ class TestTransactionList:
             (1893456000, 1901145600)}                  # 01.01.2030, 31.03.2030
 
     def test_a_purchase_reads_its_price_rate_and_charges(self):
-        t = self._trades(self._page())[0]
+        t = self._trades(self._tl_words())[0]
         assert t["booking_text"] == "Purchase Spot"
         assert t["trade_date"] == 1893542400            # 02.01.2030
         assert t["trade_time"] == "10:00:00"
@@ -1128,7 +1123,7 @@ class TestTransactionList:
         assert t["account_iban"] == "CH000000000000000000A"
 
     def test_a_sale_reads_its_cost_and_realized_result(self):
-        t = self._trades(self._page())[1]
+        t = self._trades(self._tl_words())[1]
         assert t["booking_text"] == "Sale Spot"
         assert t["quantity"] == pytest.approx(-100.0)
         assert t["cost_price"] == pytest.approx(50.0)
@@ -1145,7 +1140,7 @@ class TestTransactionList:
         assert t["security_name"] == "Shs Example Two"
 
     def test_a_corporate_action_joins_its_booking_text(self):
-        t = self._trades(self._page())[2]
+        t = self._trades(self._tl_words())[2]
         assert t["booking_text"] == "Incoming from spin-off"
         assert t["quantity"] == pytest.approx(50.0)
         assert t["currency_iso"] == "CHF"
@@ -1177,7 +1172,7 @@ class TestTransactionList:
         assert payload["B3"] == "EUR -5.00" and payload["B7"] == "EUR -7.00"
 
     def test_the_closing_totals_are_not_a_booking(self):
-        trades = self._trades(self._page())
+        trades = self._trades(self._tl_words())
         assert trades[2]["transaction_value"] is None
         assert "Subtotal" not in trades[2]["payload"]
 
@@ -1198,10 +1193,9 @@ class TestTransactionList:
             (1, "XX0000000055"), (2, "XX0000000066")]
 
     def test_a_page_without_the_list_header_adds_nothing(self):
-        pdf = _FakePDF([_FakePage(_tl_booking(217, _TL_SALE), "Valued in USD\n")])
-        from pdf_parsers import parse_statement_of_assets_pages
-        assert parse_statement_of_assets_pages(
-            pdf, "<doc-token>", self.LABEL) == ([], [])
+        pdf = _doc(_page(_tl_booking(217, _TL_SALE), "Valued in USD\n"))
+        assert soa_positions.parse(
+            pdf, "<doc-token>", self.LABEL) == ([], [], [])
 
 
 class TestCapitalCall:
@@ -1498,10 +1492,10 @@ class TestMaturityNotice:
         # Branch zfill 3 → 4, base zfill 8 → 8, hyphen → space.
         assert row["account_external_id"] == "0999 12345678.MMM 0001"
         assert row["currency_iso"] == "CHF"
-        # Outstanding goes in as a liability (negative sign).
-        assert row["outstanding_balance"] == pytest.approx(-1234567.89)
+        # The principal as printed; gold gives the liability its sign.
+        assert row["outstanding_balance"] == pytest.approx(1234567.89)
         assert row["product_name"] == "UBS Fixed-Rate Mortgage"
-        assert row["rate_type"] == "fixed"
+        assert "rate_type" not in row
         assert row["collateral_description"] == \
             "EXAMPLE ROAD 1, 0000 EXAMPLECITY"
         # 2023-09-30 UTC midnight.
@@ -1510,10 +1504,9 @@ class TestMaturityNotice:
             row["as_of_date"], timezone.utc).date() \
             == datetime(2023, 9, 30).date()
 
-    def test_saron_classified_as_variable(self):
-        """SARON Mortgage is UBS's variable-rate product; rate_type
-        should map to 'variable', not 'saron', so the canonical
-        taxonomy stays rate-basis."""
+    def test_the_product_line_is_kept_whole(self):
+        """The loader reads the rate type off the product name
+        (load_rows.py `_mortgage_rate_type`), so the name keeps its cue."""
         text = (
             "UBS SARON Mortgage CHF\n"
             f"{self.ACCT_LINE}\n"
@@ -1525,7 +1518,6 @@ class TestMaturityNotice:
         rows = parse_maturity_notice_text(text, "<doc-token>")
         assert len(rows) == 1
         assert rows[0]["product_name"] == "UBS SARON Mortgage"
-        assert rows[0]["rate_type"] == "variable"
 
     def test_non_mortgage_maturity_notice_returns_empty(self):
         """The doc_type 'Maturity notice' is also UBS-side used for
@@ -1759,15 +1751,14 @@ class TestPaymentAdvice:
         assert json.loads(r["payload"])["continuation"] == [
             "Increase Example Mandate"]
 
-    def test_a_mandate_purpose_is_marked_an_internal_transfer(self):
-        internal = _advice_row("Credit Advice", _ADV_IBAN_TO,
-                               trx="0000 036 ED 0000123",
-                               purpose="Uebertrag Example Portfolio")
-        assert json.loads(internal["payload"])["internal_transfer"]
-        external = _advice_row("Debit Advice", _ADV_IBAN_FROM,
-                               trx="0000 036 ED 0000123",
-                               purpose="YOUR PAYMENT ORDER DATED 01012020")
-        assert not json.loads(external["payload"])["internal_transfer"]
+    def test_the_purpose_travels_as_printed(self):
+        # Whether a purpose names an internal transfer is the gold
+        # adapter's first rule; it reads the purpose lines here.
+        p = json.loads(_advice_row(
+            "Credit Advice", _ADV_IBAN_TO, trx="0000 036 ED 0000123",
+            purpose="Uebertrag Example Portfolio")["payload"])
+        assert p["continuation"] == ["Uebertrag Example Portfolio"]
+        assert "internal_transfer" not in p
 
     def test_no_booking_type_and_no_counter_account_are_invented(self):
         # Gold promotes a row to external capital off the booking type,
@@ -1777,12 +1768,12 @@ class TestPaymentAdvice:
         assert r["description_kind"] is None
         assert r["counter_account"] is None
 
-    def test_the_row_is_marked_as_the_pdf_rail_and_as_an_advice(self):
-        # `source` names the rail gold dates the MT940 feed against;
-        # `document` is what the loader's re-derivation delete keys on.
+    def test_the_row_names_the_advice_as_its_source(self):
+        # `source` is the document; `document` is what the loader's
+        # re-derivation delete keys on.
         p = json.loads(_advice_row("Credit Advice", _ADV_IBAN_TO,
                                    trx="0000 036 ED 0000123")["payload"])
-        assert p["source"] == "account_statement_pdf"
+        assert p["source"] == "payment_advice_pdf"
         assert p["document"] == "payment_advice_pdf"
 
     def test_the_older_two_column_layout_still_finds_its_account(self):
@@ -2091,3 +2082,207 @@ class TestQuarterlyReport:
         call = report.replace("Quarterly Report\n", "Capital Call\n", 1)
         assert parse_quarterly_report_text(call, "<doc-token>") == ([], [])
         assert parse_capital_call_text(report, "<doc-token>") == []
+
+
+# ============================================================
+# Page furniture under the ledger
+# ============================================================
+
+def test_the_page_footer_is_no_part_of_the_last_movement():
+    """A page closes with its footer: the form note and page number,
+    then the document's code line. The movement above it ends where the
+    ledger does, and one that runs on to the next page keeps its lines
+    there."""
+    p1 = _header_row()
+    p1 += [_w("01.10.21", 42, 77, 120), *_info_words("Opening balance", 120),
+           _band_word("1000.00", "bal", 120)]
+    p1 += [_w("30.10.21", 42, 77, 140),
+           *_info_words("BALANCE CLOSING OF SERVICE PRICES", 140),
+           _band_word("12.00", "credit", 140),
+           _w("30.10.21", 432, 468, 140),
+           _band_word("1012.00", "bal", 140)]
+    p1 += [*_info_words("Example service", 155)]
+    p1 += _footer(700)
+    p2 = _header_row()
+    p2 += [*_info_words("Example detail", 110)]
+    p2 += [_w("31.10.21", 42, 77, 160), *_info_words("Closing balance", 160),
+           _band_word("1012.00", "bal", 160)]
+    rows = account_statement.movements(
+        _doc(_page(p1, _PAGE_TEXT), _page(p2, _PAGE_TEXT)), "synthetic-token")
+    assert len(rows) == 1
+    payload = json.loads(rows[0]["payload"])
+    assert payload["continuation"] == ["Example service", "Example detail"]
+    assert rows[0]["reconciled"]
+
+
+def _footer(top: float) -> list[Word]:
+    """The footer's two rows: the form note with the page number, and
+    the document's code line."""
+    return [_w("Form", 42, 62, top), _w("without", 64, 94, top),
+            _w("signature", 96, 136, top), _w("Page", 400, 420, top),
+            _w("1", 422, 427, top), _w("/", 429, 432, top), _w("2", 434, 439, top),
+            *_code(42, top + 12)]
+
+
+def _code(x0: float, top: float) -> list[Word]:
+    """The document's code line, in its printed shape: six letters and
+    two digits / six digits / fifteen letters and digits."""
+    return [_w("ABCDEF12", x0, x0 + 40, top), _w("/", x0 + 42, x0 + 45, top),
+            _w("345678", x0 + 47, x0 + 77, top), _w("/", x0 + 79, x0 + 82, top),
+            _w("AB1CD2EF3GH4IJ5", x0 + 84, x0 + 160, top)]
+
+
+def test_a_movement_below_the_footer_keeps_every_figure_and_line():
+    """The footer's rows can sit above the ledger's last rows: the
+    service-price closing and its lines below them on the page. They are
+    passed over, and every movement, figure and line around them stays."""
+    p1 = _header_row()
+    p1 += [_w("01.10.21", 42, 77, 120), *_info_words("Opening balance", 120),
+           _band_word("1000.00", "bal", 120)]
+    p1 += [_w("04.10.21", 42, 77, 140), *_info_words("CREDIT", 140),
+           _band_word("100.00", "credit", 140),
+           _w("04.10.21", 432, 468, 140), _band_word("1100.00", "bal", 140)]
+    p1 += [*_info_words("Example payer", 155)]
+    p1 += _footer(300)[:7]
+    p1 += [_w("30.10.21", 42, 77, 340),
+           *_info_words("BALANCE CLOSING OF SERVICE PRICES", 340),
+           _band_word("12.00", "credit", 340),
+           _w("30.10.21", 432, 468, 340), _band_word("1112.00", "bal", 340)]
+    p1 += [*_info_words("Example service", 355)]
+    # The code line, away from the note it belongs to.
+    p1 += _code(42, 365)
+    p1 += [_w("31.10.21", 42, 77, 380), *_info_words("Closing balance", 380),
+           _band_word("1112.00", "bal", 380)]
+    rows = account_statement.movements(_doc(_page(p1, _PAGE_TEXT)), "synthetic-token")
+    assert [(r["description_kind"], r["amount_credit"]) for r in rows] == [
+        ("CREDIT", 100.0), ("BALANCE CLOSING OF SERVICE PRICES", 12.0)]
+    assert [json.loads(r["payload"])["continuation"] for r in rows] == [
+        ["Example payer"], ["Example service"]]
+    assert all(r["reconciled"] for r in rows)
+
+
+def test_the_footer_code_on_a_ledger_line_is_taken_out_of_it():
+    """The code can print on the line of a movement's own row, to the
+    left of its date or after its text; it is taken out and the row is
+    read as it would be without it."""
+    p1 = _header_row()
+    p1 += [_w("01.10.21", 42, 77, 120), *_info_words("Opening balance", 120),
+           _band_word("1000.00", "bal", 120)]
+    p1 += [*_code(-150, 140), _w("30.10.21", 42, 77, 140),
+           *_info_words("BALANCE CLOSING OF SERVICE PRICES", 140),
+           _band_word("12.00", "credit", 140),
+           _w("30.10.21", 432, 468, 140), _band_word("1012.00", "bal", 140)]
+    p1 += [*_info_words("Example service", 155), *_code(200, 155)]
+    p1 += [_w("31.10.21", 42, 77, 180), *_info_words("Closing balance", 180),
+           _band_word("1012.00", "bal", 180)]
+    rows = account_statement.movements(_doc(_page(p1, _PAGE_TEXT)), "synthetic-token")
+    assert [(r["description_kind"], r["amount_credit"]) for r in rows] == [
+        ("BALANCE CLOSING OF SERVICE PRICES", 12.0)]
+    assert json.loads(rows[0]["payload"])["continuation"] == ["Example service"]
+    assert rows[0]["reconciled"]
+
+
+@pytest.mark.parametrize("code", [
+    ["ABCDEF12", "/", "345678", "/", "AB1CD2EF3GH4IJ5"],
+    ["ABCDEF12/", "345678/", "AB1CD2EF3GH4IJ5"],
+    ["ABCDEF12/345678/AB1CD2EF3GH4IJ5"],
+    ["ABCDEF12\u2215345678\u2215AB1CD2EF3GH4IJ5"],
+    ["ABCDEF12\uff0f345678\uff0fAB1CD2EF3GH4IJ5"],
+])
+def test_the_footer_code_leaves_the_line_it_opens(code):
+    """The code can open a continuation line that goes on with the
+    movement's own reference and date; however the extraction splits it
+    into words, it goes and the rest of the line stays."""
+    p1 = _header_row()
+    p1 += [_w("01.10.21", 42, 77, 120), *_info_words("Opening balance", 120),
+           _band_word("1000.00", "bal", 120)]
+    p1 += [_w("04.10.21", 42, 77, 140), *_info_words("E-BANKING DOMESTIC", 140),
+           _band_word("40.00", "debit", 140),
+           _w("04.10.21", 432, 468, 140), _band_word("960.00", "bal", 140)]
+    x = 85.0
+    line = []
+    for tok in [*code, "K12345", "01.02.2021"]:
+        line.append(_w(tok, x, x + 6 * len(tok), 155))
+        x += 6 * len(tok) + 4
+    p1 += line
+    p1 += [_w("31.10.21", 42, 77, 180), *_info_words("Closing balance", 180),
+           _band_word("960.00", "bal", 180)]
+    rows = account_statement.movements(_doc(_page(p1, _PAGE_TEXT)), "synthetic-token")
+    assert len(rows) == 1 and rows[0]["reconciled"]
+    assert json.loads(rows[0]["payload"])["continuation"] == ["K12345 01.02.2021"]
+
+
+# The code line as the statements print it: at the page's foot, in the
+# footer's smaller type, its third part a run of twenty-one letters and
+# digits, and a date after it. Every value is invented.
+_CODE_LINE_TOP = 812.4
+
+
+def _footer_word(text: str, x0: float, x1: float, top: float) -> Word:
+    """A word in the footer's type, six points tall."""
+    return Word(text, x0, x1, top, top + 6.0)
+
+
+def _code_line(top: float = _CODE_LINE_TOP) -> list[Word]:
+    return [_footer_word("ABCDEF12", 42.2, 72.2, top),
+            _footer_word("/", 73.9, 75.6, top),
+            _footer_word("123456", 77.2, 97.2, top),
+            _footer_word("/", 98.9, 100.5, top),
+            _footer_word("AB1C2DE34F56GHIJ78901", 102.2, 176.6, top),
+            _footer_word("01.02.2023", 283.2, 313.2, top)]
+
+
+def _form_note(top: float = 786.6) -> list[Word]:
+    return [_w(t, x0, x1, top) for t, x0, x1 in (
+        ("Form", 42.2, 62.2), ("without", 64.2, 94.2),
+        ("signature", 96.2, 136.2), ("Page", 500.0, 520.0),
+        ("1", 522.0, 527.0), ("/", 529.0, 532.0), ("2", 534.0, 539.0))]
+
+
+def _two_pages(p1_tail: list[Word], p2_lines: list[str]) -> list[dict]:
+    """The movements of a statement whose one movement opens at the foot
+    of page 1, above `p1_tail` and the page's footer, and goes on at the
+    head of page 2 with `p2_lines`."""
+    p1 = _header_row()
+    p1 += [_w("01.10.21", 42, 77, 120), *_info_words("Opening balance", 120),
+           _band_word("1000.00", "bal", 120)]
+    p1 += [_w("04.10.21", 42, 77, 760), *_info_words("CREDIT", 760),
+           _band_word("100.00", "credit", 760),
+           _w("04.10.21", 432, 468, 760), _band_word("1100.00", "bal", 760)]
+    p1 += p1_tail + _form_note() + _code_line()
+    p2 = _header_row()
+    for i, line in enumerate(p2_lines):
+        p2 += _info_words(line, 120 + 10 * i)
+    p2 += [_w("31.10.21", 42, 77, 200), *_info_words("Closing balance", 200),
+           _band_word("1100.00", "bal", 200)]
+    return account_statement.movements(
+        _doc(_page(p1, _PAGE_TEXT), _page(p2, _PAGE_TEXT)), "synthetic-token")
+
+
+def test_the_code_line_at_the_page_foot_is_no_part_of_the_movement():
+    rows = _two_pages(_info_words("Example payer", 772),
+                      ["Example purpose"])
+    assert len(rows) == 1 and rows[0]["reconciled"]
+    assert rows[0]["counterparty"] == "Example payer"
+    assert json.loads(rows[0]["payload"])["continuation"] == [
+        "Example payer", "Example purpose"]
+
+
+def test_the_code_line_under_a_movement_is_not_its_counterparty():
+    rows = _two_pages([], ["Example payer", "Example purpose"])
+    assert rows[0]["counterparty"] == "Example payer"
+    assert json.loads(rows[0]["payload"])["continuation"] == [
+        "Example payer", "Example purpose"]
+
+
+def test_words_of_the_codes_shapes_in_the_ledger_stay():
+    # The code's parts alone, a date in the ledger's type after a code,
+    # words that only look like a part, and a code whose third part is
+    # one short of fifteen are the movement's own text.
+    line = _code_line(772)
+    line[-1] = _w("01.02.2023", 283.2, 313.2, 772)
+    short = "ABCDEF12 / 123456 / AB1C2DE34F56GH"
+    rows = _two_pages(line, ["EXAMPLES AB123456", "Ref ABCDEF12 / 123456",
+                             short])
+    assert json.loads(rows[0]["payload"])["continuation"] == [
+        "01.02.2023", "EXAMPLES AB123456", "Ref ABCDEF12 / 123456", short]

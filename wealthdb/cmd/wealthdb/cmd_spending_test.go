@@ -177,20 +177,13 @@ func TestSpendingTransactionPrivacyClasses(t *testing.T) {
 	for _, c := range cols {
 		byName[c.Name] = c
 	}
+	// The shared line columns are txnLineClasses'.
 	want := map[string]PrivacyClass{
 		"merchant":           PrivacyFreeText,
 		"spend_primary":      PrivacyNone,
 		"spend_detailed":     PrivacyNone,
 		"provenance":         PrivacyNone,
 		"merchant_signature": PrivacyFreeText,
-		"counterparty":       PrivacyFreeText,
-		"description":        PrivacyFreeText,
-		"account":            PrivacyAccountID,
-		"account_id":         PrivacyAccountID,
-		"account_nickname":   PrivacyPseudonym,
-		"tx_id":              PrivacyAccountID,
-		"net_amount":         PrivacyMoney,
-		"value":              PrivacyMoney,
 	}
 	for name, class := range want {
 		c, ok := byName[name]
@@ -198,8 +191,8 @@ func TestSpendingTransactionPrivacyClasses(t *testing.T) {
 			t.Errorf("column %q is not registered", name)
 			continue
 		}
-		if c.Privacy != class {
-			t.Errorf("column %q privacy = %v, want %v", name, c.Privacy, class)
+		if c.class() != class {
+			t.Errorf("column %q privacy = %v, want %v", name, c.class(), class)
 		}
 	}
 }
@@ -236,12 +229,10 @@ func TestSpendingPrivacyRedacts(t *testing.T) {
 	description := "ZELLE PAYMENT TO " + spendTestCounterparty
 	value := "42.5"
 	row := gold.SpendTransactionRow{
-		AccountExternalID: "CARD0001234",
+		TxnLine:           gold.TxnLine{AccountExternalID: "CARD0001234"},
 		MerchantName:      &merchant,
 		MerchantSignature: &signature,
-		Counterparty:      &counterparty,
-		Description:       &description,
-		ValueOutCcy:       &value,
+		TxnValue:          gold.TxnValue{Counterparty: &counterparty, Description: &description, ValueOutCcy: &value},
 	}
 
 	off := rowsToTable([]gold.SpendTransactionRow{row}, cols, false, output.FormatTable, nil)
@@ -500,6 +491,47 @@ func TestSpendingCLIEndToEnd(t *testing.T) {
 		}
 	})
 
+	t.Run("vs-last-year sets the year before beside each row", func(t *testing.T) {
+		// The fixture's lines run from 5 May 2026, so a window from 5 May
+		// 2027 reads them as the year before and spends nothing itself.
+		// The window ends after fixtureToday, so it is in progress.
+		so, se, code := runToday(t, "-c", cfg, "spending", "categories", "2027-05-05", "2027-06-30",
+			"--period", "total", "--level", "detailed", "--vs-last-year", "-f", "csv")
+		if code != 0 {
+			t.Fatalf("exit=%d stderr=%s", code, se)
+		}
+		lines := strings.Split(strings.TrimSpace(so), "\n")
+		if !strings.HasSuffix(lines[0], ",net_spend_USD,share_pct,year_before_USD,change_pct,quality") {
+			t.Errorf("header = %q, want the plain columns then year_before, change_pct and quality", lines[0])
+		}
+		var groceries string
+		for _, l := range lines[1:] {
+			if strings.Contains(l, "Groceries") {
+				groceries = l
+			}
+		}
+		// No share: the window spent nothing at all.
+		if !strings.HasSuffix(groceries, ",0,0.00,0.00,0.00,n/a,80.00,-100.00,in_progress") {
+			t.Errorf("groceries = %q, want nothing spent against 80 the year before, -100%%, in progress", groceries)
+		}
+		// From a day earlier, the year before starts before gold's lines.
+		so, _, code = runToday(t, "-c", cfg, "spending", "categories", "2027-05-04", "2027-06-30", "--vs-last-year")
+		if code != 0 || !strings.Contains(so, "no_year_before") {
+			t.Errorf("from 4 May, exit=%d, want no_year_before:\n%s", code, so)
+		}
+		// The privacy twin keeps the change and hides both amounts.
+		so, _, code = run(t, "-c", cfg, "spending", "categories", "2027-05-05", "2027-06-30",
+			"--period", "total", "--level", "detailed", "--vs-last-year", "-p")
+		if code != 0 || strings.Contains(so, "80.00") || !strings.Contains(so, "-100.00") {
+			t.Errorf("-p exit=%d, want the change without the amounts:\n%s", code, so)
+		}
+		// Without the flag the view is the plain one.
+		so, _, _ = spending("categories")
+		if strings.Contains(so, "year_before") || strings.Contains(so, "vs_last_year") {
+			t.Errorf("the plain view shows the year before:\n%s", so)
+		}
+	})
+
 	t.Run("categories reconcile with the summary", func(t *testing.T) {
 		so, _, code := spending("categories", "--period", "total", "-f", "csv")
 		if code != 0 {
@@ -652,6 +684,8 @@ func TestSpendingCLIEndToEnd(t *testing.T) {
 			{"summary", "-C", "nope"},
 			{"summary", "-x", "DOLLARS"},
 			{"summary", "-x", "U5D"},
+			{"summary", "--vs-last-year"},
+			{"categories", "--vs-last-year", "--period", "weekly"},
 		} {
 			if _, _, code := run(t, append([]string{"-c", cfg, "spending"}, bad...)...); code != 2 {
 				t.Errorf("%v exit=%d, want 2", bad, code)
@@ -717,15 +751,17 @@ func TestSpendingTransactionsCarriesBothClassifications(t *testing.T) {
 	}
 }
 
-// TestSpendingReportRefusesAnUnroutedView: spendingReport serves its own
-// three views and no other, so a view sent to it unrouted fails rather
-// than serving the transactions.
-func TestSpendingReportRefusesAnUnroutedView(t *testing.T) {
+// Every tag of a row against last year reaches the CLI usage and the MCP
+// quality help.
+func TestSpendVsYearTagsReachBothFrontEnds(t *testing.T) {
 	t.Parallel()
-	defer func() {
-		if recover() == nil {
-			t.Error("spendingReport served view fees")
+	usage := spendingUsage()
+	for _, q := range spendVsYearTags {
+		if !strings.Contains(usage, "\n    "+q.tag+" ") {
+			t.Errorf("usage does not list the %s tag", q.tag)
 		}
-	}()
-	spendingReport(request{view: "fees", currency: "USD", period: "total"})
+		if !strings.Contains(qualityHelp, "\n- "+q.tag+": "+q.meaning+".") {
+			t.Errorf("describe topic=quality does not list the %s tag", q.tag)
+		}
+	}
 }

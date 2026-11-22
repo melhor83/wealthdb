@@ -5,13 +5,16 @@ Centralising these means selector / URL drift can be fixed in one
 place. Each constant carries a comment describing the surface it
 identifies; bump them in lockstep when Schwab restyles.
 
-Nothing here performs I/O — pure configuration data + a couple of
-URL-shape helpers.
+Nothing here performs I/O — pure configuration data, a couple of
+URL-shape helpers, and the mapping of a lookback window onto the site's
+date filters.
 """
 
 from __future__ import annotations
 
 import urllib.parse
+
+from collectorkit import cli
 
 # ============================================================
 # Entry points
@@ -27,6 +30,18 @@ MARKETING_HOMEPAGE = "https://www.schwab.com/"
 
 # `id` of the login iframe on the marketing homepage.
 LOGIN_IFRAME_ID = "schwablmslogin"
+
+# Env var names. The companion ~/.secrets/schwab-web.env file is a
+# bash script that sets `SCHWAB_LOGIN_ID=<login-id>` and
+# `SCHWAB_PASSWORD=<password>`, quoted by bash's rules (single quotes
+# keep every character as written).
+#
+# Note the asymmetry vs. schwab-api (Trader API), which uses
+# SCHWAB_CLIENT_ID / SCHWAB_CLIENT_SECRET for OAuth credentials.
+# These are the web-login credentials and live in a separate
+# namespace so the two sets never collide in a single shell env.
+LOGIN_ID_ENV = "SCHWAB_LOGIN_ID"
+PASSWORD_ENV = "SCHWAB_PASSWORD"
 
 # Stable IDs for the form inputs inside the iframe (confirmed in
 # the gateway SPA's main.*.js bundle as Angular form-control names).
@@ -277,3 +292,53 @@ def looks_locked(page_text: str) -> bool:
     """Whether visible notice-page text reads as an account lockout."""
     lowered = page_text.lower()
     return any(m in lowered for m in LOCKOUT_TEXT_MARKERS)
+
+
+# ============================================================
+# The lookback window on the site's filters
+# ============================================================
+
+# Schwab's Statements filter tops out at Last10Years. A window reaching
+# further back cannot be honoured, so the walk covers less than was asked
+# for — worth one warning rather than a silent shortfall.
+LAST_10_YEARS_DAYS = 3650
+
+
+def _since_to_schwab_preset(since, until, log=None) -> str:
+    """Map a (since, until) window to the narrowest Statements preset that
+    still covers it.
+
+    A named --lookback window runs on the preset; an exact window
+    (_exact_window) uses the custom date-range mode and falls back to this
+    preset. A window wider than the longest preset is capped, with a
+    warning."""
+    days = (until - since).days
+    if days <= 90:
+        return "Last3Months"
+    if days <= 180:
+        return "Last6Months"
+    # <= keeps the shared 5y preset (exactly 1825 days) on Last5Years.
+    # Safe: Schwab resolves Last5Years to the 5-calendar-year
+    # anniversary date, and any 5-year calendar span contains at least
+    # one leap day, so the preset always covers >= 1826 days — never a
+    # day short of 1825.
+    if days <= 1825:
+        return "Last5Years"
+    if days > LAST_10_YEARS_DAYS and log is not None:
+        log.warning(
+            "requested window reaches back to %s (%d days), but Schwab's "
+            "filter stops at Last10Years — coverage is capped at ~10 years.",
+            since, days)
+    return "Last10Years"
+
+
+def _exact_window(lookback, since, until):
+    """(since, until) when ``--lookback`` names an exact ISO date, else
+    None. resolve_lookback already validated the value, so anything
+    that is not a named preset is an ISO date. Named presets keep the
+    preset ladder on both pages; an exact date drives the shared
+    SpecifyDateRange custom mode on Statements and Tx-history alike,
+    each falling back to the covering preset if the fill fails."""
+    if lookback and lookback not in cli.LOOKBACK_PRESETS:
+        return (since, until)
+    return None

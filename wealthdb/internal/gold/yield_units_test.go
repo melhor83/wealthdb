@@ -11,97 +11,6 @@ import (
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/yield"
 )
 
-// A whole factor is n new units for each old one, or one for n old ones,
-// exactly or short of a fraction paid in cash; anything else is none, and
-// so is a quantity several factors round to.
-func TestAWholeFactor(t *testing.T) {
-	t.Parallel()
-	for _, c := range []struct {
-		before, after, want float64
-	}{
-		{33, 660, 20},
-		{100, 1000, 10},
-		{10.5, 31, 3},
-		{105, 10, 0.1},
-		{1000, 50, 0.05},
-		{100, 150, 0},
-		{10, 19, 0},
-		{0.05, 0.08, 0},
-		{100, 100, 0},
-		{7, 1, 0},
-		{0.5, 1, 0},
-	} {
-		k, ok := wholeFactor(c.before, c.after/c.before)
-		if ok != (c.want != 0) || (ok && math.Abs(k-c.want) > 1e-12) {
-			t.Errorf("%v to %v: %v %v, want %v", c.before, c.after, k, ok, c.want)
-		}
-	}
-}
-
-// A step's trades explain its quantities, or its change is one of units:
-// a corporate action's leg names it, or the price per unit moved by its
-// inverse. A change neither names is a trade no transaction records, and
-// so is a small delivery. The quantities give the factor; the legs count
-// once each and must state it. A change of units no whole factor
-// explains, or one the legs state otherwise, is not ok.
-func TestAChangeOfUnits(t *testing.T) {
-	t.Parallel()
-	v := func(x float64) *float64 { return &x }
-	for _, c := range []struct {
-		what  string
-		s     unitStep
-		k     float64
-		units bool
-	}{
-		{"a buy", unitStep{before: 100, after: 120, trades: []unitTrade{{at: 1, qty: 20}}}, 1, false},
-		{"a 20-for-1 change with its leg", unitStep{before: 100, after: 2000,
-			trades: []unitTrade{{at: 1, qty: 1900, corp: true}}}, 20, false},
-		{"a leg that states the new total", unitStep{before: 100, after: 2000,
-			trades: []unitTrade{{at: 1, qty: 2000, corp: true}}}, 20, false},
-		{"a 2-for-1 leg stated twice", unitStep{before: 100, after: 200,
-			trades: []unitTrade{{at: 1, qty: 100, corp: true}, {at: 1, qty: 100, corp: true}}}, 2, false},
-		{"a buy at the leg's second, sorted first", unitStep{before: 100, after: 250,
-			trades: []unitTrade{{at: 1, qty: 50}, {at: 1, qty: 100, corp: true}}}, 2, false},
-		{"a 2-for-1 leg, then a buy", unitStep{before: 100, after: 250,
-			trades: []unitTrade{{at: 1, qty: 100, corp: true}, {at: 2, qty: 50}}}, 2, false},
-		{"a 1-for-10 change as one net leg", unitStep{before: 100, after: 10,
-			trades: []unitTrade{{at: 1, qty: -90, corp: true}}}, 0.1, false},
-		{"a leg that states another change", unitStep{before: 100, after: 200,
-			trades: []unitTrade{{at: 1, qty: 300, corp: true}}}, 1, true},
-		{"a scrip dividend", unitStep{before: 100, after: 102, trades: []unitTrade{{at: 1, qty: 2, corp: true}}}, 1,
-			false},
-		{"a reverse split of a small position", unitStep{before: 7, after: 1,
-			trades: []unitTrade{{at: 1, qty: -7, corp: true}, {at: 1, qty: 1, corp: true}}}, 1, true},
-		{"a reverse split as two legs", unitStep{before: 105, after: 10,
-			trades: []unitTrade{{at: 1, qty: -105, corp: true}, {at: 1, qty: 10, corp: true}}}, 0.1, false},
-		{"a buy before a 2-for-1 leg", unitStep{before: 100, after: 240,
-			trades: []unitTrade{{at: 1, qty: 20}, {at: 2, qty: 120, corp: true}}}, 2, false},
-		{"a 3-for-2 split with its leg", unitStep{before: 100, after: 150,
-			trades: []unitTrade{{at: 1, qty: 50, corp: true}}}, 1, true},
-		{"a 10-for-1 change the price shows", unitStep{before: 200, after: 2000, valueBefore: v(10000),
-			valueAfter: v(10460)}, 10, false},
-		{"a buy, then a 10-for-1 change", unitStep{before: 200, after: 2200, valueBefore: v(10000),
-			valueAfter: v(10460), trades: []unitTrade{{at: 1, qty: 20}}}, 10, false},
-		{"a 10-for-1 change, then a buy", unitStep{before: 200, after: 2020, valueBefore: v(10000),
-			valueAfter: v(10460), trades: []unitTrade{{at: 1, qty: 20}}}, 10, false},
-		{"a 1-for-10 change the price shows", unitStep{before: 2000, after: 200, valueBefore: v(10000),
-			valueAfter: v(9800)}, 0.1, false},
-		{"a buy no transaction records", unitStep{before: 100, after: 200, valueBefore: v(5000),
-			valueAfter: v(10100)}, 1, false},
-		{"a doubling with no price", unitStep{before: 100, after: 200}, 1, false},
-		{"a 3-for-2 change the price shows", unitStep{before: 100, after: 150, valueBefore: v(3000),
-			valueAfter: v(3100)}, 1, true},
-		{"a sale no transaction records", unitStep{before: 100, after: 90, valueBefore: v(3000),
-			valueAfter: v(2600)}, 1, false},
-		{"a position opened", unitStep{before: 0, after: 100}, 1, false},
-	} {
-		k, ok := c.s.change()
-		if math.Abs(k-c.k) > 1e-12 || ok == c.units {
-			t.Errorf("%s: %v %v, want %v units %v", c.what, k, ok, c.k, c.units)
-		}
-	}
-}
-
 // A transaction moves its key's quantity as the lot policy reads it: a
 // trade by its quantity, cash in lieu that names one as a sale, a
 // corporate action's leg as a delivery.
@@ -140,19 +49,19 @@ func TestAPaymentsUnits(t *testing.T) {
 		{Source: "src", Account: "CASH"}: {Portfolio: "P"}, {Source: "src", Account: "DEPOT"}: {Portfolio: "P"},
 		{Source: "src", Account: "GONE"}: {Portfolio: "P"}, {Source: "src", Account: "NEW"}: {Portfolio: "P"}}}
 	u := &yieldUnits{
-		points: map[unitKey][]unitPoint{
-			{"src", "DEPOT", "QSTK"}: {{at: 10, qty: q(100)}, {at: 30, prev: 20, qty: q(200)},
-				{at: 50, prev: 40, qty: q(2000)}},
-			{"src", "GONE", "QSTK"}: {{at: 10, qty: q(50)}, {at: 30, prev: 20, qty: q(0)}},
-			{"src", "NEW", "QSTK"}:  {{at: 50, qty: q(0)}},
-		},
+		Holders: &yield.Holders{In: in, Points: map[unitKey][]yield.UnitPoint{
+			{Source: "src", Account: "DEPOT", Instrument: "QSTK"}: {{At: 10, Qty: q(100)}, {At: 30, Prev: 20, Qty: q(200)},
+				{At: 50, Prev: 40, Qty: q(2000)}},
+			{Source: "src", Account: "GONE", Instrument: "QSTK"}: {{At: 10, Qty: q(50)}, {At: 30, Prev: 20, Qty: q(0)}},
+			{Source: "src", Account: "NEW", Instrument: "QSTK"}:  {{At: 50, Qty: q(0)}},
+		}, Accounts: map[yield.InstrumentKey][]string{ik: {"DEPOT", "GONE", "NEW"}}},
 		snaps: map[accountKey][]int64{{"src", "DEPOT"}: {10, 20, 30, 40, 50, 60},
 			{"src", "GONE"}: {10, 20, 30, 40, 50, 60}, {"src", "NEW"}: {50, 60}},
-		accounts: map[yield.InstrumentKey][]string{ik: {"DEPOT", "GONE", "NEW"}},
-		changes:  map[yield.InstrumentKey][]unitChange{},
-		read:     map[yield.InstrumentKey][][2]int64{},
-		last:     map[string]int64{"src": 60},
+		changes: map[yield.InstrumentKey][]unitChange{},
+		read:    map[yield.InstrumentKey][][2]int64{},
+		last:    map[string]int64{"src": 60},
 	}
+	keysOf := func(acct, iid string) []unitKey { return u.KeysOf(in.PortfolioKeys("src", acct, iid)) }
 	u.addChange(ik, unitChange{at: 30, k: 2, ok: true})
 	u.addChange(ik, unitChange{at: 50, k: 10, ok: true})
 	u.cover()
@@ -169,37 +78,37 @@ func TestAPaymentsUnits(t *testing.T) {
 		{"GONE", 35, 0, false},
 		{"DEPOT", 5, 0, false},
 	} {
-		got, units := u.quantity(u.keysOf(in, "src", c.acct, "QSTK"), c.end)
+		got, units := u.quantity(keysOf(c.acct, "QSTK"), c.end)
 		if (got == nil) != (c.want == 0) || (got != nil && *got != c.want) || units != c.units {
 			t.Errorf("%s at %d: %v %v, want %v %v", c.acct, c.end, fmtFloatPtr(got), units, c.want, c.units)
 		}
 	}
 	u.addChange(ik, unitChange{at: 50, k: 5, ok: true})
-	if _, units := u.quantity(u.keysOf(in, "src", "DEPOT", "QSTK"), 35); !units {
+	if _, units := u.quantity(keysOf("DEPOT", "QSTK"), 35); !units {
 		t.Error("two accounts that disagree at one snapshot")
 	}
 	// DEPOT states no quantity at 40: from 20 to 50 no account held it
 	// with its units read.
 	u.changes[ik] = nil
-	u.points[unitKey{"src", "DEPOT", "QSTK"}] = []unitPoint{{at: 10, qty: q(100)}, {at: 40, prev: 30, qty: nil},
-		{at: 50, prev: 40, qty: q(1000)}}
+	u.Points[unitKey{Source: "src", Account: "DEPOT", Instrument: "QSTK"}] = []yield.UnitPoint{{At: 10, Qty: q(100)}, {At: 40, Prev: 30, Qty: nil},
+		{At: 50, Prev: 40, Qty: q(1000)}}
 	u.read = map[yield.InstrumentKey][][2]int64{}
 	u.cover()
-	if _, units := u.quantity(u.keysOf(in, "src", "DEPOT", "QSTK"), 15); !units {
+	if _, units := u.quantity(keysOf("DEPOT", "QSTK"), 15); !units {
 		t.Error("a span no account held through")
 	}
-	if _, units := u.quantity(u.keysOf(in, "src", "DEPOT", "QSTK"), 55); units {
+	if _, units := u.quantity(keysOf("DEPOT", "QSTK"), 55); units {
 		t.Error("a payment after the span")
 	}
 	// A cash account of another portfolio reads the one account of its
 	// source that held the instrument; with two such accounts, none.
 	in.Accounts[yield.AccountKey{Source: "src", Account: "OTHER"}] = yield.Account{Portfolio: "Q"}
-	u.points[unitKey{"src", "DEPOT", "QONE"}] = []unitPoint{{at: 10, qty: q(40)}}
-	u.accounts[yield.InstrumentKey{Source: "src", Instrument: "QONE"}] = []string{"DEPOT"}
-	if got, _ := u.quantity(u.keysOf(in, "src", "OTHER", "QONE"), 15); got == nil || *got != 40 {
+	u.Points[unitKey{Source: "src", Account: "DEPOT", Instrument: "QONE"}] = []yield.UnitPoint{{At: 10, Qty: q(40)}}
+	u.Accounts[yield.InstrumentKey{Source: "src", Instrument: "QONE"}] = []string{"DEPOT"}
+	if got, _ := u.quantity(keysOf("OTHER", "QONE"), 15); got == nil || *got != 40 {
 		t.Errorf("the one account: %v", fmtFloatPtr(got))
 	}
-	if got, _ := u.quantity(u.keysOf(in, "src", "OTHER", "QSTK"), 15); got != nil {
+	if got, _ := u.quantity(keysOf("OTHER", "QSTK"), 15); got != nil {
 		t.Errorf("two accounts: %v", fmtFloatPtr(got))
 	}
 }
@@ -215,23 +124,26 @@ func TestAPaymentsUnits(t *testing.T) {
 func TestAQuantityBetweenSnapshots(t *testing.T) {
 	t.Parallel()
 	q := func(x float64) *float64 { return &x }
-	out, in, stray := unitKey{"src", "B1", "QOUT"}, unitKey{"src", "B1", "QIN"}, unitKey{"src", "B1", "QSTRAY"}
-	corp, gone := unitKey{"src", "B2", "QCORP"}, unitKey{"src", "B2", "QGONE"}
+	out := unitKey{Source: "src", Account: "B1", Instrument: "QOUT"}
+	in := unitKey{Source: "src", Account: "B1", Instrument: "QIN"}
+	stray := unitKey{Source: "src", Account: "B1", Instrument: "QSTRAY"}
+	corp := unitKey{Source: "src", Account: "B2", Instrument: "QCORP"}
+	gone := unitKey{Source: "src", Account: "B2", Instrument: "QGONE"}
 	u := &yieldUnits{
 		snaps: map[accountKey][]int64{{"src", "B1"}: {10, 20, 30, 40}, {"src", "B2"}: {10, 50, 60}},
-		points: map[unitKey][]unitPoint{
-			out:   {{at: 10, qty: q(100)}, {at: 30, prev: 20, qty: q(150)}},
-			in:    {{at: 10, qty: q(100)}, {at: 20, prev: 10, qty: q(150)}},
-			stray: {{at: 10, qty: q(100)}},
-			corp:  {{at: 10, qty: q(100)}, {at: 50, prev: 10, qty: q(1030)}},
-			gone:  {{at: 10, qty: q(100)}, {at: 60, prev: 50, qty: q(0)}},
-		},
-		trades: map[unitKey][]unitTrade{
-			out:   {{at: 20, qty: 50}},
-			in:    {{at: 20, qty: 50}},
-			stray: {{at: 15, qty: 5}},
-			corp:  {{at: 20, qty: 30}, {at: 40, qty: 900, corp: true}},
-			gone:  {{at: 62, qty: 1}},
+		Holders: &yield.Holders{Points: map[unitKey][]yield.UnitPoint{
+			out:   {{At: 10, Qty: q(100)}, {At: 30, Prev: 20, Qty: q(150)}},
+			in:    {{At: 10, Qty: q(100)}, {At: 20, Prev: 10, Qty: q(150)}},
+			stray: {{At: 10, Qty: q(100)}},
+			corp:  {{At: 10, Qty: q(100)}, {At: 50, Prev: 10, Qty: q(1030)}},
+			gone:  {{At: 10, Qty: q(100)}, {At: 60, Prev: 50, Qty: q(0)}},
+		}},
+		trades: map[unitKey][]yield.UnitTrade{
+			out:   {{At: 20, Qty: 50}},
+			in:    {{At: 20, Qty: 50}},
+			stray: {{At: 15, Qty: 5}},
+			corp:  {{At: 20, Qty: 30}, {At: 40, Qty: 900, Corp: true}},
+			gone:  {{At: 62, Qty: 1}},
 		},
 		late: map[unitKey]map[int64]bool{},
 	}
@@ -242,7 +154,7 @@ func TestAQuantityBetweenSnapshots(t *testing.T) {
 	}{{out, 25, 150}, {in, 25, 150}, {stray, 15, 100}, {stray, 17, 105}, {stray, 35, 100}, {corp, 45, 130},
 		{gone, 65, 0}} {
 		if got := u.heldOn(c.k, c.at); got == nil || *got != c.want {
-			t.Errorf("%s at %d: %v, want %v", c.k.iid, c.at, fmtFloatPtr(got), c.want)
+			t.Errorf("%s at %d: %v, want %v", c.k.Instrument, c.at, fmtFloatPtr(got), c.want)
 		}
 	}
 	if got := u.heldOn(corp, 5); got != nil {
@@ -505,7 +417,7 @@ func TestADividendIsPaidOnWhatItsAccountHeld(t *testing.T) {
 			150/mean*100)
 	}
 	// The income views name SOLD's lines by its sold positions.
-	got, err := IncomeReceived(ctx, db, in, ymd(2025, 7, 1).Unix(), ymd(2026, 6, 30).Unix()+86399)
+	got, err := incomeReceived(ctx, db, in, ymd(2025, 7, 1).Unix(), ymd(2026, 6, 30).Unix()+86399)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -816,11 +728,12 @@ func TestADividendIsPaidOnItsRecordDaysQuantity(t *testing.T) {
 	}
 }
 
-// TestATradeOnTheCashAccountMovesItsPortfoliosHolding: a bank books a
-// trade, and its dividend, on a cash account beside the custody account
-// that holds the share. The book is invented, at a bank whose portfolio
-// P1 has the custody accounts SAFE and SAFE2, the cash account CASH and
-// the brokerage account BRK, each shown at month ends:
+// TestATradeMovesItsHoldersHolding: a trade moves the holding of the
+// account that held its share as it happened: a bank books a trade, and
+// its dividend, on a cash account beside the custody account. The book
+// is invented, at a bank whose portfolio P1 has the custody accounts
+// SAFE and SAFE2, the cash account CASH and the brokerage account BRK,
+// each shown at month ends:
 //   - QCHS, a Swiss share: SAFE held 50 to February; CASH booked a sale of
 //     10 on 12 March and the dividend of 31 March, 0.5 a share. The record
 //     day, two business days before, reads February's 50 less the sale.
@@ -835,11 +748,12 @@ func TestADividendIsPaidOnItsRecordDaysQuantity(t *testing.T) {
 //   - QALS: CASH names it QALT, an id only SAFE's alias folds into QALS;
 //     its sale moves SAFE's QALS.
 //   - QBRK: BRK, a brokerage account, sells it without holding it: the
-//     sale moves no other account's holding.
-//   - QOTH: CASH2, of portfolio P2, sells it: SAFE keeps February's 50.
+//     sale moves SAFE's, the one account of its portfolio that holds it.
+//   - QOTH: CASH2, of portfolio P2, sells it: the sale moves SAFE's, the
+//     one account of the bank that holds it.
 //   - QFND, a fund with no record day: CASH's buy of 50 on 2 March moves
 //     SAFE's 100, read as the pay day begins.
-func TestATradeOnTheCashAccountMovesItsPortfoliosHolding(t *testing.T) {
+func TestATradeMovesItsHoldersHolding(t *testing.T) {
 	t.Parallel()
 	early, pay := ymd(2026-1, 1, 1), ymd(2026, 3, 31)
 	sold := func(n float64) []bookSeg { return []bookSeg{{early, 50, 2500}, {pay, 50 - n, 2500 - 50*n}} }
@@ -899,7 +813,7 @@ func TestATradeOnTheCashAccountMovesItsPortfoliosHolding(t *testing.T) {
 		want      float64
 	}{
 		{"SAFE", "QCHS", 40}, {"CASH", "QOWN", 40}, {"SAFE", "QTWO", 100}, {"SAFE2", "QSEQ", 40},
-		{"SAFE", "QHLD", 40}, {"SAFE", "QALS", 40}, {"SAFE", "QBRK", 50}, {"SAFE", "QOTH", 50},
+		{"SAFE", "QHLD", 40}, {"SAFE", "QALS", 40}, {"SAFE", "QBRK", 40}, {"SAFE", "QOTH", 40},
 	} {
 		ps := in.Payments[yield.HoldingKey{Source: "bank", Account: c.acct, PositionKey: c.iid}]
 		if len(ps) != 1 || ps[0].Record == nil || *ps[0].Record != c.want {

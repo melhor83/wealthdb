@@ -21,8 +21,7 @@ characteristics each fund page serves. Two sites:
   location and market currency. A local ticker of a non-US listing goes
   to the payload (table.py). A bond line adds its duration, modified
   duration, yields to maturity, worst and call, real duration and real
-  yield, the exchange rate it was valued at and its accrual date. So a
-  composition answers the fund's line durations (`composition_facts`).
+  yield, the exchange rate it was valued at and its accrual date.
 - Characteristics: the fund page states the fund's effective duration,
   average yield to maturity, yield to worst, distribution yield, 30-day
   SEC yield, 12-month trailing yield, weighted average maturity and
@@ -56,13 +55,13 @@ characteristics each fund page serves. Two sites:
   (Parsed.events_complete); the rows of one id are one event
   (base.merge_events). The events are dated as the characteristics
   are.
-- Fetch: for a fund that wants characteristics or its calendar, a US
+- Fetch: for a request that asks for characteristics or its calendar, a US
   fetch makes one more request, for the page. For characteristics it
   also keeps the fund's product-list entry, which fills a figure the
   page lacks; the page's JSON-LD fills one neither states. A Swiss fetch
-  keeps the page it reads the holdings columns from, and for a fund that
-  wants its calendar the current fetch makes one more request, for the
-  distributions the page names. Where a fund wants a fact and the page
+  keeps the page it reads the holdings columns from, and where the
+  current fetch asks for the calendar it makes one more request, for the
+  distributions the page names. Where a fetch asks for a fact and the page
   or the distributions did not come, or the files state none, meta.json
   names it in facts_missing, so it stays due.
 
@@ -81,9 +80,9 @@ from datetime import date
 from pathlib import Path
 
 from . import fundpage, table
-from .base import (Parsed, Provider, ProviderError, Unavailable, amount, dec, event_row, facts_missing, has_file,
-                   kinds_paid, listed, merge_events, present, read_bytes, read_json, read_meta, write_file, write_json,
-                   write_meta)
+from .base import (PAGE_FLAGS, Parsed, Provider, ProviderError, Unavailable, amount, dec, event_row, facts_missing,
+                   has_file, kinds_paid, listed, merge_events, page_flags, present, read_bytes, read_json, read_meta,
+                   write_file, write_json, write_meta)
 
 HOST = "https://www.ishares.com"
 SCREENERS = {
@@ -169,7 +168,7 @@ class IShares(Provider):
     name = "ishares"
     serves_funds = True
     facts = frozenset({"characteristics", "dividend_calendar"})
-    composition_facts = frozenset({"line_durations"})
+    claim_flags = PAGE_FLAGS
 
     def _index(self, ctx) -> dict:
         """identifier -> (site, product), from both product lists: the US
@@ -197,10 +196,7 @@ class IShares(Provider):
         site, product = hit
         ids = {"isin": product.get("isin")}
         out = {"ref": fund.ref, "site": site, "page": product["productPageUrl"], "name": product.get("fundName"),
-               # A fund wanted as a proxy or an underlying wants neither,
-               # and a fetch then asks for no page or distributions.
-               "characteristics": "characteristics" in fund.wants,
-               "calendar": "dividend_calendar" in fund.wants}
+               **page_flags(fund)}
         if site == "us":
             ids.update(cusip=product.get("cusip"), symbol=product.get("localExchangeTicker"))
             out["product"] = product
@@ -273,8 +269,8 @@ class IShares(Provider):
 
     def _us_page(self, claim, day, outdir: Path, ctx) -> list:
         """Asks for a US fund page and keeps it, and the fund's product-list
-        entry where it wants characteristics. Returns the facts the fund
-        wants that they leave missing: characteristics where neither
+        entry where it asks for characteristics. Returns the facts it asks
+        for that they leave missing: characteristics where neither
         states a figure, the calendar where the page states no
         distributions table, either where the page did not come."""
         if claim["characteristics"]:

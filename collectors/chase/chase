@@ -19,12 +19,9 @@
 set -euo pipefail
 
 NAME=chase
-ENV_PREFIX=CHASE
 ENV_VARS=(CHASE_USERNAME CHASE_PASSWORD)
 HAS_DEBUG=1
-HAS_APP_MOUNT=1     # the checkout's source over /app on every verb
 HAS_SAFETY=1        # refuse to evict a live container mid-2FA / mid-VNC
-HAS_VNC=1           # forward a free 5900-6000 port
 VNC_SUBCOMMANDS=(explore vnc-login)   # the browser-over-VNC verbs
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -82,6 +79,17 @@ Credentials:
   the container (= \$HOME/.secrets/chase.env on the host). chmod 0600.
   \`download\` drives the 2FA challenge from the terminal; \`vnc-login\`
   and \`explore\` leave it to be completed by hand over VNC.
+EOF
+    exit 0
+fi
+
+# `login` folds into `download` (the session dies with Firefox, §F), so a
+# bare one is a host-side no-op. `login --check` is a read-only session
+# probe and passes through, as do the help flags.
+if wrapper_login_folds --check --help -h -- "$@"; then
+    cat >&2 <<'EOF'
+chase: 'login' folds into 'download' — nothing to persist (the session dies with Firefox; §F).
+  Run 'download' (one-shot login + scrape), or 'login --check' to probe a session.
 EOF
     exit 0
 fi

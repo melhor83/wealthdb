@@ -30,7 +30,7 @@ var instructionsBody = `wealthdb holds a household's complete financial picture 
 
 Pick the tool by the question:
 - what is held, where, and what it is worth (today or on a date); net worth; total cash (view=global); one account or one institution -> holdings
-- how investments performed, as a return % -> returns; why net worth moved, what was saved against what was gained, the household's total debt repaid (debt_repaid) -> returns (view=bridge)
+- how investments performed, as a return % -> returns; why net worth moved, what was saved against what was gained, the household's total debt repaid (debt_repaid) -> returns (view=bridge); what each private fund, SPV or private stock was paid, gave back and is marked at, its commitment and unfunded, its DPI, TVPI or IRR -> returns (view=private)
 - what was gained or lost (P&L), realized or unrealized; a year's realized gains; the unrealized gain now (to=today); a holding's cost basis -> gains
 - what is really owned once every fund is looked through: allocation by asset class, sector, country, region or currency; debt by credit, maturity or coupon; the largest issuers; how much of one company is held through funds -> exposure
 - what the holdings yield or earn; interest rates, duration, DV01; a bond's credit rating; cash against its benchmark -> yield
@@ -164,7 +164,7 @@ func (s *mcpServer) toolHelp(t toolSpec) (string, error) {
 	}
 	fam := t.family
 	columns := func(fam *family, v string) string {
-		rep := fam.buildDefault(cfg, defaultRequest(v, cfg.DefaultCurrency))
+		rep := fam.build(cfg, fam.defaultRequest(v, cfg.DefaultCurrency, s.now(), cfg.YieldHorizon()))
 		var cols []string
 		for _, c := range rep.columns {
 			name := c.header
@@ -188,7 +188,7 @@ func (s *mcpServer) toolHelp(t toolSpec) (string, error) {
 	for _, name := range slices.Sorted(maps.Keys(t.alt)) {
 		b.WriteString("  " + name + "=true: " + columns(t.alt[name], "") + "\n")
 	}
-	if fam.views != nil {
+	if !fam.oneShape() {
 		b.WriteString("\nFilters each view takes (a filter the view lacks moves the call to the first finer view that has it):\n")
 		filters := func(v string) string {
 			if fs := t.carriedParams(v); len(fs) > 0 {
@@ -199,53 +199,20 @@ func (s *mcpServer) toolHelp(t toolSpec) (string, error) {
 		for _, v := range fam.ladder() {
 			fmt.Fprintf(&b, "  %s: %s\n", v, filters(v))
 		}
-		var side []string
-		for _, v := range fam.views {
-			if fam.side[v] {
-				side = append(side, v)
-			}
-		}
-		if len(side) > 0 {
+		if side := fam.namesWhere(func(v *view) bool { return v.side }); len(side) > 0 {
 			b.WriteString("Outside that order (a view of its own, which no filter moves a call to or from):\n")
 			for _, v := range side {
 				fmt.Fprintf(&b, "  %s: %s\n", v, filters(v))
 			}
 		}
 	}
-	if note := toolNotes[t.name]; note != "" {
-		b.WriteString("\n" + note + "\n")
+	if t.notes != "" {
+		b.WriteString("\n" + t.notes + "\n")
 	}
 	if s.privacy {
 		b.WriteString("\n" + privacyNotice + "\n")
 	}
 	return strings.TrimRight(b.String(), "\n"), nil
-}
-
-// toolNotes are the conventions of each tool that its columns do not
-// say, with a second example call.
-var toolNotes = map[string]string{
-	"holdings": `Totals reconcile: global = sum of sources = sum of portfolios = sum of accounts = positions with with_cash. A loan or a card balance is negative. positions_value, cash_balance and total_value are in each account's own currency; the columns with a currency suffix are converted.
-Example: {view: "accounts", tax_wrapper: "roth_ira"}.`,
-	"returns": `The quality column explains every n/a (describe topic=quality). accounts is exact; the coarser views are best-effort, and returns do not add up across views. stated sets each period a document states for an account (stated net additions, ending value) against the engine's monthly figures for it, in the stated currency; flow_gap and value_gap are the differences. bridge explains net worth: end_net_worth = start_net_worth + net_saved + onboarded + gain. net_saved = net_flow + debt_repaid, onboarded is value that entered or left tracking, gain is the residual, returns' gain plus the FX move on debt. It reads whole months for the whole household.
-Example: {view: "sources", from: "2024", to: "2025", period: "annual", method: "twr"}.`,
-	"gains": `gain = realized + unrealized_change, the price gain on what is held; income, fees and taxes are in returns. Realized is what the sale's documents state, else what the lot engine rebuilt from the trades; unrealized is the clean value (market value less accrued interest) less the cost basis. basis_stamp says which notion of cost basis a figure is. summary, sources, portfolios and accounts add up. The quality column names every gap (describe topic=quality); the coverage view says per account where the figures are blind, and the check view compares the lot engine with the stated lots.
-Example: {view: "accounts", from: "2025", to: "2025", tax_wrapper: "taxable_joint"}.`,
-	"exposure": `Every view sums to net worth, as holdings view=global gives it: what a fund's composition does not explain is a remainder row, and a holding nothing describes is unknown, never dropped. A fund's composition is the one nearest the as-of day (the funds view says which, and how old); quality flags such as proxy, aged or partial carry the share of the row they touch (describe topic=quality). view=situs reads every holding whole, at its legal situs: it looks through no fund, and its quality says what each situs rests on; coverage's situs section lists the holdings whose situs is unknown. The view sums are in the output currency; the shares need none.
-Example: {view: "sectors", as_of: "2025-12-31", currency: "CHF"}.`,
-	"transactions": `Money leaving an account is negative. kind is the booked kind: buy, sell, dividend, interest, fee, tax, deposit, withdrawal, purchase, refund, card_payment and others.
-Example: {from: "last month", to: "last month", kind: "dividend"}.`,
-	"spending": `spend and refunds are positive; net_spend = spend - refunds. The category rows of a period sum to its summary row. (uncategorized) is what no rule or model has placed yet. The transactions view keeps the ledger sign: a purchase is negative there. fees is per portfolio, else per account outside one: fees are the primary BANK_FEES lines net of refunds, trading costs and fund costs are not in them, fee_rate_pct is fees over mean_value annualized and blank where the mean value is not above zero, and twr_pct is the entity's monthly returns chained over the months that end in the window, blank where returns has none. Returns stay net of fees.
-Example: {view: "transactions", from: "2025-03", to: "2025-03", sort: "-value", limit: 10}.`,
-	"income": `income and reversals are positive; net_income = income - reversals. The type rows of a period sum to its summary row. projection, calendar and the entity views put what was received beside what the holdings are expected to pay; their window may lie in the future, and basis says what the expected part rests on.
-Example: {view: "transactions", from: "2025", to: "2025", type: "dividend", sort: "-value"}.`,
-	"yield": `A rate belongs to a currency: an aggregate row is one entity in one currency, and the total row weighs the currencies by value (quality mixed); converted gives one row per entity. dv01 is the value lost for a rise of one basis point; a liability's is negative and nets. The quality column says what each figure rests on (describe topic=quality); view=coverage lists what is missing, and counts where the dividends' record days come from: the dividend calendar, an ex day, the issuer's learned gap, the market's lag, or none.
-Example: {view: "curve", currency: "CHF"}.`,
-	"cashflow": `The four sections sum to net_cash_flow. vehicles is every plan together; for one plan read view=flows at level=class. The mortgage is under financing. A node is a net: inflow and outflow beside it are the gross lines under it. view=projection is the plan: investment_income is income projection's expected income on the pool's accounts and vehicles_income its income and principal on every other account, which net leaves out; other_income, operating_out and vehicles are monthly averages of the trailing months, and quality says what each part rests on; net = investment_income + other_income - operating_out - debt_service + vehicles, plus principal_returned unless maturing=roll.
-Example: {view: "flows", from: "2025", to: "2025", class: "Retirement"}.`,
-	"status":          `new_data=yes means a load would bring newer data in. state "not loaded" means gold holds nothing from the source yet. marks reads month ends: a low marked_pct says a month's return rests on old marks. A month end with no position has no marked_pct; currency moves value_marked and value_total, never marked_pct.`,
-	"snapshots":       `One row per day with data; snapshots counts the snapshots taken that day.`,
-	"resolutions":     `model_name manual-override marks a ticker set in the config; any other name is the model that answered.`,
-	"categorizations": `A verdict applies to every transaction whose signature matches, at any account. The signature and name columns are text taken off statements.`,
 }
 
 const datesHelp = `Dates: "2025" is that year, "2025-06" that month, "2025-06-15" that day; "today", "yesterday", "last month", "last year" and "3 months ago" also work (English, UTC).
@@ -257,23 +224,25 @@ Every result header states the dates it used, as ISO dates.`
 // exposure and yield quality columns, of income's forward views and of
 // the cash flow projection.
 var qualityHelp = returnsGainsQualityHelp + "\n\n" + exposureQualityHelp() + "\n\n" + yieldQualityHelp() + "\n\n" +
-	incomeForwardQualityHelp() + "\n\n" + cashflowPlanQualityHelp()
+	incomeForwardQualityHelp() + "\n\n" + cashflowPlanQualityHelp() + "\n\n" + spendVsYearQualityHelp()
 
 const returnsGainsQualityHelp = `The returns quality column gives the reason for every n/a and tags every approximation. Common tags:
 - since_data_inception: the return runs from the entity's first snapshot, not from when the account opened.
 - configured_inception: the window starts at an inception date set in the config.
 - staggered_inception: the entity's parts began on different dates.
-- accounts_grain_meaningless: a return for this one account is noise (a single crypto wallet, say); read a coarser view.
+- accounts_grain_meaningless: this source's accounts are set to show values without returns (config returns_policy_overrides); read a coarser view.
 - empty_bucket, carried_forward: no snapshot fell in the bucket; the value is carried from before it.
 - boundary_same_snapshot: the bucket starts and ends on the same snapshot.
 - stale_snapshot: the end value rests on a snapshot much older than the entity's usual gap; the feed may have stopped.
 - dietz_degenerate: the bucket's approximation has no defined value.
+- loss_beyond_total: twr is n/a: a period lost more than everything while the value stayed at zero or above, so its flows and values disagree, or the period is too coarse.
 - post_exit_residue: money left nearly all of the entity; twr leaves out the periods on what remained, while gain and mwr still count its income.
 - nonpositive_base: a loan or a net-negative entity; a return means nothing.
 - mwr_no_flows: no money moved in or out, so there is no money-weighted return; read twr.
 - mwr_no_sign_change, mwr_nonunique, mwr_no_converge: the money-weighted return has no single answer.
 - mwr_negative_net_capital: the money put in, net, is zero or less.
 - unmatched_transfers=N: N transfers found no matching leg on another account.
+- cross_source_netted=N: N transfer pairs the load stored netted out inside the entity, across sources or inside one source.
 - nav_only, nav_only_capital_call_risk: a source that reports values only (private funds); the return is rough.
 - pre_fx_history: part of the window lies before the exchange-rate history begins.
 - flows_before_inception: money moved before the date the measurement starts; it counts in no window.
@@ -289,6 +258,16 @@ const returnsGainsQualityHelp = `The returns quality column gives the reason for
 - debt_unpriced: (view=bridge) a debt has no rate to the currency; its fall is left to gain.
 - bridge_gap: (view=bridge) net worth less returns' value is not the mortgages and cards; gain holds the difference.
 - tracking_netted: (view=bridge) net_flow and onboarded had opposite signs, so the smaller size reads as a move into or out of tracking, in neither column.
+- no_mark: (view=private) the holding never had a value but 0 and nothing came back, so nav, tvpi and irr_pct are blank.
+- no_cost: (view=private) no call and no stated cost, so paid_in, dpi, tvpi and irr_pct are blank.
+- paid_in_from_cost: (view=private) paid_in is the holding's stated cost on its acquisition day, not a cash leg.
+- exited: (view=private) the status is exited: nav is 0 after something came back, or the holding left the holdings.
+- at_cost: (view=private) the source carries the NAV at cost, before any valuation: with nothing back, tvpi reads 1 and irr_pct 0.
+- call_after_mark, distribution_after_mark: (view=private) a call, or a distribution or exit, came after the mark, so tvpi reads low, or high.
+- exit_unvalued=N: (view=private) N exits in kind state no value.
+- unattributed_exit=N: (view=private, the total) N exits in kind name no holding: the total counts them, no row does.
+- unmatched_commitment=N: (view=private, the total) N stated commitments of a private holding that no row takes: the total leaves them out.
+- unpriced=N: (view=private) N legs, lines or commitments have no rate to the currency: the sums leave them out, and an unpriced leg blanks irr_pct.
 Other tags name their reason the same way.
 
 On spending view=fees, quality says what a row misses, beside the return's tags:
@@ -352,6 +331,12 @@ func cashflowPlanQualityHelp() string {
 	return "On cashflow's projection, quality lists what a row rests on:" + tagList(cashflowPlanTags)
 }
 
+// spendVsYearQualityHelp lists the quality tags of spending's rows
+// against last year (spendVsYearTags).
+func spendVsYearQualityHelp() string {
+	return "On spending view=categories with vs_last_year, quality says what the comparison misses:" + tagList(spendVsYearTags)
+}
+
 func (s *mcpServer) privacyHelp() string {
 	if s.privacy {
 		return privacyNotice + ` Amounts and quantities print as *****.** and ***, account numbers keep only their last digits, and merchant, payer and narrative text prints as ***. A name a person typed about an account prints as a pseudonym: a nickname, an account category the config sets, and the names and ids of crypto, manual and declared accounts and portfolios and their line ids. The name of an account its bank names by its nickname is typed too. An account whose name is typed shows its account number instead, redacted, where that number is letters and digits with at least one digit; so does such an id. A pseudonym is a prefix and a number: the source's kind (manual-1, cointracking-2), or category-1 and nickname-1. Within one result a value always reads the same pseudonym, and two values read apart. Each call numbers afresh: manual-1 in two different calls need not be one value, so join results on other columns. A call numbers over all its rows before filters and paging, so the same call with a filter added names a row as before. A source id names a config entry and stays legible, as does a name another provider builds from the holder's words. A holding's name stays legible. A hand-entered holding's key and instrument id redact as an account number, their words kept; an id typed into its name, or into an issuer or a cash flow line named after it, masks, and the name's words stay. Other account names, holdings and their symbols, dates, categories, types, classes and shares stay legible.
@@ -389,7 +374,7 @@ func (s *mcpServer) glossary(ctx context.Context) (string, error) {
 			note("tax_wrapper", strOrEmpty(a.TaxWrapper))
 			note("management_style", strOrEmpty(a.ManagementStyle))
 		}
-		positions, err := gold.PositionsAsOf(ctx, db, asOf, cfg.DefaultCurrency, lots.MissingIgnore)
+		positions, err := gold.PositionsAsOf(ctx, db, asOf, cfg.DefaultCurrency, lots.MissingIgnore, false)
 		if err != nil {
 			return err
 		}

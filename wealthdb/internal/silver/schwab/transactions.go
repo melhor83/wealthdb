@@ -2,6 +2,7 @@ package schwab
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -47,60 +48,67 @@ func (c *apiReader) buildDescriptionToInstrumentKey(ctx context.Context) (map[st
 
 // scanPositionDescriptions records each position description's key,
 // or the "" sentinel when two positions state it under different keys
-// (possible across ticker reuse).
+// (possible across ticker reuse). Only the instrument is read: the
+// columns of migration 0006 where silver has them, one row per
+// instrument; an older silver's payloads otherwise.
 func (c *apiReader) scanPositionDescriptions(ctx context.Context, out map[string]string) error {
-	const q = `SELECT DISTINCT payload FROM positions`
-	rows, err := c.db.QueryContext(ctx, q)
+	holding, err := c.holdingRead(ctx)
 	if err != nil {
-		return fmt.Errorf("schwab descToInstrument positions: %w", err)
+		return err
 	}
-	defer rows.Close()
-	for rows.Next() {
+	record := func(i schwabInstrument) {
+		key := preferredInstrumentKey(i)
+		if i.Description == "" || key == "" || isCashAssetType(i.AssetType) {
+			return
+		}
+		norm := normalizeSchwabDescription(i.Description)
+		if norm == "" {
+			return
+		}
+		if existing, ok := out[norm]; ok && existing != key {
+			out[norm] = "" // ambiguous; sentinel
+			return
+		}
+		out[norm] = key
+	}
+	if holding.columns {
+		const q = `
+SELECT DISTINCT asset_type, cusip, symbol, description
+  FROM positions
+ WHERE description <> ''`
+		return silver.ScanRows(ctx, c.db, "schwab descToInstrument positions", q, func(rows *sql.Rows) error {
+			var assetType, cusip, symbol, description sql.NullString
+			if err := rows.Scan(&assetType, &cusip, &symbol, &description); err != nil {
+				return err
+			}
+			record(schwabInstrument{AssetType: assetType.String, CUSIP: cusip.String,
+				Symbol: symbol.String, Description: description.String})
+			return nil
+		})
+	}
+	const q = `SELECT DISTINCT payload FROM positions`
+	return silver.ScanRows(ctx, c.db, "schwab descToInstrument positions", q, func(rows *sql.Rows) error {
 		var payload string
 		if err := rows.Scan(&payload); err != nil {
 			return err
 		}
-		var p struct {
-			Instrument schwabInstrument `json:"instrument"`
+		if p, err := preV6Holding(payload); err == nil {
+			record(p.Instrument)
 		}
-		if err := json.Unmarshal([]byte(payload), &p); err != nil {
-			continue
-		}
-		if p.Instrument.Description == "" {
-			continue
-		}
-		key := preferredInstrumentKey(p.Instrument)
-		if key == "" || isCashAssetType(p.Instrument.AssetType) {
-			continue
-		}
-		norm := normalizeSchwabDescription(p.Instrument.Description)
-		if norm == "" {
-			continue
-		}
-		if existing, ok := out[norm]; ok && existing != key {
-			out[norm] = "" // ambiguous; sentinel
-			continue
-		}
-		out[norm] = key
-	}
-	return rows.Err()
+		return nil
+	})
 }
 
 // scanInstrumentDescriptions adds the instruments table's descriptions
 // the positions do not state, keyed by CUSIP else symbol; the first
 // row wins.
 func (c *apiReader) scanInstrumentDescriptions(ctx context.Context, out map[string]string) error {
-	exists, err := silver.HasTables(ctx, c.db, "instruments")
-	if err != nil || !exists {
+	s, err := c.schema(ctx)
+	if err != nil || !s.instruments {
 		return err
 	}
 	const q = `SELECT symbol, payload FROM instruments`
-	rows, err := c.db.QueryContext(ctx, q)
-	if err != nil {
-		return fmt.Errorf("schwab descToInstrument instruments: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
+	return silver.ScanRows(ctx, c.db, "schwab descToInstrument instruments", q, func(rows *sql.Rows) error {
 		var sym, payload string
 		if err := rows.Scan(&sym, &payload); err != nil {
 			return err
@@ -111,7 +119,7 @@ func (c *apiReader) scanInstrumentDescriptions(ctx context.Context, out map[stri
 		}
 		_ = json.Unmarshal([]byte(payload), &p)
 		if p.Description == "" {
-			continue
+			return nil
 		}
 		key := p.CUSIP
 		if key == "" {
@@ -119,13 +127,13 @@ func (c *apiReader) scanInstrumentDescriptions(ctx context.Context, out map[stri
 		}
 		norm := normalizeSchwabDescription(p.Description)
 		if norm == "" {
-			continue
+			return nil
 		}
 		if _, present := out[norm]; !present {
 			out[norm] = key
 		}
-	}
-	return rows.Err()
+		return nil
+	})
 }
 
 // normalizeSchwabDescription folds the formatting differences
@@ -208,26 +216,21 @@ func (c *apiReader) Transactions(ctx context.Context, w canonical.Window) (silve
 SELECT activity_id, timestamp, account_external_id, kind, payload
   FROM transactions
  WHERE timestamp BETWEEN ? AND ?`
-	rows, err := c.db.QueryContext(ctx, q, w.Start, w.End)
-	if err != nil {
-		return nil, fmt.Errorf("Transactions query: %w", err)
-	}
-	defer rows.Close()
 
 	out := canonical.TransactionBatch{}
 	var deliveries []int
-	for rows.Next() {
+	if err := silver.ScanRows(ctx, c.db, "Transactions query", q, func(rows *sql.Rows) error {
 		var (
 			activityID, extID, kind, payload string
 			occurredAt                       int64
 		)
 		if err := rows.Scan(&activityID, &occurredAt, &extID, &kind, &payload); err != nil {
-			return nil, fmt.Errorf("Transactions scan: %w", err)
+			return fmt.Errorf("Transactions scan: %w", err)
 		}
 
 		tx, err := buildTransaction(activityID, occurredAt, extID, kind, payload)
 		if err != nil {
-			return nil, fmt.Errorf("Transactions row (activity_id=%s): %w", activityID, err)
+			return fmt.Errorf("Transactions row (activity_id=%s): %w", activityID, err)
 		}
 		// If buildTransaction didn't land an instrument link (typical
 		// for DIVIDEND_OR_INTEREST where transferItems is cash-only),
@@ -250,11 +253,12 @@ SELECT activity_id, timestamp, account_external_id, kind, payload
 			deliveries = append(deliveries, len(out.Transactions))
 		}
 		out.Transactions = append(out.Transactions, tx)
-	}
-	if err := rows.Err(); err != nil {
+		return nil
+	}, w.Start, w.End); err != nil {
 		return nil, err
 	}
 	settleDeliveries(out.Transactions, deliveries)
+	setLotActions(out.Transactions)
 	return silver.NewTransactionStream(out), nil
 }
 

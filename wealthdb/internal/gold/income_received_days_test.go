@@ -3,6 +3,8 @@ package gold
 import (
 	"testing"
 	"time"
+
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/enrichtest"
 )
 
 // web_income_days holds every day to the yield report's latest day from
@@ -97,14 +99,10 @@ func TestMaterializeYieldReceivesTheWholeHistory(t *testing.T) {
 	    'CHF', 1400)`, ymd(2023, 3, 1).Unix()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(ctx, `INSERT INTO income_txn_enrichment (silver_source_id, transaction_external_id,
-	    payer_signature, signature_version, income_detailed, provenance, assigned_at) VALUES
-	    ('test-src', 'OLD1', 'sig-tenant', 1, 'INCOME_RENTAL', 'rule', 100)`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := MaterializeYield(ctx, db, at, 42, 12); err != nil {
-		t.Fatal(err)
-	}
+	enrichtest.SeedIncome(t, db,
+		enrichtest.Income{Source: "test-src", Txn: "OLD1", Signature: "sig-tenant", Detailed: "INCOME_RENTAL", Provenance: "rule"},
+	)
+	materializeYieldToday(t, ctx, db, at)
 	var first string
 	if err := db.QueryRowContext(ctx, `SELECT CAST(min(day) AS VARCHAR) FROM web_yield_received WHERE currency = 'CHF'`).
 		Scan(&first); err != nil || first != "2023-03-01" {

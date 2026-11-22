@@ -104,15 +104,16 @@ persisted session cookie until UBS invalidates it.
 
 | Script | Purpose |
 | --- | --- |
-| [`login.py`](login.py) | Drive headless Chromium through the UBS Nevis login dialog and the Access App QR challenge. It fills the contract number and renders the QR to the terminal (Unicode half-blocks the Access App scans directly). `--qr-png` also writes an upscaled PNG for a host with no usable terminal. It follows QR rotations, waits for the post-auth SPA URL, then saves the Playwright storage state at `--state-path` (default `/secrets/ubs-web-state.json`, chmod 0600; `ubs_web_state.json` is read when that file is absent). `--check` probes the stored session without a new QR challenge. |
+| [`login.py`](login.py) | Drive headless Chromium through the UBS Nevis login dialog and the Access App QR challenge. It fills the contract number and renders the QR to the terminal (Unicode half-blocks the Access App scans directly). `--qr-png` also writes an upscaled PNG for a host with no usable terminal. It follows QR rotations, waits for the post-auth SPA URL, then saves the Playwright storage state at `--state-path` (default `/secrets/ubs-web-state.json`, chmod 0600). `--check` probes the stored session without a new QR challenge. |
 | [`download.py`](download.py) | Reuse the persisted session and run six passes. **positions**: one `positions.csv` for the consolidated default view, plus one per `portfolioUid` found on the homepage. **transactions**: for each **cash** account on the homepage, the transaction list as CSV and as enriched SWIFT MT940, both bisected on the 1000-transaction export cap. **rates**: each cash account's interest conditions via [`rates.py`](rates.py) (see [Interest rates](#interest-rates)). **portfolio-transactions**: each managed portfolio's securities-transaction CSV, reached through the portfolio switcher ([DESIGN.md](DESIGN.md) §3.7b). **documents**: the eDocuments archive in adaptive windows (bisected on the 999-row display cap), each PDF fetched from `/api/v1/digital-banking/files/`. **cards**: the card surface via [`cards.py`](cards.py). `--only PASS` runs one pass and marks the dump `partial`. Writes a `run.json` manifest. Read-only — see [AGENTS.md](AGENTS.md) §1. |
 | [`explore.py`](explore.py) | Discovery harness. Launches headed Chromium on the container's Xvfb display and serves it over VNC, so a session can be driven by hand while everything it produces is recorded: the network (requests, responses and bodies, line-flushed so a crash keeps the log), the clicks, one DOM snapshot plus screenshot per structurally distinct screen, and every file downloaded. Artefacts land under `--debug-dir`, never bronze. The harness itself never navigates and never clicks — it opens the login page and records from there, so the read-only surface in [AGENTS.md](AGENTS.md) §1 binds whoever drives. An existing session is reused and saved back on exit, so a sign-in here is not paid for twice. |
 | [`cards.py`](cards.py) | The credit-card surface, read from the SPA's own REST API rather than scraped (see [DESIGN.md §5](DESIGN.md)): the roster, each card account's paged ledger, its billing periods with their reconciling totals, and each period's statement PDF. Read-only and enforced — an allow-list of read endpoints gates every request, including the paging cursor the ledger hands back, so a link the API advertises is never followed for being advertised. Driven by `download.py`; not a verb of its own. |
 | [`rates.py`](rates.py) | The cash accounts' interest conditions, read from what the browser renders: the SPA's own account API response for each homepage account, and the legacy account page for each other account the legacy contract list links. Read-only and enforced — while it runs, a route guard aborts any write to the legacy app or the account API, and any read of them outside an allow-list of routes. Driven by `download.py`; not a verb of its own. |
 | [`rate_parsers.py`](rate_parsers.py) | Bronze → silver for the interest conditions: the API's `interestItems` and the legacy page's "Credit interest" and "Debit interest" tables, read into rows. Pure functions, shared by the capture and the load. |
-| [`card_parsers.py`](card_parsers.py) | Bronze → silver for the card surface: pure functions from the captured JSON to the rows `load.py` writes, with no database handle, so each is testable against a synthetic payload. Holds the three readings that are easy to get wrong — the row key is minted from row content, because the API's `_id` is re-minted at every login and `transactionNr` is not a key, a `RESERVED` row is unposted activity rather than a transaction, and `merchantName` is the category while `details` is the merchant. |
+| [`card_parsers.py`](card_parsers.py) | Bronze → silver for the card surface: pure functions from the captured JSON to the rows [`cards_load.py`](cards_load.py) writes, with no database handle, so each is testable against a synthetic payload. Holds the three readings that are easy to get wrong — the row key is minted from row content, because the API's `_id` is re-minted at every login and `transactionNr` is not a key, a `RESERVED` row is unposted activity rather than a transaction, and `merchantName` is the category while `details` is the merchant. |
+| [`pdf_parsers.py`](pdf_parsers.py) | The document archive's extraction (one `pdfplumber` read per PDF: its text and the word positions two tables need) and the names the loader reads each kind by. Each kind has a reader module of its own, pure functions over the extracted pages: [`soa_positions.py`](soa_positions.py) with [`soa_transaction_list.py`](soa_transaction_list.py), [`account_statement.py`](account_statement.py), [`maturity_notice.py`](maturity_notice.py), [`payment_advice.py`](payment_advice.py), [`securities_advice.py`](securities_advice.py), [`quarterly_report.py`](quarterly_report.py), and what they share in [`pdf_common.py`](pdf_common.py). |
 | [`prune.py`](prune.py) | Reclaim disk from the bronze tree and the `/debug` mount; see [Reclaiming disk](#reclaiming-disk). |
-| [`load.py`](load.py) | Parse bronze artefacts into a queryable SQLite silver database using the schemas in [migrations/](migrations/). Applies pending migrations on startup; each dump loads atomically (compound-key UPSERT on transactions, content-hash dedup for documents, skip on `dump_runs` for idempotency). Parses the card surface via [`card_parsers.py`](card_parsers.py), and the interest conditions via [`rate_parsers.py`](rate_parsers.py). Also walks the documents archive — the scraped one plus any bank-delivered PDFs under `supplied-documents/` — and reads it via [`pdf_parsers.py`](pdf_parsers.py) (uses `pdfplumber`, bundled in the image): positions with their cost, and the transaction list, from each "Statement of assets"; cash balances and movements from each "Account Statement"; mortgage balances from maturity notices; payments from credit and debit advices; capital calls and contract notes; and the capital account and per-investment table of each private-markets quarterly report ([DESIGN.md](DESIGN.md) §3.6–§3.12). |
+| [`load.py`](load.py) | Parse bronze artefacts into a queryable SQLite silver database using the schemas in [migrations/](migrations/). Applies pending migrations on startup; each dump loads atomically (compound-key UPSERT on transactions, content-hash dedup for documents, skip on `dump_runs` for idempotency). Parses the card surface via [`card_parsers.py`](card_parsers.py), and the interest conditions via [`rate_parsers.py`](rate_parsers.py). Also walks the documents archive — the scraped one plus any bank-delivered PDFs under `supplied-documents/` — and reads it with one reader module per document kind, named in [`pdf_parsers.py`](pdf_parsers.py) (extracted with `pdfplumber`, bundled in the image): positions with their cost, and the transaction list, from each "Statement of assets"; cash balances and movements from each "Account Statement"; mortgage balances from maturity notices; payments from credit and debit advices; capital calls and contract notes; and the capital account and per-investment table of each private-markets quarterly report ([DESIGN.md](DESIGN.md) §3.6–§3.12). Each document is extracted once and parsed once per reader generation: both are cached under the collector's cache root, and every later walk replays them. Each pass is a module of its own beside it ([DESIGN.md](DESIGN.md) §4). |
 
 ### Why both CSV and MT940?
 
@@ -282,8 +283,9 @@ Silver holds:
 - the credit-card surface: `card_accounts`, `card_transactions`,
   `card_invoices` and `card_statements` (DESIGN.md §5.9);
 - what the PDF archive states: `historical_position_snapshots`,
-  `historical_cash_balances` and `historical_mortgages` (DESIGN.md
-  §3.8), `advices` (§3.9), `statement_trades` (§3.10) and
+  `historical_cash_balances`, `historical_mortgages` and
+  `statement_overview_totals` (DESIGN.md §3.8), `advices` (§3.9),
+  `statement_trades` (§3.10) and
   `private_market_reports` with `private_market_report_lines` (§3.12).
   The statement-era cash movements land in `transactions` (§3.6);
 - the cash accounts' interest conditions: `account_rates`
@@ -299,7 +301,7 @@ the historical-snapshot reconstruction.
 Playwright, Chromium and the PDF tooling are heavy, so the toolkit
 ships as a Docker image and runs inside the container. The Dockerfile
 builds on the shared `wealthdb/base-playwright` image, which pins
-`mcr.microsoft.com/playwright/python:v1.65.1-noble` (Chromium and its
+`mcr.microsoft.com/playwright/python:v1.65.2-noble` (Chromium and its
 OS deps under `/ms-playwright/`). `requirements.txt` pins the
 Playwright Python package to the same version. `make update` bumps
 both, and the user agent's Chrome major, in lockstep.
@@ -319,10 +321,12 @@ Credentials go in `~/.secrets/ubs-web.env`, as one line
 `UBS_CONTRACT_NUMBER=<contract-number>`. The bank-level
 `~/.secrets/ubs.env` is read when `ubs-web.env` does not exist.
 
-The tool adds a `/debug` mount for opt-in diagnostics:
+The tool also mounts its load caches and a `/debug` dir for opt-in
+diagnostics:
 
 | Container path | Host path (default) | Purpose |
 | --- | --- | --- |
+| `/cache/collector` | `${XDG_CACHE_HOME:-~/.cache}/wealthdb/ubs-web` | the parse and extraction caches a load replays |
 | `/debug` | `~/.cache/wealthdb/debug/ubs-web` (`UBS_WEB_DEBUG_DIR`) | opt-in screenshots / Playwright traces / ad-hoc QR PNGs, and the whole `explore` recording |
 
 Pass any debug-flag value as `/debug/...` so debug artefacts stay

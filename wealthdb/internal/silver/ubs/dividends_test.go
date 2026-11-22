@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/canonical"
-	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver/silvertest"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/yield"
 )
@@ -557,13 +556,7 @@ func TestAStatementDividendLinksByItsValor(t *testing.T) {
 		statementPayload("DIVIDEND", "VN 7654321 XXXXXXS9", "UNKNOWN AG"))
 	seedWebTxRaw(t, r, divStmtTwo, divIBAN, divDay+3*86400, "CHF", 130, "DIVIDEND",
 		statementPayload("DIVIDEND", "VN 2222222 XXXXXXS9", "TWOFOLD AG"))
-	stream, _, err := r.transactionsBeforePSNStart(context.Background(),
-		canonical.Window{Start: 0, End: 1 << 40, HasChanges: true}, &psnReader{db: psnDB}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stream.Close()
-	got := drainTx(t, stream)
+	got := drainTx(t, connTransactions(t, r, &psnReader{db: psnDB}, nil))
 
 	for _, tc := range []struct {
 		id, isin, hint string
@@ -590,7 +583,7 @@ func TestAStatementDividendLinksByItsValor(t *testing.T) {
 	}
 }
 
-// TestAStatementCopyOfAGrossedLineStillFolds: the era fold keys the feed
+// TestAStatementCopyOfAGrossedLineStillFolds: the reconcile table keys the feed
 // line on the amount it credited, which the statement prints too. The
 // line reading the gross does not stop its statement copy folding away.
 func TestAStatementCopyOfAGrossedLineStillFolds(t *testing.T) {
@@ -646,17 +639,11 @@ func TestAnExportDividendReadsTheGrossItStates(t *testing.T) {
 		divIBAN, divDay+6*86400, exportPayload(d1, "Dividend;Reversal", gross("-1000.00 CHF"))); err != nil {
 		t.Fatal(err)
 	}
-	// The statement's copy of the first row folds onto it: the era fold
+	// The statement's copy of the first row folds onto it: the reconcile table
 	// keys both on the amount credited.
 	seedWebTxRaw(t, r, divStmt, divIBAN, divDay, "CHF", 650, "DIVIDEND",
 		statementPayload("DIVIDEND", "VN "+divValor+" XXXXXXS9", "EXAMPLE AG"))
-	stream, _, err := r.transactionsBeforePSNStart(context.Background(),
-		canonical.Window{Start: 0, End: 1 << 40, HasChanges: true}, &psnReader{}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stream.Close()
-	got := drainTx(t, stream)
+	got := drainTx(t, connTransactions(t, r, nil, nil))
 
 	for _, tc := range []struct {
 		id, net, tax string
@@ -715,7 +702,7 @@ func TestAReversalTakesBackOnlyAGrossGoldBooked(t *testing.T) {
 	seedWebTxRaw(t, r, "EXP0000002", divIBAN, divDay, "CHF", 500, "Dividend",
 		exportPayload(divNarrative+"; "+divISIN, "Dividend", "Number/Amt. 600.00 CHF; Transaction no. EXP0000002"))
 	conn := &Connection{web: r, psn: &psnReader{db: db},
-		relationships: []silver.RelationshipPair{{WebID: "REL1", PSNStartOverride: divDay - 86400}}}
+		relationships: []RelationshipPair{{WebID: "REL1", PSNStartOverride: divDay - 86400}}}
 	stream, err := conn.Transactions(context.Background(), canonical.Window{Start: 0, End: 1 << 40, HasChanges: true})
 	if err != nil {
 		t.Fatal(err)
@@ -1513,13 +1500,7 @@ func TestAForeignExportDividendReadsItsConvertedGross(t *testing.T) {
 		divIBAN, divDay+20*86400, exportPayload(d1, "Dividend;Reversal", stated("-100.00 USD", "0.85"))); err != nil {
 		t.Fatal(err)
 	}
-	stream, _, err := r.transactionsBeforePSNStart(context.Background(),
-		canonical.Window{Start: 0, End: 1 << 40, HasChanges: true}, &psnReader{}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stream.Close()
-	got := drainTx(t, stream)
+	got := drainTx(t, connTransactions(t, r, nil, nil))
 	want := []struct{ id, net, tax string }{{"AW00000KE0000025", "-85", "12.75"}}
 	for _, row := range rows {
 		want = append(want, struct{ id, net, tax string }{row.id, row.net, row.tax})

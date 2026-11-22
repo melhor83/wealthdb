@@ -30,21 +30,22 @@ import (
 // frozenSnapshot is enrichmentSnapshot plus every other column the
 // pass writes: the oracle's contract is to cover all of them, and a
 // column outside it is a column a change could move in silence. The
-// three far columns and the stated exposure are inside it.
+// far side the pass links for each row and the stated exposure are
+// inside it.
 func frozenSnapshot(t *testing.T, db *sql.DB, ctx context.Context) string {
 	t.Helper()
 	rows, err := db.QueryContext(ctx, `
-        SELECT silver_source_id, transaction_external_id,
-               COALESCE(merchant_signature, '(null)'), signature_version,
-               COALESCE(spend_detailed, '(null)'), provenance,
-               COALESCE(merchant_label, '(null)'),
-               COALESCE(far_silver_source_id, '(null)'),
-               COALESCE(far_account_external_id, '(null)'),
-               COALESCE(far_class, '(null)'),
-               COALESCE(stated_asset_class, '(null)'),
-               COALESCE(provider_spend_detailed, '(null)')
-          FROM spend_txn_enrichment
-         ORDER BY silver_source_id, transaction_external_id`)
+        SELECT e.silver_source_id, e.transaction_external_id,
+               COALESCE(e.merchant_signature, '(null)'), e.signature_version,
+               COALESCE(e.spend_detailed, '(null)'), e.provenance,
+               COALESCE(e.merchant_label, '(null)'),
+               COALESCE(l.far_silver_source_id, '(null)'),
+               COALESCE(l.far_account_external_id, '(null)'),
+               COALESCE(e.stated_asset_class, '(null)'),
+               COALESCE(e.provider_spend_detailed, '(null)')
+          FROM spend_txn_enrichment e
+          LEFT JOIN transfer_links l USING (silver_source_id, transaction_external_id)
+         ORDER BY e.silver_source_id, e.transaction_external_id`)
 	if err != nil {
 		t.Fatalf("read overlay: %v", err)
 	}
@@ -52,15 +53,15 @@ func frozenSnapshot(t *testing.T, db *sql.DB, ctx context.Context) string {
 	var b strings.Builder
 	for rows.Next() {
 		var src, id, sig, detailed, prov, label string
-		var farSrc, farAcct, farClass, exposure, provider string
+		var farSrc, farAcct, exposure, provider string
 		var version int
 		if err := rows.Scan(&src, &id, &sig, &version, &detailed, &prov, &label,
-			&farSrc, &farAcct, &farClass, &exposure, &provider); err != nil {
+			&farSrc, &farAcct, &exposure, &provider); err != nil {
 			t.Fatalf("scan overlay: %v", err)
 		}
-		fmt.Fprintf(&b, "%s/%s sig=%q v%d cat=%s via=%s label=%s far=%s/%s farclass=%s exposure=%s issuer=%s\n",
+		fmt.Fprintf(&b, "%s/%s sig=%q v%d cat=%s via=%s label=%s far=%s/%s exposure=%s issuer=%s\n",
 			src, id, sig, version, detailed, prov, label,
-			farSrc, farAcct, farClass, exposure, provider)
+			farSrc, farAcct, exposure, provider)
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterate overlay: %v", err)
@@ -169,20 +170,20 @@ func TestSpendingPassOutputIsFrozen(t *testing.T) {
 
 // The golden. It moves only with SignatureVersion or a
 // deliberate verdict change, never to make a test pass.
-const frozenSpendingOverlay = `bank/T-BACKLOG sig="UNPLACEABLE COUNTERPARTY" v13 cat=(null) via=signature-only label=(null) far=(null)/(null) farclass=(null) exposure=(null) issuer=(null)
-bank/T-CARD-BILL sig="PAYMENT TO CHASE CARD ENDING IN" v13 cat=card_spend via=rule label=Chase far=(null)/(null) farclass=(null) exposure=(null) issuer=(null)
-bank/T-CONFIG-RULE sig="EXAMPLE BROKER SUBSCRIPTION" v13 cat=investment via=rule label=(null) far=(null)/(null) farclass=(null) exposure=private_equity issuer=(null)
-bank/T-FUND-IN sig="(null)" v13 cat=internal_transfer via=matcher label=(null) far=bank/CASH1 farclass=(null) exposure=(null) issuer=(null)
-bank/T-FUND-OUT sig="TRANSFER TO INVESTMENT" v13 cat=internal_transfer via=matcher label=(null) far=bank/BRK1 farclass=(null) exposure=(null) issuer=(null)
-bank/T-MATCH-OUT sig="AUTOPAY PAYMENT" v13 cat=internal_transfer via=matcher label=(null) far=other-bank/CASH2 farclass=(null) exposure=(null) issuer=GENERAL_MERCHANDISE_OTHER_GENERAL_MERCHANDISE
-bank/T-MEMO sig="ATM WITHDRAWAL MAIN STREET" v13 cat=cash_withdrawal via=rule label=(null) far=(null)/(null) farclass=(null) exposure=(null) issuer=(null)
-bank/T-PIN-OVER-MATCH sig="LOOKS INTERNAL" v13 cat=gift via=manual label=(null) far=bank/CUST1 farclass=(null) exposure=(null) issuer=(null)
-bank/T-PIN-PAIR sig="(null)" v13 cat=internal_transfer via=matcher label=(null) far=bank/CASH1 farclass=(null) exposure=(null) issuer=(null)
-bank/T-PROVIDER sig="CORNER MARKET" v13 cat=FOOD_AND_DRINK_GROCERIES via=provider label=(null) far=(null)/(null) farclass=(null) exposure=(null) issuer=FOOD_AND_DRINK_GROCERIES
-bank/T-PROVIDER-CATCHALL sig="SOME DEPARTMENT STORE" v13 cat=(null) via=signature-only label=(null) far=(null)/(null) farclass=(null) exposure=(null) issuer=GENERAL_MERCHANDISE_OTHER_GENERAL_MERCHANDISE
-bank/T-RULE sig="ATM WITHDRAWAL MAIN STREET" v13 cat=cash_withdrawal via=rule label=(null) far=(null)/(null) farclass=(null) exposure=(null) issuer=GENERAL_MERCHANDISE_OTHER_GENERAL_MERCHANDISE
-other-bank/T-MATCH-IN sig="(null)" v13 cat=internal_transfer via=matcher label=(null) far=bank/CASH1 farclass=(null) exposure=(null) issuer=(null)
-other-bank/T-PIN-OUTSIDE sig="NAMED BY HAND" v13 cat=other via=manual label=(null) far=(null)/(null) farclass=(null) exposure=(null) issuer=(null)
+const frozenSpendingOverlay = `bank/T-BACKLOG sig="UNPLACEABLE COUNTERPARTY" v13 cat=(null) via=signature-only label=(null) far=(null)/(null) exposure=(null) issuer=(null)
+bank/T-CARD-BILL sig="PAYMENT TO CHASE CARD ENDING IN" v13 cat=card_spend via=rule label=Chase far=(null)/(null) exposure=(null) issuer=(null)
+bank/T-CONFIG-RULE sig="EXAMPLE BROKER SUBSCRIPTION" v13 cat=investment via=rule label=(null) far=(null)/(null) exposure=private_equity issuer=(null)
+bank/T-FUND-IN sig="(null)" v13 cat=internal_transfer via=matcher label=(null) far=bank/CASH1 exposure=(null) issuer=(null)
+bank/T-FUND-OUT sig="TRANSFER TO INVESTMENT" v13 cat=internal_transfer via=matcher label=(null) far=bank/BRK1 exposure=(null) issuer=(null)
+bank/T-MATCH-OUT sig="AUTOPAY PAYMENT" v13 cat=internal_transfer via=matcher label=(null) far=other-bank/CASH2 exposure=(null) issuer=GENERAL_MERCHANDISE_OTHER_GENERAL_MERCHANDISE
+bank/T-MEMO sig="ATM WITHDRAWAL MAIN STREET" v13 cat=cash_withdrawal via=rule label=(null) far=(null)/(null) exposure=(null) issuer=(null)
+bank/T-PIN-OVER-MATCH sig="LOOKS INTERNAL" v13 cat=gift via=manual label=(null) far=bank/CUST1 exposure=(null) issuer=(null)
+bank/T-PIN-PAIR sig="(null)" v13 cat=internal_transfer via=matcher label=(null) far=bank/CASH1 exposure=(null) issuer=(null)
+bank/T-PROVIDER sig="CORNER MARKET" v13 cat=FOOD_AND_DRINK_GROCERIES via=provider label=(null) far=(null)/(null) exposure=(null) issuer=FOOD_AND_DRINK_GROCERIES
+bank/T-PROVIDER-CATCHALL sig="SOME DEPARTMENT STORE" v13 cat=(null) via=signature-only label=(null) far=(null)/(null) exposure=(null) issuer=GENERAL_MERCHANDISE_OTHER_GENERAL_MERCHANDISE
+bank/T-RULE sig="ATM WITHDRAWAL MAIN STREET" v13 cat=cash_withdrawal via=rule label=(null) far=(null)/(null) exposure=(null) issuer=GENERAL_MERCHANDISE_OTHER_GENERAL_MERCHANDISE
+other-bank/T-MATCH-IN sig="(null)" v13 cat=internal_transfer via=matcher label=(null) far=bank/CASH1 exposure=(null) issuer=(null)
+other-bank/T-PIN-OUTSIDE sig="NAMED BY HAND" v13 cat=other via=manual label=(null) far=(null)/(null) exposure=(null) issuer=(null)
 `
 
 // Ten population rows — every purchase and withdrawal above — plus the
@@ -295,7 +296,7 @@ func seedFrozenIncomeFixture(t *testing.T, db *sql.DB, ctx context.Context) Opti
 		// a deposit and its reversal on one account.
 		txn{"bank", "I-BOOKED", "CASH1", "deposit", day(90), 911, "Example Payer Three", "", ""},
 		txn{"bank", "I-REVERSED", "CASH1", "deposit", day(91), -911, "Example Payer Three", "", ""},
-		// the mortgage rule's far class, on the spending side.
+		// the mortgage rule's own value, on the spending side.
 		txn{"bank", "I-MORTGAGE", "CASH1", "withdrawal", day(100), -1812, "", "MORTGAGE PAYMENT", ""},
 		// a stated counter account on an outflow, and on an inflow.
 		txn{"bank", "I-STATED-OUT", "CASH1", "withdrawal", day(110), -333, "", "Wire to own account", ""},
@@ -393,24 +394,23 @@ swiss/I-PROVIDER-RAIL sig="EXAMPLE PAYER TWO" v13 cat=(null) via=signature-only 
 swiss/I-RULE sig="CASH DEPOSIT BRANCH" v13 cat=cash_deposit via=rule exposure=(null) provider=INCOME_SALARY
 `
 
-const frozenIncomeFixtureSpendingOverlay = `bank/I-BOOKED sig="EXAMPLE PAYER THREE" v13 cat=internal_transfer via=matcher label=(null) far=bank/CASH1 farclass=(null) exposure=(null) issuer=(null)
-bank/I-FAR-IN sig="TRANSFER FROM EXAMPLE SAVINGS BANK" v13 cat=internal_transfer via=rule label=(null) far=declared/savings-bank farclass=(null) exposure=(null) issuer=(null)
-bank/I-FAR-OUT sig="TRANSFER TO EXAMPLE SAVINGS BANK" v13 cat=internal_transfer via=rule label=(null) far=declared/savings-bank farclass=(null) exposure=(null) issuer=(null)
-bank/I-MATCH-OUT sig="OWN TRANSFER" v13 cat=internal_transfer via=matcher label=(null) far=swiss/CASH9 farclass=(null) exposure=(null) issuer=(null)
-bank/I-MORTGAGE sig="MORTGAGE PAYMENT" v13 cat=internal_transfer via=rule label=(null) far=(null)/(null) farclass=mortgage exposure=(null) issuer=(null)
-bank/I-PIN-PAIR sig="LOOKS INTERNAL" v13 cat=internal_transfer via=matcher label=(null) far=swiss/CASH9 farclass=(null) exposure=(null) issuer=(null)
-bank/I-REVERSED sig="EXAMPLE PAYER THREE" v13 cat=internal_transfer via=matcher label=(null) far=bank/CASH1 farclass=(null) exposure=(null) issuer=(null)
-bank/I-STATED-OUT sig="WIRE TO OWN ACCOUNT" v13 cat=(null) via=signature-only label=(null) far=other-bank/CUST2 farclass=(null) exposure=(null) issuer=(null)
-swiss/I-MATCH-IN sig="OWN TRANSFER" v13 cat=internal_transfer via=matcher label=(null) far=bank/CASH1 farclass=(null) exposure=(null) issuer=(null)
-swiss/I-PIN sig="LOOKS INTERNAL" v13 cat=internal_transfer via=matcher label=(null) far=bank/CASH1 farclass=(null) exposure=(null) issuer=(null)
+const frozenIncomeFixtureSpendingOverlay = `bank/I-BOOKED sig="EXAMPLE PAYER THREE" v13 cat=internal_transfer via=matcher label=(null) far=bank/CASH1 exposure=(null) issuer=(null)
+bank/I-FAR-IN sig="TRANSFER FROM EXAMPLE SAVINGS BANK" v13 cat=internal_transfer via=rule label=(null) far=declared/savings-bank exposure=(null) issuer=(null)
+bank/I-FAR-OUT sig="TRANSFER TO EXAMPLE SAVINGS BANK" v13 cat=internal_transfer via=rule label=(null) far=declared/savings-bank exposure=(null) issuer=(null)
+bank/I-MATCH-OUT sig="OWN TRANSFER" v13 cat=internal_transfer via=matcher label=(null) far=swiss/CASH9 exposure=(null) issuer=(null)
+bank/I-MORTGAGE sig="MORTGAGE PAYMENT" v13 cat=mortgage_transfer via=rule label=(null) far=(null)/(null) exposure=(null) issuer=(null)
+bank/I-PIN-PAIR sig="LOOKS INTERNAL" v13 cat=internal_transfer via=matcher label=(null) far=swiss/CASH9 exposure=(null) issuer=(null)
+bank/I-REVERSED sig="EXAMPLE PAYER THREE" v13 cat=internal_transfer via=matcher label=(null) far=bank/CASH1 exposure=(null) issuer=(null)
+bank/I-STATED-OUT sig="WIRE TO OWN ACCOUNT" v13 cat=(null) via=signature-only label=(null) far=other-bank/CUST2 exposure=(null) issuer=(null)
+swiss/I-MATCH-IN sig="OWN TRANSFER" v13 cat=internal_transfer via=matcher label=(null) far=bank/CASH1 exposure=(null) issuer=(null)
+swiss/I-PIN sig="LOOKS INTERNAL" v13 cat=internal_transfer via=matcher label=(null) far=bank/CASH1 exposure=(null) issuer=(null)
 `
 
 // TestTransferLinksAreFrozen holds transfer_links to a literal over the
 // income fixture, which reaches every road a link has but the ledger,
 // the reference, the described counter leg and the name
 // (TestTransferLinksCarryTheAssertedRoads): a pair on amount, a
-// reversal, a stated counter account, a far rule in both directions and
-// the mortgage rule's class.
+// reversal, a stated counter account and a far rule in both directions.
 func TestTransferLinksAreFrozen(t *testing.T) {
 	db, ctx := openGold(t)
 	runPass(t, db, ctx, seedFrozenIncomeFixture(t, db, ctx))
@@ -421,36 +421,30 @@ func TestTransferLinksAreFrozen(t *testing.T) {
 
 // The golden of transfer_links. It moves only with SignatureVersion or a
 // deliberate verdict change, never to make a test pass.
-const frozenTransferLinks = `bank/I-BOOKED far=bank/CASH1 tx=I-REVERSED class=(null) by=reversal measure=cash
-bank/I-FAR-IN far=declared/savings-bank tx=(null) class=(null) by=rule measure=cash
-bank/I-FAR-OUT far=declared/savings-bank tx=(null) class=(null) by=rule measure=cash
-bank/I-MATCH-OUT far=swiss/CASH9 tx=I-MATCH-IN class=(null) by=amount measure=cash
-bank/I-MORTGAGE far=(null)/(null) tx=(null) class=mortgage by=rule measure=cash
-bank/I-PIN-PAIR far=swiss/CASH9 tx=I-PIN class=(null) by=amount measure=cash
-bank/I-REVERSED far=bank/CASH1 tx=I-BOOKED class=(null) by=reversal measure=cash
-bank/I-STATED-OUT far=other-bank/CUST2 tx=(null) class=(null) by=stated-account measure=cash
-swiss/I-MATCH-IN far=bank/CASH1 tx=I-MATCH-OUT class=(null) by=amount measure=cash
-swiss/I-PIN far=bank/CASH1 tx=I-PIN-PAIR class=(null) by=amount measure=cash
+const frozenTransferLinks = `bank/I-BOOKED far=bank/CASH1 tx=I-REVERSED by=reversal measure=cash
+bank/I-FAR-IN far=declared/savings-bank tx=(null) by=rule measure=cash
+bank/I-FAR-OUT far=declared/savings-bank tx=(null) by=rule measure=cash
+bank/I-MATCH-OUT far=swiss/CASH9 tx=I-MATCH-IN by=amount measure=cash
+bank/I-PIN-PAIR far=swiss/CASH9 tx=I-PIN by=amount measure=cash
+bank/I-REVERSED far=bank/CASH1 tx=I-BOOKED by=reversal measure=cash
+bank/I-STATED-OUT far=other-bank/CUST2 tx=(null) by=stated-account measure=cash
+swiss/I-MATCH-IN far=bank/CASH1 tx=I-MATCH-OUT by=amount measure=cash
+swiss/I-PIN far=bank/CASH1 tx=I-PIN-PAIR by=amount measure=cash
 `
 
-// assertLinksAreTheOverlay holds transfer_links to the spending overlay
-// it is written from: every link is an overlay row's far account or
-// class, and back.
+// assertLinksAreTheOverlay holds transfer_links to the spending overlay:
+// every cash link is the far side of a row the pass wrote there. The
+// in-kind ledger links are writeStatedMoveLinks', and a stated leg the
+// matcher never paired has no overlay row.
 func assertLinksAreTheOverlay(t *testing.T, db *sql.DB) {
 	t.Helper()
-	overlay := scanPairs(t, db, `
-        SELECT silver_source_id || '/' || transaction_external_id,
-               COALESCE(far_silver_source_id, '(null)') || '/' ||
-               COALESCE(far_account_external_id, '(null)') || ' ' || COALESCE(far_class, '(null)')
-          FROM spend_txn_enrichment
-         WHERE far_account_external_id IS NOT NULL OR far_class IS NOT NULL`)
-	links := scanPairs(t, db, `
-        SELECT silver_source_id || '/' || transaction_external_id,
-               COALESCE(far_silver_source_id, '(null)') || '/' ||
-               COALESCE(far_account_external_id, '(null)') || ' ' || COALESCE(far_class, '(null)')
-          FROM transfer_links`)
-	if fmt.Sprint(links) != fmt.Sprint(overlay) {
-		t.Errorf("links hold %v, the overlay %v", links, overlay)
+	orphans := scanPairs(t, db, `
+        SELECT l.silver_source_id || '/' || l.transaction_external_id, l.evidence
+          FROM transfer_links l
+          LEFT JOIN spend_txn_enrichment e USING (silver_source_id, transaction_external_id)
+         WHERE l.measure = ? AND e.silver_source_id IS NULL`, gold.LinkMeasureCash)
+	if len(orphans) > 0 {
+		t.Errorf("links with no spending row: %v", orphans)
 	}
 }
 
@@ -519,10 +513,10 @@ func TestTransferLinksCarryTheAssertedRoads(t *testing.T) {
 // The golden of the asserted roads' links. It moves only with
 // SignatureVersion or a deliberate verdict change, never to make a test
 // pass.
-const frozenAssertedLinks = `bank/L-FX-IN far=bank/CASH1 tx=L-FX-OUT class=(null) by=stated-counter measure=cash
-bank/L-FX-OUT far=bank/BRK1 tx=L-FX-IN class=(null) by=stated-counter measure=cash
-bank/L-LEDGER-OUT far=other-bank/CUST2 tx=L-LEDGER-IN class=(null) by=ledger measure=cash
-bank/L-NAMED-OUT far=other-bank/CASH2 tx=L-NAMED-IN class=(null) by=named measure=cash
-other-bank/L-LEDGER-IN far=bank/CASH1 tx=L-LEDGER-OUT class=(null) by=ledger measure=cash
-other-bank/L-NAMED-IN far=bank/CASH1 tx=L-NAMED-OUT class=(null) by=named measure=cash
+const frozenAssertedLinks = `bank/L-FX-IN far=bank/CASH1 tx=L-FX-OUT by=stated-counter measure=cash
+bank/L-FX-OUT far=bank/BRK1 tx=L-FX-IN by=stated-counter measure=cash
+bank/L-LEDGER-OUT far=other-bank/CUST2 tx=L-LEDGER-IN by=ledger measure=cash
+bank/L-NAMED-OUT far=other-bank/CASH2 tx=L-NAMED-IN by=named measure=cash
+other-bank/L-LEDGER-IN far=bank/CASH1 tx=L-LEDGER-OUT by=ledger measure=cash
+other-bank/L-NAMED-IN far=bank/CASH1 tx=L-NAMED-OUT by=named measure=cash
 `

@@ -29,27 +29,41 @@ import logging
 import re
 import sys
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from urllib.parse import urlsplit, parse_qs
+from urllib.parse import urlsplit
 
-from collectorkit import bronze, cli, debugcap, launch, session
+from collectorkit import bronze, cli, debugcap, launch
 
 import cards  # local module
 import landmarks as ubs  # local module
 import rates  # local module
+# The SPA's URL helpers and the walk's pure name and text rules.
+# Each name is bound here too, so an importer of download finds it.
+from landmarks import (  # noqa: F401
+    _href_to_route,
+    _origin,
+    _build_spa_url,
+    _extract_query_param,
+)
+from names import (  # noqa: F401
+    _windows,
+    _fmt_dmy,
+    _suggest_extension,
+    _strip_apikey,
+    _exported_portfolio,
+    _export_window,
+)
 # The session login.py mints is the one this walk reuses: same state file,
 # same UA (UBS's anti-bot heuristics must see a single session), same
 # screenshot convention.
 from login import (  # local module
-    DEFAULT_STATE_PATH, LEGACY_STATE_PATH, USER_AGENT, maybe_screenshot,
+    DEFAULT_STATE_PATH, USER_AGENT, maybe_screenshot,
 )
 
 log = logging.getLogger("ubs-web.download")
-
-# The walk's passes, in the order it runs them. `--only` names one.
-PASSES = ("positions", "transactions", "rates", "portfolio-transactions",
-          "documents", "cards")
 
 NAV_TIMEOUT_MS = 60_000
 LANDMARK_TIMEOUT_MS = 30_000
@@ -266,28 +280,6 @@ def enumerate_accounts(page, screenshot_dir: Path | None) -> list[dict]:
     return list(accounts.values())
 
 
-def _href_to_route(href: str) -> str:
-    """Reduce a full or relative href down to its hash route."""
-    if "#" in href:
-        return "#" + href.split("#", 1)[1]
-    return href
-
-
-def _origin(url: str) -> str:
-    """Return the `scheme://host[:port]` of a URL."""
-    s = urlsplit(url)
-    return f"{s.scheme}://{s.netloc}"
-
-
-def _build_spa_url(current_url: str, hash_route: str) -> str:
-    """Replace just the fragment of the post-auth SPA URL."""
-    s = urlsplit(current_url)
-    base = f"{s.scheme}://{s.netloc}{s.path}"
-    if s.query:
-        base += "?" + s.query
-    return base + (hash_route if hash_route.startswith("#") else "#" + hash_route)
-
-
 # ============================================================
 # Per-account transactions export
 # ============================================================
@@ -366,14 +358,6 @@ def export_transactions(page, account: dict, since: date, until: date,
         "mt940_filenames": [p.name for p in mt940_paths],
         "mt940_gaps": _windows(mt940_gaps),
     }
-
-
-def _windows(gaps: list[tuple[date, date]]) -> list[str]:
-    """Un-exported windows as `YYYY-MM-DD..YYYY-MM-DD` strings, for the
-    manifest and the log. Always written, empty list included, so a
-    reader can tell a run that covered everything from one taken before
-    the field existed."""
-    return [f"{a.isoformat()}..{b.isoformat()}" for a, b in gaps]
 
 
 def _export_with_split(page, account: dict, since: date, until: date,
@@ -510,10 +494,6 @@ def _set_transaction_period_custom(page, since: date, until: date,
     # Give the table a moment to re-render with the new window.
     page.wait_for_timeout(1500)
     return applied_since, applied_until
-
-
-def _fmt_dmy(d: date) -> str:
-    return d.strftime("%d.%m.%Y")
 
 
 def _clamp_dates_to_popover_limit(page, since: date,
@@ -866,16 +846,6 @@ def _save_download(download, account: dict, out_dir: Path,
     return out_path
 
 
-def _suggest_extension(suggested: str | None, fmt: str) -> str:
-    """Pick a sane file extension. UBS suggests filenames; trust them
-    when they end in something obvious, otherwise fall back to fmt."""
-    if suggested:
-        ext = Path(suggested).suffix.lstrip(".").lower()
-        if ext:
-            return ext
-    return {"csv": "csv", "mt940": "mt940", "pdf": "pdf"}.get(fmt, "bin")
-
-
 # ============================================================
 # Bank documents harvest
 # ============================================================
@@ -1084,18 +1054,6 @@ def _fetch_document(context, href: str, token: str,
     }
 
 
-def _strip_apikey(href: str) -> str:
-    """Don't persist the apikey query param in run.json — it is a
-    long-lived tenant secret. Token + Accept are enough to re-fetch
-    by re-running download.py (which gets a fresh apikey from the
-    rendered DOM)."""
-    s = urlsplit(href)
-    qs = parse_qs(s.query)
-    qs.pop("apikey", None)
-    flat = "&".join(f"{k}={v[0]}" for k, v in qs.items())
-    return f"{s.scheme}://{s.netloc}{s.path}" + (f"?{flat}" if flat else "")
-
-
 # ============================================================
 # Card surface
 # ============================================================
@@ -1187,12 +1145,18 @@ def open_legacy_rates(page):
 # ============================================================
 
 def write_run_json(run_dir: Path, since: date, until: date,
-                   accounts: list[dict], documents: list[dict],
-                   positions: list[dict],
-                   cards_meta: dict | None = None,
-                   portfolio_transactions: list[dict] | None = None,
-                   only: str | None = None,
-                   rates_meta: dict | None = None) -> None:
+                   results: dict, only: str | None = None) -> None:
+    """Write the terminal manifest from each pass's result, keyed by the
+    pass's run.json key (`Pass.key`). A pass that did not run, or failed
+    in isolation, leaves its key out of `results`, and its list reads as
+    empty. The card and rate blocks are written only when their pass
+    returned one."""
+    accounts = results.get("transactions", [])
+    documents = results.get("documents", [])
+    positions = results.get("positions", [])
+    portfolio_transactions = results.get("portfolio_transactions", [])
+    cards_meta = results.get("cards")
+    rates_meta = results.get("rates")
     payload = {
         "dump_started_at": bronze.ts_slug(),
         # Terminal status for the run.json lifecycle: this function is
@@ -1361,26 +1325,6 @@ def _enumerate_portfolios(page,
         seen.add(key)
         portfolios.append({"portfolio_uid": uid, "banking_relation_id": rel})
     return portfolios
-
-
-def _extract_query_param(href: str, name: str) -> str | None:
-    """Pull a query-string param out of a URL whose query lives in
-    the hash fragment (SPA-style), which urlsplit's query field does
-    not reach."""
-    if "#" in href:
-        _, frag = href.split("#", 1)
-    else:
-        frag = href
-    if "?" not in frag:
-        return None
-    _, qs = frag.split("?", 1)
-    for kv in qs.split("&"):
-        if "=" not in kv:
-            continue
-        k, v = kv.split("=", 1)
-        if k == name:
-            return v
-    return None
 
 
 def _download_positions_csv(page, hash_route: str, out_dir: Path,
@@ -1596,18 +1540,6 @@ def _save_portfolio_transactions(out_dir: Path, body: bytes,
     }
 
 
-def _exported_portfolio(text: str) -> str | None:
-    """The portfolio an export says it is for, from its first row.
-
-    The file is named for this rather than for the scope asked of the
-    surface, so a dump never claims a portfolio it does not hold."""
-    rows = text.splitlines()
-    if len(rows) < 2:
-        return None
-    cells = rows[1].split(";")
-    return cells[2].strip() if len(cells) > 2 and cells[2].strip() else None
-
-
 def _apply_portfolio_window(page, since: date, until: date) -> bool:
     """Put the transaction list on a window, through its own panel.
 
@@ -1723,41 +1655,148 @@ def _click_portfolio_export(page) -> bytes | None:
         return None
 
 
-def _export_window(text: str) -> tuple[str, str] | None:
-    """The period the export's own footer states, or None when absent."""
-    for line in reversed(text.splitlines()):
-        if line.startswith(ubs.TXN_EXPORT_FOOTER_PREFIX):
-            m = ubs.TXN_EXPORT_FOOTER_RE.search(line)
-            if m:
-                return m.group(1), m.group(2)
-    return None
-
-
 # ============================================================
 # Main
 # ============================================================
+
+@dataclass(frozen=True)
+class Pass:
+    """One pass of the walk.
+
+    `plan` gives the dry-run sentence for a real run with these flags and
+    this many cash accounts, or None when the flags skip the pass. `run`
+    makes the export, and write_run_json writes its result as the block
+    under `key`. A failure of an `isolated` pass is
+    logged and captured as `failure_capture`, and the walk goes on. Any
+    other failure ends the walk, and no manifest is written.
+    """
+
+    name: str       # the --only word
+    key: str        # its run.json block (write_run_json)
+    plan: Callable[[argparse.Namespace, int], str | None]
+    run: Callable[[_Walk], object]
+    isolated: bool = False
+    failure_capture: str = ""
+
+
+@dataclass(frozen=True)
+class _Walk:
+    """What the passes of one real run share."""
+
+    args: argparse.Namespace
+    page: object
+    context: object
+    run_dir: Path
+    since: date
+    until: date
+    accounts: list[dict]
+    apikey_holder: dict
+    capture: Callable
+
+
+def _run_transactions(w: _Walk) -> list[dict]:
+    """Each cash account's transaction export. One account's failure is
+    logged and captured, and the walk goes on to the next."""
+    txn_results: list[dict] = []
+    for account in w.accounts:
+        try:
+            meta = export_transactions(
+                w.page, account, w.since, w.until, w.run_dir,
+                w.args.screenshot_dir,
+            )
+            txn_results.append(meta)
+        except SystemExit:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.exception("transactions export failed for %s "
+                          "account %s: %s",
+                          account["kind"],
+                          _log_id(account), e)
+            # Failure path only: the page is still on the
+            # surface that raised, so this is the DOM the
+            # failing step saw. One capture per account
+            # would bury it. Named by the sha256 prefix the
+            # export filenames already use.
+            w.capture(w.page, "20-txn-"
+                      f"{bronze.short_token(account['account_id'])}"
+                      "-failed")
+    return txn_results
+
+
+# The walk's passes, in the order it runs them. `--only` names one.
+# A lambda looks its export up when it runs, so a test can replace it.
+PASS_TABLE = (
+    Pass("positions", "positions",
+         plan=lambda args, n: "the positions of each portfolio",
+         run=lambda w: export_positions(
+             w.page, w.run_dir, w.args.screenshot_dir,
+         )),
+    Pass("transactions", "transactions",
+         plan=lambda args, n: f"the transactions of {n} cash account(s)",
+         run=_run_transactions),
+    Pass("rates", "rates",
+         plan=lambda args, n: f"the interest conditions of {n} cash "
+                              "account(s), and of the legacy list's other "
+                              "accounts",
+         run=lambda w: _capture_rates(
+             w.page, w.run_dir, w.accounts, w.args.screenshot_dir)),
+    Pass("portfolio-transactions", "portfolio_transactions",
+         plan=lambda args, n: "one securities-transaction export per "
+                              "managed portfolio",
+         run=lambda w: export_portfolio_transactions(
+             w.page, w.run_dir, w.since, w.until,
+             w.args.screenshot_dir,
+         ),
+         isolated=True, failure_capture="25-portfolio-txn-failed"),
+    Pass("documents", "documents",
+         plan=lambda args, n: "the documents archive",
+         run=lambda w: harvest_documents(
+             w.page, w.since, w.until, w.run_dir,
+             w.context, w.args.screenshot_dir, capture=w.capture,
+         )),
+    Pass("cards", "cards",
+         plan=lambda args, n: None if args.no_cards else (
+             "the card roster, each card's ledger and its invoices"
+             + ("" if args.no_card_statements else " and statement PDFs")),
+         run=lambda w: None if w.args.no_cards else _capture_cards(
+             w.context, w.page, w.apikey_holder, w.run_dir,
+             w.since, w.until,
+             statements=not w.args.no_card_statements,
+         )),
+)
+PASSES = tuple(p.name for p in PASS_TABLE)
+
 
 def dry_run_plan(args: argparse.Namespace, cash_accounts: int) -> str:
     """What a real run with these flags would export, for the dry-run log:
     the passes `--only` selects, without the card pass under
     `--no-cards`."""
-    what = {
-        "positions": "the positions of each portfolio",
-        "transactions": f"the transactions of {cash_accounts} cash "
-                        "account(s)",
-        "rates": f"the interest conditions of {cash_accounts} cash "
-                 "account(s), and of the legacy list's other accounts",
-        "portfolio-transactions": "one securities-transaction export per "
-                                  "managed portfolio",
-        "documents": "the documents archive",
-        "cards": "the card roster, each card's ledger and its invoices"
-                 + ("" if args.no_card_statements else " and statement PDFs"),
-    }
-    passes = [p for p in PASSES if args.only in (None, p)
-              and not (p == "cards" and args.no_cards)]
-    if not passes:
+    what = [s for p in PASS_TABLE if args.only in (None, p.name)
+            and (s := p.plan(args, cash_accounts)) is not None]
+    if not what:
         return "nothing"
-    return "would export " + "; ".join(what[p] for p in passes)
+    return "would export " + "; ".join(what)
+
+
+def _run_passes(w: _Walk) -> dict:
+    """Run the passes `--only` selects, in table order; return each
+    result under its run.json key."""
+    results: dict = {}
+    for p in PASS_TABLE:
+        if w.args.only not in (None, p.name):
+            continue
+        if not p.isolated:
+            results[p.key] = p.run(w)
+            continue
+        try:
+            results[p.key] = p.run(w)
+        except SystemExit:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.exception("%s export failed: %s",
+                          p.name.replace("-", " "), e)
+            w.capture(w.page, p.failure_capture)
+    return results
 
 
 def main(argv: list[str]) -> int:
@@ -1798,8 +1837,7 @@ def main(argv: list[str]) -> int:
     rc = 0
     try:
         with sync_playwright() as pw:
-            browser, context = _new_context(pw, session.resolve_state_path(
-                args.state_path, DEFAULT_STATE_PATH, LEGACY_STATE_PATH))
+            browser, context = _new_context(pw, args.state_path)
             if args.trace:
                 context.tracing.start(screenshots=True, snapshots=True, sources=True)
             # The card and account APIs authenticate with a header the SPA
@@ -1818,12 +1856,6 @@ def main(argv: list[str]) -> int:
                 # warn. This DOM is what says whether the anchors moved or
                 # were genuinely absent.
                 capture(page, "10-home")
-                txn_results: list[dict] = []
-                doc_results: list[dict] = []
-                positions_meta: list[dict] = []
-                portfolio_txn_meta: list[dict] = []
-                cards_meta: dict | None = None
-                rates_meta: dict | None = None
                 if args.dry_run:
                     # Read-only walk: session verified and accounts
                     # enumerated above. Log the plan (what a real run
@@ -1833,65 +1865,12 @@ def main(argv: list[str]) -> int:
                     log.info("dry-run plan: %s, in [%s..%s]",
                              dry_run_plan(args, len(accounts)), since, until)
                 else:
-                    def run(name):
-                        return args.only in (None, name)
-                    if run("positions"):
-                        positions_meta = export_positions(
-                            page, run_dir, args.screenshot_dir,
-                        )
-                    for account in (accounts if run("transactions") else []):
-                        try:
-                            meta = export_transactions(
-                                page, account, since, until, run_dir,
-                                args.screenshot_dir,
-                            )
-                            txn_results.append(meta)
-                        except SystemExit:
-                            raise
-                        except Exception as e:  # noqa: BLE001
-                            log.exception("transactions export failed for %s "
-                                          "account %s: %s",
-                                          account["kind"],
-                                          _log_id(account), e)
-                            # Failure path only: the page is still on the
-                            # surface that raised, so this is the DOM the
-                            # failing step saw. One capture per account
-                            # would bury it. Named by the sha256 prefix the
-                            # export filenames already use.
-                            capture(page, "20-txn-"
-                                    f"{bronze.short_token(account['account_id'])}"
-                                    "-failed")
-                    if run("rates"):
-                        rates_meta = _capture_rates(
-                            page, run_dir, accounts, args.screenshot_dir)
-                    try:
-                        if run("portfolio-transactions"):
-                            portfolio_txn_meta = export_portfolio_transactions(
-                                page, run_dir, since, until,
-                                args.screenshot_dir,
-                            )
-                    except SystemExit:
-                        raise
-                    except Exception as e:  # noqa: BLE001
-                        log.exception("portfolio transactions export "
-                                      "failed: %s", e)
-                        capture(page, "25-portfolio-txn-failed")
-                    if run("documents"):
-                        doc_results = harvest_documents(
-                            page, since, until, run_dir,
-                            context, args.screenshot_dir, capture=capture,
-                        )
-                    if not args.no_cards and run("cards"):
-                        cards_meta = _capture_cards(
-                            context, page, apikey_holder, run_dir,
-                            since, until,
-                            statements=not args.no_card_statements,
-                        )
-                    write_run_json(run_dir, since, until,
-                                   txn_results, doc_results,
-                                   positions_meta, cards_meta,
-                                   portfolio_txn_meta, args.only,
-                                   rates_meta)
+                    results = _run_passes(_Walk(
+                        args=args, page=page, context=context,
+                        run_dir=run_dir, since=since, until=until,
+                        accounts=accounts, apikey_holder=apikey_holder,
+                        capture=capture))
+                    write_run_json(run_dir, since, until, results, args.only)
             finally:
                 debugcap.stop_trace_if_active(context, args.trace,
                                               args.screenshot_dir,

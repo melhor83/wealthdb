@@ -9,7 +9,7 @@ canonical gold schema:
   account-statement export, statements reconstructed from the PDF
   archive, cards, mortgages and the portfolio transaction list.
 
-It implements the `silver.Adapter` / `silver.Connection` interface of
+It implements the `silver.Connection` interface of
 [../DESIGN.md](../DESIGN.md) §6. With both subsources configured, the
 orchestrator (`merge.go`) splices them:
 
@@ -66,10 +66,11 @@ Web silver:
 
 | Silver table | Gold target | Notes |
 | --- | --- | --- |
-| `accounts`, `portfolios`, `positions` | `accounts`, `portfolios`, `instruments` | Accounts and portfolios before PSN starts. The web feed's instrument descriptions read better than PSN's names; the latest snapshot's wins. Live positions reach gold as `payload.web` on PSN's rows. |
+| `accounts`, `portfolios`, `positions` | `accounts`, `portfolios`, `instruments` | Accounts and portfolios before PSN starts. The web feed's instrument descriptions read better than PSN's names; the latest snapshot's wins. Live positions reach gold as `payload.web` on PSN's position rows, and their `Rating` as `rating_sp` there. |
 | `transactions` | `transactions` | §5, §7. |
 | `mortgages`, `historical_mortgages` | `accounts` (kind `mortgage`) + a negative `mortgage` position | No PSN cut: PSN carries no mortgages. |
 | `historical_position_snapshots`, `historical_cash_balances` | `positions`, `cash_balances` | §9. The positions also feed the valor index and road 3 of a dividend's security (§7). |
+| `statement_overview_totals` | `positions` | The USD copy's precious-metals total, one position per date and portfolio (§9). |
 | `card_accounts`, `card_invoices`, `card_transactions` | `accounts`, `cash_balances`, `transactions` | §10. |
 | `portfolio_transactions` | `transactions`; `realized_lots` | A managed portfolio's securities settlements, booked on the cash account that paid (§11). Its sales with a realized P/L are also realized lots (§12). |
 | `statement_trades` | `realized_lots` | The trade list a Statement of Assets prints (ubs-web DESIGN.md §3.10). Each sale is a realized lot with the cost it drew on (§12). |
@@ -90,6 +91,17 @@ daily book balance for every cash account (`appendBookBalances`).
 - It is signed at the source, so no credit/debit indicator applies.
 - An (account, currency, day) the statement feed already emitted is
   skipped, so the pass only adds.
+- Its payload is the account's record, with the record's interest
+  conditions added under the stated-rate keys (YIELD.md §3):
+  - up to four tiers per side, each numbered by its column. A tier past
+    the first counts only when the column before it has a limit between
+    0.005 and 1e14.
+  - the day each side holds from.
+  - the term's end, unless the account is open-ended (year 9000 or
+    later).
+  - the day count.
+- The netbanking's conditions do not land on a balance whose record
+  states tiers.
 
 ## 4. `(asset_class, vehicle)` derivation for `holdings`
 
@@ -161,7 +173,7 @@ UBS's `silver.events.kind` maps to gold's `kind`:
 | --- | --- | --- |
 | `cash_movement` | `deposit` / `withdrawal` / `fee` / `interest` / `tax` / `dividend` / `buy` / `sell` / `fx` | From the MT940 `:86:` narrative, with the `:61:` type code as a floor (§6). A deposit or withdrawal whose same-day mirror books on another own account carries the conduit verdict in its payload (same-day offset veto, `buildSameDayOffsetVeto`). A converted movement (`/OCMT/`) whose other account the feed does not speak for gets a counter-leg, `mirror:<event id>` (§7). A dividend line whose confirmation states its gross reads the gross, with the tax withheld beside it as `<event id>:tax`. A reversal of a dividend credit is a dividend reversal (§7, *Dividends: the security and the gross*). |
 | `securities_movement` | `transfer_in` / `transfer_out` | By the credit/debit mark. |
-| `trade_confirmation` | `buy` or `sell` | MT515 payload `side`, which the collector reads off the order's business function (`:22H::BUSE//`). A market trade names the holder's role (`BUYI` / `SELL`, folded to `BUY` / `SELL` at load). A fund order names the operation (`SUBS` subscribes, `REDM` redeems, kept verbatim). Dated to the trade day, not the settlement day. Booked against the settlement's cash account, resolved to its IBAN (`cashAccountIBANs`). The MT940 line for the same settlement folds away (§7, *The settlement fold*). |
+| `trade_confirmation` | `buy` or `sell` | MT515 payload `side`, which the collector reads off the order's business function (`:22H::BUSE//`). A market trade names the holder's role (`BUYI` / `SELL`, folded to `BUY` / `SELL` at load). A fund order names the operation (`SUBS` subscribes, `REDM` redeems, kept verbatim). Dated to the trade day, not the settlement day. Booked against the settlement's cash account, resolved to its IBAN (`cashAccountIBANs`). The MT940 line for the same settlement drops (§7, *A trade on two PSN rails*). |
 | `fx_confirmation` | `fx` | MT300. |
 | `fx_option_confirmation` | `fx` | MT305. No dedicated option kind: the settlement is an FX cash effect. |
 | `loan_deposit_confirmation` | `other` | MT320/MT330/MT350. |
@@ -175,7 +187,7 @@ UBS's `silver.events.kind` maps to gold's `kind`:
 
 ### `ubs-web` booking types
 
-`webKind` (`web_reader.go`) classifies the web silver's
+`webKind` (`web_kind.go`) classifies the web silver's
 `description_kind`. That is the statement PDF's printed booking type,
 or the export's `Description2` label.
 
@@ -221,8 +233,19 @@ on a statement stays negative. `ApplyCanonicalSign` orients the net
 amount by the kind, so a reversal keeps its inflow whichever column
 printed it.
 
-A statement-era deposit or withdrawal then passes the era-gated
-external-flow test (`pdfCashIsExternal`):
+A deposit or withdrawal read from the PDF archive then passes the
+external-flow test (`pdfCashIsExternal`). Such a row is a statement row
+or a payment advice (`source` `payment_advice_pdf`; an older silver
+marks the advice in `document`).
+
+First, a move between the relationship's own accounts and mandates is
+internal (`pdfInternalTransfer`). It is a statement row under a booking
+type that moves cash, or a payment advice, whose narrative lines carry
+one of the transfer or mandate words (`UEBERTRAG`, `UMBUCHUNG`,
+`MANDAT`, `MANAGE`, `PORTFOLIO`, `REDUK`, `REDUCTION`, `INCREAS`). No
+later rule can make it external.
+
+The rail promotion is era-gated:
 
 - In the MT940 era, the TWINT credit and reversal count as arrivals,
   beside `CREDIT`, `E-BANKING CREDIT` and `SALARY PAYMENT`. The TWINT
@@ -273,40 +296,82 @@ in order:
 - The one exception is `NDIV` on an `RC`: the bank taking back a
   dividend. It reads as a dividend reversal (§7, *Dividends: the
   security and the gross*).
-- The mark gives a reversal's sign, whatever kind it reads as.
-  `buildTransaction` signs an `RC` negative: it takes back a credit. It
-  signs an `RD` positive: it returns a debit, such as a payment that
-  came back. So the stream, the era fold and the offset veto read one
-  sign.
+- The mark gives every line's sign, whatever kind it reads as
+  (`markSigned`). A `C` and an `RD` (a returned payment) bring money in.
+  A `D` and an `RC` (a credit taken back) take money out. A line with no
+  mark is signed by its kind. So the stream, the reconcile table and the
+  offset veto read one sign.
 - An `NSEC` line whose trade the MT515 rail also confirms never reaches
-  the floor. The settlement fold (§7) drops it in favour of the
+  the floor. The reconcile table (§7) drops it in favour of the
   confirmation, which names the security.
 
 ## 7. Transactions across the feeds
 
-Three eras record the cash ledger:
+Four kinds of record state the cash ledger:
 
 | Era | Silver rows | Ids |
 | --- | --- | --- |
 | Statement reconstruction | `ubs-web.transactions`, `payload.source = "account_statement_pdf"` | `stmt:`, a content hash of the printed row |
 | Account-statement export | `ubs-web.transactions`, no `payload.source` | UBS's "Transaction no." |
+| Payment advice | `ubs-web.transactions`, `payment_advice_pdf` marker | UBS's "Transaction no." |
 | PSN | `ubs-psn.events` | `mt940:`, `mt515:`, … |
 
 Their time ranges overlap and their id spaces are disjoint. The adapter
-emits each booking once:
+adds records of its own: a conversion's other leg and a corporate
+action's cash leg (*The accounts the feed does not speak for*). The
+portfolio transaction list states a managed portfolio's trades once
+more (§11).
 
-- **The hard cut** gives a web row on or after PSN start to PSN, per
-  account (*The accounts the feed does not speak for*).
-- **The seam** drops the web copy of a booking the first PSN dump
-  reaches back over.
-- **The era fold** drops a statement copy that the export or the feed
-  also holds, and an export copy of a confirmation's cash leg.
-- **The settlement fold** drops the MT940 cash leg of a trade an MT515
-  confirmation states.
+### The reconcile table
 
-The folds remove rows; they never change an amount, a date, a kind or
-an id. Text moves only downward: a richer copy fills a column the
-surviving row left empty or bare.
+One ordered table of rules decides which record of a booking gold keeps
+(`reconcile.go`). Each record is read once and is a candidate. Each
+rule names the records that lose and the records that win, a key the
+two share, and how many losers one winner takes. A rule reads only the
+candidates the rules before it left standing.
+
+| # | Rule | Loses | Wins | Key | Match |
+| --- | --- | --- | --- | --- | --- |
+| 1 | split legs over their movement | statement | — | a leg `<id>#1` stands | authority |
+| 2 | web over advice | advice | statement, export | account, currency, column, magnitude, the same value or booking date | first free |
+| 3 | the cut | statement, export, advice | — | PSN start, account covered | authority |
+| 4 | leg over export | export, advice | cash leg | booking | 1:1 |
+| 5 | export over statement | statement | export | booking | 1:1 |
+| 6 | feed over statement | statement | feed, mirror, cash leg | booking | 1:1 |
+| 7 | feed over web by number | statement, export, advice | feed | account, bank number | any |
+| 8 | web over mirror | mirror | statement, export, advice | booking (deposits and withdrawals) | any |
+| 9 | confirmation over settlement line | feed `NSEC` or `NMSC` | MT515 | settlement | 1:1 |
+| 10 | settlement over list | list row | statement, export, advice, MT515, feed | cash account, currency, day | 1:1 |
+
+- **The keys differ** because the rails state one booking differently.
+  The booking key is signed cents (*Statement copies*). The settlement
+  key is an unsigned figure on the day the cash lands (*A trade on two
+  PSN rails*). The list states a value no cash record shares, so its key
+  has no amount (§11).
+- **1:1 counts.** N winners take at most N losers, so a second equal
+  booking survives. Pairs go in id order. Rules 9 and 10 take their
+  losers in the order the silver lists them.
+- **Any** drops every loser while one winner holds the key.
+- **First free** takes the advices in id order. Each goes to the first
+  ledger row by id that states its movement on the same value date or
+  on the same booking date, and that no earlier advice took.
+- **No rule pairs two records of one kind.** Two identical payments on
+  one day are two bookings.
+- **The whole silver**, unwindowed. Whether a booking is recorded twice
+  depends on silver's contents, never on the slice a load covers.
+- Rule 4 has an exception: where the leg reads no gross and its export
+  copy states one, the leg goes and the copy stays.
+- A statement can print a batch of payments whole where another lists
+  them, and the parser splits the listed batch into legs under the
+  movement's id. Rule 1 keeps the legs.
+- An advice states one movement and nothing else. Rule 2 keeps the
+  ledger's row where it holds that movement: the figure in the same
+  column, the magnitude equal to the cent. The export signs its cells
+  and the printed eras do not, so the column gives the direction.
+
+A rule removes records. It never changes an amount, a date, a kind or
+an id. Text moves only downward: the survivor takes each column it left
+empty or bare from the copies it replaced.
 
 ### Transaction text columns
 
@@ -396,8 +461,11 @@ line (`BALANCE CLOSING OF SERVICE PRICES`, `INTEREST CALCULATION
 BALANCE`), which reaches silver with a figure of `0.00` and the totals
 as its only narrative.
 
-- The adapter drops a row with an amount of exactly zero and no
-  narrative but the turnover-total line (`isStatementSummary`).
+- The adapter drops every statement row with an amount of exactly
+  zero: it moves no money, whatever its booking type says (a period
+  close, a low booking amount). Silver keeps it as printed.
+- It drops an advice row of amount zero whose only narrative is the
+  turnover-total line (`isStatementSummary`).
 - The export prints the same marker as a zero-amount `Balance closing
   of service prices` row without a booking type. It is dropped the same
   way (`isServicePriceClose`).
@@ -467,7 +535,7 @@ tier translates the types whose meaning is clear in every spelling:
 fees and charges, ATM cash, FX between own currency accounts, and card
 bills. It treats every other type as a payment rail that says nothing
 about what was bought ([../SPENDING.md](../SPENDING.md) §3,
-`internal/spending/providermap.go`). The web eras' FX types are `fx`
+`internal/spending/vocab_ubs.go`). The web eras' FX types are `fx`
 kinds, which the spending population excludes by kind. Of the FX codes,
 only an MT940 `NFEX` reversal, which the type-code floor does not read
 (§6), reaches that tier.
@@ -492,9 +560,9 @@ number the bank wrote.
 
 Three passes read the reference:
 
-- The era text fold and the seam (below) match an export row to its
-  MT940 copy on (account, number). The account is part of the key
-  because the two legs of a transfer share the number.
+- The era text fold and rule 7 of the reconcile table match an export
+  row to its MT940 copy on (account, number). The account is part of
+  the key because the two legs of a transfer share the number.
 - The internal-transfer matcher pairs on it ahead of amounts
   ([../SPENDING.md](../SPENDING.md) §3, *The reference road*). That
   reaches a conversion between two own accounts, whose legs carry
@@ -513,7 +581,7 @@ often says less than the export's:
 
 The export's row for the same entry names the payee, the printed
 booking type and the detail line. So the PSN transaction stream is
-wrapped in a fold (`psnWebTextFoldStream`). It fills such a column from
+wrapped in a fold (`psnWebTextFold`). It fills such a column from
 the export's record of the same entry, matched on (account, bank
 reference).
 
@@ -531,18 +599,18 @@ reference).
 The fold changes what `Normalize` sees, so the rows it reaches are
 re-keyed (`SignatureVersion` 7, [../SPENDING.md](../SPENDING.md) §4).
 
-### The era fold
+### Statement copies
 
 A statement row and its export or MT940 copy share no id. Nothing in
 silver pairs them: the statement loader dedups only within the archive,
 and the hard cut arbitrates web against PSN, not one web era against
 another.
 
-The era fold (`buildEraFold`, web side) is that match. Its key is four
-facts of the booking. Each comes from the adapter's own projection of
-the row, never from the raw silver columns:
+Rules 4 to 6 of the reconcile table are that match. Their key, the
+booking key, is four facts of the booking. Each comes from the
+adapter's own projection of the row, never from the raw silver columns:
 
-| Key component | Web eras (`webProjectedNet`) | Feed era (`buildTransaction`) |
+| Key component | Web eras (`webProjectedNet`) | Feed era (`feedRow.transaction`) |
 | --- | --- | --- |
 | Account | `transactions.account_external_id` | `payload.account`, else `events.account_external_id` |
 | Value day | `value_date`, floored to UTC midnight | `events.timestamp`, floored to UTC midnight |
@@ -560,14 +628,15 @@ magnitude from the figure (`canonical.ApplyCanonicalSign`), so both
 eras land on one signed number.
 
 - The key is signed. A booking and the bank's correction of it are
-  equal and opposite on one day, and folding them would delete a real
+  equal and opposite on one day, and pairing them would delete a real
   entry. A reversal row (`<base>;Reversal`) keeps its own sign for the
   same reason.
-- A kind with no pinned direction (interest, `fx`, `other`) passes the
-  source's sign through. There the eras can disagree, and the pair does
-  not fold. The fold never guesses.
+- A kind with no pinned direction (interest, `fx`, `other`) keeps the
+  sign the row states. The statement's debit column is a printed figure
+  and is subtracted. The export's debit cell is signed and is added. So
+  both eras land on one signed number for these kinds too.
 - No narrative enters the key: each era words the entry differently.
-- A zero amount never folds. It names no sum, and a day can carry
+- A zero amount never pairs. It names no sum, and a day can carry
   several unrelated zero-amount period-close lines.
 - All three eras store a UTC-midnight value date. The flooring is a
   safety net.
@@ -577,54 +646,54 @@ eras land on one signed number.
 - **The statement copy is the one dropped.** The export and the feed
   are the bank's machine-readable record. A statement row comes from a
   layout parser, one step further from the bank. The rule is per era,
-  not per row. The only export row the fold drops is a copy of a
+  not per row. The only export row these rules drop is a copy of a
   confirmation's cash leg (below). The survivor's id, account, amount,
   value date and kind stay as they are.
-- **Two rows of one era never fold.** Two identical payments on one day
+- **Two rows of one era never pair.** Two identical payments on one day
   are ordinary, and within one era they carry distinct ids. Pairing is
   1:1 and deterministic: ids sorted, export rows offered before feed
-  rows. A day with two statement copies and one export row folds exactly
+  rows. A day with two statement copies and one export row drops exactly
   one of them.
-- **An export copy of a confirmation's cash leg folds into the leg.** On
+- **An export copy of a confirmation's cash leg goes into the leg.** On
   an account the feed does not speak for, the export is the record of
   every day, and a confirmation books its own cash leg (*The accounts
-  the feed does not speak for*). The fold keys the leg on the amount it
+  the feed does not speak for*). The leg is keyed on the amount it
   posted (`:19B::PSTA//`), which is what the export row moved. The
-  export copy folds into the leg first, 1:1, and only on the leg's own
-  day. A statement copy then folds onto the leg as onto any feed row.
-  The leg keeps its security, its gross and its tax row.
+  export copy pairs with the leg first (rule 4), 1:1, and only on the
+  leg's own day. A statement copy then pairs with the leg as with any
+  feed row. The leg keeps its security, its gross and its tax row.
 - **Where the leg reads no gross and its export copy states one**, the
   copy is the record instead. The export row stays, at the gross it
-  states, and the leg is withheld (`psnHints.withheld`, as for a
-  conversion mirror). A statement copy then folds onto the export row.
+  states, and the leg is withheld, as a conversion mirror is. A
+  statement copy then pairs with the export row.
 - **The dropped copy's text carries over**, by the same `richerText`
   rule as the era text fold. An export survivor takes it as it is
-  emitted. A feed survivor takes it in `psnStatementCarryStream`,
-  applied outside `psnWebTextFoldStream`, so the export's text fills a
+  emitted. A feed survivor takes it in `psnStatementCarry`,
+  applied outside `psnWebTextFold`, so the export's text fills a
   bare column first. A cash leg takes its export copy's text first and
   its statement copy's after.
 
 **What follows:**
 
-- A folded row is out of the same-day offset veto's universe
+- A dropped row is out of the same-day offset veto's universe
   (`buildSameDayOffsetVeto`). Otherwise one booking could consume two
   mirrors.
-- Where a folded row carried an external deposit or withdrawal, returns
-  count that flow once. The fold adds no flow and changes no amount.
+- Where a dropped row carried an external deposit or withdrawal, returns
+  count that flow once. The table adds no flow and changes no amount.
 - Survivors that gain a payee are re-keyed (`SignatureVersion` 8,
   [../SPENDING.md](../SPENDING.md) §4).
-- The adapter logs how many web rows the era fold and the seam dropped
-  on each load, beside the dropped period summaries.
+- The adapter logs how many web rows the table dropped on each load,
+  beside the dropped zero-amount rows.
 
-### The settlement fold
+### A trade on two PSN rails
 
 Two PSN rails record one securities trade: the MT515 confirmation and
 the MT940 `:61:` line for its cash leg, typed `NSEC` with a bare
 booking code. They share no id. Left alone, one trade would be two
 rows, and every count, turnover and per-instrument total would double.
 
-`buildSettlementFold` (`transactions.go`) matches them on the
-settlement both rails state:
+Rule 9 of the reconcile table matches them on the settlement both
+rails state (`settlementKey`):
 
 - the cash account;
 - the currency;
@@ -633,13 +702,11 @@ settlement both rails state:
 - the settlement day: `:98A::SETT//` on the confirmation, the value
   date on the line.
 
-It reads the whole silver, unwindowed. Whether a booking is recorded
-twice depends on silver's contents, never on the slice a load covers.
-
 - **The confirmation survives.** It carries the ISIN, the quantity, the
   price and the side. The line names no security.
-- Only a line the bank typed `NSEC` is eligible. An ordinary payment
-  that matches a trade's account, day and figure stays.
+- Only a line the bank typed `NSEC` is eligible, or `NMSC`, under which
+  the bank books a fund redemption's cash. An ordinary payment that
+  matches a trade's account, day and figure stays.
 - A trade settling on a cash account outside the MT940 delivery keeps
   its confirmation alone.
 
@@ -657,17 +724,16 @@ ledger. But the first dump's statements reach back over the days before
 it. For a short window both feeds hold an entry and neither side's
 window excludes it.
 
-`buildSeamBankRefs` closes that window on (account, bank reference).
-That is an exact identity, not a signature over amounts. The web copy
-is dropped, as the cut does on every later day: the MT940 row reaches
-gold and the export's text folds onto it.
+Rule 7 of the reconcile table closes that window on (account, bank
+reference). That is an exact identity, not a signature over amounts.
+The web copy is dropped, as the cut does on every later day: the MT940
+row reaches gold and the export's text folds onto it.
 
 ### The accounts the feed does not speak for
 
 The MT940 feed is delivered per account, and a relationship's delivery
-need not reach every account. A current account is typically in scope.
-The cash accounts behind a managed portfolio, one per currency, often
-are not. `psnCashCoverage` records, per account, the first value day
+need not reach every account, and an account outside it receives no
+statements. `psnCashCoverage` records, per account, the first value day
 the feed carried a movement. Three decisions read it.
 
 **The hard cut is per account** (`psnCut`). The cut gives a web row to
@@ -708,10 +774,10 @@ currency, the same value day, the opposite direction, id
 - Where the feed speaks for the other account that day, nothing is
   booked: its own statement carries the leg.
 - Where the export carries the booking, the export's row is the record
-  and the mirror is withheld (`buildSameDayOffsetVeto`). The feed row
-  still names the account.
-- A statement copy from a later annual statement folds onto the mirror
-  as onto any feed row (the era fold).
+  and the mirror is withheld (rule 8 of *The reconcile table*). The feed
+  row still names the account.
+- A statement copy from a later annual statement pairs with the mirror
+  as with any feed row (*Statement copies*).
 - A payment abroad in a foreign currency carries the same subfield but
   names a payee other than the holder. It books nothing.
 - Two accounts of one currency in one portfolio are refused, not
@@ -742,8 +808,8 @@ gross*).
   security and gross, books no second leg.
 - It books on the payment day, and loads with the window that holds
   that day.
-- An export or statement copy of the payment folds into the leg (*The
-  era fold*).
+- An export or statement copy of the payment goes into the leg
+  (*Statement copies*).
 - A capital call confirmed as `OTHR`, a dividend taken in shares, an
   exchange or any other event is left to the rails that carry it.
 - Without this leg, a mandate's foreign-currency income would show only
@@ -777,8 +843,10 @@ The readers:
 
 - **Returns.** In either era, a counter account the relationship owns
   makes the row internal (`buildOwnIBANSet`; also rule 2 of
-  `pdfCashIsExternal`'s decision order). This only demotes, as the conduit model requires: a known own
-  counter can take a row out of the flow series, never put one in.
+  `pdfCashIsExternal`'s decision order, after the internal-transfer
+  rule of §5). This only demotes, as the conduit model requires: a
+  known own counter can take a row out of the flow series, never put
+  one in.
 - **The far account.** Gold keeps the payload verbatim. The enrichment
   pass resolves the stated counter account against gold's accounts and
   records where an own-account move went, even where the far side has
@@ -861,6 +929,77 @@ Where the lookup finds nothing, two weaker claims follow, in order:
   instrument's own row answers.
 
 A dividend names its security in other ways (below).
+
+### The private-equity fund a cash row names
+
+A capital call settles under the bank's own booking type, as a buy of
+the fund's units. Other rows that move a fund's cash state no
+instrument:
+
+- a distribution or a return of capital, credited as a plain credit;
+- a call paid by payment order;
+- a statement line whose valor the index does not know.
+
+Such a row takes the fund by one of two roads (`private_funds.go`).
+
+First, the fund's corporate action. A confirmation on a fund whose cash
+option moves cash names the line that books it. The pair is the cash
+account, the payment day, the amount posted, signed by the `CRDB` mark,
+and its currency, as for a dividend (*Dividends: the security and the
+gross*). A confirmation that stands counts. The pair holds only where
+one line answers, and the confirmations that answer name one fund. The
+line is a feed line, or a web row the reconcile table leaves standing.
+A credit then books as `distribution`, a debit as `buy`. The
+confirmation keeps its marker and books no cash leg.
+
+Else the text names the fund. Such a row takes it where all of these
+hold:
+
+- No other road links it to an instrument.
+- Its kind is a buy, a sell, a deposit or a withdrawal. The first road
+  asks this of its line too, and the last condition below.
+- Its text names exactly one private-equity fund of its account's
+  portfolios. It names a fund by the fund's ISIN, by its valor, or by
+  one of its names whole. A valor is a whole number of five digits or
+  more; leading zeros do not count. A name has two words or more.
+  Case, spacing and punctuation do not count. A name the text holds
+  only inside another fund's longer name does not count: "X Partners
+  II" names that fund, not "X Partners".
+- It is no move between the relationship's own accounts. The same-day
+  offset veto found no mirror for it, its counter account is no own
+  one, and its narrative names no internal transfer.
+
+An MT940 line states no counter account. On the feed, the offset veto
+and the narrative tell such a move.
+
+The fund is an instrument the adapter classifies `(private_equity,
+fund)`, as it emits it (§4). Its names are the feed's long and short
+names and every description the statements of assets print for it. Its
+valors are the feed's, a Swiss ISIN's own, and those the statements of
+assets print. The text is the row's narrative, its promoted valor, and
+an MT940 line's customer reference.
+
+The valor index above answers for the whole relationship and reads only
+a promoted valor, so it drops a valor two securities share, and it sees
+none in free text. This search runs only over the funds of the row's own
+portfolios. So it reads a valor in free text, and a valor two
+securities share. A portfolio holds the funds the feed's holdings and
+the statements of assets place in it. A cash account belongs to the
+portfolios the feed's master data and the printed cash positions place
+it in, as for a dividend's ticker (below).
+
+The row then books as its kind says:
+
+| Kind | Books as |
+| --- | --- |
+| `buy`, `sell` | the same kind |
+| `withdrawal` | `buy`: a call paid in |
+| `deposit` | `distribution`: cash the fund paid out |
+
+On an MT940 line the mark says which side a reversal undoes. `RC`
+takes back a credit: a distribution, negative. `RD` takes back a
+debit: a buy, positive. The amount, the day and the id stay the row's.
+A row that names no fund, or several, stays as it is.
 
 ### Dividends: the security and the gross
 
@@ -1074,17 +1213,18 @@ names a confirmation. The gross is read in one of two ways:
 A reversal (`Dividend;Reversal`) reads the gross negative. Its tax row
 is positive: the tax taken back with the dividend.
 
-The folds and the veto leave the pair whole:
+The reconcile table and the veto leave the pair whole:
 
-- The era fold keys the MT940 line and the export row on the amount
-  they credited, as `buildTransaction` and `webProjectedNet` project
-  them; a reversal on the amount it took back; a confirmation's cash leg
-  on the amount it posted. A statement copy prints that amount, so it
-  still folds onto the row booked gross. A tax row has no statement
-  copy and is not in the fold.
-- The settlement fold reads `NSEC` lines and the offset veto deposits
-  and withdrawals. Neither reads a dividend, a dividend reversal or a
-  tax row.
+- The booking key holds the amount each record moved. For the MT940
+  line and the export row, it is the amount credited, as
+  `feedRow.transaction` and `webProjectedNet` project them. For a
+  reversal, it is the amount taken back. For a confirmation's cash leg, it is the
+  amount posted. A statement copy prints that amount, so it still
+  pairs with the row booked gross. A tax row has no statement copy and
+  is no candidate.
+- Rule 9 reads `NSEC` and `NMSC` lines. The offset veto reads deposits
+  and withdrawals. Neither reads a dividend, a dividend reversal or a tax
+  row.
 - The tax row's payload carries no bank reference. So the era text fold
   leaves its text alone, and the reference road of the transfer matcher
   sees no third row under the line's number.
@@ -1096,19 +1236,22 @@ two.
 
 - **PSN:** `MAX(dump_runs.snapshot_at)`, or `-1` when `dump_runs` is
   empty.
-- **Web:** the later of `MAX(dump_runs.snapshot_at)` and
-  `MAX(transactions.value_date)`, or `-1` when both are empty.
+- **Web:** `MAX(dump_runs.snapshot_at)`, or `-1` when `dump_runs` is
+  empty.
 
-Other web dates never count toward the change number:
+No date a row states counts toward the change number:
 
+- a transaction can be valued after the dump that read it, such as a
+  payment order set for a later day;
 - the statement reconstructions and historical mortgages widen
   `Status`'s snapshot range;
 - they, the card ledger and statements, and the portfolio transaction
   list widen the load window (§9, §10.3, §11).
 
-`ChangeWindow` never advances the watermark to those dates. A
-future-dated maturity notice would otherwise keep the source from ever
-reading as up to date.
+`ChangeWindow` never advances the watermark to those dates. A date past
+the latest dump would otherwise hold the watermark ahead of every later
+dump of both feeds, and a future-dated maturity notice would keep the
+source from ever reading as up to date.
 
 **The load window.**
 
@@ -1126,9 +1269,11 @@ reading as up to date.
   copy gold already holds. Silver dates it by the day it states, not
   the day it arrived. So the rows it changes lie outside a later load's
   window.
-- Web: a dump or a transaction value date past the watermark triggers a
-  load. The new change number is the latest of them. The window then
-  widens to every historical, card and portfolio-transaction date.
+- Web: a dump past the watermark triggers a load, and its time is the
+  new change number. The window spans the dump and the value dates of
+  the transactions it wrote (`transactions.snapshot_at`), which can lie
+  before the watermark. It then widens to every historical, card and
+  portfolio-transaction date.
 
 **Observed through.** The report feed is observed through its latest
 report. The web feed is observed through its latest run for the
@@ -1147,6 +1292,7 @@ the reports state the securities, the web feed the cash accounts
 | `historical_position_snapshots` | "Statement of Assets" | Quarterly | `positions` (securities); cash rows skipped, see below |
 | `historical_cash_balances` | "Account Statement" | Monthly | `cash_balances` (opening + closing) |
 | `historical_mortgages` | "Maturity Notice" | Quarterly | `accounts` (kind `mortgage`) + a negative `mortgage` position |
+| `statement_overview_totals` | "Statement of Assets" (overview) | Quarterly | `positions` (one precious-metals position per portfolio) |
 
 They cover the dates before PSN starts. A row on or after its
 portfolio's or account's PSN start is dropped, so PSN owns those days
@@ -1157,7 +1303,7 @@ streams, so gold fills oldest-first.
 ### Security positions
 
 These are the `historical_position_snapshots` rows with an
-`instrument_isin`. The PDFs do not state the safekeeping account
+`instrument_isin`, plus the precious-metals positions below. The PDFs do not state the safekeeping account
 reliably, so silver leaves `account_external_id` empty. The adapter
 attaches each position to the PSN safekeeping account its portfolio
 maps to, where exactly one can hold it (`statementSecuritiesAccount`).
@@ -1179,12 +1325,25 @@ row.
 | `description` | `instruments.name` |
 | `sector` | payload only |
 
-A year-end Statement of Assets can print a gold-bar detail line for a
-precious-metals portfolio that the quarterly statements omit. The
-adapter also emits one overview precious-metals position
-(`PM-<portfolio>`) for such a portfolio. Where the overview exists for
-the same date and portfolio, the detail line is suppressed, so the metal
-counts once.
+A portfolio held in precious-metals custody has no detailed positions
+page. Its overview total is one position (`preciousMetalsTotals`):
+
+- It is read from `statement_overview_totals`. The overview prints the
+  total once per valuation currency, and silver keeps every copy. The
+  adapter reads the USD copy only. The other copies are not read.
+- Where the document walk wrote several USD copies for one date and
+  portfolio, the last one is the position.
+- Its instrument key is `PM-<portfolio>`. The key is not ISIN-shaped,
+  so the instrument has no canonical ISIN. Its name is "Precious metals
+  & commodities".
+- An older silver holds the same position as a
+  `historical_position_snapshots` row under that key, and the adapter
+  reads it there.
+
+A year-end Statement of Assets can print a gold-bar detail line for
+such a portfolio that the quarterly statements omit. Where the overview
+position exists for the same date and portfolio, the detail line is
+suppressed, so the metal counts once.
 
 The PDFs carry no CFI or UAC code, so the pair comes from the
 description (`taxonomyPairForWebDescription`). UBS generates
@@ -1224,9 +1383,11 @@ not read as 0. Silver keeps NULL apart from a real zero.
 
 ### Mortgages
 
-A Maturity Notice states a mortgage's balance "as at" a date. The
-adapter emits it on the portfolio snapshot of that date, as the same
-account, instrument and position triple as a live mortgage. It only
+A Maturity Notice states a mortgage's balance "as at" a date. Silver
+holds the principal as printed. The adapter gives the position its
+negative sign (`liability`), whichever sign silver holds. It emits it
+on the portfolio snapshot of that date, as the same account,
+instrument and position triple as a live mortgage. It only
 joins a snapshot that already exists. UBS issues the next quarter's
 notice ahead of time. A mortgage-only snapshot at that future date
 would end every account last observed beside the mortgage
@@ -1259,7 +1420,7 @@ Same treatment as mortgages, for the same reason.
 This is the one place a reader of the chase adapter will guess wrong.
 
 Chase's silver stores a card provider-verbatim as a **positive amount
-owed**, and `signedBalance` negates it. UBS reports the opposite already:
+owed**, and the shared bank adapter (`internal/silver/bank`) negates it. UBS reports the opposite already:
 a purchase is negative, a payment positive, and a balance is negative
 while the card carries debt. That is `AccountKindCard`'s own convention —
 a revolving-credit liability held as negative cash — so the figures pass
@@ -1267,9 +1428,8 @@ through unnegated. Gold migration 0037's note about "the adapter negating
 the provider's owed-positive figure" describes chase's silver, not this
 one.
 
-Amounts still pass through `canonical.ApplyCanonicalSign`, because the
-card kinds have a fixed direction: a `purchase` comes out negative and a
-`refund` / `card_payment` positive whatever the row said.
+Each row keeps its sign. The kind is read off that sign (§10.2), so the
+kind and the amount always agree.
 
 ### 10.2 `transactions.kind`
 
@@ -1362,7 +1522,8 @@ this source's booking types are payment rails where a miss is the normal
 case. Both belong to the same `ubs` silver kind, so the spending
 provider map is keyed by **product**: `ubs/card` for the MCC
 descriptions, `ubs` for the booking types
-(`internal/spending/providermap.go`, SPENDING.md §3). One entry is
+(`internal/spending/vocab_ubs.go`, keyed in `providermap.go`, SPENDING.md
+§3). One entry is
 deliberately left untranslated — the bank's own catch-all for a card row
 that moved money rather than bought something names no line of business,
 and placing it would file person-to-person transfers as shopping.
@@ -1461,23 +1622,22 @@ and settle nothing.
 not in it. The difference to the confirmations is the fee, so a coverage
 gap this rail closes closes to within the fees rather than exactly.
 
-### The settled-day fold
+### The settled day
 
-One booking, one row, as everywhere else in this adapter — but the
-identity has to be weaker here than the [era fold](#the-era-fold)'s,
-because the three rails state different AMOUNTS for the same trade:
-the gross value here, the net debit on the statement and on the
-confirmation. So the key is (cash account, currency, settlement day),
-with no amount in it, and it counts rather than sets: a day the other
-rails cover only partly — a statement published for some of a year's
-trades and not others — keeps its surplus.
+One booking, one row, as everywhere else in this adapter. This is the
+last rule of [the reconcile table](#the-reconcile-table). Its identity
+is weaker than the booking key, because the three rails state different
+amounts for the same trade: the gross value here, the net debit on the
+statement and on the confirmation.
 
-What it counts is the EMITTED universe, never silver's contents. The
-cash pass hands over its own count, accumulated from the rows it
-emitted after its cut, its era fold and its seam; the feed's half is
-rebuilt through the same [settlement fold](#the-settlement-fold) the
-PSN pass applies, so a trade recorded there twice — as a confirmation
-and as the MT940 line for its cash leg — is counted once.
+- The key is (cash account, currency, settlement day), with no amount.
+- It counts rather than sets. A day the other rails cover only partly
+  keeps its surplus: a statement published for some of a year's trades
+  and not others.
+- Its winners are the records the earlier rules left standing: the web
+  rows past the cut and the other rules, every confirmation, and the
+  MT940 lines rule 9 kept. A trade recorded twice on the feed, as a
+  confirmation and as the line for its cash leg, counts once.
 
 No PSN cutoff applies, and none could: the cut arbitrates between two
 records of one booking, and this pass emits only where no rail
@@ -1635,8 +1795,17 @@ composition on that day, one line per investment.
 - **The window.** The change window reaches the reports' dates, so a
   load's windowed delete clears the records and compositions before it
   writes them again.
+- **The capital account.** Every report also gives the fund's capital
+  account on its date, reconciled or not (`capital.go`, gold
+  `capital_accounts`): the investor's net commitment, the capital
+  called and the valuation, as printed, in the report's currency. It
+  names the fund by its ISIN and no account or portfolio, so a fund two
+  portfolios hold can have two reports on one day. Each is kept, named
+  by its document token. A report that prints no currency gives none.
+  The report states no distributions and no multiple.
 - **Reaching gold.** A ubs-web collector load writes no new dump. So new
-  records and compositions reach gold on the next `wealthdb reload ubs`.
+  records, compositions and capital accounts reach gold on the next
+  `wealthdb reload ubs`.
 
 ## 14. FX forwards
 

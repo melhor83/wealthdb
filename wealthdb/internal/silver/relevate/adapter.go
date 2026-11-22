@@ -45,30 +45,64 @@ package relevate
 import (
 	"context"
 	"database/sql"
+	"path/filepath"
 
+	"github.com/smartpointer-com/wealthdb/wealthdb/internal/returns"
 	"github.com/smartpointer-com/wealthdb/wealthdb/internal/silver"
 )
 
 const kindName = "relevate"
 
+// init registers the kind (silver.Source).
+//
+// Returns: flow-complete bank/pension (every capital kind counts),
+// forward knobs defaulted (no-op).
 func init() {
-	silver.Register(&Adapter{})
+	rp := returns.DefaultReturnsPolicy(returns.BankFlowPolicy())
+	silver.Register(silver.Source{
+		Kind:    kindName,
+		Open:    (&Adapter{}).Open,
+		Returns: &rp,
+	})
 }
 
 type Adapter struct{}
 
-func (*Adapter) Kind() string { return kindName }
-
-func (*Adapter) Open(_ context.Context, spec silver.OpenSpec) (silver.Connection, error) {
+func (*Adapter) Open(ctx context.Context, spec silver.OpenSpec) (silver.Connection, error) {
 	db, err := silver.OpenReadOnlySQLite(spec.Path, "relevate silver")
 	if err != nil {
 		return nil, err
 	}
-	return &Connection{db: db}, nil
+	c := &Connection{db: db}
+	note, err := silver.ProbeOptional(ctx, c.db, filepath.Base(spec.Path), c.schema.optional()...)
+	if err != nil {
+		c.db.Close()
+		return nil, err
+	}
+	c.Note(note)
+	return c, nil
 }
 
 type Connection struct {
-	db *sql.DB
+	db     *sql.DB
+	schema schema
+	silver.Advice
 }
 
 func (c *Connection) Close() error { return silver.CloseDB(&c.db) }
+
+// schema is which optional parts of the silver schema a file holds,
+// probed once at open.
+type schema struct {
+	historicalPositions bool // the Quartalsbericht snapshots (silver migration 0002)
+	historicalCash      bool // their cash balances (silver migration 0002)
+	runStamp            bool // transactions.run_snapshot_at (silver migration 0005)
+}
+
+func (s *schema) optional() []silver.Optional {
+	return []silver.Optional{
+		{Table: "historical_position_snapshots", Version: 2, Has: &s.historicalPositions},
+		{Table: "historical_cash_balances", Version: 2, Has: &s.historicalCash},
+		{Table: "transactions", Columns: []string{"run_snapshot_at"}, Version: 5, Has: &s.runStamp},
+	}
+}

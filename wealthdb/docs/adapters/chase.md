@@ -1,9 +1,9 @@
 # Chase adapter
 
 Adapter that projects the `chase` silver SQLite database into the
-canonical gold schema. Implements the `silver.Adapter` /
-`silver.Connection` interface defined in
-[../DESIGN.md](../DESIGN.md) §6.
+canonical gold schema. It is a source of the shared bank adapter
+(`internal/silver/bank`), which implements the `silver.Connection`
+interface defined in [../DESIGN.md](../DESIGN.md) §6.
 
 The source is a JPMorgan Chase retail relationship. The adapter
 handles two kinds of account: **deposit accounts** (checking /
@@ -87,7 +87,7 @@ is signed the same way (spend negative, anything reducing the
 balance owed positive). Silver never normalises a liability.
 
 **Negating it is this adapter's job**, and it happens in exactly
-one place (`signedBalance` in `snapshots.go`). A card balance of
+one place (`signed` in `internal/silver/bank/engine.go`). A card balance of
 `1234.56` owed projects as `-1234.56`. Nothing downstream re-flips
 it.
 
@@ -283,12 +283,12 @@ Three decisions of record:
 
 ## 7. Returns treatment
 
-The source registers `returns.DepositBankPolicy()`
-(`internal/silver/chase/policy.go`): regime `flow_complete`, the
-standard bank external-capital set, and `AccountsGrainHidden`.
+The source registers the bank policy in its `silver.Source`
+(`internal/silver/chase/adapter.go`): regime `flow_complete`, so every
+capital kind counts as an external flow.
 
-`AccountsGrainHidden` governs the **deposit** accounts: they emit
-no per-account return rows at any grain — a deposit account is pure
+A **deposit** account is a `cash` account, which the engine hides on
+any source: it emits no per-account return rows at any grain — it is pure
 cash plumbing whose rows are noise (a drained-then-refunded account
 chains a permanent −100%) — while their balances and flows still
 enter every aggregate, where transfer legs against tracked sources
@@ -303,23 +303,20 @@ says why.
 
 ## 8. Change number
 
-The source runs on the shared load clock (`silver.LoadClockStatus`,
-`silver.LoadClockChangeWindow`): `LatestChangeNumber` is
+The source runs on the shared load clock (`silver.LoadClock`):
+`LatestChangeNumber` is
 `MAX(dump_runs.snapshot_at)`, and a new load re-emits the full history
 ([../DESIGN.md](../DESIGN.md) §6.4).
 
-The re-emit window is the MIN/MAX over three columns:
+The window is the whole history (`Window.Full`): the load deletes the
+source's rows whole before it re-inserts them, so a statement period
+with no ledger row of its own, whose closing balance sits at its
+`period_end`, is replaced like every other row. The snapshot range
+`Status` reports is the MIN/MAX over three columns:
 
 - `accounts.snapshot_at`;
 - `transactions.posted_at`;
 - `statement_balances.period_end`.
-
-The third is required for correctness. A statement period with no
-ledger row of its own still emits a closing balance at its
-`period_end`. That can be a quiet month, or one whose transactions were
-refused. A record outside the delete window is re-inserted without its
-predecessor being removed, so it would duplicate on every load.
-`period_start` is not included: nothing is emitted at it.
 
 ## 9. Known limits
 

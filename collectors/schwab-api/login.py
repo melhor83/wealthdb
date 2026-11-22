@@ -45,7 +45,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import logging
 import os
 import sys
@@ -55,23 +54,22 @@ from pathlib import Path
 
 import _tokenclient
 import oauth_landmarks as lm
+# The token file's age report, and the consent drive's guard with
+# the error it raises; each name is bound here too.
+from tokeninfo import (  # noqa: F401
+    REFRESH_TOKEN_TTL_SECONDS,
+    read_token_creation_time,
+    print_token_age,
+)
+from guard import (  # noqa: F401
+    LoginFlowError,
+    AdvanceGuard,
+)
 
 from collectorkit import cli, debugcap, envfile, launch, session
 
 log = logging.getLogger("schwab-login")
 
-# Schwab refresh tokens are valid for 7 days from issue. Surfaced as a
-# constant so --check output matches the actual cap.
-REFRESH_TOKEN_TTL_SECONDS = 7 * 24 * 3600
-
-# Credential env vars whose env-file value wins over a value inherited
-# from the calling environment. The OAuth app id/secret live in
-# schwab-api.env; the Schwab web login id/password (reused to pre-fill
-# the consent login) live in schwab-web.env.
-_CRED_OVERRIDE_VARS = frozenset({
-    "SCHWAB_CLIENT_ID", "SCHWAB_CLIENT_SECRET",
-    "SCHWAB_LOGIN_ID", "SCHWAB_PASSWORD",
-})
 
 # Env files sourced (first existing path of each set, container then host
 # form). schwab-api.env carries the OAuth app credentials; schwab-web.env
@@ -103,11 +101,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument(
         "--client-id", default=None,
         help="Schwab OAuth Client ID (falls back to SCHWAB_CLIENT_ID).",
-    )
-    p.add_argument(
-        "--client-secret", default=None,
-        help="Schwab OAuth Client Secret (falls back to SCHWAB_CLIENT_SECRET). "
-             "Prefer the env var over the command line.",
     )
     p.add_argument(
         "--callback-url", default=lm.DEFAULT_CALLBACK_URL,
@@ -192,67 +185,20 @@ def source_env_files(explicit: Path | None = None) -> None:
     are both available. Absent files are fine. An explicit --env-file (or
     the SCHWAB_API_ENV_FILE env var) is then sourced last and wins."""
     for candidates in _ENV_FILE_SETS:
-        envfile.source_first_env_file(None, candidates, logger=log,
-                                      override_vars=_CRED_OVERRIDE_VARS)
+        envfile.load(None, candidates=candidates, logger=log)
     # An explicit --env-file (or $SCHWAB_API_ENV_FILE) is sourced last, so
-    # its credential values win.
-    lead = explicit or (Path(os.environ["SCHWAB_API_ENV_FILE"])
-                        if os.environ.get("SCHWAB_API_ENV_FILE") else None)
-    if lead is not None:
-        envfile.source_first_env_file(lead, (), logger=log,
-                                      override_vars=_CRED_OVERRIDE_VARS)
+    # its values win.
+    envfile.load(explicit, env_var="SCHWAB_API_ENV_FILE", logger=log)
 
 
 # ============================================================
 # Token-file inspection (--check)
 # ============================================================
 
-def read_token_creation_time(path: Path) -> datetime | None:
-    try:
-        with path.open("r", encoding="utf-8") as fh:
-            blob = json.load(fh)
-    except (OSError, json.JSONDecodeError) as exc:
-        log.warning("Could not parse token file %s: %s", path, exc)
-        return None
-    ts = blob.get("creation_timestamp")
-    if isinstance(ts, (int, float)):
-        return datetime.fromtimestamp(ts, tz=timezone.utc)
-    try:
-        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
-    except OSError:
-        return None
-
-
 # Exit codes of --check.
 CHECK_NO_TOKEN = 1        # no token file to check
 CHECK_REJECTED = 3        # Schwab refused the token (expired, revoked, bad client)
 CHECK_PROBE_FAILED = 4    # the probe call failed (HTTP status, network)
-
-
-def print_token_age(token_path: Path) -> None:
-    """Print when the token file was issued and when its refresh token
-    runs out by the 7-day cap. An estimate from the file alone: the
-    probe in :func:`cmd_check` is what proves the token."""
-    issued = read_token_creation_time(token_path)
-    print(f"Token file:        {token_path}")
-    if issued is None:
-        print("Issued (UTC):      unknown (no issue timestamp in the file)")
-        return
-    age = datetime.now(timezone.utc) - issued
-    remaining_s = REFRESH_TOKEN_TTL_SECONDS - age.total_seconds()
-    print(f"Issued (UTC):      {issued.isoformat(timespec='seconds')}")
-    print(f"Age:               {age}")
-    if remaining_s <= 0:
-        print("Estimated expiry:  EXPIRED by the 7-day cap.")
-        return
-    renew_by = datetime.fromtimestamp(
-        issued.timestamp() + REFRESH_TOKEN_TTL_SECONDS, tz=timezone.utc,
-    )
-    print(f"Estimated expiry:  {renew_by.isoformat(timespec='seconds')} "
-          f"({remaining_s / 3600:.1f}h from now)")
-    if remaining_s / 3600 < 24:
-        print("WARNING: refresh window expires in under 24 hours. "
-              "Re-run login soon.")
 
 
 def probe_token(args: argparse.Namespace) -> int:
@@ -263,8 +209,7 @@ def probe_token(args: argparse.Namespace) -> int:
     never printed: it holds the plain account numbers."""
     client_id = envfile.resolve_credential(args.client_id, "SCHWAB_CLIENT_ID",
                                            "--client-id")
-    client_secret = envfile.resolve_credential(
-        args.client_secret, "SCHWAB_CLIENT_SECRET", "--client-secret")
+    client_secret = _tokenclient.client_secret()
     try:
         client = _tokenclient.client_from_token_file(
             args.token_path, client_id, client_secret)
@@ -317,18 +262,18 @@ def open_camoufox_context(profile_dir: Path, trace: bool):
                                    humanize=False, geoip=False, logger=log)
 
 
+def _capture(page, screenshot_dir: Path | None, label: str) -> None:
+    """A sign-in landmark into `screenshot_dir` (None captures nothing),
+    the Schwab login credentials masked out of the markup. Never
+    raises."""
+    debugcap.landmark_capturer(screenshot_dir, user_env="SCHWAB_LOGIN_ID",
+                               pass_env="SCHWAB_PASSWORD", log=log)(page, label)
+
+
 def _scopes(page) -> list:
     """The page itself, then each of its child frames: every place a
     login, 2FA or error element may render."""
     return [page, *[f for f in page.frames if f.parent_frame is not None]]
-
-
-def _live_url(page) -> str:
-    """page.url can lag behind a client-side redirect; read it live."""
-    try:
-        return page.evaluate("() => window.location.href")
-    except Exception:
-        return page.url
 
 
 def _fill_first(scope, candidates, value: str) -> bool:
@@ -375,20 +320,6 @@ def prefill_login(page, login_id: str | None, password: str | None,
 def _prompt_for_mfa_code() -> str:
     return cli.prompt_on_stderr(
         "Schwab 2FA: enter your code, then press Enter.")
-
-
-class LoginFlowError(RuntimeError):
-    """Terminal login-flow failure: the run stops, reports, and exits
-    nonzero. Re-running login is the recovery path — there are no in-run
-    retries (see DESIGN.md §3.1, "Failure discipline")."""
-
-    exit_code = 8
-
-    def __init__(self, message: str, *, page_text: str = "",
-                 locked: bool = False):
-        super().__init__(message)
-        self.page_text = page_text
-        self.locked = locked
 
 
 class TerminalPageError(LoginFlowError):
@@ -445,7 +376,7 @@ def _visible_error_text(page) -> str:
 def _notice_scope(page):
     """The page or frame currently on the gateway's terminal notice
     route, or None."""
-    if lm.is_gateway_notice_url(_live_url(page)):
+    if lm.is_gateway_notice_url(launch.live_url(page)):
         return page
     try:
         frames = [f for f in page.frames if f.parent_frame is not None]
@@ -540,7 +471,7 @@ def classify_page(page, callback_url: str) -> str:
     'terms' / 'account-link' / 'review' (the consent flow, by heading),
     'login' (the credential form), or 'unknown'. Ordered so terminal and
     challenge states win over anything else the DOM might still show."""
-    url = _live_url(page)
+    url = launch.live_url(page)
     if lm.is_callback_url(url, callback_url):
         return "callback"
     if _notice_scope(page) is not None:
@@ -558,52 +489,6 @@ def classify_page(page, callback_url: str) -> str:
     return "unknown"
 
 
-class AdvanceGuard:
-    """Budget + progress guard for the consent-drive loop.
-
-    Two invariants (DESIGN.md §3.1, "Failure discipline"): a page that did not
-    change since the last advance click is never clicked again, and a
-    page that stops changing at all — clicked or not — fails the run
-    after STALL_LIMIT_S instead of spinning. CLICK_BUDGET caps total
-    advance clicks well above the flow's three known pages."""
-
-    CLICK_BUDGET = 8
-    STALL_LIMIT_S = 60.0
-
-    def __init__(self):
-        self.clicks = 0
-        self._sig = None
-        self._sig_since = time.monotonic()
-        self._clicked_sig = None
-
-    def observe(self, kind: str, sig: str) -> None:
-        """Track the page state; raise once it has stalled too long."""
-        now = time.monotonic()
-        if sig != self._sig:
-            self._sig = sig
-            self._sig_since = now
-            return
-        if now - self._sig_since > self.STALL_LIMIT_S:
-            raise LoginFlowError(
-                f"page stopped changing for {int(self.STALL_LIMIT_S)}s "
-                f"while driving the consent flow (state: {kind}); not "
-                f"clicking further — re-run login, or drive it over VNC "
-                f"(vnc-login)")
-
-    def may_click(self) -> bool:
-        """Whether an advance click is allowed: the page must have
-        changed since the last click. Budget exhaustion raises."""
-        if self.clicks >= self.CLICK_BUDGET:
-            raise LoginFlowError(
-                f"advance-click budget ({self.CLICK_BUDGET}) exhausted "
-                f"without reaching the callback; not clicking further")
-        return self._sig != self._clicked_sig
-
-    def record_click(self) -> None:
-        self.clicks += 1
-        self._clicked_sig = self._sig
-
-
 def _page_signature(page) -> str:
     """Hash of the page URL + structural DOM signature, for deciding
     whether a click actually changed anything. Text-insensitive, so a
@@ -612,7 +497,7 @@ def _page_signature(page) -> str:
         struct = page.evaluate(_STRUCT_SIG_JS)
     except Exception:
         struct = ""
-    raw = f"{_live_url(page)}|{struct}"
+    raw = f"{launch.live_url(page)}|{struct}"
     return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:16]
 
 
@@ -719,8 +604,7 @@ def select_all_link_accounts(page, screenshot_dir=None, seen=None) -> int:
         except Exception as e:
             log.warning("on the account-link page but could not read the "
                         "checkboxes (%s) — capturing DOM for refinement", e)
-        debugcap.capture_landmark(page, screenshot_dir, "025-account-link",
-                                  log=log)
+        _capture(page, screenshot_dir, "025-account-link")
     n = _check_visible_checkboxes(page)
     if n:
         log.info("auto-ticked %d previously-unselected account checkbox(es)", n)
@@ -756,7 +640,8 @@ def _explore_dump(page, screenshot_dir, state) -> None:
     try:
         screenshot_dir.mkdir(parents=True, exist_ok=True)
         (screenshot_dir / f"{label}.html").write_text(
-            debugcap.scrub_dom(page.content()), encoding="utf-8")
+            debugcap.scrub_dom(page.content(), debugcap.env_redactor(
+                "SCHWAB_LOGIN_ID", "SCHWAB_PASSWORD")), encoding="utf-8")
         try:
             page.screenshot(path=str(screenshot_dir / f"{label}.png"),
                             full_page=True, timeout=4_000)
@@ -818,7 +703,7 @@ def _wait_for_callback(page, captured: list, callback_url: str,
     while time.monotonic() < deadline:
         if captured:
             return captured[0]
-        url = _live_url(page)
+        url = launch.live_url(page)
         if lm.is_callback_url(url, callback_url):
             return url
         scope = _notice_scope(page)
@@ -846,9 +731,7 @@ def cmd_login_browser(args: argparse.Namespace) -> int:
 
     client_id = envfile.resolve_credential(args.client_id, "SCHWAB_CLIENT_ID",
                                    "--client-id")
-    client_secret = envfile.resolve_credential(args.client_secret,
-                                       "SCHWAB_CLIENT_SECRET",
-                                       "--client-secret")
+    client_secret = _tokenclient.client_secret()
     login_id = os.environ.get("SCHWAB_LOGIN_ID")
     password = os.environ.get("SCHWAB_PASSWORD")
 
@@ -884,11 +767,9 @@ def cmd_login_browser(args: argparse.Namespace) -> int:
             page.goto(ctx.authorization_url, wait_until="domcontentloaded")
         except Exception as e:
             log.warning("initial navigation reported: %s", e)
-        debugcap.capture_landmark(page, args.screenshot_dir, "01-authorize",
-                                  log=log)
+        _capture(page, args.screenshot_dir, "01-authorize")
         prefill_login(page, login_id, password)
-        debugcap.capture_landmark(page, args.screenshot_dir, "02-prefilled",
-                                  log=log)
+        _capture(page, args.screenshot_dir, "02-prefilled")
 
         try:
             if args.cli_mfa:
@@ -908,8 +789,7 @@ def cmd_login_browser(args: argparse.Namespace) -> int:
                                               args.screenshot_dir,
                                               args.cli_mfa, args.explore)
         except LoginFlowError as exc:
-            debugcap.capture_landmark(page, args.screenshot_dir, "99-terminal",
-                                      log=log)
+            _capture(page, args.screenshot_dir, "99-terminal")
             debugcap.stop_trace_if_active(context, args.trace,
                                           args.screenshot_dir, "login-terminal",
                                           log=log)
@@ -917,8 +797,7 @@ def cmd_login_browser(args: argparse.Namespace) -> int:
             return exc.exit_code
         finally:
             bodies.flush()
-        debugcap.capture_landmark(page, args.screenshot_dir, "03-postconsent",
-                                  log=log)
+        _capture(page, args.screenshot_dir, "03-postconsent")
         if received_url is None:
             debugcap.stop_trace_if_active(context, args.trace,
                                           args.screenshot_dir, "login-timeout",
@@ -1049,9 +928,7 @@ def cmd_login_manual(args: argparse.Namespace) -> int:
         raise SystemExit("schwab-py is not installed.") from None
     client_id = envfile.resolve_credential(args.client_id, "SCHWAB_CLIENT_ID",
                                    "--client-id")
-    client_secret = envfile.resolve_credential(args.client_secret,
-                                       "SCHWAB_CLIENT_SECRET",
-                                       "--client-secret")
+    client_secret = _tokenclient.client_secret()
     args.token_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         schwab_auth.client_from_manual_flow(

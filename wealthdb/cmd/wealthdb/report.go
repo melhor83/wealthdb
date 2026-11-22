@@ -39,8 +39,9 @@ type report struct {
 type reportColumn struct {
 	name    string
 	header  string
-	align   output.Alignment
-	date    bool
+	kind    ColumnKind
+	unit    MoneyUnit
+	twin    string
 	privacy PrivacyClass
 }
 
@@ -63,7 +64,9 @@ type request struct {
 	currency string
 	// from and to bound a window, inclusive, in epoch seconds; from 0
 	// is an open start. asOf is the as-of instant of holdings, exposure
-	// and yield, and today on income's forward views.
+	// and yield. On a trailing-year window it is the last second of
+	// today, which income's forward views and spending's in_progress
+	// tag read.
 	from, to int64
 	asOf     int64
 
@@ -79,12 +82,17 @@ type request struct {
 	withCash     bool              // holdings positions
 	country      string            // exposure: risk | domicile
 	converted    bool              // yield: one row per entity in the output currency
+	vsLastYear   bool              // spending categories: each row beside the year before
 	assumptions  yield.Assumptions // income's forward views: rate path, maturing rule, shift
 	series       []seriesPoint     // exposure and yield --period: the instants of a series
 	newestFirst  bool              // transactions, gains realized
 	allDocuments bool              // gains realized: every copy of a sale, not the primary set
 	missing      lots.MissingBasis // gains, holdings positions: how a missing cost basis counts
 	categories   typedCategories   // the account_category values -p prints as pseudonyms
+
+	verbose          bool   // status: the counts of the rows nothing classified
+	latestOnly       bool   // snapshots: each source's latest snapshot alone
+	categorizeFamily string // categorizations: the family a call names, "" for both
 }
 
 // newReport wraps a typed registry and fetch function as a report.
@@ -92,7 +100,7 @@ func newReport[T any](registry []columnSpec[T], defaults []string, fetch func(co
 	cols := make([]reportColumn, len(registry))
 	index := make(map[string]int, len(registry))
 	for i, c := range registry {
-		cols[i] = reportColumn{name: c.Name, header: c.header(), align: c.Align, date: c.Date, privacy: c.Privacy}
+		cols[i] = reportColumn{name: c.Name, header: c.header(), kind: c.Kind, unit: c.Unit, twin: c.Twin, privacy: c.class()}
 		index[c.Name] = i
 	}
 	return &report{
@@ -225,25 +233,29 @@ type reportOutput struct {
 // views that print it.
 type cliFilter struct {
 	conds []string
-	tool  string
 	fam   *family
 	req   request
 	cfg   *config.Config
 	now   time.Time
 }
 
+// view is the name of the view the conditions bind to: "" for a tool of
+// one shape, whose request may name a view no command spells (status
+// --marks).
+func (f *cliFilter) view() string { return f.fam.view(f.req.view).name }
+
 // label names the command in a condition's message: "wealthdb yield
-// positions".
+// positions", "wealthdb status".
 func (f *cliFilter) label() string {
-	return strings.TrimSpace("wealthdb " + f.tool + " " + f.req.view)
+	return strings.TrimSpace("wealthdb " + f.fam.name + " " + f.view())
 }
 
 // bind reads the conditions against rep, as the server reads its filter
 // parameter.
 func (f *cliFilter) bind(rep *report, privacy bool) ([]condition, error) {
 	front := filterFront{prefix: f.label() + ":", cli: true}
-	target := filterTarget{view: f.req.view, lookup: f.fam.lookup(rep, f.req), privacy: privacy, now: f.now, front: front,
-		elsewhere: func(col string) string { return columnElsewhere(f.cfg, f.tool, f.req.view, col, true) }}
+	target := filterTarget{view: f.view(), lookup: f.fam.lookup(rep, f.req), privacy: privacy, now: f.now, front: front,
+		elsewhere: func(col string) string { return columnElsewhere(f.cfg, f.fam.name, f.view(), col, true) }}
 	raws, bad := parseConditions(f.conds, front)
 	conds, err := target.bind(raws, bad)
 	if err != nil {
@@ -280,10 +292,15 @@ func writeReport(ctx context.Context, rep *report, out reportOutput, open func()
 		return err
 	}
 	if out.filter == nil {
-		return writeFormatted(w, out.format, rows.table(nil, cols, out.privacy, out.format, nil))
+		// Under -p the pseudonyms number as a filtered run's do
+		// (numberedCells).
+		var names *pseudonyms
+		if out.privacy {
+			_, names = numberedCells(rep, rows)
+		}
+		return writeFormatted(w, out.format, rows.table(nil, cols, out.privacy, out.format, names))
 	}
-	// Pseudonyms number over every row, as the server's do, so a
-	// filtered csv names a row as the unfiltered one.
+	// The conditions read the cells as printed.
 	rs := newResultSet(rep, rows, out.privacy)
 	all := rs.filter(nil, "")
 	idx, _ := keepRows(rs.cells, all, conds)

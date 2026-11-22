@@ -19,8 +19,9 @@ gold DB, never the live file. The snapshot is mounted `:ro`. Never:
 The one narrow carve-out: before snapshotting, `web refresh` (and the
 initial snapshot in `web start`) invokes the **engine's** hidden
 `web-materialize` subcommand. It rewrites the serving tables, the
-`report_returns` (with `report_bridge` and the benchmark tables),
-`report_gains`, `report_exposure*` and `report_yield_*` tables and
+`report_returns` (with `report_bridge`, `report_private_markets` and the
+benchmark tables), `report_gains`, `report_exposure*` and
+`report_yield_*` tables and
 `report_cashflow_plan` in live gold (DESIGN.md §8). That is
 an engine-owned write, not a web write path:
 
@@ -48,8 +49,8 @@ port-forward; auth is Metabase's own login.
   repo. Keeping the image content-free also keeps source data out of git.
 - The **one allowed exception** is what `provision.py` creates at
   runtime over the API, in a dedicated `wealthdb (pre-defined)`
-  collection. All of it is content-free *definitions* — MBQL and SQL
-  only, never source data — and what it builds is described in
+  collection. All of it is content-free *definitions* — SQL only,
+  never source data — and what it builds is described in
   [DESIGN.md §6](DESIGN.md): the models, the dashboards, their privacy
   twins and how each twin normalises. Read that before changing a card;
   it is not repeated here.
@@ -59,19 +60,20 @@ port-forward; auth is Metabase's own login.
   survive. Duplicate a pre-defined card into another collection
   before customizing it. User content elsewhere is never touched. Card
   and dashboard matching is scoped to the pre-defined collection.
-- Adding a serving view? Register it in `FILTER_FIELD_COLUMNS`. That is
-  the single registry both the field-id resolution and the startup probe
-  read, and the probe aborts the run rather than converging every card
-  to a degraded shape when a view the cards need is missing.
+- A serving view needs no registry entry. The field-id resolution and
+  the startup probe read the views and filter columns off the card and
+  model definitions (`filter_field_columns`). The probe aborts the run
+  when a view the cards need is missing, and a filter column without a
+  field id stops it before any card is sent.
 - The `web_*` views live in `wealthdb/internal/gold/derived/90_web.sql`,
   beside every other macro and view of gold. A view is added or changed
   there, never in a migration.
   [derived/README.md](../wealthdb/internal/gold/derived/README.md) says
   how.
-- A card that starts reading a new view or table raises
+- A card that starts reading a new view, macro or table raises
   `MIN_GOLD_SCHEMA` to the gold schema version that brings it: the
-  derived version for a view, the migration for a table. A test holds
-  it there.
+  derived version for a view or macro, the migration for a table. A
+  test holds it there.
 - The gold DuckDB connection is added at runtime by `provision.py`,
   never baked into the image.
 - This component holds **no source credentials**. Its one secret is the
@@ -107,7 +109,8 @@ A fourth invariant, same weight (DESIGN.md §7): **keep the memory
 discipline**. DuckDB runs in-process in the Metabase JVM — do not remove
 the container/JVM caps in `web/web`, the `memory_limit`/`threads`
 connection details in `provision.py`, or the writable spill mount at
-`<database_file>.tmp`; and never move DuckDB settings into `init_sql`
+`/spill` and its `temp_directory` in the connection's additional
+options; and never move DuckDB settings into `init_sql`
 (it runs per pooled connection, and re-`SET`ting a used
 `temp_directory` breaks every later query).
 

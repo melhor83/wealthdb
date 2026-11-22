@@ -43,7 +43,7 @@ log = logging.getLogger("swissquote.login")
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/158.0.0.0 Safari/537.36"
+    "Chrome/159.0.0.0 Safari/537.36"
 )
 
 # Playwright timeouts (milliseconds). Generous defaults — the WAN
@@ -56,9 +56,6 @@ LANDMARK_TIMEOUT_MS = 30_000
 # WEALTHDB_SECRETS_DIR) at /secrets, so the session state lives
 # there by default and survives across container runs.
 DEFAULT_STATE_PATH = Path("/secrets/swissquote-state.json")
-# Fallback state location (underscore) — read when the canonical file is absent,
-# so a session stored under this name keeps working. login writes the canonical name.
-LEGACY_STATE_PATH = Path("/secrets/swissquote_state.json")
 
 # Default credentials env-file locations (the wrapper mounts ~/.secrets at
 # /secrets). --env-file wins; else the first existing candidate.
@@ -141,18 +138,26 @@ def screenshot(page, screenshot_dir: Path | None, name: str) -> None:
         log.warning("Screenshot %s failed: %s", path, e)
 
 
-def _dump_html(page, screenshot_dir: Path | None, name: str) -> None:
+def _dump_html(page, screenshot_dir: Path | None, name: str, *,
+               secrets: tuple[str, ...]) -> None:
     """Save the page's rendered HTML next to the screenshot. Useful for
     pinning a selector against the live DOM (a screenshot can't be
-    grepped). Best-effort; only when a screenshot dir is configured."""
+    grepped). Best-effort; only when a screenshot dir is configured.
+
+    Every value in `secrets` (the run's credentials) is masked wherever
+    the markup carries it."""
     if not screenshot_dir:
         return
     screenshot_dir.mkdir(parents=True, exist_ok=True)
     path = screenshot_dir / f"{name}.html"
     try:
         # Scrubbed: a dump taken on the sign-in page would otherwise
-        # persist the typed password as a `value` attribute.
-        path.write_text(debugcap.scrub_dom(page.content()), encoding="utf-8")
+        # persist the typed password as a `value` attribute, and the
+        # username in a text input, a hidden field or a script.
+        path.write_text(
+            debugcap.scrub_dom(page.content(),
+                               debugcap.secret_redactor(*secrets)),
+            encoding="utf-8")
         log.info("Page HTML: %s", path)
     except Exception as e:  # noqa: BLE001 - best-effort debug aid
         log.warning("HTML dump %s failed: %s", path, e)
@@ -262,8 +267,7 @@ def check_session(args: argparse.Namespace) -> int:
     """Return 0 if the saved session still authenticates, 1 otherwise."""
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-    state_path = session.resolve_state_path(
-        args.state_path, DEFAULT_STATE_PATH, LEGACY_STATE_PATH)
+    state_path = args.state_path
     if not state_path.is_file():
         raise SystemExit(
             f"No state file at {state_path}. Nothing to check; "
@@ -379,7 +383,8 @@ def login(args: argparse.Namespace) -> int:
                     timeout=5000,
                 )
                 screenshot(page, args.screenshot_dir, f"login_{ts}_03_mfa")
-                _dump_html(page, args.screenshot_dir, f"login_{ts}_03_mfa")
+                _dump_html(page, args.screenshot_dir, f"login_{ts}_03_mfa",
+                           secrets=(username, password))
                 _announce_operation_code(
                     page,
                     waiting_note=f"Waiting up to {args.mfa_timeout}s ...",
@@ -517,8 +522,8 @@ def main(argv: list[str] | None = None) -> int:
     # login isn't forced to getpass-prompt. --env-file wins, else the first
     # existing default candidate. A named file that is missing, or a bash
     # error, stops the run.
-    envfile.source_first_env_file(args.env_file, DEFAULT_ENV_FILE_CANDIDATES,
-                                  logger=log)
+    envfile.load(args.env_file, candidates=DEFAULT_ENV_FILE_CANDIDATES,
+                 logger=log)
 
     # --trace must be paired with --screenshot-dir. The trace bundle
     # lands inside that directory; there is no implicit fallback to
